@@ -5,15 +5,19 @@
 
 use std::path::Path;
 
+use sekvent_testing::DOCKER_TESTS_ENV;
 use thiserror::Error;
 
-use crate::config::{Config, FeatureSet, Features, GateConfig};
+use crate::config::{Config, FeatureSet, Features, GateConfig, HarnessConfig};
 use crate::location::EnvMap;
 use crate::metadata::Metadata;
 use crate::process::Cmd;
 
 /// `RUST_TEST_THREADS`, set from `[gate].test_threads` unless already set.
 pub const TEST_THREADS_ENV: &str = "RUST_TEST_THREADS";
+
+/// Libtest flag that runs `#[ignore]`d tests along with the others.
+pub const INCLUDE_IGNORED: &str = "--include-ignored";
 
 /// A package selection that does not match the workspace.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -119,33 +123,59 @@ pub fn clippy_command(root: &Path, selection: &Selection, gate: &GateConfig) -> 
         .args(gate.clippy_args.iter().cloned())
 }
 
-/// `RUST_TEST_THREADS` from the configuration, unless `env` already has it.
-pub fn test_env(gate: &GateConfig, env: &EnvMap) -> Vec<(String, String)> {
-    if env.contains_key(TEST_THREADS_ENV) {
-        Vec::new()
+/// Environment of a test run: `RUST_TEST_THREADS` from `[gate].test_threads`
+/// and, with `[harness].docker_tests`, `SEKVENT_DOCKER_TESTS=1`; a variable
+/// `env` already sets is left to the environment.
+pub fn test_env(config: &Config, env: &EnvMap) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    if !env.contains_key(TEST_THREADS_ENV) {
+        vars.push((
+            TEST_THREADS_ENV.to_owned(),
+            config.gate.test_threads.to_string(),
+        ));
+    }
+    if config.harness.docker_tests && !env.contains_key(DOCKER_TESTS_ENV) {
+        vars.push((DOCKER_TESTS_ENV.to_owned(), "1".to_owned()));
+    }
+    vars
+}
+
+/// Arguments for the test binaries: `extra`, plus [`INCLUDE_IGNORED`] with
+/// `[harness].docker_tests` unless `extra` already selects ignored tests
+/// (libtest rejects `--ignored` together with `--include-ignored`).
+pub fn test_binary_args(harness: &HarnessConfig, extra: &[String]) -> Vec<String> {
+    let mut out = extra.to_vec();
+    let selects_ignored = extra
+        .iter()
+        .any(|arg| arg == INCLUDE_IGNORED || arg == "--ignored");
+    if harness.docker_tests && !selects_ignored {
+        out.push(INCLUDE_IGNORED.to_owned());
+    }
+    out
+}
+
+fn with_binary_args(cmd: Cmd, args: &[String]) -> Cmd {
+    if args.is_empty() {
+        cmd
     } else {
-        vec![(TEST_THREADS_ENV.to_owned(), gate.test_threads.to_string())]
+        cmd.arg("--").args(args.iter().cloned())
     }
 }
 
-/// `cargo test` over the selection; `extra` goes after `--`.
+/// `cargo test` over the selection; [`test_binary_args`] go after `--`.
 pub fn test_command(
     root: &Path,
     selection: &Selection,
-    gate: &GateConfig,
+    config: &Config,
     env: &EnvMap,
     extra: &[String],
 ) -> Cmd {
     let cmd = cargo(root, "test")
         .args(selection.workspace_args())
-        .args(feature_args(&gate.features))
+        .args(feature_args(&config.gate.features))
         .arg("--locked")
-        .envs(&test_env(gate, env));
-    if extra.is_empty() {
-        cmd
-    } else {
-        cmd.arg("--").args(extra.iter().cloned())
-    }
+        .envs(&test_env(config, env));
+    with_binary_args(cmd, &test_binary_args(&config.harness, extra))
 }
 
 /// `cargo doc --no-deps` with warnings denied.
@@ -235,7 +265,7 @@ pub fn gate_steps(
     ));
     steps.push(Step::run(
         "test",
-        test_command(root, selection, gate, env, &[]).envs(harness_env),
+        test_command(root, selection, config, env, &[]).envs(harness_env),
     ));
     if gate.doc {
         steps.push(Step::run(
@@ -264,14 +294,15 @@ pub fn coverage_clean_command(root: &Path) -> Cmd {
 pub fn coverage_run_command(
     root: &Path,
     selection: &Selection,
-    gate: &GateConfig,
+    config: &Config,
     env: &EnvMap,
 ) -> Cmd {
-    cargo(root, "llvm-cov")
+    let cmd = cargo(root, "llvm-cov")
         .args(selection.workspace_args())
-        .args(feature_args(&gate.features))
+        .args(feature_args(&config.gate.features))
         .args(["--locked", "--no-report"])
-        .envs(&test_env(gate, env))
+        .envs(&test_env(config, env));
+    with_binary_args(cmd, &test_binary_args(&config.harness, &[]))
 }
 
 /// `cargo llvm-cov report --json` into `output`; `summary_only` drops the
@@ -458,11 +489,12 @@ mod tests {
         let cmd = test_command(
             Path::new("/w"),
             &selection,
-            &gate(&[]),
+            &Config::with_name("orders"),
             &env,
             &["--nocapture".into()],
         );
         assert_eq!(cmd.env_value("RUST_TEST_THREADS"), None);
+        assert_eq!(cmd.env_value("SEKVENT_DOCKER_TESTS"), None);
         assert_eq!(
             cmd.to_string(),
             "cargo test --workspace --all-features --locked -- --nocapture"
@@ -481,12 +513,15 @@ mod tests {
             coverage_clean_command(root).to_string(),
             "cargo llvm-cov clean --workspace"
         );
-        let run = coverage_run_command(root, &selection, &gate(&["vendored"]), &EnvMap::new());
+        let mut config = Config::with_name("orders");
+        config.gate = gate(&["vendored"]);
+        let run = coverage_run_command(root, &selection, &config, &EnvMap::new());
         assert_eq!(
             run.to_string(),
             "cargo llvm-cov --workspace --exclude vendored --all-features --locked --no-report"
         );
         assert_eq!(run.env_value("RUST_TEST_THREADS"), Some("8"));
+        assert_eq!(run.env_value("SEKVENT_DOCKER_TESTS"), None);
         assert_eq!(
             coverage_json_command(root, "x", Path::new("/tmp/c.json"), true).to_string(),
             "cargo llvm-cov report --json --summary-only --ignore-filename-regex x --output-path /tmp/c.json"
@@ -513,5 +548,94 @@ mod tests {
     fn empty_hooks_are_skipped() {
         let steps = hook_steps(Path::new("/w"), "pre", &[Vec::new(), vec!["a".into()]], &[]);
         assert_eq!(lines(&steps), ["pre[1]: a"]);
+    }
+
+    fn docker_config() -> Config {
+        let mut config = Config::with_name("orders");
+        config.harness.docker_tests = true;
+        config
+    }
+
+    #[test]
+    fn docker_tests_opt_in_to_ignored_tests_in_the_gate() {
+        let config = docker_config();
+        let selection = Selection::new(&meta(), &config.gate).unwrap();
+        let steps = gate_steps(Path::new("/w"), &config, &selection, &EnvMap::new(), &[]);
+        let Some(Step::Run { cmd: test, .. }) = steps.iter().find(|step| step.name() == "test")
+        else {
+            panic!("test step")
+        };
+        assert_eq!(
+            test.to_string(),
+            "cargo test --workspace --all-features --locked -- --include-ignored"
+        );
+        assert_eq!(test.env_value("SEKVENT_DOCKER_TESTS"), Some("1"));
+        assert_eq!(test.env_value("RUST_TEST_THREADS"), Some("8"));
+    }
+
+    #[test]
+    fn docker_tests_merge_with_user_test_arguments() {
+        let config = docker_config();
+        let selection = Selection::new(&meta(), &config.gate).unwrap();
+        let cmd = test_command(
+            Path::new("/w"),
+            &selection,
+            &config,
+            &EnvMap::new(),
+            &["orders::".into(), "--nocapture".into()],
+        );
+        assert_eq!(
+            cmd.to_string(),
+            "cargo test --workspace --all-features --locked -- orders:: --nocapture \
+             --include-ignored"
+        );
+        for selects_ignored in ["--ignored", "--include-ignored"] {
+            let cmd = test_command(
+                Path::new("/w"),
+                &selection,
+                &config,
+                &EnvMap::new(),
+                &[selects_ignored.into()],
+            );
+            assert_eq!(
+                cmd.to_string(),
+                format!("cargo test --workspace --all-features --locked -- {selects_ignored}")
+            );
+        }
+    }
+
+    #[test]
+    fn docker_tests_respect_an_explicit_environment_value() {
+        let config = docker_config();
+        let mut env = EnvMap::new();
+        env.insert("SEKVENT_DOCKER_TESTS".into(), "0".into());
+        env.insert("RUST_TEST_THREADS".into(), "2".into());
+        assert!(test_env(&config, &env).is_empty());
+        assert_eq!(
+            test_env(&config, &EnvMap::new()),
+            [
+                ("RUST_TEST_THREADS".to_owned(), "8".to_owned()),
+                ("SEKVENT_DOCKER_TESTS".to_owned(), "1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_tests_reach_the_coverage_run() {
+        let config = docker_config();
+        let selection = Selection::new(&meta(), &config.gate).unwrap();
+        let run = coverage_run_command(Path::new("/w"), &selection, &config, &EnvMap::new());
+        assert_eq!(
+            run.to_string(),
+            "cargo llvm-cov --workspace --all-features --locked --no-report -- --include-ignored"
+        );
+        assert_eq!(run.env_value("SEKVENT_DOCKER_TESTS"), Some("1"));
+    }
+
+    #[test]
+    fn without_docker_tests_no_binary_arguments_are_added() {
+        let harness = HarnessConfig::default();
+        assert!(test_binary_args(&harness, &[]).is_empty());
+        assert_eq!(test_binary_args(&harness, &["x".into()]), ["x"]);
     }
 }

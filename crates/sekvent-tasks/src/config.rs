@@ -258,6 +258,10 @@ pub struct HarnessConfig {
     /// Age (humantime, e.g. `6h`) after which another run's containers are
     /// swept before a gate.
     pub stale_after: String,
+    /// Run the container-backed tests in `gate`, `test` and `coverage`:
+    /// `SEKVENT_DOCKER_TESTS=1` is exported (unless the environment already
+    /// sets it) and the test binaries get `--include-ignored`.
+    pub docker_tests: bool,
 }
 
 impl Default for HarnessConfig {
@@ -265,6 +269,7 @@ impl Default for HarnessConfig {
         Self {
             label_namespace: sekvent_testing::DEFAULT_NAMESPACE.to_owned(),
             stale_after: DEFAULT_STALE_AFTER.to_owned(),
+            docker_tests: false,
         }
     }
 }
@@ -519,6 +524,7 @@ exclude = ["orders-proto"]
 [harness]
 label_namespace = "com.example.harness"
 stale_after = "2h"
+docker_tests = true
 
 [hooks]
 pre_gate = [["echo", "pre"]]
@@ -568,6 +574,7 @@ description = "Seed the dev database"
             config.harness.stale_after().unwrap(),
             Duration::from_secs(7200)
         );
+        assert!(config.harness.docker_tests);
         assert_eq!(config.hooks.pre_gate, [["echo", "pre"]]);
         assert_eq!(config.hooks.post_coverage.len(), 2);
         let seed = &config.tasks["seed"];
@@ -592,6 +599,7 @@ description = "Seed the dev database"
             config.harness.stale_after().unwrap(),
             Duration::from_hours(6)
         );
+        assert!(!config.harness.docker_tests);
         assert!(config.tasks.is_empty());
     }
 
@@ -611,6 +619,7 @@ description = "Seed the dev database"
             "[project]\nname = \"x\"\n[[gate.boundaries]]\nfrom = \"a\"\nto = \"b\"\nvia = \"c\"\n",
             "[project]\nname = \"x\"\n[coverage]\nfail_under = 1.0\n",
             "[project]\nname = \"x\"\n[harness]\nnamespace = \"a\"\n",
+            "[project]\nname = \"x\"\n[harness]\ndocker_test = true\n",
             "[project]\nname = \"x\"\n[hooks]\npre_test = []\n",
             "[project]\nname = \"x\"\n[tasks.a]\nrun = [\"a\"]\nenv = {}\n",
             "[project]\nname = \"x\"\n[unknown]\n",
@@ -671,6 +680,7 @@ description = "Seed the dev database"
         assert_eq!(parse(&text).unwrap(), config);
         let defaults = Config::with_name("orders").to_toml().unwrap();
         assert!(defaults.contains("stale_after = \"6h\""), "{defaults}");
+        assert!(defaults.contains("docker_tests = false"), "{defaults}");
     }
 
     #[test]

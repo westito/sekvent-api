@@ -61,10 +61,14 @@ pub fn download_command(url: &str, output: &Path) -> Cmd {
 
 /// A SHA-256 command available on this machine.
 pub fn checksum_command(file: &Path) -> anyhow::Result<Cmd> {
+    checksum_command_with(file, |program| which::which(program).is_ok())
+}
+
+fn checksum_command_with(file: &Path, installed: impl Fn(&str) -> bool) -> anyhow::Result<Cmd> {
     let path = file.display().to_string();
-    if which::which("sha256sum").is_ok() {
+    if installed("sha256sum") {
         Ok(Cmd::new("sha256sum").arg(path))
-    } else if which::which("shasum").is_ok() {
+    } else if installed("shasum") {
         Ok(Cmd::new("shasum").args(["-a", "256"]).arg(path))
     } else {
         bail!("neither `sha256sum` nor `shasum` is installed")
@@ -152,12 +156,20 @@ pub fn update_executable(runner: &dyn Runner, exe: &Path, target: &str) -> anyho
 
 /// `cargo sekvent self-update` for the running executable.
 pub fn self_update(runner: &dyn Runner) -> anyhow::Result<()> {
-    if BUILD_TARGET.is_empty() {
+    update_current(runner, std::env::current_exe(), BUILD_TARGET)
+}
+
+fn update_current(
+    runner: &dyn Runner,
+    exe: std::io::Result<PathBuf>,
+    target: &str,
+) -> anyhow::Result<()> {
+    if target.is_empty() {
         bail!("this build does not know its target triple");
     }
-    let exe = std::env::current_exe().context("cannot locate the running executable")?;
+    let exe = exe.context("cannot locate the running executable")?;
     let exe = exe.canonicalize().unwrap_or(exe);
-    update_executable(runner, &exe, BUILD_TARGET)
+    update_executable(runner, &exe, target)
 }
 
 #[cfg(test)]
@@ -216,5 +228,213 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join(BINARY), "bin").unwrap();
         assert_eq!(find_binary(dir.path()), Some(nested.join(BINARY)));
+    }
+
+    #[test]
+    fn the_checksum_tool_is_picked_by_availability() {
+        let file = Path::new("/tmp/a.tar.gz");
+        assert_eq!(
+            checksum_command_with(file, |_| true).unwrap().to_string(),
+            "sha256sum /tmp/a.tar.gz"
+        );
+        assert_eq!(
+            checksum_command_with(file, |program| program == "shasum")
+                .unwrap()
+                .to_string(),
+            "shasum -a 256 /tmp/a.tar.gz"
+        );
+        let error = checksum_command_with(file, |_| false).unwrap_err();
+        assert!(error.to_string().contains("sha256sum"), "{error}");
+    }
+
+    const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const NEW_BINARY: &str = "new binary";
+
+    /// Serves a release: `curl` writes the archive or the published digest,
+    /// the checksum tool prints `computed`, and `tar` unpacks a binary when
+    /// `with_binary`.
+    struct Release {
+        published: String,
+        computed: String,
+        with_binary: bool,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Release {
+        fn new() -> Self {
+            Self {
+                published: format!("{}  {}\n", "ab".repeat(32), asset_name(TARGET)),
+                computed: "ab".repeat(32),
+                with_binary: true,
+                calls: std::cell::RefCell::default(),
+            }
+        }
+
+        fn last_arg(cmd: &Cmd) -> &str {
+            cmd.args.last().map_or("", String::as_str)
+        }
+    }
+
+    impl Runner for Release {
+        fn status(&self, cmd: &Cmd) -> std::io::Result<i32> {
+            self.calls.borrow_mut().push(cmd.program.clone());
+            match cmd.program.as_str() {
+                "curl" => {
+                    let output = cmd
+                        .args
+                        .iter()
+                        .skip_while(|arg| *arg != "--output")
+                        .nth(1)
+                        .expect("curl --output");
+                    let body = if Self::last_arg(cmd).ends_with(".sha256") {
+                        self.published.as_str()
+                    } else {
+                        "archive"
+                    };
+                    std::fs::write(output, body)?;
+                    Ok(0)
+                }
+                "tar" => {
+                    if self.with_binary {
+                        let nested = Path::new(Self::last_arg(cmd)).join("release");
+                        std::fs::create_dir_all(&nested)?;
+                        std::fs::write(nested.join(BINARY), NEW_BINARY)?;
+                    }
+                    Ok(0)
+                }
+                _ => Ok(127),
+            }
+        }
+
+        fn output(
+            &self,
+            cmd: &Cmd,
+            _timeout: Option<std::time::Duration>,
+        ) -> std::io::Result<crate::process::CmdOutput> {
+            self.calls.borrow_mut().push(cmd.program.clone());
+            Ok(crate::process::CmdOutput {
+                code: 0,
+                stdout: format!("{}  {}\n", self.computed, Self::last_arg(cmd)),
+                stderr: String::new(),
+            })
+        }
+
+        fn exec(&self, cmd: &Cmd) -> std::io::Result<i32> {
+            self.status(cmd)
+        }
+    }
+
+    fn installed_exe() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join(BINARY);
+        std::fs::write(&exe, "old").unwrap();
+        (dir, exe)
+    }
+
+    #[test]
+    fn a_verified_release_replaces_the_executable() {
+        let (dir, exe) = installed_exe();
+        let release = Release::new();
+        update_executable(&release, &exe, TARGET).unwrap();
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), NEW_BINARY);
+        assert_eq!(
+            release.calls.borrow()[..2],
+            ["curl".to_owned(), "curl".to_owned()]
+        );
+        assert_eq!(release.calls.borrow().last().unwrap(), "tar");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, [BINARY]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+    }
+
+    #[test]
+    fn a_checksum_mismatch_keeps_the_old_executable() {
+        let (_dir, exe) = installed_exe();
+        let release = Release {
+            computed: "cd".repeat(32),
+            ..Release::new()
+        };
+        let error = update_executable(&release, &exe, TARGET).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+    }
+
+    #[test]
+    fn unreadable_digests_are_errors() {
+        let (_dir, exe) = installed_exe();
+        let published = Release {
+            published: "not found\n".into(),
+            ..Release::new()
+        };
+        let error = update_executable(&published, &exe, TARGET).unwrap_err();
+        assert!(error.to_string().contains("no SHA-256 digest"), "{error}");
+
+        let computed = Release {
+            computed: "?".into(),
+            ..Release::new()
+        };
+        let error = update_executable(&computed, &exe, TARGET).unwrap_err();
+        assert!(error.to_string().contains("computed digest"), "{error}");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+    }
+
+    #[test]
+    fn an_archive_without_the_binary_is_rejected() {
+        let (_dir, exe) = installed_exe();
+        let release = Release {
+            with_binary: false,
+            ..Release::new()
+        };
+        let error = update_executable(&release, &exe, TARGET).unwrap_err();
+        assert!(
+            error.to_string().contains("no cargo-sekvent binary"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_executable_needs_a_writable_parent() {
+        let error = update_executable(&Release::new(), Path::new("/"), TARGET).unwrap_err();
+        assert!(error.to_string().contains("no parent directory"), "{error}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("missing").join(BINARY);
+        let error = update_executable(&Release::new(), &exe, TARGET).unwrap_err();
+        assert!(
+            error.to_string().starts_with("cannot write into"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_failed_checksum_download_stops_the_update() {
+        let (_dir, exe) = installed_exe();
+        let runner = FakeRunner::with_codes(&[0, 22]);
+        let error = update_executable(&runner, &exe, TARGET).unwrap_err();
+        assert!(error.to_string().contains(".sha256"), "{error}");
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[test]
+    fn the_running_executable_is_resolved_first() {
+        let runner = FakeRunner::default();
+        let error = update_current(&runner, Ok(PathBuf::from("/x")), "").unwrap_err();
+        assert!(error.to_string().contains("target triple"), "{error}");
+        let missing = Err(std::io::Error::other("gone"));
+        let error = update_current(&runner, missing, TARGET).unwrap_err();
+        assert!(error.to_string().contains("running executable"), "{error}");
+        assert!(runner.calls().is_empty());
+
+        let (_dir, exe) = installed_exe();
+        update_current(&Release::new(), Ok(exe.clone()), TARGET).unwrap();
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), NEW_BINARY);
     }
 }

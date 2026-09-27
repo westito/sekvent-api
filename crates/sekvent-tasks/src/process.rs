@@ -343,4 +343,101 @@ mod tests {
         };
         assert!(!failed.success());
     }
+
+    const MISSING: &str = "sekvent-tasks-no-such-program";
+
+    fn shell(script: &str) -> Cmd {
+        Cmd::new("sh").args(["-c", script])
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_system_runner_reports_exit_codes() {
+        assert_eq!(SystemRunner.status(&Cmd::new("true")).unwrap(), 0);
+        assert_eq!(SystemRunner.status(&Cmd::new("false")).unwrap(), 1);
+        assert_eq!(SystemRunner.status(&shell("exit 3")).unwrap(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_maps_to_128_plus_its_number() {
+        assert_eq!(SystemRunner.status(&shell("kill -9 $$")).unwrap(), 137);
+        let output = SystemRunner.output(&shell("kill -15 $$"), None).unwrap();
+        assert_eq!(output.code, 143);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_is_captured_with_env_and_directory() {
+        const SCRIPT: &str =
+            "printf '%s|%s' \"$SEKVENT_PROCESS_TEST\" \"$(pwd -P)\"; echo oops >&2; exit 2";
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = shell(SCRIPT)
+            .env("SEKVENT_PROCESS_TEST", "value")
+            .cwd(dir.path());
+        let output = SystemRunner.output(&cmd, None).unwrap();
+        let expected_dir = dir.path().canonicalize().unwrap();
+        assert_eq!(output.stdout, format!("value|{}", expected_dir.display()));
+        assert_eq!(output.stderr, "oops\n");
+        assert_eq!(output.code, 2);
+        assert!(!output.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_the_timeout_is_returned() {
+        let cmd = Cmd::new("echo").arg("hi");
+        let output = SystemRunner
+            .output(&cmd, Some(Duration::from_mins(1)))
+            .unwrap();
+        assert_eq!(output.stdout, "hi\n");
+        assert!(output.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_past_its_timeout_is_killed() {
+        let started = Instant::now();
+        let error = SystemRunner
+            .output(
+                &Cmd::new("sleep").arg("30"),
+                Some(Duration::from_millis(100)),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("did not finish"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_missing_program_names_the_program() {
+        let cmd = Cmd::new(MISSING);
+        for error in [
+            SystemRunner.status(&cmd).unwrap_err(),
+            SystemRunner.output(&cmd, None).unwrap_err(),
+            SystemRunner.exec(&cmd).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("cannot run `{MISSING}`")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fake_runner_answers_from_its_queues() {
+        let runner = fake::FakeRunner::with_codes(&[4]);
+        runner.push_output("out");
+        assert_eq!(runner.exec(&Cmd::new("a")).unwrap(), 4);
+        assert_eq!(runner.status(&Cmd::new("b")).unwrap(), 0);
+        assert_eq!(runner.output(&Cmd::new("c"), None).unwrap().stdout, "out");
+        assert_eq!(
+            runner.output(&Cmd::new("d"), None).unwrap(),
+            CmdOutput::default()
+        );
+        assert_eq!(runner.lines(), ["a", "b", "c", "d"]);
+    }
 }

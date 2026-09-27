@@ -36,12 +36,21 @@ fn docker_available() -> bool {
     which::which("docker").is_ok()
 }
 
+/// Run `sweep` only when Docker is installed; nothing to remove otherwise.
+fn when_available(
+    available: bool,
+    sweep: impl FnOnce() -> Result<SweepReport, HarnessError>,
+) -> Result<SweepReport, HarnessError> {
+    if available {
+        sweep()
+    } else {
+        Ok(SweepReport::default())
+    }
+}
+
 impl Sweeper for DockerSweeper {
     fn sweep_run(&self, harness: &Harness, run_id: &str) -> Result<SweepReport, HarnessError> {
-        if !docker_available() {
-            return Ok(SweepReport::default());
-        }
-        harness.sweep_run(run_id)
+        when_available(docker_available(), || harness.sweep_run(run_id))
     }
 
     fn sweep_stale(
@@ -49,19 +58,15 @@ impl Sweeper for DockerSweeper {
         harness: &Harness,
         older_than: Duration,
     ) -> Result<SweepReport, HarnessError> {
-        if !docker_available() {
-            return Ok(SweepReport::default());
-        }
-        harness.sweep_stale(older_than)
+        when_available(docker_available(), || harness.sweep_stale(older_than))
     }
 
     fn sweep_all(&self, harness: &Harness) -> Result<SweepReport, HarnessError> {
-        if !docker_available() {
-            return Ok(SweepReport::default());
-        }
         // A zero age still requires `age > 0`; moving "now" forward also
         // catches containers created within the current second.
-        harness.sweep_stale_at(Duration::ZERO, SystemTime::now() + Duration::from_secs(1))
+        when_available(docker_available(), || {
+            harness.sweep_stale_at(Duration::ZERO, SystemTime::now() + Duration::from_secs(1))
+        })
     }
 }
 
@@ -209,6 +214,7 @@ mod tests {
         HarnessConfig {
             label_namespace: "com.example.h".into(),
             stale_after: "1h".into(),
+            docker_tests: false,
         }
     }
 
@@ -261,5 +267,71 @@ mod tests {
         let error = clean(&config(), &sweeper, &CleanScope::All, false).unwrap_err();
         assert!(error.to_string().contains("--yes"), "{error}");
         assert!(sweeper.calls.borrow().is_empty());
+    }
+
+    /// Fails every sweep.
+    struct BrokenSweeper;
+
+    fn broken() -> HarnessError {
+        HarnessError::Docker("daemon unreachable".into())
+    }
+
+    impl Sweeper for BrokenSweeper {
+        fn sweep_run(&self, _: &Harness, _: &str) -> Result<SweepReport, HarnessError> {
+            Err(broken())
+        }
+
+        fn sweep_stale(&self, _: &Harness, _: Duration) -> Result<SweepReport, HarnessError> {
+            Err(broken())
+        }
+
+        fn sweep_all(&self, _: &Harness) -> Result<SweepReport, HarnessError> {
+            Err(broken())
+        }
+    }
+
+    #[test]
+    fn sweep_failures_do_not_stop_a_session() {
+        let session = HarnessSession::start(&config(), &BrokenSweeper).unwrap();
+        session.finish(&BrokenSweeper);
+        assert!(clean(&config(), &BrokenSweeper, &CleanScope::Stale, false).is_err());
+        assert!(clean(&config(), &BrokenSweeper, &CleanScope::All, true).is_err());
+    }
+
+    #[test]
+    fn a_bad_stale_age_skips_the_stale_sweep() {
+        let config = HarnessConfig {
+            stale_after: "soon".into(),
+            ..config()
+        };
+        let sweeper = FakeSweeper::default();
+        let session = HarnessSession::start(&config, &sweeper).unwrap();
+        assert!(sweeper.calls.borrow().is_empty());
+        session.finish(&sweeper);
+        assert_eq!(sweeper.calls.borrow().len(), 1);
+        assert!(clean(&config, &sweeper, &CleanScope::Stale, false).is_err());
+    }
+
+    #[test]
+    fn a_bad_namespace_is_rejected_up_front() {
+        let config = HarnessConfig {
+            label_namespace: "bad namespace".into(),
+            ..config()
+        };
+        let sweeper = FakeSweeper::default();
+        assert!(HarnessSession::start(&config, &sweeper).is_err());
+        assert!(clean(&config, &sweeper, &CleanScope::Stale, false).is_err());
+        assert!(sweeper.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn sweeps_run_only_with_docker_installed() {
+        let removed = SweepReport {
+            removed: vec!["c1".into()],
+        };
+        let skipped = when_available(false, || panic!("must not sweep")).unwrap();
+        assert!(skipped.removed.is_empty());
+        let swept = when_available(true, || Ok(removed.clone())).unwrap();
+        assert_eq!(swept, removed);
     }
 }

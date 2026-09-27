@@ -73,3 +73,40 @@ pub fn install_interrupt_handler() -> Arc<AtomicBool> {
     })
     .clone()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RemoteMode;
+    use crate::harness::fake::FakeSweeper;
+    use crate::location::{LocalReason, RRB_CONTAINER_ENV};
+    use crate::process::fake::FakeRunner;
+
+    #[test]
+    fn the_context_exposes_location_and_interrupts() {
+        let runner = FakeRunner::default();
+        let sweeper = FakeSweeper::default();
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let mut config = Config::with_name("orders");
+        config.remote.mode = RemoteMode::Rrb;
+        let project = Project {
+            root: "/work".into(),
+            config,
+        };
+        let mut ctx = Context::new(
+            project,
+            EnvMap::new(),
+            &runner,
+            &sweeper,
+            Arc::clone(&interrupted),
+        );
+        assert_eq!(ctx.root, PathBuf::from("/work"));
+        assert_eq!(ctx.location(), Location::Remote);
+        ctx.env.insert(RRB_CONTAINER_ENV.into(), "1".into());
+        assert_eq!(ctx.location(), Location::Local(LocalReason::InsideBuilder));
+
+        assert!(!ctx.is_interrupted());
+        interrupted.store(true, Ordering::SeqCst);
+        assert!(ctx.is_interrupted());
+    }
+}

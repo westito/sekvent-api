@@ -122,8 +122,8 @@ pub fn single(ctx: &Context<'_>, step: &SingleStep) -> anyhow::Result<i32> {
             )
         }
         SingleStep::Test(extra) => with_harness(ctx, |harness_env| {
-            let cmd =
-                plan::test_command(&ctx.root, &selection, gate, &ctx.env, extra).envs(harness_env);
+            let cmd = plan::test_command(&ctx.root, &selection, &ctx.config, &ctx.env, extra)
+                .envs(harness_env);
             run_steps(
                 ctx,
                 "test",
@@ -184,7 +184,7 @@ pub fn coverage(ctx: &Context<'_>, options: &CoverageOptions) -> anyhow::Result<
         });
         steps.push(Step::Run {
             name: "run".into(),
-            cmd: plan::coverage_run_command(root, &selection, &ctx.config.gate, &ctx.env)
+            cmd: plan::coverage_run_command(root, &selection, &ctx.config, &ctx.env)
                 .envs(harness_env),
         });
         steps.push(Step::Run {
@@ -241,14 +241,15 @@ mod tests {
 
     use super::*;
     use crate::config::{Boundary, Config, Project};
-    use crate::fixtures::METADATA;
+    use crate::fixtures::{COVERAGE, METADATA};
     use crate::harness::fake::FakeSweeper;
     use crate::location::EnvMap;
     use crate::process::fake::FakeRunner;
+    use crate::process::{Cmd, CmdOutput, Runner};
 
     fn context<'a>(
         config: Config,
-        runner: &'a FakeRunner,
+        runner: &'a dyn Runner,
         sweeper: &'a FakeSweeper,
     ) -> Context<'a> {
         let mut env = EnvMap::new();
@@ -395,5 +396,173 @@ mod tests {
             misses: Some("vendored".into()),
         };
         assert!(coverage(&ctx, &options).is_err());
+    }
+
+    /// A [`FakeRunner`] whose `llvm-cov report --json` writes the fixture
+    /// export to `--output-path`.
+    struct Reporting {
+        inner: FakeRunner,
+    }
+
+    impl Runner for Reporting {
+        fn status(&self, cmd: &Cmd) -> std::io::Result<i32> {
+            if cmd.args.iter().any(|arg| arg == "--json") {
+                let output = cmd
+                    .args
+                    .iter()
+                    .skip_while(|arg| *arg != "--output-path")
+                    .nth(1)
+                    .expect("--output-path");
+                std::fs::write(output, COVERAGE)?;
+            }
+            self.inner.status(cmd)
+        }
+
+        fn output(
+            &self,
+            cmd: &Cmd,
+            timeout: Option<std::time::Duration>,
+        ) -> std::io::Result<CmdOutput> {
+            self.inner.output(cmd, timeout)
+        }
+
+        fn exec(&self, cmd: &Cmd) -> std::io::Result<i32> {
+            self.inner.exec(cmd)
+        }
+    }
+
+    fn reporting(codes: &[i32]) -> Reporting {
+        let runner = Reporting {
+            inner: FakeRunner::with_codes(codes),
+        };
+        runner.inner.push_output(METADATA);
+        runner
+    }
+
+    fn passing_config() -> Config {
+        let mut config = config();
+        config.coverage.thresholds.insert("orders-db".into(), 50.0);
+        config.hooks.pre_coverage = vec![vec!["echo".into(), "pre".into()]];
+        config.hooks.post_coverage = vec![vec!["echo".into(), "post".into()]];
+        config
+    }
+
+    #[test]
+    fn coverage_reports_misses_and_runs_post_hooks() {
+        let runner = reporting(&[]);
+        let sweeper = FakeSweeper::default();
+        let ctx = context(passing_config(), &runner, &sweeper);
+        let options = CoverageOptions {
+            lcov: None,
+            misses: Some("orders-db".into()),
+        };
+        assert_eq!(coverage(&ctx, &options).unwrap(), 0);
+        let lines = runner.inner.lines();
+        assert_eq!(lines[1], "echo pre");
+        assert_eq!(lines[2], "cargo llvm-cov clean --workspace");
+        assert!(
+            lines[4].starts_with("cargo llvm-cov report --json --ignore-filename-regex"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[5], "echo post");
+        assert_eq!(lines.len(), 6);
+        assert_eq!(sweeper.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn coverage_below_a_floor_fails_after_the_post_hooks() {
+        let mut config = passing_config();
+        config.coverage.thresholds.clear();
+        let runner = reporting(&[]);
+        let sweeper = FakeSweeper::default();
+        let ctx = context(config, &runner, &sweeper);
+        assert_eq!(coverage(&ctx, &CoverageOptions::default()).unwrap(), 1);
+        assert_eq!(runner.inner.lines().last().unwrap(), "echo post");
+    }
+
+    #[test]
+    fn a_failing_post_hook_fails_coverage() {
+        let mut config = passing_config();
+        config.hooks.pre_coverage.clear();
+        let runner = reporting(&[0, 0, 0, 0, 7]);
+        let sweeper = FakeSweeper::default();
+        let ctx = context(config, &runner, &sweeper);
+        let options = CoverageOptions {
+            lcov: Some("/tmp/lcov.info".into()),
+            misses: None,
+        };
+        assert_eq!(coverage(&ctx, &options).unwrap(), 7);
+        let lines = runner.inner.lines();
+        assert!(
+            lines[4].starts_with("cargo llvm-cov report --lcov"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[5], "echo post");
+    }
+
+    #[test]
+    fn a_missing_coverage_export_is_an_error() {
+        let runner = FakeRunner::default();
+        runner.push_output(METADATA);
+        let sweeper = FakeSweeper::default();
+        let ctx = context(config(), &runner, &sweeper);
+        let error = coverage(&ctx, &CoverageOptions::default()).unwrap_err();
+        assert!(error.to_string().starts_with("cannot read"), "{error}");
+    }
+
+    #[test]
+    fn docker_tests_reach_every_test_run() {
+        let mut config = config();
+        config.harness.docker_tests = true;
+
+        let runner = FakeRunner::default();
+        runner.push_output(METADATA);
+        let sweeper = FakeSweeper::default();
+        let ctx = context(config.clone(), &runner, &sweeper);
+        assert_eq!(gate(&ctx).unwrap(), 0);
+        let test = &runner.calls()[3];
+        assert!(
+            test.to_string().ends_with("--locked -- --include-ignored"),
+            "{test}"
+        );
+        assert_eq!(test.env_value("SEKVENT_DOCKER_TESTS"), Some("1"));
+
+        let runner = FakeRunner::default();
+        runner.push_output(METADATA);
+        let ctx = context(config.clone(), &runner, &sweeper);
+        let step = SingleStep::Test(vec!["--nocapture".into()]);
+        assert_eq!(single(&ctx, &step).unwrap(), 0);
+        assert!(
+            runner.lines()[1].ends_with("-- --nocapture --include-ignored"),
+            "{:?}",
+            runner.lines()
+        );
+
+        let runner = FakeRunner::with_codes(&[0, 0, 1]);
+        runner.push_output(METADATA);
+        let mut env = EnvMap::new();
+        env.insert("SEKVENT_DOCKER_TESTS".into(), "0".into());
+        let ctx = Context {
+            env,
+            ..context(config, &runner, &sweeper)
+        };
+        assert_eq!(coverage(&ctx, &CoverageOptions::default()).unwrap(), 1);
+        let run = &runner.calls()[2];
+        assert!(
+            run.to_string()
+                .ends_with("--no-report -- --include-ignored"),
+            "{run}"
+        );
+        assert_eq!(run.env_value("SEKVENT_DOCKER_TESTS"), None);
+    }
+
+    #[test]
+    fn the_boundary_step_needs_the_graph() {
+        let runner = FakeRunner::default();
+        let sweeper = FakeSweeper::default();
+        let ctx = context(config(), &runner, &sweeper);
+        assert_eq!(boundaries(&ctx).unwrap(), 0);
+        assert!(runner.calls().is_empty());
+        assert!(run_steps(&ctx, "gate", &[Step::Boundaries], None).is_err());
     }
 }

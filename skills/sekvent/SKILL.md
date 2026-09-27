@@ -273,6 +273,9 @@ async fn orders_are_persisted() {
 `sekvent-testing = { workspace = true, features = ["postgres"] }` under
 `[dev-dependencies]`. Containers carry a label namespace and are reaped even
 after `SIGKILL`; `cargo sekvent harness-clean` sweeps leftovers.
+`cargo sekvent gate`/`test`/`coverage` skip these tests unless `sekvent.toml`
+sets `[harness] docker_tests = true` (exports `SEKVENT_DOCKER_TESTS=1` and
+passes `--include-ignored`).
 
 ### Proto build
 

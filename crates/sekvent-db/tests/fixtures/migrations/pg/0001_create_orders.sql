@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id BIGSERIAL PRIMARY KEY,
+    reference TEXT NOT NULL UNIQUE
+);

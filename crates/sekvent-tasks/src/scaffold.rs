@@ -81,17 +81,20 @@ pub fn render_new(
     if let Some(ci) = ci {
         merge(&mut files, template::render_kind(ci.template_kind(), vars)?)?;
     }
-    let body = agents::section_body(vars)?;
+    upsert_agents(&mut files, &agents::section_body(vars)?);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+fn upsert_agents(files: &mut Vec<RenderedFile>, body: &str) {
     match files.iter_mut().find(|file| file.path == AGENTS_FILE) {
-        Some(file) => file.contents = agents::upsert(Some(&file.text()), &body).into_bytes(),
+        Some(file) => file.contents = agents::upsert(Some(&file.text()), body).into_bytes(),
         None => files.push(RenderedFile {
             path: AGENTS_FILE.to_owned(),
-            contents: agents::upsert(None, &body).into_bytes(),
+            contents: agents::upsert(None, body).into_bytes(),
             executable: false,
         }),
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
 }
 
 fn sekvent_source(cwd: &Path, path: Option<&Path>) -> anyhow::Result<SekventSource> {
@@ -546,5 +549,205 @@ mod tests {
             workspace_sekvent_source("[workspace.dependencies]\nsekvent = { git = \"x\" }\n"),
             SekventSource::Git
         );
+        assert_eq!(
+            workspace_sekvent_source(
+                "[workspace.dependencies]\nsekvent = { path = \"sekvent\" }\n"
+            ),
+            SekventSource::Path("sekvent".into())
+        );
+        assert_eq!(workspace_sekvent_source("not toml ["), SekventSource::Git);
+    }
+
+    fn file(path: &str) -> RenderedFile {
+        RenderedFile {
+            path: path.to_owned(),
+            contents: Vec::new(),
+            executable: false,
+        }
+    }
+
+    #[test]
+    fn two_kinds_rendering_the_same_path_are_rejected() {
+        let mut files = vec![file("a")];
+        merge(&mut files, vec![file("b")]).unwrap();
+        let error = merge(&mut files, vec![file("a")]).unwrap_err();
+        assert!(error.to_string().contains("`a`"), "{error}");
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn the_agents_section_is_added_when_no_template_renders_one() {
+        let mut files = vec![file("README.md")];
+        upsert_agents(&mut files, "body");
+        let agents = rendered(&files, AGENTS_FILE).unwrap().text();
+        assert_eq!(agents.matches(agents::BEGIN).count(), 1, "{agents}");
+        assert!(agents.contains("body"), "{agents}");
+    }
+
+    #[test]
+    fn a_sekvent_path_must_be_a_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            sekvent_source(dir.path(), None).unwrap(),
+            SekventSource::Git
+        );
+        let missing = sekvent_source(dir.path(), Some(Path::new("missing"))).unwrap_err();
+        assert!(missing.to_string().contains("does not exist"), "{missing}");
+        std::fs::create_dir_all(dir.path().join("checkout/crates/sekvent")).unwrap();
+        let bare = sekvent_source(dir.path(), Some(Path::new("checkout"))).unwrap_err();
+        assert!(
+            bare.to_string().contains("not a sekvent checkout"),
+            "{bare}"
+        );
+        std::fs::write(
+            dir.path().join("checkout/crates/sekvent/Cargo.toml"),
+            "[package]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            sekvent_source(dir.path(), Some(Path::new("checkout"))).unwrap(),
+            SekventSource::Path(dir.path().join("checkout").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn new_honours_the_directory_path_and_git_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("sekvent");
+        std::fs::create_dir_all(checkout.join("crates/sekvent")).unwrap();
+        std::fs::write(checkout.join("crates/sekvent/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("empty")).unwrap();
+
+        let runner = crate::process::fake::FakeRunner::default();
+        let options = NewOptions {
+            name: "billing".into(),
+            kind: ServiceKind::Worker,
+            dir: Some(PathBuf::from("empty")),
+            sekvent_path: Some(PathBuf::from("sekvent")),
+            ci: None,
+            git: false,
+        };
+        let target = new_project(&runner, dir.path(), &options).unwrap();
+        assert_eq!(target, dir.path().join("empty"));
+        assert!(target.join(CONFIG_FILE).is_file());
+        assert!(!target.join(".github").exists());
+        let manifest = std::fs::read_to_string(target.join("Cargo.toml")).unwrap();
+        assert!(manifest.contains("path = "), "{manifest}");
+        assert!(runner.calls().is_empty());
+
+        let failing = crate::process::fake::FakeRunner::with_codes(&[128]);
+        let options = NewOptions {
+            dir: Some(PathBuf::from("second")),
+            sekvent_path: None,
+            git: true,
+            ..options
+        };
+        new_project(&failing, dir.path(), &options).unwrap();
+        assert_eq!(failing.lines(), ["git init --quiet"]);
+    }
+
+    fn workspace(dir: &Path) -> PathBuf {
+        let root = dir.join("billing");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        root
+    }
+
+    #[test]
+    fn init_creates_missing_files_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = workspace(dir.path());
+        init(&root, ServiceKind::Grpc, false).unwrap();
+        let remote = std::fs::read_to_string(root.join(REMOTE_BUILD_FILE)).unwrap();
+        assert_eq!(
+            remote_build::ensure_command(&remote, false).unwrap(),
+            Edit::Unchanged
+        );
+        assert!(root.join(AGENTS_FILE).is_file());
+        assert!(root.join(BOOTSTRAP).is_file());
+
+        init(&root, ServiceKind::Grpc, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(REMOTE_BUILD_FILE)).unwrap(),
+            remote
+        );
+    }
+
+    #[test]
+    fn init_keeps_a_conflicting_remote_command_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = workspace(dir.path());
+        let conflicting = "[run.commands]\nsekvent = [\"other.sh\"]\n";
+        std::fs::write(root.join(REMOTE_BUILD_FILE), conflicting).unwrap();
+        init(&root, ServiceKind::Http, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(REMOTE_BUILD_FILE)).unwrap(),
+            conflicting
+        );
+        init(&root, ServiceKind::Http, true).unwrap();
+        let replaced = std::fs::read_to_string(root.join(REMOTE_BUILD_FILE)).unwrap();
+        assert!(replaced.contains(BOOTSTRAP), "{replaced}");
+    }
+
+    #[test]
+    fn init_reports_an_unreadable_remote_build_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = workspace(dir.path());
+        std::fs::create_dir_all(root.join(REMOTE_BUILD_FILE)).unwrap();
+        let error = init(&root, ServiceKind::Http, false).unwrap_err();
+        assert!(error.to_string().starts_with("cannot read"), "{error:#}");
+    }
+
+    #[test]
+    fn add_renders_a_service_and_registers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(add(dir.path(), "billing", "ledger", ServiceKind::Http, false).is_err());
+
+        let root = workspace(dir.path());
+        add(&root, "billing", "ledger", ServiceKind::Http, false).unwrap();
+        assert!(root.join("crates/ledger/Cargo.toml").is_file());
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(manifest.contains("\"crates/ledger\""), "{manifest}");
+
+        let error = add(&root, "billing", "ledger", ServiceKind::Http, false).unwrap_err();
+        assert!(error.to_string().contains("--force"), "{error}");
+        add(&root, "billing", "ledger", ServiceKind::Http, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+            manifest
+        );
+    }
+
+    #[test]
+    fn ci_templates_and_the_agents_section_are_written_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ci_generate(dir.path(), "billing", CiProvider::Bitbucket, false).unwrap();
+        assert!(!first.is_empty());
+        assert!(
+            first
+                .iter()
+                .all(|(_, outcome)| *outcome == WriteOutcome::Created)
+        );
+        let again = ci_generate(dir.path(), "billing", CiProvider::Bitbucket, false).unwrap();
+        assert!(
+            again
+                .iter()
+                .all(|(_, outcome)| *outcome == WriteOutcome::Unchanged)
+        );
+
+        let agents = dir.path().join(AGENTS_FILE);
+        assert!(agents_update(&agents, "billing").unwrap());
+        assert!(!agents_update(&agents, "billing").unwrap());
+    }
+
+    #[test]
+    fn members_are_created_or_rejected_when_malformed() {
+        let updated = add_members("[workspace]\n", &["crates/a".into()])
+            .unwrap()
+            .unwrap();
+        assert!(updated.contains("\"crates/a\""), "{updated}");
+        assert!(add_members("[workspace]\nmembers = \"x\"\n", &[]).is_err());
+        assert!(add_members("[workspace\n", &[]).is_err());
+        assert!(members_cover(&["*".to_owned()], "orders"));
     }
 }

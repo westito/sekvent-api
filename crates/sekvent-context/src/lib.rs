@@ -228,3 +228,177 @@ impl CallContext {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn populated() -> CallContext {
+        CallContext::new()
+            .with_request_id("req-orders-1")
+            .with_caller(ServiceIdentity::trusted("billing"))
+            .with_subject("user-7")
+            .with_tenant("tenant-a")
+            .with_idempotency_key("order-42")
+            .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+    }
+
+    #[test]
+    fn identities_record_whether_the_caller_is_trusted() {
+        let untrusted = ServiceIdentity::untrusted("orders");
+        assert_eq!(untrusted.name, "orders");
+        assert!(!untrusted.trusted);
+        let trusted = ServiceIdentity::trusted(String::from("billing"));
+        assert_eq!(trusted.name, "billing");
+        assert!(trusted.trusted);
+        assert_ne!(untrusted, ServiceIdentity::trusted("orders"));
+    }
+
+    #[test]
+    fn a_new_context_is_empty_with_a_fresh_v7_request_id() {
+        let ctx = CallContext::default();
+        let id = uuid::Uuid::parse_str(ctx.request_id()).unwrap();
+        assert_eq!(id.get_version_num(), 7);
+        assert_ne!(ctx.request_id(), CallContext::new().request_id());
+        assert_eq!(ctx.deadline(), None);
+        assert_eq!(ctx.remaining(), None);
+        assert!(!ctx.is_expired());
+        assert!(!ctx.cancel_token().is_cancelled());
+        assert_eq!(ctx.caller(), None);
+        assert_eq!(ctx.subject(), None);
+        assert_eq!(ctx.tenant(), None);
+        assert_eq!(ctx.idempotency_key(), None);
+        assert_eq!(ctx.traceparent(), None);
+    }
+
+    #[test]
+    fn builders_set_every_field() {
+        let ctx = populated();
+        assert_eq!(ctx.request_id(), "req-orders-1");
+        assert_eq!(ctx.caller(), Some(&ServiceIdentity::trusted("billing")));
+        assert_eq!(ctx.subject(), Some("user-7"));
+        assert_eq!(ctx.tenant(), Some("tenant-a"));
+        assert_eq!(ctx.idempotency_key(), Some("order-42"));
+        assert_eq!(
+            ctx.traceparent(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
+    }
+
+    #[test]
+    fn a_deadline_only_ever_narrows() {
+        let base = Instant::now();
+        let near = base + Duration::from_secs(5);
+        let far = base + Duration::from_mins(1);
+
+        let ctx = CallContext::new().with_deadline(far);
+        assert_eq!(ctx.deadline(), Some(far));
+        let ctx = ctx.with_deadline(near);
+        assert_eq!(ctx.deadline(), Some(near));
+        let ctx = ctx.with_deadline(far);
+        assert_eq!(ctx.deadline(), Some(near), "a later deadline is ignored");
+    }
+
+    #[test]
+    fn a_timeout_becomes_a_deadline_relative_to_now() {
+        let before = Instant::now();
+        let ctx = CallContext::new().with_timeout(Duration::from_hours(1));
+        let deadline = ctx.deadline().unwrap();
+        assert!(deadline >= before + Duration::from_hours(1));
+        assert!(deadline <= Instant::now() + Duration::from_hours(1));
+
+        let remaining = ctx.remaining().unwrap();
+        assert!(remaining > Duration::ZERO);
+        assert!(remaining <= Duration::from_hours(1));
+        assert!(!ctx.is_expired());
+
+        let narrowed = ctx.with_timeout(Duration::from_hours(2));
+        assert_eq!(narrowed.deadline(), Some(deadline));
+    }
+
+    #[test]
+    fn a_passed_deadline_leaves_zero_time_and_is_expired() {
+        let ctx = CallContext::new().with_deadline(Instant::now());
+        assert_eq!(ctx.remaining(), Some(Duration::ZERO));
+        assert!(ctx.is_expired());
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_token_resolves_cancelled() {
+        let token = CancellationToken::new();
+        let ctx = CallContext::new().with_cancel(token.clone());
+        assert!(!ctx.cancel_token().is_cancelled());
+
+        token.cancel();
+
+        ctx.cancelled().await;
+        assert!(ctx.cancel_token().is_cancelled());
+    }
+
+    #[test]
+    fn a_child_keeps_identity_and_deadline_but_not_the_caller() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let parent = populated().with_deadline(deadline);
+
+        let child = parent.child();
+
+        assert_eq!(child.request_id(), parent.request_id());
+        assert_eq!(child.deadline(), Some(deadline));
+        assert_eq!(child.caller(), None);
+        assert_eq!(child.subject(), parent.subject());
+        assert_eq!(child.tenant(), parent.tenant());
+        assert_eq!(child.idempotency_key(), parent.idempotency_key());
+        assert_eq!(child.traceparent(), parent.traceparent());
+    }
+
+    #[tokio::test]
+    async fn cancellation_flows_from_parent_to_child_only() {
+        let parent = CallContext::new();
+        let first = parent.child();
+        first.cancel_token().cancel();
+        assert!(!parent.cancel_token().is_cancelled());
+
+        let second = parent.child();
+        parent.cancel_token().cancel();
+        second.cancelled().await;
+        assert!(second.cancel_token().is_cancelled());
+    }
+
+    #[test]
+    fn a_detached_context_drops_deadline_cancellation_and_caller() {
+        let parent = populated().with_timeout(Duration::from_secs(1));
+
+        let detached = parent.detached();
+        parent.cancel_token().cancel();
+
+        assert_eq!(detached.request_id(), parent.request_id());
+        assert_eq!(detached.deadline(), None);
+        assert!(!detached.cancel_token().is_cancelled());
+        assert_eq!(detached.caller(), None);
+        assert_eq!(detached.subject(), Some("user-7"));
+        assert_eq!(detached.tenant(), Some("tenant-a"));
+        assert_eq!(detached.idempotency_key(), Some("order-42"));
+        assert_eq!(detached.traceparent(), parent.traceparent());
+    }
+
+    #[test]
+    fn only_a_trusted_caller_keeps_subject_and_tenant() {
+        let trusted = populated().sanitize_for_caller();
+        assert_eq!(trusted.subject(), Some("user-7"));
+        assert_eq!(trusted.tenant(), Some("tenant-a"));
+
+        let untrusted = populated()
+            .with_caller(ServiceIdentity::untrusted("orders"))
+            .sanitize_for_caller();
+        assert_eq!(untrusted.subject(), None);
+        assert_eq!(untrusted.tenant(), None);
+        assert_eq!(untrusted.idempotency_key(), Some("order-42"));
+
+        let anonymous = CallContext::new()
+            .with_subject("user-7")
+            .with_tenant("tenant-a")
+            .sanitize_for_caller();
+        assert_eq!(anonymous.subject(), None);
+        assert_eq!(anonymous.tenant(), None);
+    }
+}

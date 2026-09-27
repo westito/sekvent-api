@@ -84,15 +84,19 @@ pub fn default_destinations(home: &Path) -> Vec<PathBuf> {
 
 /// `cargo sekvent skills install`.
 pub fn install(dest: Option<&Path>) -> anyhow::Result<()> {
+    install_from(&SKILLS, dest, dirs::home_dir().as_deref())
+}
+
+fn install_from(root: &Dir<'_>, dest: Option<&Path>, home: Option<&Path>) -> anyhow::Result<()> {
     let destinations = if let Some(dest) = dest {
         vec![dest.to_owned()]
     } else {
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("cannot find the home directory; pass --dest"))?;
-        default_destinations(&home)
+        let home =
+            home.ok_or_else(|| anyhow::anyhow!("cannot find the home directory; pass --dest"))?;
+        default_destinations(home)
     };
     for destination in destinations {
-        let installed = install_into(&SKILLS, &destination)?;
+        let installed = install_into(root, &destination)?;
         println!(
             "installed {} into {}",
             if installed.is_empty() {
@@ -177,5 +181,52 @@ mod tests {
         let dest = tempfile::tempdir().unwrap();
         let installed = install_into(&SKILLS, dest.path()).unwrap();
         assert!(installed.iter().all(|name| name.starts_with(OWNED_PREFIX)));
+    }
+
+    static EMPTY: Dir<'static> = Dir::new("", &[]);
+
+    #[test]
+    fn an_explicit_destination_wins_over_home() {
+        let dest = tempfile::tempdir().unwrap();
+        let target = dest.path().join("nested/skills");
+        install_from(&ROOT, Some(&target), None).unwrap();
+        assert!(target.join("sekvent-gate/SKILL.md").is_file());
+        install_from(&EMPTY, Some(&target), None).unwrap();
+    }
+
+    #[test]
+    fn without_a_destination_skills_go_under_home() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude/skills")).unwrap();
+        install_from(&ROOT, None, Some(home.path())).unwrap();
+        assert!(
+            home.path()
+                .join(".kodein/skills/sekvent-gate/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            home.path()
+                .join(".claude/skills/sekvent-gate/SKILL.md")
+                .is_file()
+        );
+        let error = install_from(&ROOT, None, None).unwrap_err();
+        assert!(error.to_string().contains("--dest"), "{error}");
+    }
+
+    #[test]
+    fn a_file_in_place_of_a_skill_is_replaced() {
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(dest.path().join("sekvent-gate"), "a file").unwrap();
+        install_into(&ROOT, dest.path()).unwrap();
+        assert!(dest.path().join("sekvent-gate/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn an_unusable_destination_is_an_error() {
+        let dest = tempfile::tempdir().unwrap();
+        let file = dest.path().join("plain");
+        std::fs::write(&file, "x").unwrap();
+        assert!(install_into(&ROOT, &file).is_err());
+        assert!(install_into(&ROOT, &file.join("below")).is_err());
     }
 }

@@ -88,3 +88,77 @@ impl fmt::Debug for UnitContext {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(attempt: u32) -> (UnitContext, CancellationToken, watch::Receiver<bool>) {
+        let shutdown = CancellationToken::new();
+        let (ready, ready_rx) = watch::channel(false);
+        let ctx = UnitContext::new(
+            Arc::from("orders-consumer"),
+            Stage::Workers,
+            attempt,
+            shutdown.clone(),
+            Arc::new(ready),
+            HealthRegistry::new(),
+        );
+        (ctx, shutdown, ready_rx)
+    }
+
+    #[test]
+    fn accessors_report_what_the_supervisor_passed_in() {
+        let (ctx, _, _) = context(3);
+        assert_eq!(ctx.name(), "orders-consumer");
+        assert_eq!(ctx.stage(), Stage::Workers);
+        assert_eq!(ctx.attempt(), 3);
+        assert!(ctx.health().is_live());
+        assert!(!ctx.health().is_ready());
+    }
+
+    #[test]
+    fn shutdown_is_seen_through_the_token_and_every_clone() {
+        let (ctx, shutdown, _) = context(0);
+        let clone = ctx.clone();
+        let token = ctx.shutdown();
+        assert!(!ctx.is_shutting_down());
+        assert!(!token.is_cancelled());
+
+        shutdown.cancel();
+
+        assert!(ctx.is_shutting_down());
+        assert!(clone.is_shutting_down());
+        assert!(token.is_cancelled());
+        assert!(ctx.shutdown().is_cancelled());
+    }
+
+    #[test]
+    fn ready_raises_the_shared_flag_and_repeats_harmlessly() {
+        let (ctx, _, mut ready_rx) = context(0);
+        assert!(!*ready_rx.borrow_and_update());
+
+        ctx.clone().ready();
+        assert!(ready_rx.has_changed().unwrap());
+        assert!(*ready_rx.borrow_and_update());
+
+        ctx.ready();
+        assert!(*ready_rx.borrow());
+    }
+
+    #[test]
+    fn debug_shows_identity_and_draining_but_not_internals() {
+        let (ctx, shutdown, _) = context(2);
+        let running = format!("{ctx:?}");
+        assert!(running.starts_with("UnitContext {"));
+        assert!(running.contains("\"orders-consumer\""));
+        assert!(running.contains("Workers"));
+        assert!(running.contains("attempt: 2"));
+        assert!(running.contains("shutting_down: false"));
+        assert!(running.ends_with(".. }"));
+        assert!(!running.contains("health"));
+
+        shutdown.cancel();
+        assert!(format!("{ctx:?}").contains("shutting_down: true"));
+    }
+}

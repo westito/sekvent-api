@@ -22,11 +22,11 @@ default = "gate"
 
 [run.commands]
 check  = ["cargo", "check", "--workspace", "--all-targets", "--all-features", "--locked"]
-clippy = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+clippy = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--keep-going", "--", "-D", "warnings"]
 test   = ["cargo", "test", "--workspace", "--all-features", "--locked"]
 # The full gate: format check, lint, tests (Docker-backed ones included, on
 # rtx's daemon). Read-only, so it belongs here.
-gate   = ["bash", "-c", "set -euo pipefail; cargo fmt --all --check; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings; SEKVENT_DOCKER_TESTS=1 cargo test --workspace --all-features --locked -- --include-ignored"]
+gate   = ["bash", "-c", "set -euo pipefail; cargo fmt --all --check; cargo clippy --workspace --all-targets --all-features --locked --keep-going -- -D warnings; SEKVENT_DOCKER_TESTS=1 cargo test --workspace --all-features --locked -- --include-ignored"]
 coverage = ["bash", "-c", "set -euo pipefail; cargo llvm-cov clean --workspace; SEKVENT_DOCKER_TESTS=1 cargo llvm-cov --workspace --all-features --locked --ignore-filename-regex '(^|/)(tests|examples|benches)/|(^|/)src/main\\.rs$|(^|/)sekvent-macros/' --fail-under-lines 95 --summary-only -- --include-ignored"]
 
 [env]

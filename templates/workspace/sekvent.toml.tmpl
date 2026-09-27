@@ -55,6 +55,11 @@ exclude = []
 label_namespace = "io.sekvent.harness"
 # Containers older than this are swept as stale.
 stale_after = "6h"
+# Run the container-backed (`#[ignore]`d) tests in the gate's test step and
+# the coverage run: exports SEKVENT_DOCKER_TESTS=1 unless the environment
+# sets it, and passes --include-ignored to the test binaries. Needs Docker
+# wherever the tests compile and run.
+docker_tests = false
 
 [hooks]
 # Commands (argv arrays, no shell) run around the gate and coverage.
