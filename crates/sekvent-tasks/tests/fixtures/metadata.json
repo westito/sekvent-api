@@ -1,0 +1,56 @@
+{
+  "packages": [
+    {"name": "orders-api", "version": "0.1.0", "id": "path+file:///work/crates/api#orders-api@0.1.0", "manifest_path": "/work/crates/api/Cargo.toml", "dependencies": [], "targets": []},
+    {"name": "orders-domain", "version": "0.1.0", "id": "path+file:///work/crates/api/domain#orders-domain@0.1.0", "manifest_path": "/work/crates/api/domain/Cargo.toml", "dependencies": [], "targets": []},
+    {"name": "orders-db", "version": "0.1.0", "id": "path+file:///work/crates/db#orders-db@0.1.0", "manifest_path": "/work/crates/db/Cargo.toml", "dependencies": [], "targets": []},
+    {"name": "vendored", "version": "0.3.0", "id": "path+file:///work/vendor/vendored#0.3.0", "manifest_path": "/work/vendor/vendored/Cargo.toml", "dependencies": [], "targets": []},
+    {"name": "serde", "version": "1.0.0", "id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0", "manifest_path": "/home/dev/.cargo/registry/src/index/serde-1.0.0/Cargo.toml", "dependencies": [], "targets": []},
+    {"name": "cc", "version": "1.2.0", "id": "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.0", "manifest_path": "/home/dev/.cargo/registry/src/index/cc-1.2.0/Cargo.toml", "dependencies": [], "targets": []}
+  ],
+  "workspace_members": [
+    "path+file:///work/crates/api#orders-api@0.1.0",
+    "path+file:///work/crates/api/domain#orders-domain@0.1.0",
+    "path+file:///work/crates/db#orders-db@0.1.0",
+    "path+file:///work/vendor/vendored#0.3.0"
+  ],
+  "workspace_default_members": [],
+  "resolve": {
+    "nodes": [
+      {
+        "id": "path+file:///work/crates/api#orders-api@0.1.0",
+        "dependencies": [],
+        "deps": [
+          {"name": "orders_domain", "pkg": "path+file:///work/crates/api/domain#orders-domain@0.1.0", "dep_kinds": [{"kind": null, "target": null}]},
+          {"name": "orders_db", "pkg": "path+file:///work/crates/db#orders-db@0.1.0", "dep_kinds": [{"kind": "dev", "target": null}]}
+        ],
+        "features": []
+      },
+      {
+        "id": "path+file:///work/crates/api/domain#orders-domain@0.1.0",
+        "dependencies": [],
+        "deps": [
+          {"name": "orders_db", "pkg": "path+file:///work/crates/db#orders-db@0.1.0", "dep_kinds": [{"kind": null, "target": "cfg(unix)"}]},
+          {"name": "serde", "pkg": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0", "dep_kinds": [{"kind": null, "target": null}]}
+        ],
+        "features": []
+      },
+      {
+        "id": "path+file:///work/crates/db#orders-db@0.1.0",
+        "dependencies": [],
+        "deps": [
+          {"name": "serde", "pkg": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0", "dep_kinds": [{"kind": null, "target": null}]},
+          {"name": "cc", "pkg": "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.0", "dep_kinds": [{"kind": "build", "target": null}]}
+        ],
+        "features": []
+      },
+      {"id": "path+file:///work/vendor/vendored#0.3.0", "dependencies": [], "deps": [], "features": []},
+      {"id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0", "dependencies": [], "deps": [], "features": []},
+      {"id": "registry+https://github.com/rust-lang/crates.io-index#cc@1.2.0", "dependencies": [], "deps": [], "features": []}
+    ],
+    "root": null
+  },
+  "target_directory": "/work/target",
+  "version": 1,
+  "workspace_root": "/work",
+  "metadata": null
+}

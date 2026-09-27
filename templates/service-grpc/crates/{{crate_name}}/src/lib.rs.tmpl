@@ -1,0 +1,92 @@
+//! The {{service_pascal}} service: the `{{proto_package}}` gRPC API (native and
+//! gRPC-Web), health and graceful shutdown on one listener.
+//!
+//! [`serve`] runs it until a signal. [`runtime`] assembles it without running
+//! it, so tests can bind port 0 and drive it through a `RuntimeHandle`.
+
+#![forbid(unsafe_code)]
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use sekvent::prelude::*;
+use sekvent::runtime::RunReport;
+use tonic::{Request, Response, Status};
+use {{crate_ident}}_proto::api::{PingReply, PingRequest};
+
+use crate::proto::api::{{crate_ident}}_service_server::{{service_pascal}}Service;
+use crate::proto::api::{{crate_ident}}_service_server::{{service_pascal}}ServiceServer;
+
+/// Generated gRPC stubs of `{{proto_package}}`: `api::*_server` holds the
+/// service trait, `api::*_client` the client. Messages live in
+/// `{{crate_name}}-proto`.
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/sekvent_protos.rs"));
+    include!(concat!(env!("OUT_DIR"), "/package_alias.rs"));
+}
+
+/// Longest message `Ping` accepts, in bytes.
+pub const MAX_PING_LEN: usize = 1024;
+
+/// Service configuration, read from the environment.
+#[derive(Debug, EnvConfig)]
+pub struct Config {
+    /// Address for gRPC, gRPC-Web and the health endpoints.
+    #[config(default = "0.0.0.0:8080")]
+    pub listen_addr: SocketAddr,
+    /// Pause between turning health to not-serving and draining, so load
+    /// balancers stop routing here first.
+    #[config(default = "0s")]
+    pub shutdown_delay: Duration,
+}
+
+/// The `{{service_pascal}}Service` implementation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct {{service_pascal}}Api;
+
+#[tonic::async_trait]
+impl {{service_pascal}}Service for {{service_pascal}}Api {
+    async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
+        // The server attaches a CallContext (request id, deadline, caller) to
+        // every request.
+        let request_id = request
+            .extensions()
+            .get::<CallContext>()
+            .map(|cx| cx.request_id().to_owned());
+        let message = request.into_inner().message;
+        if message.is_empty() || message.len() > MAX_PING_LEN {
+            return Err(AppError::invalid_argument("the message must be 1 to 1024 bytes long")
+                .with_field_violation("message", "must be 1 to 1024 bytes long")
+                .into());
+        }
+        tracing::debug!(request_id = request_id.as_deref(), "ping");
+        Ok(Response::new(PingReply { message }))
+    }
+}
+
+/// Bind the listener and assemble the runtime without starting it.
+///
+/// Returns the builder, so callers can add units (or, in tests, call
+/// `without_signals`), and the bound address, which carries the real port
+/// when `listen_addr` asks for port 0.
+pub async fn runtime(config: &Config) -> Result<(RuntimeBuilder, SocketAddr), AppError> {
+    let server = Server::builder()
+        .add_service({{service_pascal}}ServiceServer::new({{service_pascal}}Api))
+        .bind(config.listen_addr)
+        .await?;
+    let addr = server.local_addr();
+    let builder = Runtime::builder()
+        .shutdown_delay(config.shutdown_delay)
+        .unit("grpc", Stage::Ingress, UnitPolicy::Critical, server.into_unit());
+    builder.health().set_version(env!("CARGO_PKG_VERSION"));
+    Ok((builder, addr))
+}
+
+/// Serve until SIGINT/SIGTERM or `shutdown` resolves, then drain gracefully.
+pub async fn serve(
+    config: Config,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<RunReport, AppError> {
+    let (builder, _addr) = runtime(&config).await?;
+    builder.shutdown_on(shutdown).build()?.run().await
+}

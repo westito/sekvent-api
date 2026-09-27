@@ -1,0 +1,55 @@
+//! Starts the service on port 0 through the runtime handle and calls it over
+//! native gRPC.
+
+use sekvent::config::MapSource;
+use sekvent::prelude::*;
+use tonic::Code;
+use {{crate_ident}}::Config;
+use {{crate_ident}}::proto::api::{{crate_ident}}_service_client::{{service_pascal}}ServiceClient;
+use {{crate_ident}}_proto::api::PingRequest;
+
+fn config() -> Config {
+    Config::from_config(&MapSource::new().with("LISTEN_ADDR", "127.0.0.1:0")).unwrap()
+}
+
+#[tokio::test]
+async fn ping_round_trips_over_native_grpc() {
+    let (builder, addr) = {{crate_ident}}::runtime(&config()).await.unwrap();
+    let handle = builder
+        .without_signals()
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    assert!(handle.health().is_ready());
+
+    let mut client = {{service_pascal}}ServiceClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let reply = client
+        .ping(PingRequest {
+            message: "hello".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.message, "hello");
+
+    let status = client
+        .ping(PingRequest {
+            message: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn serve_drains_when_its_shutdown_future_resolves() {
+    let report = {{crate_ident}}::serve(config(), async {}).await.unwrap();
+    assert!(report.unit("grpc").is_some());
+}

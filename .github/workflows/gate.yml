@@ -1,0 +1,83 @@
+# sekvent's own gate: format check, clippy with warnings denied, the test
+# suite (including the Docker-backed harness tests) and a 95 % line coverage
+# floor. The commands match `.remote-build.toml`.
+
+name: gate
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      # Must match rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+      # The container tests are `#[ignore]`d and gated on SEKVENT_DOCKER_TESTS;
+      # the runner has Docker, so run them here.
+      - name: Test (Docker-backed)
+        env:
+          SEKVENT_DOCKER_TESTS: "1"
+        run: cargo test --workspace --all-features --locked -- --ignored
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Coverage
+        env:
+          SEKVENT_DOCKER_TESTS: "1"
+        run: >-
+          cargo llvm-cov --workspace --all-features --locked
+          --ignore-filename-regex '(^|/)(tests|examples|benches)/|(^|/)src/main\.rs$|(^|/)sekvent-macros/'
+          --fail-under-lines 95
+          --summary-only
+          -- --include-ignored

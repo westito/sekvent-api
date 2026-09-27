@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Run `cargo sekvent <args>` with the CLI built from the exact sekvent
+# revision this project is locked to.
+#
+# Used inside the remote builder container (`rrb run sekvent <args>`) and in
+# CI, where cargo-sekvent runs its commands locally. The revision comes from
+# Cargo.lock, so the CLI and the libraries can never disagree. The installed
+# revision is stamped in $CARGO_HOME and reinstalled only when it moves.
+#
+# A project that depends on sekvent by path (framework development) has no
+# git revision; set SEKVENT_SRC to the sekvent checkout instead.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+git_url="{{sekvent_git_url}}"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export PATH="$CARGO_HOME/bin:$PATH"
+stamp="$CARGO_HOME/.sekvent-cli-rev"
+
+if [[ ! -f Cargo.lock ]]; then
+  echo "error: Cargo.lock is missing; run \`cargo generate-lockfile\` and commit it" >&2
+  exit 1
+fi
+
+# The `source` line of the `sekvent` package, e.g.
+#   source = "git+https://github.com/westito/sekvent?branch=master#0123abcd…"
+source_line="$(awk '
+  /^\[\[package\]\]/ { in_sekvent = 0; next }
+  /^name = "sekvent"$/ { in_sekvent = 1; next }
+  in_sekvent && /^source = / { print; exit }
+' Cargo.lock)"
+
+if [[ -n "$source_line" ]]; then
+  source="${source_line#source = \"}"
+  source="${source%\"}"
+  case "$source" in
+    "git+${git_url}"*"#"*) ;;
+    *)
+      echo "error: sekvent in Cargo.lock comes from an unexpected source: $source" >&2
+      echo "       expected git+${git_url}" >&2
+      exit 1
+      ;;
+  esac
+  rev="${source##*#}"
+  installed="$(cat "$stamp" 2>/dev/null || true)"
+  if [[ "$installed" != "$rev" ]] || ! command -v cargo-sekvent >/dev/null 2>&1; then
+    echo "installing cargo-sekvent at ${rev:0:12}" >&2
+    cargo install --locked --force --git "$git_url" --rev "$rev" cargo-sekvent
+    printf '%s\n' "$rev" > "$stamp"
+  fi
+elif grep -q '^name = "sekvent"$' Cargo.lock; then
+  # A path dependency: no source line, no revision to pin.
+  if [[ -z "${SEKVENT_SRC:-}" ]]; then
+    echo "error: sekvent is a path dependency, so there is no git revision to install" >&2
+    echo "       the CLI from; set SEKVENT_SRC to the sekvent checkout" >&2
+    exit 1
+  fi
+  echo "installing cargo-sekvent from $SEKVENT_SRC" >&2
+  cargo install --locked --force --path "$SEKVENT_SRC/crates/cargo-sekvent" \
+    --target-dir "${CARGO_TARGET_DIR:-target}/sekvent-cli"
+  printf 'path:%s\n' "$SEKVENT_SRC" > "$stamp"
+else
+  echo "error: Cargo.lock has no sekvent package; is sekvent in [workspace.dependencies]?" >&2
+  exit 1
+fi
+
+exec cargo sekvent "$@"

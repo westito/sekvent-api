@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "{{edition}}"
+rust-version = "{{rust_version}}"
+publish = false
+
+[workspace.dependencies]
+# sekvent itself: a git dependency on master; Cargo.lock pins the revision.
+# Update with `cargo sekvent sdk update`.
+{{sekvent_deps}}
+
+# Third-party versions, pinned once to the set sekvent is tested against.
+# `cargo sekvent deps check` reports drift, `cargo sekvent deps sync` fixes it.
+{{pinned_dependencies}}
+
+[workspace.lints.rust]
+# `deny`, not `forbid`: edition 2024 makes `std::env::set_var` unsafe, and a
+# crate may need one audited use. Crates add `#![forbid(unsafe_code)]`.
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+# Password hashing is memory-hard on purpose; unoptimised it dominates test time.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.bcrypt]
+opt-level = 3
+[profile.dev.package.blowfish]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

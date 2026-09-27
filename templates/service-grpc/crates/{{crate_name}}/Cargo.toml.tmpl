@@ -1,0 +1,21 @@
+[package]
+name = "{{crate_name}}"
+description = "The {{service_pascal}} gRPC service."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+{{crate_name}}-proto = { path = "../{{crate_name}}-proto" }
+sekvent = { workspace = true, features = ["error-grpc", "runtime-grpc-web"] }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+sekvent-proto-build = { workspace = true }
+
+[lints]
+workspace = true

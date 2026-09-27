@@ -1,0 +1,16 @@
+[package]
+name = "{{crate_name}}-proto"
+description = "Protobuf messages of {{proto_package}} (portable: no tonic)."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+
+[build-dependencies]
+sekvent-proto-build = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "cargo-sekvent"
+description = "The `cargo sekvent` command: gate, coverage, scaffolding and dependency pins for sekvent projects."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cargo-sekvent"
+path = "src/main.rs"
+
+[dependencies]
+sekvent-tasks = { path = "../sekvent-tasks" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

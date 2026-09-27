@@ -1,0 +1,104 @@
+//! The {{service_pascal}} HTTP service: a REST API under `/api`, health at
+//! the root (`/livez`, `/readyz`, `/healthz`) and graceful shutdown, all on
+//! one listener.
+//!
+//! [`serve`] runs it until a signal. [`runtime`] assembles it without running
+//! it, so tests can bind port 0 and drive it through a `RuntimeHandle`.
+
+#![forbid(unsafe_code)]
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use axum::extract::Path;
+use axum::routing::get;
+use axum::{Json, Router};
+use sekvent::prelude::*;
+use sekvent::runtime::RunReport;
+use serde::Serialize;
+
+/// Path prefix of the REST API.
+pub const API_PREFIX: &str = "/api";
+
+/// Longest name `GET /api/greetings/{name}` accepts, in bytes.
+pub const MAX_NAME_LEN: usize = 64;
+
+/// Service configuration, read from the environment.
+#[derive(Debug, EnvConfig)]
+pub struct Config {
+    /// Address for the API and the health endpoints.
+    #[config(default = "0.0.0.0:8080")]
+    pub listen_addr: SocketAddr,
+    /// Pause between turning health to not-serving and draining, so load
+    /// balancers stop routing here first.
+    #[config(default = "0s")]
+    pub shutdown_delay: Duration,
+}
+
+/// Body of `GET /api/ping`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Pong {
+    /// Always `pong`.
+    pub message: String,
+    /// The request id the server assigned or accepted from `x-request-id`.
+    pub request_id: String,
+}
+
+/// Body of `GET /api/greetings/{name}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Greeting {
+    /// The greeting.
+    pub greeting: String,
+}
+
+/// The REST routes, relative to [`API_PREFIX`].
+pub fn routes() -> Router {
+    Router::new()
+        .route("/ping", get(ping))
+        .route("/greetings/{name}", get(greet))
+}
+
+async fn ping(Ctx(cx): Ctx) -> Json<Pong> {
+    Json(Pong {
+        message: "pong".to_owned(),
+        request_id: cx.request_id().to_owned(),
+    })
+}
+
+async fn greet(Path(name): Path<String>) -> Result<Json<Greeting>, AppError> {
+    if name.len() > MAX_NAME_LEN {
+        return Err(AppError::invalid_argument("the name is too long")
+            .with_field_violation("name", "must be at most 64 bytes long"));
+    }
+    Ok(Json(Greeting {
+        greeting: format!("hello, {name}"),
+    }))
+}
+
+/// Bind the listener and assemble the runtime without starting it.
+///
+/// Returns the builder, so callers can add units (or, in tests, call
+/// `without_signals`), and the bound address, which carries the real port
+/// when `listen_addr` asks for port 0.
+pub async fn runtime(config: &Config) -> Result<(RuntimeBuilder, SocketAddr), AppError> {
+    let server = Server::builder()
+        .prefix(API_PREFIX)
+        .rest(routes())
+        .bind(config.listen_addr)
+        .await?;
+    let addr = server.local_addr();
+    let builder = Runtime::builder()
+        .shutdown_delay(config.shutdown_delay)
+        .unit("http", Stage::Ingress, UnitPolicy::Critical, server.into_unit());
+    builder.health().set_version(env!("CARGO_PKG_VERSION"));
+    Ok((builder, addr))
+}
+
+/// Serve until SIGINT/SIGTERM or `shutdown` resolves, then drain gracefully.
+pub async fn serve(
+    config: Config,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<RunReport, AppError> {
+    let (builder, _addr) = runtime(&config).await?;
+    builder.shutdown_on(shutdown).build()?.run().await
+}

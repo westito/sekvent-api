@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+// The public contract of {{crate_name}}. Change it only compatibly: add
+// fields and RPCs, never renumber, retype or remove. A breaking change is a
+// new package version served alongside this one.
+package {{proto_package}};
+
+// {{service_pascal}}Service is the gRPC API of {{crate_name}}.
+service {{service_pascal}}Service {
+  // Ping echoes a message back. Useful as a smoke test for clients.
+  rpc Ping(PingRequest) returns (PingReply);
+}
+
+message PingRequest {
+  // Text to echo; must not be empty.
+  string message = 1;
+}
+
+message PingReply {
+  // The request's message.
+  string message = 1;
+}

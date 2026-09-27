@@ -93,9 +93,10 @@ impl PostgresHarness {
             image: &image,
             port: PORT,
             // The entrypoint runs a temporary server during initialisation
-            // and prints the message once for it and once for the real one.
+            // and prints the message once for it and once for the real one,
+            // on different streams.
             ready_log: WaitFor::log(
-                LogWaitStrategy::stderr("database system is ready to accept connections")
+                LogWaitStrategy::stdout_or_stderr("database system is ready to accept connections")
                     .with_times(2),
             ),
             env: vec![

@@ -1,0 +1,71 @@
+//! Starts the service on port 0 through the runtime handle and calls the
+//! REST API and the health endpoints over HTTP.
+
+use sekvent::config::MapSource;
+use sekvent::prelude::*;
+use serde_json::Value;
+use {{crate_ident}}::Config;
+
+fn config() -> Config {
+    Config::from_config(&MapSource::new().with("LISTEN_ADDR", "127.0.0.1:0")).unwrap()
+}
+
+#[tokio::test]
+async fn the_api_and_health_are_served() {
+    let (builder, addr) = {{crate_ident}}::runtime(&config()).await.unwrap();
+    let handle = builder
+        .without_signals()
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+
+    let ready = http
+        .get(format!("http://{addr}/readyz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+
+    let pong: Value = http
+        .get(format!("http://{addr}/api/ping"))
+        .header("x-request-id", "req-1")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pong["message"], "pong");
+    assert_eq!(pong["request_id"], "req-1");
+
+    let greeting: Value = http
+        .get(format!("http://{addr}/api/greetings/ada"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(greeting["greeting"], "hello, ada");
+
+    let too_long = http
+        .get(format!("http://{addr}/api/greetings/{}", "x".repeat(65)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(too_long.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = too_long.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_ARGUMENT");
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn serve_drains_when_its_shutdown_future_resolves() {
+    let report = {{crate_ident}}::serve(config(), async {}).await.unwrap();
+    assert!(report.unit("http").is_some());
+}

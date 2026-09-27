@@ -1,0 +1,11 @@
+# {{crate_name}}-proto
+
+Generated protobuf messages for `{{proto_package}}`. Nothing here is written
+by hand except `build.rs` and `src/lib.rs`.
+
+- The contract is `proto/{{proto_package_path}}/{{crate_ident}}.proto`. Change
+  it only compatibly (add fields and RPCs; never renumber, retype or remove).
+- Keep this crate free of tonic and of any runtime dependency: clients and
+  wasm builds use it.
+- Generated code is not covered (`coverage.thresholds` is 0 for this crate)
+  and is linted with the allowances the generator adds.

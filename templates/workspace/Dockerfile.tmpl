@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1
+#
+# Release image for one binary of {{project_name}}. Build only: pushing and
+# deploying belong to the environment that runs it.
+#
+#   docker build --build-arg BIN={{crate_name}} -t {{crate_name}} .
+#
+# RUST_VERSION must equal the channel in rust-toolchain.toml, so the image is
+# built with exactly the compiler the gate ran. `cargo sekvent sdk update`
+# moves both together; do not bump one by hand.
+ARG RUST_VERSION={{rust_version}}
+
+FROM rust:${RUST_VERSION}-bookworm AS chef
+# protoc for the protobuf build scripts.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+
+# Dependency recipe: changes only when manifests or the lockfile change.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Dependencies are cooked in their own layer and cached across source edits.
+FROM chef AS builder
+ARG BIN={{crate_name}}
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --locked --bin "${BIN}" \
+    && cp "target/release/${BIN}" /app/service
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+COPY --from=builder /app/service /usr/local/bin/service
+USER 10001:10001
+# The runtime drains on SIGTERM: health turns not-serving, in-flight requests
+# finish, then the process exits. Give it the configured grace period.
+STOPSIGNAL SIGTERM
+# HTTP and gRPC services serve health on their port (/livez, /readyz,
+# grpc.health.v1); probe it from the orchestrator rather than with a
+# HEALTHCHECK that would need curl in the image.
+ENTRYPOINT ["/usr/local/bin/service"]

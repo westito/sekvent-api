@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.profraw
+/lcov.info
+.env
+.DS_Store

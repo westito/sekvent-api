@@ -1,0 +1,46 @@
+# {{project_name}}
+
+<!-- One paragraph: what this service does and who uses it. -->
+
+Built on [sekvent]({{sekvent_git_url}}).
+
+## Layout
+
+- `crates/` — the workspace members. Each crate's `src/main.rs` is thin;
+  the logic and its tests live in the library.
+- `proto/` — protobuf contracts, compiled in `build.rs` (gRPC services only).
+- `sekvent.toml` — gate, coverage and task configuration.
+
+## Development
+
+Install the CLI once:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/westito/sekvent/master/scripts/install.sh | sh
+```
+
+Then:
+
+```sh
+cargo fmt --all              # formatting runs locally
+cargo sekvent check          # compiling commands run on the remote builder
+cargo sekvent test
+cargo sekvent gate           # fmt --check, clippy, tests: must pass before merging
+cargo sekvent coverage       # per-package line coverage floors
+```
+
+Configuration comes from the environment; see `.env.example` for the keys.
+A missing or malformed key stops the service at startup with the key's name.
+
+## Release image
+
+```sh
+docker build --build-arg BIN={{crate_name}} -t {{crate_name}} .
+docker run --rm --env-file .env -e LISTEN_ADDR=0.0.0.0:8080 -p 8080:8080 {{crate_name}}
+```
+
+## Updating sekvent
+
+```sh
+cargo sekvent sdk update     # moves the locked sekvent revision and the pinned dependency set
+```

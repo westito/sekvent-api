@@ -1,0 +1,113 @@
+//! The {{service_pascal}} worker: a background loop with no listener, run as one
+//! unit in the runtime's `Workers` stage. It backs off after failures and
+//! stops promptly when shutdown begins.
+//!
+//! The work itself is a [`Job`]; [`Heartbeat`] is a placeholder to replace.
+//! [`serve`] runs until a signal; [`runtime`] assembles the runtime without
+//! running it, so tests can drive it through a `RuntimeHandle`.
+
+#![forbid(unsafe_code)]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use sekvent::prelude::*;
+use sekvent::resilience::Backoff;
+use sekvent::runtime::RunReport;
+
+/// Worker configuration, read from the environment.
+#[derive(Debug, Clone, Copy, EnvConfig)]
+pub struct Config {
+    /// Pause after a run that found nothing to do.
+    #[config(default = "5s")]
+    pub idle_interval: Duration,
+    /// First pause after a failed run; it doubles, with jitter, up to
+    /// `retry_max`.
+    #[config(default = "1s")]
+    pub retry_initial: Duration,
+    /// Longest pause after repeated failures.
+    #[config(default = "1m")]
+    pub retry_max: Duration,
+}
+
+/// What one run of a [`Job`] achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Work was done; run again at once.
+    Worked,
+    /// Nothing to do; wait `idle_interval`.
+    Idle,
+}
+
+/// A source of work the worker loop runs repeatedly.
+pub trait Job: Send + Sync + 'static {
+    /// Do at most one batch of work. An error is logged and retried after a
+    /// backoff delay, so make the work safe to repeat.
+    fn run_once(&self) -> impl Future<Output = Result<Outcome, AppError>> + Send;
+}
+
+/// Placeholder job: logs a heartbeat and reports [`Outcome::Idle`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Heartbeat;
+
+impl Job for Heartbeat {
+    async fn run_once(&self) -> Result<Outcome, AppError> {
+        tracing::debug!("heartbeat");
+        Ok(Outcome::Idle)
+    }
+}
+
+/// Run `job` until the unit's shutdown fires.
+///
+/// Every wait ends early on shutdown, so draining never sits out a delay.
+pub async fn run<J: Job>(job: Arc<J>, config: Config, ctx: UnitContext) -> Result<(), AppError> {
+    let backoff = Backoff::exponential(config.retry_initial, config.retry_max);
+    let mut delays = backoff.iter();
+    let shutdown = ctx.shutdown();
+    ctx.ready();
+    while !shutdown.is_cancelled() {
+        let pause = match job.run_once().await {
+            Ok(Outcome::Worked) => {
+                delays = backoff.iter();
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Ok(Outcome::Idle) => {
+                delays = backoff.iter();
+                config.idle_interval
+            }
+            Err(error) => {
+                let delay = delays.next().unwrap_or(config.retry_max);
+                tracing::warn!(error = ?error, retry_in = ?delay, "job failed");
+                delay
+            }
+        };
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(pause) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Assemble the runtime with `job` as the `worker` unit, without starting it.
+pub fn runtime<J: Job>(config: Config, job: Arc<J>) -> RuntimeBuilder {
+    let builder = Runtime::builder().unit(
+        "worker",
+        Stage::Workers,
+        UnitPolicy::Critical,
+        move |ctx: UnitContext| run(Arc::clone(&job), config, ctx),
+    );
+    builder.health().set_version(env!("CARGO_PKG_VERSION"));
+    builder
+}
+
+/// Run `job` until SIGINT/SIGTERM or `shutdown` resolves, then stop.
+pub async fn serve<J: Job>(
+    config: Config,
+    job: Arc<J>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<RunReport, AppError> {
+    runtime(config, job).shutdown_on(shutdown).build()?.run().await
+}

@@ -1,0 +1,88 @@
+# The sekvent gate for {{project_name}}: format check, clippy, tests and
+# per-package coverage floors. Gate only: no image push, no deploy.
+#
+# cargo-sekvent is installed at the exact revision Cargo.lock pins for the
+# sekvent libraries, by the same `.sekvent/run.sh` the remote builder uses.
+# GitHub sets CI=true, so the CLI runs every command on the runner instead
+# of forwarding to the remote builder.
+
+name: gate
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-${{{{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: "true"
+  # The runner has Docker, so the container-backed harness tests run too.
+  SEKVENT_DOCKER_TESTS: "1"
+
+jobs:
+  gate:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      # Must match rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "{{rust_version}}"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-sekvent
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/cargo-sekvent
+            ~/.cargo/.sekvent-cli-rev
+          key: cargo-sekvent-${{{{ runner.os }}-${{{{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-sekvent-${{{{ runner.os }}-
+
+      - name: Gate
+        run: .sekvent/run.sh gate
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "{{rust_version}}"
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-sekvent
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/cargo-sekvent
+            ~/.cargo/.sekvent-cli-rev
+          key: cargo-sekvent-${{{{ runner.os }}-${{{{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-sekvent-${{{{ runner.os }}-
+
+      - name: Coverage
+        run: .sekvent/run.sh coverage

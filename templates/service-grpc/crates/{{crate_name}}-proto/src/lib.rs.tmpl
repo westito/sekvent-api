@@ -1,0 +1,14 @@
+//! Protobuf messages of `{{proto_package}}`, generated at build time from
+//! `proto/{{proto_package_path}}/`.
+//!
+//! This crate has no tonic dependency, so client libraries and wasm builds
+//! can use the messages. The gRPC stubs are generated in `{{crate_name}}`,
+//! which refers back to these types.
+//!
+//! The package keeps its full module path (`api` is an alias for it), which
+//! the stubs in `{{crate_name}}` rely on.
+
+#![forbid(unsafe_code)]
+
+include!(concat!(env!("OUT_DIR"), "/sekvent_protos.rs"));
+include!(concat!(env!("OUT_DIR"), "/package_alias.rs"));

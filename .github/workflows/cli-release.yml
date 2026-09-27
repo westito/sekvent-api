@@ -1,0 +1,118 @@
+# The rolling CLI release: every push to master that can change the CLI
+# rebuilds `cargo-sekvent` for each supported target and replaces the assets
+# of the `cli-latest` prerelease, which `scripts/install.sh` and
+# `cargo sekvent self-update` download.
+#
+# Assets per target:
+#   cargo-sekvent-<target>.tar.gz         the binary at the archive root
+#   cargo-sekvent-<target>.tar.gz.sha256  "<hex>  <name>"
+
+name: cli-release
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "crates/**"
+      - "templates/**"
+      - "skills/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Queue rather than cancel: a release job stopped between deleting and
+# recreating the release would leave no assets at all.
+concurrency:
+  group: cli-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          # The last hosted Intel macOS image; macos-13 is retired.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Must match rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p cargo-sekvent --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          asset="cargo-sekvent-${TARGET}.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/${asset}" -C "target/${TARGET}/release" cargo-sekvent
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${asset}" > "${asset}.sha256"
+          else
+            shasum -a 256 "${asset}" > "${asset}.sha256"
+          fi
+          cat "${asset}.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cargo-sekvent-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish cli-latest
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cargo-sekvent-*
+          path: dist
+          merge-multiple: true
+
+      - name: Replace the cli-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          gh release delete cli-latest --yes --cleanup-tag || true
+          gh release create cli-latest \
+            --prerelease \
+            --title "cargo-sekvent (latest master)" \
+            --notes "Rolling build of cargo-sekvent from ${GITHUB_SHA}. Install with scripts/install.sh or update with \`cargo sekvent self-update\`." \
+            --target "${GITHUB_SHA}" \
+            dist/*.tar.gz dist/*.tar.gz.sha256

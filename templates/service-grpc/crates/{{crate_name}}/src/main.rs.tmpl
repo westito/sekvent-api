@@ -1,0 +1,32 @@
+//! Entry point of {{crate_name}}: telemetry, configuration, then
+//! [`{{crate_ident}}::serve`]. Keep it this thin; logic belongs in the library.
+
+use std::process::ExitCode;
+
+use sekvent::telemetry::{self, TelemetryOptions};
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    if let Err(error) = telemetry::init("{{crate_name}}", TelemetryOptions::new()) {
+        eprintln!("{{crate_name}}: cannot initialise logging: {error}");
+        return ExitCode::FAILURE;
+    }
+    let config: {{crate_ident}}::Config = match sekvent::config::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            // Names the offending keys, never their values.
+            tracing::error!(%error, "invalid configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    match {{crate_ident}}::serve(config, std::future::pending()).await {
+        Ok(report) => {
+            tracing::info!(reason = %report.reason, "stopped");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!(error = ?error, "stopped on a failure");
+            ExitCode::FAILURE
+        }
+    }
+}

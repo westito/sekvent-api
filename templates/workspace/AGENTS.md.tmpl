@@ -1,0 +1,105 @@
+# {{project_name}} — agent manual
+
+Rules for anyone (human or agent) changing this repository. Keep it short and
+true; nested `AGENTS.md` files in each crate hold crate-specific rules and win
+over this one for their directory.
+
+## What this is
+
+<!-- One paragraph: what the service does, who calls it, what it owns. -->
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `crates/` | workspace members; each has its own `AGENTS.md` |
+| `proto/` | protobuf contracts (if any); code is generated in `build.rs` |
+| `sekvent.toml` | gate, coverage, harness and task configuration |
+| `.remote-build.toml` | remote builder (rrb) configuration |
+| `.sekvent/run.sh` | installs the locked cargo-sekvent in containers and CI |
+| `Dockerfile` | release image build (no deploy tooling here) |
+
+## Rules
+
+- Code, comments, identifiers and docs are in English.
+- `src/main.rs` stays thin: telemetry, config, `serve`. Logic lives in the
+  library so tests can reach it.
+- Wire contracts (proto packages, JSON shapes, header names, error reasons)
+  change only compatibly; a breaking change is a new version.
+- Dependency versions come from `[workspace.dependencies]`; crates use
+  `{ workspace = true }`.
+
+<!-- sekvent:begin -->
+## sekvent
+
+This project is built on [sekvent]({{sekvent_git_url}}), a Rust backend
+framework. The section between the `sekvent:begin` / `sekvent:end` markers is
+managed by `cargo sekvent agents`; edit outside it.
+
+### Where things run
+
+- Everything that compiles (check, clippy, tests, coverage) runs on the
+  remote builder: `cargo sekvent <command>` forwards to rrb, which syncs the
+  tree and runs the command in a container with Docker access for the test
+  harness. See the `build-on-rtx` skill.
+- `cargo fmt` (the writing form) and in-tree code generation run locally.
+- There is no local fallback. If the builder is unreachable, stop and report;
+  do not "just run cargo test here". CI runs the same commands locally
+  (`CI=true`).
+
+### Commands
+
+```sh
+cargo fmt --all                 # local, writes
+cargo sekvent check             # remote: cargo check, all targets
+cargo sekvent clippy            # remote: clippy -D warnings
+cargo sekvent test              # remote: the test suite
+cargo sekvent gate              # remote: fmt --check + clippy + tests + boundaries
+cargo sekvent coverage          # remote: llvm-cov, per-package line floors
+cargo sekvent harness-clean     # remove leftover test containers
+```
+
+The gate and the coverage floors (`[coverage]` in `sekvent.toml`, 95 % lines
+per package by default) must pass before work is done.
+
+### Configuration
+
+- Each crate reads one `Config` struct with `#[derive(EnvConfig)]`; `main`
+  calls `sekvent::config::from_env()`. Tests build it from a `MapSource`,
+  never by mutating the process environment.
+- Keys under `SEKVENT_` are reserved for the framework (logging, links, the
+  harness). Do not invent new ones.
+- Secrets are `Secret` fields. Never log, format, `Debug`-print or return a
+  secret, token, password, database URL or upstream body; use
+  `sekvent::telemetry::truncate_for_log` for untrusted text.
+- Fail closed: a missing key is a startup error naming the key, never a
+  silent default for anything security-relevant.
+
+### Errors
+
+- Handlers return `AppError`: an `ErrorCode`, a caller-safe message, and
+  optionally a reason, metadata and field violations. Internal detail goes in
+  the source (`AppError::internal(err)` / `.with_source(err)`), which is
+  logged but never sent to the caller.
+- Map at the edge only: `AppError` converts to `tonic::Status` and to an
+  axum response; do not hand-roll status mapping.
+
+### Tests
+
+- Unit tests next to the code, integration tests in `tests/`.
+- No fixed sleeps. Wait on completion signals (channels, join handles,
+  `RuntimeHandle::wait`), use `tokio::time::pause` / `start_paused` for
+  timers, inject `Clock` where behaviour depends on wall time, and use
+  `sekvent_testing::await_until!` only for side effects without a signal.
+- Servers in tests bind port 0 and run through the runtime handle
+  (`builder.without_signals().build()?.start().await?`).
+- Database tests use `sekvent-testing` containers (one database per test);
+  they are `#[ignore]`d unless `SEKVENT_DOCKER_TESTS=1`, which the gate sets.
+- See the `rust-testing` skill for speed and flake work.
+
+### Updating sekvent
+
+- `cargo sekvent sdk update` moves the locked sekvent revision and the pinned
+  third-party set together. `cargo sekvent deps check` reports drift.
+- Do not bump a dependency that sekvent pins on your own; update sekvent.
+<!-- sekvent:end -->

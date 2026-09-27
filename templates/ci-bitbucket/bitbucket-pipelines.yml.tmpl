@@ -1,0 +1,50 @@
+# The sekvent gate for {{project_name}}: format check, clippy, tests and
+# per-package coverage floors. Gate only: no image push, no deploy.
+#
+# cargo-sekvent is installed at the exact revision Cargo.lock pins for the
+# sekvent libraries, by the same `.sekvent/run.sh` the remote builder uses.
+# With CI=true the CLI runs every command in the step instead of forwarding
+# to the remote builder.
+
+# Must match rust-toolchain.toml.
+image: rust:{{rust_version}}-bookworm
+
+definitions:
+  services:
+    # Test containers (Postgres, MySQL) run on this daemon as siblings of the
+    # build container; their ports are published on the docker host.
+    docker:
+      memory: 3072
+  caches:
+    # Registry, git checkouts and the installed cargo-sekvent with its stamp.
+    cargo-home: /usr/local/cargo
+    cargo-target: target
+
+pipelines:
+  default:
+    - parallel:
+        - step:
+            name: gate
+            size: 2x
+            services: [docker]
+            caches: [cargo-home, cargo-target]
+            script:
+              - apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+              - rustup component add rustfmt clippy
+              - export CI=true
+              - export SEKVENT_DOCKER_TESTS=1
+              - export TESTCONTAINERS_HOST_OVERRIDE="$BITBUCKET_DOCKER_HOST_INTERNAL"
+              - .sekvent/run.sh gate
+        - step:
+            name: coverage
+            size: 2x
+            services: [docker]
+            caches: [cargo-home]
+            script:
+              - apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+              - rustup component add llvm-tools-preview
+              - command -v cargo-llvm-cov >/dev/null || cargo install --locked cargo-llvm-cov
+              - export CI=true
+              - export SEKVENT_DOCKER_TESTS=1
+              - export TESTCONTAINERS_HOST_OVERRIDE="$BITBUCKET_DOCKER_HOST_INTERNAL"
+              - .sekvent/run.sh coverage

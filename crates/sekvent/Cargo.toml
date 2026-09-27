@@ -8,7 +8,87 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = ["config", "error", "context", "telemetry", "runtime"]
+
+# One feature per library crate.
+config = ["dep:sekvent-config"]
+error = ["dep:sekvent-error"]
+context = ["dep:sekvent-context"]
+telemetry = ["dep:sekvent-telemetry"]
+runtime = ["dep:sekvent-runtime"]
+resilience = ["dep:sekvent-resilience"]
+auth = ["dep:sekvent-auth"]
+link = ["dep:sekvent-link"]
+client = ["dep:sekvent-client"]
+db = ["dep:sekvent-db"]
+
+# sekvent-error wire mappings.
+error-http = ["error", "sekvent-error/http"]
+error-grpc = ["error", "sekvent-error/grpc"]
+
+# sekvent-runtime: serve gRPC-Web next to native gRPC on the same listener.
+runtime-grpc-web = ["runtime", "sekvent-runtime/grpc-web"]
+
+# sekvent-auth adapters.
+auth-axum = ["auth", "sekvent-auth/axum"]
+auth-tonic = ["auth", "sekvent-auth/tonic"]
+
+# sekvent-link adapters.
+link-axum = ["link", "sekvent-link/axum"]
+link-tonic = ["link", "sekvent-link/tonic"]
+
+# sekvent-db backends and migrations.
+db-sqlx-postgres = ["db", "sekvent-db/sqlx-postgres"]
+db-sqlx-mysql = ["db", "sekvent-db/sqlx-mysql"]
+db-sea-orm-postgres = ["db", "sekvent-db/sea-orm-postgres"]
+db-sea-orm-mysql = ["db", "sekvent-db/sea-orm-mysql"]
+db-migrate = ["db", "sekvent-db/migrate"]
+db-sea-orm-migrate = ["db", "sekvent-db/sea-orm-migrate"]
+
+full = [
+    "config",
+    "error",
+    "context",
+    "telemetry",
+    "runtime",
+    "resilience",
+    "auth",
+    "link",
+    "client",
+    "db",
+    "error-http",
+    "error-grpc",
+    "runtime-grpc-web",
+    "auth-axum",
+    "auth-tonic",
+    "link-axum",
+    "link-tonic",
+    "db-sqlx-postgres",
+    "db-sqlx-mysql",
+    "db-sea-orm-postgres",
+    "db-sea-orm-mysql",
+    "db-migrate",
+    "db-sea-orm-migrate",
+]
+
 [dependencies]
+sekvent-config = { workspace = true, optional = true }
+sekvent-error = { workspace = true, optional = true }
+sekvent-context = { workspace = true, optional = true }
+sekvent-telemetry = { workspace = true, optional = true }
+# A path dependency rather than `workspace = true`: the workspace entry keeps
+# sekvent-runtime's default features on, and edition 2024 refuses to turn them
+# off from a member. This keeps `runtime-grpc-web` a real switch.
+sekvent-runtime = { path = "../sekvent-runtime", default-features = false, optional = true }
+sekvent-resilience = { workspace = true, optional = true }
+sekvent-auth = { workspace = true, optional = true }
+sekvent-link = { workspace = true, optional = true }
+sekvent-client = { workspace = true, optional = true }
+sekvent-db = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true

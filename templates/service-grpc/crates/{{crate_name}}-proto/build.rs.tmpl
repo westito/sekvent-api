@@ -1,0 +1,21 @@
+//! Generates the message types of `{{proto_package}}` from `proto/`.
+
+use std::path::Path;
+
+fn main() {
+    let compiled = sekvent_proto_build::ProtoBuild::new("../../proto")
+        .files(["{{proto_package_path}}/{{crate_ident}}.proto"])
+        .messages_only()
+        .compile()
+        .unwrap_or_else(|error| panic!("{error}"));
+    write_package_alias(&compiled.out_dir, "{{proto_package}}");
+}
+
+/// Re-export the package module as `api`, so code writes `api::PingRequest`
+/// instead of spelling out the package path.
+fn write_package_alias(out_dir: &Path, package: &str) {
+    let module = package.replace('.', "::");
+    let source = format!("/// The `{package}` package.\npub use self::{module} as api;\n");
+    std::fs::write(out_dir.join("package_alias.rs"), source)
+        .unwrap_or_else(|error| panic!("cannot write the package alias: {error}"));
+}

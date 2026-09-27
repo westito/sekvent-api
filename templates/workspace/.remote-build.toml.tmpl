@@ -1,0 +1,50 @@
+# rrb (build-on-rtx) — {{project_name}}.
+#
+# The directory holding this file is the sync root and the Cargo workspace
+# root. Everything that compiles runs on the remote builder; `cargo fmt` (the
+# writing form) and in-tree codegen stay on this machine. You rarely call rrb
+# directly: `cargo sekvent <command>` forwards to it.
+
+[project]
+# Remote directory, volume names and container label. [A-Za-z0-9._-]+ only.
+name = "{{project_name}}"
+
+[sync]
+exclude = []
+
+[image]
+# The Rust version in the tag must agree with rust-toolchain.toml. The image
+# carries cargo-llvm-cov and the docker client for coverage and
+# testcontainers.
+base = "{{rrb_image}}"
+
+[run]
+workdir = "/work"
+default = "sekvent"
+
+[run.commands]
+# rrb appends extra arguments verbatim: `rrb run sekvent gate` runs
+# `.sekvent/run.sh gate`, which installs the pinned cargo-sekvent and execs
+# `cargo sekvent gate` inside the container (where it runs locally).
+sekvent = [".sekvent/run.sh"]
+# Direct cargo commands for quick iteration without the CLI.
+check = ["cargo", "check", "--workspace", "--all-targets", "--all-features", "--locked"]
+clippy = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+
+[env]
+set = {}
+forward = []
+
+[docker]
+volumes = []
+ports = []
+args = []
+# The test harness starts Postgres and MySQL as sibling containers on the
+# builder's daemon. SECURITY: mounting the socket grants this container
+# effective root on the builder host. Turn it off if the project has no
+# container-backed tests.
+testcontainers = true
+
+[toolchain]
+channel = "{{rust_version}}"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

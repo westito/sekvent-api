@@ -1,0 +1,12 @@
+# {{crate_name}}
+
+The {{service_pascal}} background worker: one runtime unit in the `Workers`
+stage, no listener. It runs a `Job` in a loop, backs off with jitter after
+failures (`sekvent::resilience::Backoff`) and stops promptly on shutdown.
+
+- `src/main.rs` only initialises telemetry, reads `Config` and calls `serve`.
+- A job run must be safe to repeat: a failed run is retried.
+- Never sleep in tests: run on a paused clock (`start_paused = true`) and
+  wait on signals from the job, as `tests/worker.rs` does.
+
+<!-- Add: what this worker consumes and produces, and its invariants. -->

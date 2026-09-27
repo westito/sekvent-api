@@ -1,0 +1,74 @@
+# cargo sekvent — project configuration.
+#
+# Unknown keys are rejected, so a typo fails loudly instead of being ignored.
+# Every section except [project] is optional; the values below are the
+# defaults, written out so they are easy to change.
+
+[project]
+name = "{{project_name}}"
+
+[remote]
+# "rrb": compiling commands (check, clippy, test, gate, coverage) run on the
+# remote builder through rrb. "local": run them on this machine. CI and the
+# builder container itself always run locally.
+mode = "rrb"
+rrb = "~/.kodein/skills/build-on-rtx/bin/rrb"
+
+[gate]
+# Workspace packages left out of fmt, clippy, test and coverage.
+exclude = []
+# "all", "default" or a list of feature names.
+features = "all"
+# RUST_TEST_THREADS for test runs, unless the environment sets it.
+test_threads = 8
+# Extra clippy arguments after `-- -D warnings`.
+clippy_args = []
+fmt = true
+# Also run `cargo doc --no-deps` with warnings denied.
+doc = false
+
+# Dependency rules: package `from` must not depend on `to`, transitively
+# (normal dependencies only). Checked by the gate.
+#
+# [[gate.boundaries]]
+# from = "{{crate_name}}-proto"
+# to = "tonic"
+
+[coverage]
+# Line coverage floor for every workspace package.
+fail_under_lines = 95.0
+# Extra filename regexes left out of the report (tests/, benches/, examples/,
+# target/ and build-script output are always left out).
+ignore = ['(^|/)src/main\.rs$', '(^|/)build\.rs$']
+# Packages left out of coverage entirely.
+exclude = []
+
+[coverage.thresholds]
+# Per-package floors that override fail_under_lines. Generated protobuf code
+# is not worth covering; an entry for a package that does not exist is
+# ignored.
+"{{crate_name}}-proto" = 0.0
+
+[harness]
+# Label namespace stamped on every test container, used by
+# `cargo sekvent harness-clean` to find leftovers.
+label_namespace = "io.sekvent.harness"
+# Containers older than this are swept as stale.
+stale_after = "6h"
+
+[hooks]
+# Commands (argv arrays, no shell) run around the gate and coverage.
+pre_gate = []
+post_gate = []
+pre_coverage = []
+post_coverage = []
+# Example:
+# pre_gate = [["cargo", "sekvent", "deps", "check"]]
+
+# Project tasks: `cargo sekvent run <name>`. `remote = true` runs the task on
+# the remote builder like the gate does.
+#
+# [tasks.migrate]
+# run = ["cargo", "run", "-p", "{{crate_name}}", "--", "migrate"]
+# remote = false
+# description = "Apply database migrations against DATABASE_URL"

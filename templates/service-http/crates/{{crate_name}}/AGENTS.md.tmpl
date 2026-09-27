@@ -1,0 +1,15 @@
+# {{crate_name}}
+
+The {{service_pascal}} HTTP service: axum routes under `/api`, health at the
+root (`/livez`, `/readyz`, `/healthz`) and graceful shutdown on one listener.
+
+- `src/main.rs` only initialises telemetry, reads `Config` and calls `serve`.
+- Handlers return `Result<_, AppError>`; the error renders as
+  `{"error": {...}}` with the matching status. Read the `CallContext` with
+  the `Ctx` extractor.
+- Routes use axum 0.8 path syntax: `/items/{id}`, not `/items/:id`.
+- JSON shapes are a public contract: add fields, never rename or remove.
+- Tests start the server on port 0 via `runtime(..)` and the runtime handle;
+  never with a fixed port or a sleep.
+
+<!-- Add: what this service owns, its dependencies, its invariants. -->

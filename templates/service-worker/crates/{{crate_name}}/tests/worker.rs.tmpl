@@ -1,0 +1,77 @@
+//! Drives the worker through the runtime handle on a paused clock: every
+//! wait is a completion signal, and backoff delays elapse instantly.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use sekvent::config::MapSource;
+use sekvent::prelude::*;
+use sekvent::runtime::UnitExit;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+use {{crate_ident}}::{Config, Heartbeat, Job, Outcome};
+
+fn config() -> Config {
+    Config::from_config(&MapSource::new()).unwrap()
+}
+
+/// Fails once, works once, then stays idle; reports every run.
+struct Scripted {
+    runs: AtomicU32,
+    observed: mpsc::UnboundedSender<(u32, Instant)>,
+}
+
+impl Job for Scripted {
+    async fn run_once(&self) -> Result<Outcome, AppError> {
+        let run = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.observed.send((run, Instant::now()));
+        match run {
+            1 => Err(AppError::unavailable("the queue is unreachable")),
+            2 => Ok(Outcome::Worked),
+            _ => Ok(Outcome::Idle),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_worker_backs_off_idles_and_stops_on_shutdown() {
+    let (observed, mut runs) = mpsc::unbounded_channel();
+    let job = Arc::new(Scripted {
+        runs: AtomicU32::new(0),
+        observed,
+    });
+    let handle = {{crate_ident}}::runtime(config(), job)
+        .without_signals()
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+
+    let mut at = Vec::new();
+    for expected in 1..=4 {
+        let (run, instant) = runs.recv().await.unwrap();
+        assert_eq!(run, expected);
+        at.push(instant);
+    }
+    // Work is followed by an immediate run; idleness by the idle interval.
+    assert_eq!(at[2], at[1]);
+    assert!(at[3] - at[2] >= config().idle_interval);
+
+    handle.shutdown();
+    let report = handle.wait().await.unwrap();
+    assert_eq!(report.unit("worker").unwrap().exit, UnitExit::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn serve_stops_when_its_shutdown_future_resolves() {
+    let report = {{crate_ident}}::serve(config(), Arc::new(Heartbeat), async {})
+        .await
+        .unwrap();
+    assert!(report.unit("worker").is_some());
+}
+
+#[tokio::test]
+async fn the_heartbeat_is_idle() {
+    assert_eq!(Heartbeat.run_once().await.unwrap(), Outcome::Idle);
+}
