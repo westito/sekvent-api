@@ -1,0 +1,46 @@
+[package]
+name = "sekvent-db"
+description = "Database pools, migrations and generic list filtering for sqlx and sea-orm."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# sqlx Postgres pools, classification and migrations.
+sqlx-postgres = ["dep:sqlx", "sqlx/postgres"]
+# sqlx MySQL pools, classification and migrations.
+sqlx-mysql = ["dep:sqlx", "sqlx/mysql"]
+# sea-orm error classification and list helpers (no backend by itself).
+sea-orm = ["dep:sea-orm"]
+# sea-orm over the registry's Postgres pools.
+sea-orm-postgres = ["sea-orm", "sqlx-postgres", "sea-orm/sqlx-postgres"]
+# sea-orm over the registry's MySQL pools.
+sea-orm-mysql = ["sea-orm", "sqlx-mysql", "sea-orm/sqlx-mysql"]
+# Migrations on boot (sqlx migrator; with `sea-orm-migrate`, sea-orm's).
+migrate = []
+# sea-orm `MigratorTrait` runner. Separate from `migrate` so sqlx-only users
+# do not pull sea-orm-migration.
+sea-orm-migrate = ["sea-orm", "migrate", "dep:sea-orm-migration"]
+# `Deserialize`/`Serialize` for `ListParams` and `ColumnFilter`.
+serde = ["dep:serde"]
+
+[dependencies]
+sekvent-config = { workspace = true }
+sekvent-error = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sqlx = { workspace = true, optional = true }
+sea-orm = { workspace = true, optional = true }
+sea-orm-migration = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+sekvent-testing = { workspace = true, features = ["postgres", "mysql"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

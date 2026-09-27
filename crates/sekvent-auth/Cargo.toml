@@ -1,0 +1,40 @@
+[package]
+name = "sekvent-auth"
+description = "Password hashing and JWT sessions with an injected clock; wasm-compatible core."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Bearer-token extractor and role guard for axum. Not wasm.
+axum = ["dep:axum", "dep:http", "dep:sekvent-context", "sekvent-error/http"]
+# Request interceptor and role guard for tonic. Not wasm.
+tonic = ["dep:tonic", "dep:sekvent-context", "sekvent-error/grpc"]
+
+[dependencies]
+sekvent-error = { workspace = true }
+sekvent-config = { workspace = true }
+argon2 = { workspace = true }
+bcrypt = { workspace = true }
+jsonwebtoken = { workspace = true }
+getrandom = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+sekvent-context = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

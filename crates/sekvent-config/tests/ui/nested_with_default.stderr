@@ -1,0 +1,5 @@
+error: `default` cannot be combined with `nested`; declare defaults on the fields of the nested config
+  --> tests/ui/nested_with_default.rs:10:32
+   |
+10 |     #[config(nested, default = "x")]
+   |                                ^^^

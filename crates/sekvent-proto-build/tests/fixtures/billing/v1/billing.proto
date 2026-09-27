@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+// A package keyword inside a comment must not confuse discovery:
+// package not.this;
+package billing.v1;
+
+import "common/v1/money.proto";
+
+message Invoice {
+  string id = 1;
+  common.v1.Money total = 2;
+  bytes pdf = 3;
+}
+
+message GetInvoiceRequest {
+  string id = 1;
+}
+
+service Invoices {
+  rpc GetInvoice(GetInvoiceRequest) returns (Invoice);
+}

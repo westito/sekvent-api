@@ -1,0 +1,32 @@
+[package]
+name = "sekvent-config"
+description = "Environment-driven configuration with secret redaction and fail-fast validation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["derive"]
+derive = ["dep:sekvent-macros"]
+
+[dependencies]
+sekvent-macros = { workspace = true, optional = true }
+humantime = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+trybuild = { workspace = true }
+
+[[test]]
+name = "derive"
+required-features = ["derive"]
+
+[[test]]
+name = "ui"
+required-features = ["derive"]
+[lints]
+workspace = true

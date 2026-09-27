@@ -1,0 +1,425 @@
+//! Wire encoding of [`CallContext`](crate::CallContext) as HTTP/gRPC headers.
+//!
+//! Inbound values are validated before they are trusted with anything: a
+//! request id or key must be visible ASCII without spaces and of bounded
+//! length, a `traceparent` must have the W3C version-00 shape, and
+//! `subject`/`tenant` survive only when the authenticated caller is a trusted
+//! link. Anything that fails validation is dropped (or, for the request id,
+//! replaced) rather than rejected, so a sloppy client still gets served.
+
+use std::time::{Duration, Instant};
+
+use http::{HeaderMap, HeaderValue};
+
+use crate::{CallContext, ServiceIdentity};
+
+/// Request id header.
+pub const REQUEST_ID: &str = "x-request-id";
+/// gRPC relative deadline, e.g. `250m` (see the gRPC over HTTP/2 spec).
+pub const GRPC_TIMEOUT: &str = "grpc-timeout";
+/// W3C trace context.
+pub const TRACEPARENT: &str = "traceparent";
+/// End-user subject, honoured only from trusted links.
+pub const SUBJECT: &str = "x-sekvent-subject";
+/// Tenant, honoured only from trusted links.
+pub const TENANT: &str = "x-sekvent-tenant";
+/// Idempotency key.
+pub const IDEMPOTENCY_KEY: &str = "idempotency-key";
+
+/// Longest accepted request id.
+const MAX_REQUEST_ID_LEN: usize = 128;
+/// Longest accepted subject, tenant or idempotency key.
+const MAX_VALUE_LEN: usize = 255;
+/// Most digits a `grpc-timeout` value may carry.
+const MAX_TIMEOUT_DIGITS: usize = 8;
+/// Largest `grpc-timeout` value.
+const MAX_TIMEOUT_VALUE: u128 = 99_999_999;
+
+/// `grpc-timeout` units from finest to coarsest, with their size in nanoseconds.
+const TIMEOUT_UNITS: [(char, u128); 6] = [
+    ('n', 1),
+    ('u', 1_000),
+    ('m', 1_000_000),
+    ('S', 1_000_000_000),
+    ('M', 60 * 1_000_000_000),
+    ('H', 3_600 * 1_000_000_000),
+];
+
+/// Build a server-side context from inbound headers.
+///
+/// `caller` is the identity established by authentication (or `None`).
+/// Untrusted callers' `subject`/`tenant` headers are ignored. A missing or
+/// malformed request id is replaced by a fresh one; a malformed
+/// `grpc-timeout` is ignored.
+pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> CallContext {
+    let mut ctx = CallContext::new();
+    if let Some(id) = token(headers, REQUEST_ID, MAX_REQUEST_ID_LEN) {
+        ctx = ctx.with_request_id(id);
+    }
+    if let Some(deadline) = header_str(headers, GRPC_TIMEOUT)
+        .and_then(parse_grpc_timeout)
+        .and_then(|timeout| Instant::now().checked_add(timeout))
+    {
+        ctx = ctx.with_deadline(deadline);
+    }
+    if let Some(traceparent) = header_str(headers, TRACEPARENT).filter(|v| is_traceparent(v)) {
+        ctx = ctx.with_traceparent(traceparent);
+    }
+    if let Some(subject) = token(headers, SUBJECT, MAX_VALUE_LEN) {
+        ctx = ctx.with_subject(subject);
+    }
+    if let Some(tenant) = token(headers, TENANT, MAX_VALUE_LEN) {
+        ctx = ctx.with_tenant(tenant);
+    }
+    if let Some(key) = token(headers, IDEMPOTENCY_KEY, MAX_VALUE_LEN) {
+        ctx = ctx.with_idempotency_key(key);
+    }
+    if let Some(caller) = caller {
+        ctx = ctx.with_caller(caller);
+    }
+    ctx.sanitize_for_caller()
+}
+
+/// Write the context onto outbound headers (the remaining deadline as
+/// `grpc-timeout`). Existing values for these names are replaced.
+///
+/// A field the context does not carry removes any stale header of that name,
+/// so a reused header map never leaks a previous call's values. An expired
+/// deadline is sent as `1n`, the shortest positive timeout.
+pub fn inject(ctx: &CallContext, headers: &mut HeaderMap) {
+    set(headers, REQUEST_ID, Some(ctx.request_id()));
+    let timeout = ctx.remaining().map(encode_grpc_timeout);
+    set(headers, GRPC_TIMEOUT, timeout.as_deref());
+    set(headers, TRACEPARENT, ctx.traceparent());
+    set(headers, SUBJECT, ctx.subject());
+    set(headers, TENANT, ctx.tenant());
+    set(headers, IDEMPOTENCY_KEY, ctx.idempotency_key());
+}
+
+/// Encode a duration as a `grpc-timeout` value (at most 8 digits, choosing
+/// the finest unit that fits).
+///
+/// The value is truncated to the chosen unit, never rounded up, so the callee
+/// never gets more time than the caller has. Zero becomes `1n` because the
+/// wire format only allows positive values; anything beyond 99 999 999 hours
+/// is capped there.
+pub fn encode_grpc_timeout(timeout: std::time::Duration) -> String {
+    let nanos = timeout.as_nanos().max(1);
+    for (unit, size) in TIMEOUT_UNITS {
+        let value = nanos / size;
+        if value <= MAX_TIMEOUT_VALUE {
+            return format!("{value}{unit}");
+        }
+    }
+    format!("{MAX_TIMEOUT_VALUE}H")
+}
+
+/// Parse a `grpc-timeout` value.
+///
+/// Accepts one to eight ASCII digits followed by one of `H`, `M`, `S`, `m`,
+/// `u`, `n`; anything else is `None`.
+pub fn parse_grpc_timeout(value: &str) -> Option<std::time::Duration> {
+    let unit = value.chars().next_back()?;
+    let digits = &value[..value.len() - unit.len_utf8()];
+    if digits.is_empty()
+        || digits.len() > MAX_TIMEOUT_DIGITS
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let amount: u64 = digits.parse().ok()?;
+    Some(match unit {
+        'H' => Duration::from_secs(amount * 3_600),
+        'M' => Duration::from_secs(amount * 60),
+        'S' => Duration::from_secs(amount),
+        'm' => Duration::from_millis(amount),
+        'u' => Duration::from_micros(amount),
+        'n' => Duration::from_nanos(amount),
+        _ => return None,
+    })
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// A header value that is non-empty visible ASCII (no spaces) of bounded length.
+fn token<'a>(headers: &'a HeaderMap, name: &str, max_len: usize) -> Option<&'a str> {
+    header_str(headers, name).filter(|value| is_token(value, max_len))
+}
+
+fn is_token(value: &str, max_len: usize) -> bool {
+    !value.is_empty() && value.len() <= max_len && value.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// `00-<32 hex>-<16 hex>-<2 hex>`, lowercase, with non-zero trace and parent ids.
+fn is_traceparent(value: &str) -> bool {
+    fn lower_hex(part: &str, len: usize) -> bool {
+        part.len() == len && part.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+    fn not_zero(part: &str) -> bool {
+        part.bytes().any(|b| b != b'0')
+    }
+
+    let mut parts = value.split('-');
+    let (Some(version), Some(trace_id), Some(parent_id), Some(flags), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    version == "00"
+        && lower_hex(trace_id, 32)
+        && lower_hex(parent_id, 16)
+        && lower_hex(flags, 2)
+        && not_zero(trace_id)
+        && not_zero(parent_id)
+}
+
+/// Replace `name` with `value`, or remove it when there is no valid value.
+fn set(headers: &mut HeaderMap, name: &'static str, value: Option<&str>) {
+    match value.and_then(|value| HeaderValue::from_str(value).ok()) {
+        Some(value) => {
+            headers.insert(name, value);
+        }
+        None => {
+            headers.remove(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRACE: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn encoding_picks_the_finest_unit_that_fits() {
+        assert_eq!(encode_grpc_timeout(Duration::ZERO), "1n");
+        assert_eq!(encode_grpc_timeout(Duration::from_nanos(1)), "1n");
+        assert_eq!(
+            encode_grpc_timeout(Duration::from_nanos(99_999_999)),
+            "99999999n"
+        );
+        assert_eq!(encode_grpc_timeout(Duration::from_millis(100)), "100000u");
+        assert_eq!(encode_grpc_timeout(Duration::from_millis(250)), "250000u");
+        assert_eq!(encode_grpc_timeout(Duration::from_secs(5)), "5000000u");
+        assert_eq!(encode_grpc_timeout(Duration::from_secs(100)), "100000m");
+        assert_eq!(encode_grpc_timeout(Duration::from_secs(100_000)), "100000S");
+        assert_eq!(
+            encode_grpc_timeout(Duration::from_secs(100_000_000)),
+            "1666666M"
+        );
+        assert_eq!(
+            encode_grpc_timeout(Duration::from_mins(100_000_000)),
+            "1666666H"
+        );
+        assert_eq!(encode_grpc_timeout(Duration::MAX), "99999999H");
+    }
+
+    #[test]
+    fn every_unit_parses() {
+        assert_eq!(parse_grpc_timeout("2H"), Some(Duration::from_secs(7_200)));
+        assert_eq!(parse_grpc_timeout("3M"), Some(Duration::from_secs(180)));
+        assert_eq!(parse_grpc_timeout("4S"), Some(Duration::from_secs(4)));
+        assert_eq!(parse_grpc_timeout("250m"), Some(Duration::from_millis(250)));
+        assert_eq!(parse_grpc_timeout("7u"), Some(Duration::from_micros(7)));
+        assert_eq!(
+            parse_grpc_timeout("99999999n"),
+            Some(Duration::from_nanos(99_999_999))
+        );
+        assert_eq!(parse_grpc_timeout("0n"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn malformed_timeouts_are_rejected() {
+        for bad in [
+            "",
+            "m",
+            "123",
+            "123456789n",
+            "-1S",
+            "+1S",
+            "1.5S",
+            "1s",
+            "1 S",
+            "1é",
+            "S1",
+        ] {
+            assert_eq!(parse_grpc_timeout(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn encoded_values_parse_back_without_gaining_time() {
+        for nanos in [1, 999, 1_000_001, 123_456_789_012, 3_600_000_000_000_123] {
+            let original = Duration::from_nanos(nanos);
+            let parsed = parse_grpc_timeout(&encode_grpc_timeout(original)).unwrap();
+            assert!(parsed <= original, "{original:?} became {parsed:?}");
+        }
+    }
+
+    #[test]
+    fn a_trusted_caller_propagates_every_field() {
+        let map = headers(&[
+            (REQUEST_ID, "req-1"),
+            (GRPC_TIMEOUT, "10S"),
+            (TRACEPARENT, TRACE),
+            (SUBJECT, "user-7"),
+            (TENANT, "acme"),
+            (IDEMPOTENCY_KEY, "key-1"),
+        ]);
+        let before = Instant::now();
+        let ctx = from_headers(&map, Some(ServiceIdentity::trusted("billing")));
+        assert_eq!(ctx.request_id(), "req-1");
+        let deadline = ctx.deadline().expect("deadline");
+        assert!(deadline >= before + Duration::from_secs(10));
+        assert!(deadline <= Instant::now() + Duration::from_secs(10));
+        assert_eq!(ctx.traceparent(), Some(TRACE));
+        assert_eq!(ctx.subject(), Some("user-7"));
+        assert_eq!(ctx.tenant(), Some("acme"));
+        assert_eq!(ctx.idempotency_key(), Some("key-1"));
+        assert_eq!(ctx.caller(), Some(&ServiceIdentity::trusted("billing")));
+    }
+
+    #[test]
+    fn untrusted_and_anonymous_callers_cannot_assert_identity() {
+        let map = headers(&[
+            (SUBJECT, "user-7"),
+            (TENANT, "acme"),
+            (IDEMPOTENCY_KEY, "k"),
+        ]);
+        for caller in [None, Some(ServiceIdentity::untrusted("web"))] {
+            let ctx = from_headers(&map, caller.clone());
+            assert_eq!(ctx.subject(), None);
+            assert_eq!(ctx.tenant(), None);
+            assert_eq!(ctx.idempotency_key(), Some("k"));
+            assert_eq!(ctx.caller(), caller.as_ref());
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_request_ids_are_replaced() {
+        let long = "a".repeat(MAX_REQUEST_ID_LEN + 1);
+        let exact = "b".repeat(MAX_REQUEST_ID_LEN);
+        assert_eq!(
+            from_headers(&headers(&[(REQUEST_ID, &exact)]), None).request_id(),
+            exact
+        );
+        for bad in ["", "has space", long.as_str()] {
+            let ctx = from_headers(&headers(&[(REQUEST_ID, bad)]), None);
+            assert_ne!(ctx.request_id(), bad);
+            assert!(!ctx.request_id().is_empty());
+        }
+        let mut map = HeaderMap::new();
+        map.insert(REQUEST_ID, HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap());
+        assert!(from_headers(&map, None).request_id().is_ascii());
+        assert!(
+            !from_headers(&HeaderMap::new(), None)
+                .request_id()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_optional_headers_are_dropped() {
+        let map = headers(&[
+            (GRPC_TIMEOUT, "soon"),
+            (
+                TRACEPARENT,
+                "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            ),
+            (IDEMPOTENCY_KEY, "two words"),
+        ]);
+        let ctx = from_headers(&map, None);
+        assert_eq!(ctx.deadline(), None);
+        assert_eq!(ctx.traceparent(), None);
+        assert_eq!(ctx.idempotency_key(), None);
+    }
+
+    #[test]
+    fn traceparent_shape_is_checked() {
+        assert!(is_traceparent(TRACE));
+        for bad in [
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-xx",
+        ] {
+            assert!(!is_traceparent(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn inject_writes_everything_and_replaces_stale_values() {
+        let ctx = CallContext::new()
+            .with_request_id("req-9")
+            .with_timeout(Duration::from_secs(30))
+            .with_traceparent(TRACE)
+            .with_subject("user-1")
+            .with_tenant("acme")
+            .with_idempotency_key("idem");
+        let mut map = headers(&[(REQUEST_ID, "stale"), (GRPC_TIMEOUT, "1H")]);
+        inject(&ctx, &mut map);
+
+        assert_eq!(map[REQUEST_ID], "req-9");
+        assert_eq!(map.get_all(REQUEST_ID).iter().count(), 1);
+        let sent = parse_grpc_timeout(map[GRPC_TIMEOUT].to_str().unwrap()).unwrap();
+        assert!(sent <= Duration::from_secs(30) && sent > Duration::from_secs(29));
+        assert_eq!(map[TRACEPARENT], TRACE);
+        assert_eq!(map[SUBJECT], "user-1");
+        assert_eq!(map[TENANT], "acme");
+        assert_eq!(map[IDEMPOTENCY_KEY], "idem");
+
+        let back = from_headers(&map, Some(ServiceIdentity::trusted("orders")));
+        assert_eq!(back.request_id(), "req-9");
+        assert_eq!(back.subject(), Some("user-1"));
+    }
+
+    #[test]
+    fn inject_removes_fields_the_context_does_not_carry() {
+        let mut map = headers(&[
+            (GRPC_TIMEOUT, "1H"),
+            (TRACEPARENT, TRACE),
+            (SUBJECT, "old"),
+            (TENANT, "old"),
+            (IDEMPOTENCY_KEY, "old"),
+        ]);
+        inject(&CallContext::new().with_request_id("fresh"), &mut map);
+        assert_eq!(map[REQUEST_ID], "fresh");
+        for name in [GRPC_TIMEOUT, TRACEPARENT, SUBJECT, TENANT, IDEMPOTENCY_KEY] {
+            assert!(map.get(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_expired_deadline_is_sent_as_one_nanosecond() {
+        let ctx = CallContext::new().with_deadline(Instant::now());
+        let mut map = HeaderMap::new();
+        inject(&ctx, &mut map);
+        assert_eq!(map[GRPC_TIMEOUT], "1n");
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_valid_header_is_skipped() {
+        let ctx = CallContext::new().with_request_id("bad\nid");
+        let mut map = headers(&[(REQUEST_ID, "stale")]);
+        inject(&ctx, &mut map);
+        assert!(map.get(REQUEST_ID).is_none());
+    }
+}

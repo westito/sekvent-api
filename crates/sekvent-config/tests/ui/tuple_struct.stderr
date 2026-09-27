@@ -1,0 +1,5 @@
+error: `EnvConfig` requires a struct with named fields; tuple structs are not supported
+ --> tests/ui/tuple_struct.rs:4:14
+  |
+4 | struct Config(String);
+  |              ^^^^^^^^

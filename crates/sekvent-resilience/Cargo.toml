@@ -1,0 +1,30 @@
+[package]
+name = "sekvent-resilience"
+description = "Timeouts, retries with budgets, rate gates, bulkheads and circuit breakers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sekvent-error = { workspace = true }
+sekvent-context = { workspace = true }
+sekvent-config = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+humantime = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util = { workspace = true }
+
+[lints]
+workspace = true

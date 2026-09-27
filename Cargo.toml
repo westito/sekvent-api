@@ -1,0 +1,135 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/westito/sekvent"
+publish = false
+
+[workspace.dependencies]
+# --- internal ---
+sekvent-config = { path = "crates/sekvent-config" }
+sekvent-macros = { path = "crates/sekvent-macros" }
+sekvent-telemetry = { path = "crates/sekvent-telemetry" }
+sekvent-error = { path = "crates/sekvent-error" }
+sekvent-context = { path = "crates/sekvent-context" }
+sekvent-runtime = { path = "crates/sekvent-runtime" }
+sekvent-resilience = { path = "crates/sekvent-resilience" }
+sekvent-auth = { path = "crates/sekvent-auth" }
+sekvent-link = { path = "crates/sekvent-link" }
+sekvent-client = { path = "crates/sekvent-client" }
+sekvent-db = { path = "crates/sekvent-db" }
+sekvent-testing = { path = "crates/sekvent-testing" }
+sekvent-proto-build = { path = "crates/sekvent-proto-build" }
+
+# --- async runtime ---
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
+tokio-stream = "0.1.19"
+futures = "0.3.34"
+pin-project-lite = "0.2.17"
+
+# --- gRPC / protobuf (tonic 0.14: prost codec and build are separate crates) ---
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tonic-web = "0.14.6"
+tonic-types = "0.14.6"
+tonic-health = "0.14.6"
+prost = "0.14.4"
+prost-types = "0.14.4"
+prost-build = "0.14.4"
+
+# --- HTTP ---
+axum = "0.8.9"
+tower = { version = "0.5.3", features = ["util", "timeout", "limit", "load-shed", "retry"] }
+tower-http = { version = "0.7.1", features = ["trace", "cors", "request-id", "propagate-header"] }
+http = "1.5.0"
+http-body = "1.0.1"
+http-body-util = "0.1.5"
+hyper = "1.11.1"
+hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
+bytes = "1.12.1"
+# One TLS stack: rustls. Never enable native-tls anywhere in the graph.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "gzip", "charset", "http2", "query"] }
+
+# --- persistence ---
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "macros", "migrate", "chrono", "uuid", "json"] }
+sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "with-uuid", "with-rust_decimal"] }
+sea-orm-migration = { version = "2.0.4", default-features = false, features = ["runtime-tokio-rustls"] }
+rust_decimal = "1"
+
+# --- auth / crypto ---
+argon2 = { version = "0.6.0", features = ["zeroize"] }
+bcrypt = "0.19.3"
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
+subtle = "2.6.1"
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
+getrandom = "0.4.3"
+rand = "0.10.3"
+
+# --- serialization / misc ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+humantime = "2.4.0"
+regex = "1.13.1"
+croner = "4.0.0"
+
+# --- errors / logging ---
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# --- proc macros ---
+syn = { version = "3.0.6", features = ["full", "extra-traits"] }
+quote = "1.0.47"
+proc-macro2 = "1.0.107"
+
+# --- tests / tooling ---
+# NOT testcontainers-modules: 0.15 requires testcontainers ^0.27, and the
+# harness only needs GenericImage.
+testcontainers = "0.28.0"
+rstest = "0.27.0"
+trybuild = "1.0.121"
+insta = "1.48.0"
+tempfile = "3.27.0"
+clap = { version = "4.6.7", features = ["derive"] }
+toml = "1.1.6"
+cargo_metadata = "0.23.1"
+
+[workspace.lints.rust]
+# `deny`, not `forbid`: edition 2024 makes `std::env::set_var` unsafe and the
+# harness crate needs one audited use.
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+# Password hashing is memory-hard on purpose; unoptimised it dominates test time.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.bcrypt]
+opt-level = 3
+[profile.dev.package.blowfish]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

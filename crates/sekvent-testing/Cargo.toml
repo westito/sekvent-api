@@ -1,0 +1,32 @@
+[package]
+name = "sekvent-testing"
+description = "Testcontainers harness for Postgres and MySQL with crash-safe cleanup."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Dev-only: consumers add this crate under `[dev-dependencies]`.
+
+[features]
+default = []
+# `PostgresHarness`: a shared Postgres container with one database per test.
+postgres = ["dep:sqlx", "sqlx/postgres"]
+# `MySqlHarness`: a shared MySQL container with one database per test.
+mysql = ["dep:sqlx", "sqlx/mysql"]
+
+[dependencies]
+testcontainers = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true, optional = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

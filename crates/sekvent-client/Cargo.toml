@@ -1,0 +1,34 @@
+[package]
+name = "sekvent-client"
+description = "Outbound HTTP client with resilience, context propagation and OAuth2 token caching."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sekvent-config = { workspace = true }
+sekvent-context = { workspace = true }
+sekvent-error = { workspace = true, features = ["http"] }
+sekvent-resilience = { workspace = true }
+sekvent-telemetry = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+# HTTP-date parsing for `Retry-After`.
+httpdate = "1.0.3"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

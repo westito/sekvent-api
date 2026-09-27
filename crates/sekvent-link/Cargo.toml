@@ -1,0 +1,36 @@
+[package]
+name = "sekvent-link"
+description = "Service-to-service bearer-token authentication."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Inbound middleware for axum.
+axum = ["dep:axum", "sekvent-error/http"]
+# Outbound and inbound interceptors for tonic.
+tonic = ["dep:tonic", "sekvent-error/grpc"]
+
+[dependencies]
+sekvent-config = { workspace = true }
+sekvent-context = { workspace = true }
+sekvent-error = { workspace = true }
+getrandom = { workspace = true }
+http = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+
+axum = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

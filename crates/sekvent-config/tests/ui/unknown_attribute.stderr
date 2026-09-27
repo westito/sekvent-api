@@ -1,0 +1,5 @@
+error: unknown config attribute `colour`; expected one of `key`, `default`, `secret`, `nested`, `validate`
+ --> tests/ui/unknown_attribute.rs:5:14
+  |
+5 |     #[config(colour = "red")]
+  |              ^^^^^^

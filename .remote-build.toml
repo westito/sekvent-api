@@ -1,0 +1,45 @@
+# rrb (build-on-rtx) — sekvent.
+#
+# The directory holding this file is the sync root and the Cargo workspace
+# root. Everything that compiles runs on rtx; `cargo fmt` (the writing form)
+# and in-tree codegen stay on the Mac. See ~/.kodein/skills/build-on-rtx/SKILL.md.
+
+[project]
+name = "sekvent"
+
+[sync]
+exclude = []
+
+[image]
+# The r2 revision carries cargo-llvm-cov and the docker client, both needed by
+# the coverage gate and the testcontainers harness tests. The Rust version in
+# the tag must agree with rust-toolchain.toml.
+base = "remote-builder:rust1.98.1-flutter3.47.2-r2"
+
+[run]
+workdir = "/work"
+default = "gate"
+
+[run.commands]
+check  = ["cargo", "check", "--workspace", "--all-targets", "--all-features", "--locked"]
+clippy = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+test   = ["cargo", "test", "--workspace", "--all-features", "--locked"]
+# The full gate: format check, lint, tests. Read-only, so it belongs here.
+gate   = ["bash", "-c", "set -euo pipefail; cargo fmt --all --check; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings; cargo test --workspace --all-features --locked"]
+coverage = ["bash", "-c", "set -euo pipefail; cargo llvm-cov clean --workspace; cargo llvm-cov --workspace --all-features --locked --ignore-filename-regex '(^|/)(tests|examples|benches)/|(^|/)src/main\\.rs$|(^|/)sekvent-macros/' --fail-under-lines 95 --summary-only"]
+
+[env]
+set = {}
+forward = []
+
+[docker]
+volumes = []
+ports = []
+args = []
+# sekvent-testing's own tests start Postgres and MySQL siblings on rtx's
+# daemon. SECURITY: the socket grants this container effective root on rtx.
+testcontainers = true
+
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

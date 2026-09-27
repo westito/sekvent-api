@@ -1,0 +1,5 @@
+error: `EnvConfig` can only be derived for structs with named fields, not enums
+ --> tests/ui/enum.rs:4:6
+  |
+4 | enum Mode {
+  |      ^^^^

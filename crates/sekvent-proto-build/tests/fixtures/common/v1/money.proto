@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package common.v1;
+
+// An amount in minor units of a currency.
+message Money {
+  string currency = 1;
+  int64 minor_units = 2;
+}

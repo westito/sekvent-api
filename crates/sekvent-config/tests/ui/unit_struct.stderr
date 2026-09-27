@@ -1,0 +1,5 @@
+error: `EnvConfig` requires a struct with named fields; unit structs are not supported
+ --> tests/ui/unit_struct.rs:4:8
+  |
+4 | struct Config;
+  |        ^^^^^^
