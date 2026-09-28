@@ -1,6 +1,5 @@
 //! `#[derive(EnvConfig)]`: attribute parsing and code generation.
 
-use proc_macro_crate::FoundCrate;
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use syn::ext::IdentExt;
@@ -62,37 +61,9 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
     }
     let krate = match &container.krate {
         Some(path) => quote!(#path),
-        None => runtime_path(proc_macro_crate::crate_name("sekvent-config").ok(), || {
-            proc_macro_crate::crate_name("sekvent").ok()
-        }),
+        None => crate::paths::resolve("sekvent-config", "sekvent_config", "config"),
     };
     Ok(generate(input, &container.prefix, &krate, &fields))
-}
-
-/// The path of the `sekvent_config` runtime as seen from the crate being
-/// compiled: a direct `sekvent-config` dependency first (under its possibly
-/// renamed name), else the `config` module of the `sekvent` facade, else
-/// `::sekvent_config` (inside sekvent-config itself, which aliases itself
-/// under that name, and when the manifest cannot be read).
-fn runtime_path(
-    config: Option<FoundCrate>,
-    facade: impl FnOnce() -> Option<FoundCrate>,
-) -> TokenStream {
-    match config {
-        Some(FoundCrate::Name(name)) => {
-            let ident = Ident::new(&name, Span::call_site());
-            quote!(::#ident)
-        }
-        Some(FoundCrate::Itself) => quote!(::sekvent_config),
-        None => match facade() {
-            Some(FoundCrate::Name(name)) => {
-                let ident = Ident::new(&name, Span::call_site());
-                quote!(::#ident::config)
-            }
-            Some(FoundCrate::Itself) => quote!(crate::config),
-            None => quote!(::sekvent_config),
-        },
-    }
 }
 
 /// How a field is read, decided by its type (or by `nested`).
@@ -647,33 +618,6 @@ mod tests {
                 "missing `{needle}` in\n{out}"
             );
         }
-    }
-
-    #[test]
-    fn the_runtime_path_follows_the_dependency_graph() {
-        let name = |name: &str| Some(FoundCrate::Name(name.to_owned()));
-        let unreachable = || -> Option<FoundCrate> { panic!("the facade is not consulted") };
-        let path = |tokens: TokenStream| compact(&tokens.to_string());
-
-        assert_eq!(
-            path(runtime_path(name("sekvent_config"), unreachable)),
-            "::sekvent_config"
-        );
-        assert_eq!(path(runtime_path(name("cfg"), unreachable)), "::cfg");
-        assert_eq!(
-            path(runtime_path(Some(FoundCrate::Itself), unreachable)),
-            "::sekvent_config"
-        );
-        assert_eq!(
-            path(runtime_path(None, || name("sekvent"))),
-            "::sekvent::config"
-        );
-        assert_eq!(path(runtime_path(None, || name("fw"))), "::fw::config");
-        assert_eq!(
-            path(runtime_path(None, || Some(FoundCrate::Itself))),
-            "crate::config"
-        );
-        assert_eq!(path(runtime_path(None, || None)), "::sekvent_config");
     }
 
     #[test]

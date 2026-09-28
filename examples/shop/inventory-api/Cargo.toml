@@ -1,0 +1,19 @@
+[package]
+name = "inventory-api"
+description = "Contract of the example shop's inventory component: messages, trait and error."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+prost = { workspace = true }
+sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
+
+[build-dependencies]
+sekvent-proto-build = { path = "../../../crates/sekvent-proto-build" }
+
+[lints]
+workspace = true

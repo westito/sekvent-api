@@ -1,0 +1,5 @@
+error: component methods must be `async fn`
+ --> tests/ui/fail/m8_not_async.rs:4:5
+  |
+4 |     fn ping(
+  |     ^^

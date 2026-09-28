@@ -1,0 +1,6 @@
+error: the #[other] variant must be a tuple variant holding one AppError, e.g. `Other(AppError)`
+ --> tests/ui/fail/d5_other_shape.rs:7:5
+  |
+7 | /     #[other]
+8 | |     Other,
+  | |_________^

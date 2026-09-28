@@ -1,0 +1,5 @@
+error: a component trait cannot be unsafe or auto
+ --> tests/ui/fail/c9_unsafe_trait.rs:2:5
+  |
+2 | pub unsafe trait Echo {
+  |     ^^^^^^

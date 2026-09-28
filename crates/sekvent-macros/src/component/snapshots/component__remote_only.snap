@@ -1,0 +1,134 @@
+---
+source: crates/sekvent-macros/src/component/tests.rs
+expression: text
+---
+pub(crate) trait Ledger: Send + ::core::marker::Sync + 'static {
+    /// Record an entry.
+    fn record(
+        &self,
+        cx: &CallContext,
+        req: RecordRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<RecordReply, LedgerError>,
+    > + ::core::marker::Send;
+}
+#[doc(hidden)]
+pub(crate) trait __LedgerDyn: ::core::marker::Send + ::core::marker::Sync + 'static {
+    fn __record<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: RecordRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<'a, Result<RecordReply, LedgerError>>;
+}
+#[allow(clippy::all, clippy::pedantic)]
+impl<T: Ledger> __LedgerDyn for T {
+    fn __record<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: RecordRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'a,
+        Result<RecordReply, LedgerError>,
+    > {
+        ::std::boxed::Box::pin(<T as Ledger>::record(self, cx, req))
+    }
+}
+/// Cloneable handle to the [`Ledger`] component (`ledger`).
+///
+/// Get it from `Deps::handle` in a factory or from `App::handle`; the App
+/// builder decides whether its calls run in-process or across a
+/// serialization boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct LedgerHandle(
+    ::sekvent_component::__private::Endpoint<dyn __LedgerDyn>,
+);
+#[allow(clippy::all, clippy::pedantic)]
+impl LedgerHandle {
+    #[doc(hidden)]
+    pub const __METHODS: &'static [::sekvent_component::MethodDescriptor] = &[
+        ::sekvent_component::MethodDescriptor::call("record", "Record")
+            .with_idempotent()
+            .with_timeout(::core::time::Duration::new(90u64, 0u32)),
+    ];
+    /// Record an entry.
+    pub fn record<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: RecordRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<RecordReply, LedgerError>,
+    > + ::core::marker::Send + 'a {
+        self.0
+            .call(
+                0usize,
+                cx,
+                req,
+                |
+                    imp: ::std::sync::Arc<dyn __LedgerDyn>,
+                    cx: ::sekvent_component::CallContext,
+                    req: RecordRequest|
+                async move { __LedgerDyn::__record(&*imp, &cx, req).await },
+            )
+    }
+    /// The binding this handle's calls use.
+    pub fn binding(&self) -> ::sekvent_component::Binding {
+        self.0.binding()
+    }
+    /// Declare this remote-only component; it must be bound to a remote transport.
+    pub fn install_remote(
+        app: &mut ::sekvent_component::AppBuilder<'_>,
+    ) -> ::core::result::Result<(), ::sekvent_component::BuildError> {
+        ::sekvent_component::__private::install_remote(app, LedgerHandle)
+    }
+}
+#[allow(clippy::all, clippy::pedantic)]
+impl ::sekvent_component::ComponentHandle for LedgerHandle {
+    const DESCRIPTOR: &'static ::sekvent_component::ComponentDescriptor = &::sekvent_component::ComponentDescriptor::new(
+            "ledger",
+            "Ledger",
+            LedgerHandle::__METHODS,
+        )
+        .with_package("shop.ledger.v1")
+        .with_mode(::sekvent_component::ComponentMode::RemoteOnly);
+}
+#[doc(hidden)]
+pub(crate) struct __LedgerDispatcher(::std::sync::Arc<dyn __LedgerDyn>);
+#[allow(clippy::all, clippy::pedantic)]
+impl ::sekvent_component::__private::Dispatch for __LedgerDispatcher {
+    fn dispatch(
+        &self,
+        method: usize,
+        cx: ::sekvent_component::CallContext,
+        body: ::sekvent_component::__private::Bytes,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'static,
+        ::core::result::Result<
+            ::sekvent_component::__private::Bytes,
+            ::sekvent_component::AppError,
+        >,
+    > {
+        let imp = ::std::sync::Arc::clone(&self.0);
+        match method {
+            0usize => {
+                ::sekvent_component::__private::serve(
+                    cx,
+                    body,
+                    move |cx: ::sekvent_component::CallContext, req: RecordRequest| async move {
+                        __LedgerDyn::__record(&*imp, &cx, req).await
+                    },
+                )
+            }
+            _ => {
+                ::sekvent_component::__private::unknown_method(
+                    <LedgerHandle as ::sekvent_component::ComponentHandle>::DESCRIPTOR,
+                    method,
+                )
+            }
+        }
+    }
+}
+const _: () = {
+    ::sekvent_component::__private::assert_wire::<RecordRequest>();
+    ::sekvent_component::__private::assert_wire::<RecordReply>();
+    ::sekvent_component::__private::assert_error::<LedgerError>();
+};

@@ -1,0 +1,5 @@
+error: a component trait may only have `Send`, `Sync` and `'static` as supertraits
+ --> tests/ui/fail/c10_supertrait.rs:2:17
+  |
+2 | pub trait Echo: Clone {
+  |                 ^^^^^

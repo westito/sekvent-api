@@ -1,0 +1,5 @@
+error: method `ping` needs a kind attribute: #[call]
+ --> tests/ui/fail/m1_no_kind.rs:3:14
+  |
+3 |     async fn ping(
+  |              ^^^^

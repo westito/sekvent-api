@@ -1,0 +1,19 @@
+[package]
+name = "notifications"
+description = "The example shop's notifications component: an in-memory outbox with a blocklist."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+notifications-api = { path = "../notifications-api" }
+sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

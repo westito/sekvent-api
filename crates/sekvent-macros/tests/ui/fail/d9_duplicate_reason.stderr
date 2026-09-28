@@ -1,0 +1,5 @@
+error: reason `ORDER_GONE` is used by more than one variant
+ --> tests/ui/fail/d9_duplicate_reason.rs:7:14
+  |
+7 |     #[reason("ORDER_GONE", code = NotFound)]
+  |              ^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: a component trait cannot have generic parameters or a where clause
+ --> tests/ui/fail/c8_generic_trait.rs:2:15
+  |
+2 | pub trait Echo<T> {
+  |               ^^^

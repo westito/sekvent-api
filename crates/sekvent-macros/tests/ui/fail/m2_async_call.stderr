@@ -1,0 +1,11 @@
+error: #[async_call] is planned for milestone C3 and not available yet
+ --> tests/ui/fail/m2_async_call.rs:3:5
+  |
+3 |     #[async_call]
+  |     ^^^^^^^^^^^^^
+
+error: #[deferred] is planned for milestone C3 and not available yet
+  --> tests/ui/fail/m2_async_call.rs:13:5
+   |
+13 |     #[deferred]
+   |     ^^^^^^^^^^^

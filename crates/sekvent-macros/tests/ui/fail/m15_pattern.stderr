@@ -1,0 +1,5 @@
+error: arguments must be plain identifiers
+ --> tests/ui/fail/m15_pattern.rs:7:9
+  |
+7 |         mut req: String,
+  |         ^^^^^^^

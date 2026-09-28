@@ -16,12 +16,14 @@ config = ["dep:sekvent-config"]
 error = ["dep:sekvent-error"]
 context = ["dep:sekvent-context"]
 telemetry = ["dep:sekvent-telemetry"]
-runtime = ["dep:sekvent-runtime"]
+runtime = ["dep:sekvent-runtime", "sekvent-component?/runtime"]
 resilience = ["dep:sekvent-resilience"]
 auth = ["dep:sekvent-auth"]
 link = ["dep:sekvent-link"]
 client = ["dep:sekvent-client"]
 db = ["dep:sekvent-db"]
+# Components need the config source, the error model and the call context.
+component = ["dep:sekvent-component", "config", "error", "context"]
 
 # sekvent-error wire mappings.
 error-http = ["error", "sekvent-error/http"]
@@ -57,6 +59,7 @@ full = [
     "link",
     "client",
     "db",
+    "component",
     "error-http",
     "error-grpc",
     "runtime-grpc-web",
@@ -86,6 +89,7 @@ sekvent-auth = { workspace = true, optional = true }
 sekvent-link = { workspace = true, optional = true }
 sekvent-client = { workspace = true, optional = true }
 sekvent-db = { workspace = true, optional = true }
+sekvent-component = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

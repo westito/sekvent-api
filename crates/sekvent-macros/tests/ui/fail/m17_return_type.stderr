@@ -1,0 +1,5 @@
+error: the return type must be Result<Reply, Error>
+ --> tests/ui/fail/m17_return_type.rs:4:79
+  |
+4 |     async fn ping(&self, cx: &sekvent_component::CallContext, req: String) -> Option<String>;
+  |                                                                               ^^^^^^^^^^^^^^

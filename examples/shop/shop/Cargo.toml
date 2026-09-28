@@ -1,0 +1,26 @@
+[package]
+name = "shop"
+description = "The example shop as one binary: inventory, notifications and orders as components."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+inventory = { path = "../inventory" }
+inventory-api = { path = "../inventory-api" }
+notifications = { path = "../notifications" }
+notifications-api = { path = "../notifications-api" }
+orders = { path = "../orders" }
+orders-api = { path = "../orders-api" }
+sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component", "config", "runtime"] }
+tokio = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

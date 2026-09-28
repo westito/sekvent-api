@@ -1,0 +1,5 @@
+error: ComponentError can only be derived for an enum
+ --> tests/ui/fail/d1_not_an_enum.rs:4:12
+  |
+4 | pub struct Plain;
+  |            ^^^^^

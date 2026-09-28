@@ -1,0 +1,5 @@
+error: bulkhead must be an integer from 1 to 4294967295
+ --> tests/ui/fail/m6_bad_bulkhead.rs:3:23
+  |
+3 |     #[call(bulkhead = 0)]
+  |                       ^

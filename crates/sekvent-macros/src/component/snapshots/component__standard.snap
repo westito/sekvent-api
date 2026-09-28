@@ -1,0 +1,252 @@
+---
+source: crates/sekvent-macros/src/component/tests.rs
+expression: text
+---
+pub trait Inventory: Send + Sync + 'static {
+    /// Reserve stock for an order.
+    fn reserve(
+        &self,
+        cx: &CallContext,
+        req: ReserveRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<ReserveReply, InventoryError>,
+    > + ::core::marker::Send;
+    /// Release a reservation.
+    fn release(
+        &self,
+        cx: &CallContext,
+        req: ReleaseRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<ReleaseReply, InventoryError>,
+    > + ::core::marker::Send;
+}
+#[doc(hidden)]
+pub trait __InventoryDyn: ::core::marker::Send + ::core::marker::Sync + 'static {
+    fn __reserve<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: ReserveRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'a,
+        Result<ReserveReply, InventoryError>,
+    >;
+    fn __release<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: ReleaseRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'a,
+        Result<ReleaseReply, InventoryError>,
+    >;
+}
+#[allow(clippy::all, clippy::pedantic)]
+impl<T: Inventory> __InventoryDyn for T {
+    fn __reserve<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: ReserveRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'a,
+        Result<ReserveReply, InventoryError>,
+    > {
+        ::std::boxed::Box::pin(<T as Inventory>::reserve(self, cx, req))
+    }
+    fn __release<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: ReleaseRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'a,
+        Result<ReleaseReply, InventoryError>,
+    > {
+        ::std::boxed::Box::pin(<T as Inventory>::release(self, cx, req))
+    }
+}
+/// Cloneable handle to the [`Inventory`] component (`inventory`).
+///
+/// Get it from `Deps::handle` in a factory or from `App::handle`; the App
+/// builder decides whether its calls run in-process or across a
+/// serialization boundary.
+#[derive(Clone, Debug)]
+pub struct InventoryHandle(::sekvent_component::__private::Endpoint<dyn __InventoryDyn>);
+#[allow(clippy::all, clippy::pedantic)]
+impl InventoryHandle {
+    #[doc(hidden)]
+    pub const __METHODS: &'static [::sekvent_component::MethodDescriptor] = &[
+        ::sekvent_component::MethodDescriptor::call("reserve", "Reserve")
+            .with_idempotent()
+            .with_timeout(::core::time::Duration::new(2u64, 0u32))
+            .with_bulkhead(16u32),
+        ::sekvent_component::MethodDescriptor::call("release", "Release")
+            .with_timeout(::core::time::Duration::new(0u64, 500000000u32)),
+    ];
+    /// Reserve stock for an order.
+    pub fn reserve<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: ReserveRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<ReserveReply, InventoryError>,
+    > + ::core::marker::Send + 'a {
+        self.0
+            .call(
+                0usize,
+                cx,
+                req,
+                |
+                    imp: ::std::sync::Arc<dyn __InventoryDyn>,
+                    cx: ::sekvent_component::CallContext,
+                    req: ReserveRequest|
+                async move { __InventoryDyn::__reserve(&*imp, &cx, req).await },
+            )
+    }
+    /// Release a reservation.
+    pub fn release<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: ReleaseRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<ReleaseReply, InventoryError>,
+    > + ::core::marker::Send + 'a {
+        self.0
+            .call(
+                1usize,
+                cx,
+                req,
+                |
+                    imp: ::std::sync::Arc<dyn __InventoryDyn>,
+                    cx: ::sekvent_component::CallContext,
+                    req: ReleaseRequest|
+                async move { __InventoryDyn::__release(&*imp, &cx, req).await },
+            )
+    }
+    /// The binding this handle's calls use.
+    pub fn binding(&self) -> ::sekvent_component::Binding {
+        self.0.binding()
+    }
+    /// Install the implementation `factory` builds. The factory runs during
+    /// `AppBuilder::build`, in install order, and only when the component is
+    /// bound `local` or `local-serialized`.
+    pub fn install<T, F>(
+        app: &mut ::sekvent_component::AppBuilder<'_>,
+        factory: F,
+    ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
+    where
+        T: Inventory,
+        F: ::core::ops::FnOnce(
+                &mut ::sekvent_component::Deps<'_>,
+            ) -> ::core::result::Result<T, ::sekvent_component::AppError>
+            + ::core::marker::Send + 'static,
+    {
+        ::sekvent_component::__private::install_local(
+            app,
+            InventoryHandle,
+            move |deps| {
+                let imp: ::std::sync::Arc<dyn __InventoryDyn> = ::std::sync::Arc::new(
+                    factory(deps)?,
+                );
+                let dispatch = ::std::sync::Arc::new(
+                    __InventoryDispatcher(::std::sync::Arc::clone(&imp)),
+                );
+                ::core::result::Result::Ok(
+                    ::sekvent_component::__private::Local::new(imp)
+                        .with_dispatch(dispatch),
+                )
+            },
+        )
+    }
+    /// Like [`InventoryHandle::install`], and also run the implementation's
+    /// `Lifecycle` hooks when the App starts and stops.
+    pub fn install_with_lifecycle<T, F>(
+        app: &mut ::sekvent_component::AppBuilder<'_>,
+        factory: F,
+    ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
+    where
+        T: Inventory + ::sekvent_component::Lifecycle,
+        F: ::core::ops::FnOnce(
+                &mut ::sekvent_component::Deps<'_>,
+            ) -> ::core::result::Result<T, ::sekvent_component::AppError>
+            + ::core::marker::Send + 'static,
+    {
+        ::sekvent_component::__private::install_local(
+            app,
+            InventoryHandle,
+            move |deps| {
+                let concrete = ::std::sync::Arc::new(factory(deps)?);
+                let imp: ::std::sync::Arc<dyn __InventoryDyn> = ::std::sync::Arc::<
+                    T,
+                >::clone(&concrete);
+                let dispatch = ::std::sync::Arc::new(
+                    __InventoryDispatcher(::std::sync::Arc::clone(&imp)),
+                );
+                ::core::result::Result::Ok(
+                    ::sekvent_component::__private::Local::new(imp)
+                        .with_dispatch(dispatch)
+                        .with_lifecycle(concrete),
+                )
+            },
+        )
+    }
+}
+#[allow(clippy::all, clippy::pedantic)]
+impl ::sekvent_component::ComponentHandle for InventoryHandle {
+    const DESCRIPTOR: &'static ::sekvent_component::ComponentDescriptor = &::sekvent_component::ComponentDescriptor::new(
+            "inventory",
+            "Inventory",
+            InventoryHandle::__METHODS,
+        )
+        .with_package("shop.inventory.v1");
+}
+#[doc(hidden)]
+pub struct __InventoryDispatcher(::std::sync::Arc<dyn __InventoryDyn>);
+#[allow(clippy::all, clippy::pedantic)]
+impl ::sekvent_component::__private::Dispatch for __InventoryDispatcher {
+    fn dispatch(
+        &self,
+        method: usize,
+        cx: ::sekvent_component::CallContext,
+        body: ::sekvent_component::__private::Bytes,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'static,
+        ::core::result::Result<
+            ::sekvent_component::__private::Bytes,
+            ::sekvent_component::AppError,
+        >,
+    > {
+        let imp = ::std::sync::Arc::clone(&self.0);
+        match method {
+            0usize => {
+                ::sekvent_component::__private::serve(
+                    cx,
+                    body,
+                    move |cx: ::sekvent_component::CallContext, req: ReserveRequest| async move {
+                        __InventoryDyn::__reserve(&*imp, &cx, req).await
+                    },
+                )
+            }
+            1usize => {
+                ::sekvent_component::__private::serve(
+                    cx,
+                    body,
+                    move |cx: ::sekvent_component::CallContext, req: ReleaseRequest| async move {
+                        __InventoryDyn::__release(&*imp, &cx, req).await
+                    },
+                )
+            }
+            _ => {
+                ::sekvent_component::__private::unknown_method(
+                    <InventoryHandle as ::sekvent_component::ComponentHandle>::DESCRIPTOR,
+                    method,
+                )
+            }
+        }
+    }
+}
+const _: () = {
+    ::sekvent_component::__private::assert_wire::<ReserveRequest>();
+    ::sekvent_component::__private::assert_wire::<ReserveReply>();
+    ::sekvent_component::__private::assert_error::<InventoryError>();
+    ::sekvent_component::__private::assert_wire::<ReleaseRequest>();
+    ::sekvent_component::__private::assert_wire::<ReleaseReply>();
+    ::sekvent_component::__private::assert_error::<InventoryError>();
+};

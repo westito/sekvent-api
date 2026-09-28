@@ -1,0 +1,11 @@
+error: unknown #[call] argument `retry`; expected idempotent, timeout or bulkhead
+ --> tests/ui/fail/m4_unknown_call_argument.rs:3:12
+  |
+3 |     #[call(retry)]
+  |            ^^^^^
+
+error: duplicate #[call] argument `idempotent`
+  --> tests/ui/fail/m4_unknown_call_argument.rs:13:24
+   |
+13 |     #[call(idempotent, idempotent)]
+   |                        ^^^^^^^^^^

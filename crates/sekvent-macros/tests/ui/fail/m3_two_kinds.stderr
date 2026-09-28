@@ -1,0 +1,5 @@
+error: a method has exactly one kind attribute
+ --> tests/ui/fail/m3_two_kinds.rs:4:5
+  |
+4 |     #[call(idempotent)]
+  |     ^^^^^^^^^^^^^^^^^^^

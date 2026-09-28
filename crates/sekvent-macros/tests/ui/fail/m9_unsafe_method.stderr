@@ -1,0 +1,5 @@
+error: component methods cannot be const, unsafe or extern
+ --> tests/ui/fail/m9_unsafe_method.rs:4:11
+  |
+4 |     async unsafe fn ping(
+  |           ^^^^^^

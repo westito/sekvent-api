@@ -1,0 +1,5 @@
+error: a component needs at least one method
+ --> tests/ui/fail/c12_no_methods.rs:2:11
+  |
+2 | pub trait Echo {}
+  |           ^^^^

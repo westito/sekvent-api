@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+// Messages of the inventory component. The component itself is declared in
+// Rust (`inventory_api::Inventory`); this file only defines what travels.
+package shop.inventory.v1;
+
+// Reserve `quantity` units of `sku` for an order.
+message ReserveRequest {
+  string order_id = 1;
+  string sku = 2;
+  uint32 quantity = 3;
+}
+
+// A reservation and the stock left after it.
+message ReserveReply {
+  string reservation_id = 1;
+  uint32 remaining = 2;
+}
+
+// Give a reservation's units back.
+message ReleaseRequest {
+  string reservation_id = 1;
+}
+
+// Whether the reservation was released.
+message ReleaseReply {
+  bool released = 1;
+}
+
+// Ask how many units of `sku` are available.
+message StockRequest {
+  string sku = 1;
+}
+
+// Units of `sku` available right now.
+message StockReply {
+  string sku = 1;
+  uint32 available = 2;
+}

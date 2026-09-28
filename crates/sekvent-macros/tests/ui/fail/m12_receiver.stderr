@@ -1,0 +1,5 @@
+error: component methods take `&self`
+ --> tests/ui/fail/m12_receiver.rs:5:9
+  |
+5 |         self,
+  |         ^^^^

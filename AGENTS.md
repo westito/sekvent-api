@@ -16,7 +16,7 @@ behaviour in your own words and use neutral examples (`billing`, `orders`).
 | Crate | Responsibility | Depends on (sekvent) |
 |---|---|---|
 | `sekvent-config` | `ConfigSource`, `Secret`, readers, `FromConfig`, reserved `SEKVENT_*` keys | macros (derive) |
-| `sekvent-macros` | proc macros (`EnvConfig`; later `component`) | — |
+| `sekvent-macros` | proc macros (`EnvConfig`, `component`, `ComponentError`) | — |
 | `sekvent-telemetry` | tracing init, log ring buffer, request-id layer, `truncate_for_log` | — |
 | `sekvent-error` | `ErrorCode`, `AppError`, `WireError`, HTTP + gRPC mappings | — |
 | `sekvent-context` | `CallContext`, `ServiceIdentity`, `Clock`, header codec | — |
@@ -26,6 +26,7 @@ behaviour in your own words and use neutral examples (`billing`, `orders`).
 | `sekvent-link` | service tokens, `TokenMap`, middleware, interceptor | config, context, error |
 | `sekvent-client` | reqwest builder, resilience, context propagation, OAuth2 cache | config, context, error, resilience, telemetry |
 | `sekvent-db` | named pools, migrations, distinct-target check, sea-orm filters | config, error |
+| `sekvent-component` | components, App builder, local and serialized bindings | config, error, context, resilience, macros, runtime (optional) |
 | `sekvent-testing` | Postgres/MySQL containers, reaper, `await_until!` | — |
 | `sekvent-proto-build` | build.rs codegen helpers | — |
 | `sekvent` | facade re-exporting the above behind features | all |

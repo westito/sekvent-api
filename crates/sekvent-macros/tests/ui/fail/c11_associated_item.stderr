@@ -1,0 +1,5 @@
+error: a component trait may only contain methods
+ --> tests/ui/fail/c11_associated_item.rs:3:5
+  |
+3 |     type Item;
+  |     ^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: unknown error code `Teapot`; expected one of Cancelled, Unknown, InvalidArgument, DeadlineExceeded, NotFound, AlreadyExists, PermissionDenied, ResourceExhausted, FailedPrecondition, Aborted, OutOfRange, Unimplemented, Internal, Unavailable, DataLoss, Unauthenticated
+ --> tests/ui/fail/d11_unknown_code.rs:5:35
+  |
+5 |     #[reason("ORDER_GONE", code = Teapot)]
+  |                                   ^^^^^^

@@ -1,0 +1,5 @@
+error: ComponentError cannot be derived for a generic enum
+ --> tests/ui/fail/d2_generic_enum.rs:4:21
+  |
+4 | pub enum OrdersError<T> {
+  |                     ^^^

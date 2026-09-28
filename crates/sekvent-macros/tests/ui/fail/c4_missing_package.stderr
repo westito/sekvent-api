@@ -1,0 +1,7 @@
+error: missing `package = "..."`; only a local_only component may omit it
+ --> tests/ui/fail/c4_missing_package.rs:1:1
+  |
+1 | #[sekvent_component::component(name = "echo")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)

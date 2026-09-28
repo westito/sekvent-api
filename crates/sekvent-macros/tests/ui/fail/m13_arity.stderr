@@ -1,0 +1,6 @@
+error: component methods take `&self`, `cx: &CallContext` and one request
+ --> tests/ui/fail/m13_arity.rs:5:9
+  |
+5 | /         &self,
+6 | |         cx: &sekvent_component::CallContext,
+  | |____________________________________________^

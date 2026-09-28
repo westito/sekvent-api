@@ -1,11 +1,17 @@
 # The sekvent component model
 
-> **Status: planned.** Nothing in this document is implemented yet. It
-> describes the intended design so that code written today does not fight
-> it. Names and syntax shown here are illustrative and may change before
-> the first milestone lands. The `cargo sekvent` subcommand names
-> `component`, `contract`, `extract`, `queue` and `schedule` are reserved
-> for this work; today they exit with status 2.
+> **Status: milestone C1 implemented.** The `local` and `local-serialized`
+> bindings, `#[call]` methods, the fail-closed App builder, lifecycle hooks
+> with draining, per-method timeouts and bulkheads, `ComponentError` and the
+> `local_only` / `remote_only` modes are in `sekvent-component` (facade
+> feature `component`); the exact C1 API, key grammar and semantics are in
+> [design/component-c1.md](design/component-c1.md), which wins where it is
+> more specific than this document, and [examples/shop](../examples/shop)
+> shows them end to end. Everything from milestone C2 on (see the roadmap
+> below) is still planned: names and syntax shown for it are illustrative.
+> The `cargo sekvent` subcommand names `component`, `contract`, `extract`,
+> `queue` and `schedule` are reserved for this work; today they exit with
+> status 2.
 
 ## Goal
 
@@ -305,7 +311,7 @@ Call sites do not change: callers already hold the handle.
 
 | Milestone | Scope |
 |---|---|
-| C1 | `local` and `local-serialized` bindings, `#[call]`, the App builder, timeout and bulkhead, `ComponentError`, `local_only` / `remote_only`, an `examples/shop` workspace |
+| C1 (implemented) | `local` and `local-serialized` bindings, `#[call]`, the App builder, timeout and bulkhead, `ComponentError`, `local_only` / `remote_only`, an `examples/shop` workspace |
 | C2 | `grpc` binding with link authentication, circuit breaker and retry, `contract emit` / `contract check`, a `split-grpc` CI profile |
 | C3 | The bus (SQL outbox, inbox, relay), `#[async_call]`, `#[deferred]`, topics |
 | C4 | Schedule |

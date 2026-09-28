@@ -1,0 +1,5 @@
+error: exactly one variant needs #[other] to catch unknown reasons
+ --> tests/ui/fail/d3_no_other.rs:4:10
+  |
+4 | pub enum OrdersError {
+  |          ^^^^^^^^^^^

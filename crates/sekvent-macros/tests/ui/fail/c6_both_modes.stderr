@@ -1,0 +1,5 @@
+error: `local_only` and `remote_only` exclude each other
+ --> tests/ui/fail/c6_both_modes.rs:1:86
+  |
+1 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", local_only, remote_only)]
+  |                                                                                      ^^^^^^^^^^^

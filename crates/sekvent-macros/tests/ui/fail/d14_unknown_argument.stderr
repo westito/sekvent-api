@@ -1,0 +1,11 @@
+error: unknown #[reason] argument `colour`; expected code or message
+ --> tests/ui/fail/d14_unknown_argument.rs:5:45
+  |
+5 |     #[reason("ORDER_GONE", code = NotFound, colour = "red")]
+  |                                             ^^^^^^
+
+error: unknown #[component_error] argument `colour`; expected domain or crate
+  --> tests/ui/fail/d14_unknown_argument.rs:12:19
+   |
+12 | #[component_error(colour = "red")]
+   |                   ^^^^^^

@@ -1,0 +1,19 @@
+[package]
+name = "inventory"
+description = "The example shop's inventory component: in-memory stock and reservations."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+inventory-api = { path = "../inventory-api" }
+sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

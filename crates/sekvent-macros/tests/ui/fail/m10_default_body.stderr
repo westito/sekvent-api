@@ -1,0 +1,8 @@
+error: component methods cannot have a default body
+  --> tests/ui/fail/m10_default_body.rs:8:54
+   |
+ 8 |       ) -> Result<String, sekvent_component::AppError> {
+   |  ______________________________________________________^
+ 9 | |         Ok(req)
+10 | |     }
+   | |_____^

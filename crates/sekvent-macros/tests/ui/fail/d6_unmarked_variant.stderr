@@ -1,0 +1,5 @@
+error: variant `Plain` needs #[reason("REASON", code = ...)] or #[other]
+ --> tests/ui/fail/d6_unmarked_variant.rs:9:5
+  |
+9 |     Plain,
+  |     ^^^^^

@@ -1,0 +1,5 @@
+error: only one variant can be #[other]
+ --> tests/ui/fail/d4_two_others.rs:9:5
+  |
+9 |     #[other]
+  |     ^^^^^^^^

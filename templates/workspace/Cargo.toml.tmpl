@@ -30,6 +30,8 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+# Component traits are implemented with `async fn` whether or not a body awaits.
+unused_async_trait_impl = "allow"
 
 # Password hashing is memory-hard on purpose; unoptimised it dominates test time.
 [profile.dev.package.argon2]

@@ -1,0 +1,5 @@
+error: the first argument must be `cx: &CallContext`
+ --> tests/ui/fail/m14_context.rs:6:13
+  |
+6 |         cx: sekvent_component::CallContext,
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

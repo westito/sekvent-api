@@ -1,0 +1,76 @@
+error[E0277]: `PlainError` is not a component error
+ --> tests/ui/fail/rustc_error_not_component_error.rs:6:1
+  |
+6 | #[sekvent_component::component(name = "echo", package = "check.echo.v1")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `ComponentError` is not implemented for `PlainError`
+ --> tests/ui/fail/rustc_error_not_component_error.rs:4:1
+  |
+4 | pub struct PlainError;
+  | ^^^^^^^^^^^^^^^^^^^^^
+  = note: derive it with `#[derive(ComponentError)]`, or use `AppError`
+help: the trait `ComponentError` is implemented for `AppError`
+ --> $WORKSPACE/crates/sekvent-component/src/error.rs
+  |
+  | impl ComponentError for AppError {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `sekvent_component::__private::Endpoint::<D>::call`
+ --> $WORKSPACE/crates/sekvent-component/src/link.rs
+  |
+  |     pub fn call<'a, Req, Rep, E, L, Fut>(
+  |            ---- required by a bound in this associated function
+...
+  |         E: ComponentError,
+  |            ^^^^^^^^^^^^^^ required by this bound in `Endpoint::<D>::call`
+  = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `PlainError` is not a component error
+ --> tests/ui/fail/rustc_error_not_component_error.rs:6:1
+  |
+6 | #[sekvent_component::component(name = "echo", package = "check.echo.v1")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `ComponentError` is not implemented for `PlainError`
+ --> tests/ui/fail/rustc_error_not_component_error.rs:4:1
+  |
+4 | pub struct PlainError;
+  | ^^^^^^^^^^^^^^^^^^^^^
+  = note: derive it with `#[derive(ComponentError)]`, or use `AppError`
+help: the trait `ComponentError` is implemented for `AppError`
+ --> $WORKSPACE/crates/sekvent-component/src/error.rs
+  |
+  | impl ComponentError for AppError {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `sekvent_component::__private::serve`
+ --> $WORKSPACE/crates/sekvent-component/src/__private.rs
+  |
+  | pub fn serve<Req, Rep, E, F, Fut>(
+  |        ----- required by a bound in this function
+...
+  |     E: ComponentError,
+  |        ^^^^^^^^^^^^^^ required by this bound in `serve`
+  = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `PlainError` is not a component error
+  --> tests/ui/fail/rustc_error_not_component_error.rs:13:25
+   |
+13 |     ) -> Result<String, PlainError>;
+   |                         ^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `ComponentError` is not implemented for `PlainError`
+  --> tests/ui/fail/rustc_error_not_component_error.rs:4:1
+   |
+ 4 | pub struct PlainError;
+   | ^^^^^^^^^^^^^^^^^^^^^
+   = note: derive it with `#[derive(ComponentError)]`, or use `AppError`
+help: the trait `ComponentError` is implemented for `AppError`
+  --> $WORKSPACE/crates/sekvent-component/src/error.rs
+   |
+   | impl ComponentError for AppError {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `sekvent_component::__private::assert_error`
+  --> $WORKSPACE/crates/sekvent-component/src/__private.rs
+   |
+   | pub const fn assert_error<T: ComponentError>() {}
+   |                              ^^^^^^^^^^^^^^ required by this bound in `assert_error`

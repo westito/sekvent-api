@@ -1,0 +1,123 @@
+---
+source: crates/sekvent-macros/src/component/tests.rs
+expression: text
+---
+const _: () = {
+    ::sekvent_component::__private::assert_metadata::<String>();
+    ::sekvent_component::__private::assert_metadata::<u32>();
+    ::sekvent_component::__private::assert_metadata::<String>();
+    ::sekvent_component::__private::assert_metadata::<String>();
+};
+#[automatically_derived]
+#[allow(clippy::all, clippy::pedantic)]
+impl ::sekvent_component::ComponentError for InventoryError {
+    fn into_app_error(self) -> ::sekvent_component::AppError {
+        match self {
+            Self::OutOfStock { sku, available } => {
+                ::sekvent_component::AppError::new(
+                        ::sekvent_component::ErrorCode::FailedPrecondition,
+                        ::std::format!("only {available} of {sku} left"),
+                    )
+                    .with_reason("OUT_OF_STOCK")
+                    .with_domain("shop.inventory.v1")
+                    .with_metadata("sku", ::std::string::ToString::to_string(&sku))
+                    .with_metadata(
+                        "available",
+                        ::std::string::ToString::to_string(&available),
+                    )
+            }
+            Self::ReservationNotFound { reservation_id, hint } => {
+                let error = ::sekvent_component::AppError::new(
+                        ::sekvent_component::ErrorCode::NotFound,
+                        ::std::string::String::from("reservation not found"),
+                    )
+                    .with_reason("RESERVATION_NOT_FOUND")
+                    .with_domain("shop.inventory.v1")
+                    .with_metadata(
+                        "reservation_id",
+                        ::std::string::ToString::to_string(&reservation_id),
+                    );
+                match hint {
+                    ::core::option::Option::Some(value) => {
+                        error
+                            .with_metadata(
+                                "hint",
+                                ::std::string::ToString::to_string(&value),
+                            )
+                    }
+                    ::core::option::Option::None => error,
+                }
+            }
+            Self::Closed => {
+                ::sekvent_component::AppError::new(
+                        ::sekvent_component::ErrorCode::Unavailable,
+                        ::std::string::String::from("inventory closed"),
+                    )
+                    .with_reason("INVENTORY_CLOSED")
+                    .with_domain("shop.inventory.v1")
+            }
+            Self::Other(error) => error,
+        }
+    }
+    fn from_app_error(error: ::sekvent_component::AppError) -> Self {
+        if ::sekvent_component::__private::matches(
+            &error,
+            "OUT_OF_STOCK",
+            ::core::option::Option::Some("shop.inventory.v1"),
+        ) {
+            match (
+                ::sekvent_component::__private::field::<String>(&error, "sku"),
+                ::sekvent_component::__private::field::<u32>(&error, "available"),
+            ) {
+                (
+                    ::core::option::Option::Some(sku),
+                    ::core::option::Option::Some(available),
+                ) => return Self::OutOfStock { sku, available },
+                _ => {}
+            }
+        }
+        if ::sekvent_component::__private::matches(
+            &error,
+            "RESERVATION_NOT_FOUND",
+            ::core::option::Option::Some("shop.inventory.v1"),
+        ) {
+            match (
+                ::sekvent_component::__private::field::<
+                    String,
+                >(&error, "reservation_id"),
+                ::sekvent_component::__private::optional_field::<String>(&error, "hint"),
+            ) {
+                (
+                    ::core::option::Option::Some(reservation_id),
+                    ::core::option::Option::Some(hint),
+                ) => {
+                    return Self::ReservationNotFound {
+                        reservation_id,
+                        hint,
+                    };
+                }
+                _ => {}
+            }
+        }
+        if ::sekvent_component::__private::matches(
+            &error,
+            "INVENTORY_CLOSED",
+            ::core::option::Option::Some("shop.inventory.v1"),
+        ) {
+            return Self::Closed;
+        }
+        Self::Other(error)
+    }
+}
+#[automatically_derived]
+impl ::core::convert::From<::sekvent_component::AppError> for InventoryError {
+    fn from(error: ::sekvent_component::AppError) -> Self {
+        <Self as ::sekvent_component::ComponentError>::from_app_error(error)
+    }
+}
+#[automatically_derived]
+impl ::core::convert::From<InventoryError> for ::sekvent_component::AppError {
+    fn from(error: InventoryError) -> Self {
+        <InventoryError as ::sekvent_component::ComponentError>::into_app_error(error)
+    }
+}

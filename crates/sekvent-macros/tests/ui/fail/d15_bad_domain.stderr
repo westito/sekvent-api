@@ -1,0 +1,5 @@
+error: domain must be non-empty and contain no whitespace
+ --> tests/ui/fail/d15_bad_domain.rs:4:28
+  |
+4 | #[component_error(domain = "shop orders")]
+  |                            ^^^^^^^^^^^^^

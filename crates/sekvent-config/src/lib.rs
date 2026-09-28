@@ -75,11 +75,15 @@ pub const FRAMEWORK_KEYS: &[&str] = &[
 /// Key families under [`RESERVED_PREFIX`] that the framework reads by
 /// prefix. [`load`] accepts every key that starts with one of them.
 ///
+/// - `SEKVENT_COMPONENT_`: component bindings and policy overrides
+///   (`sekvent-component` validates the names against the installed
+///   components);
 /// - `SEKVENT_LINK_INBOUND_` and `SEKVENT_LINK_OUTBOUND_`: one service-link
 ///   token per link name (`sekvent-link` validates the names and tokens);
 /// - `SEKVENT_TEST_`: test-only settings such as `SEKVENT_TEST_RUN_ID` and
 ///   `SEKVENT_TEST_POSTGRES_IMAGE` (`sekvent-testing`, `cargo sekvent`).
 pub const FRAMEWORK_PREFIXES: &[&str] = &[
+    "SEKVENT_COMPONENT_",
     "SEKVENT_LINK_INBOUND_",
     "SEKVENT_LINK_OUTBOUND_",
     "SEKVENT_TEST_",
@@ -860,10 +864,15 @@ mod tests {
         assert!(is_framework_key("SEKVENT_LINK_OUTBOUND_ORDERS"));
         assert!(is_framework_key("SEKVENT_TEST_RUN_ID"));
         assert!(is_framework_key("SEKVENT_TEST_POSTGRES_IMAGE"));
+        assert!(is_framework_key("SEKVENT_COMPONENT_BINDING"));
+        assert!(is_framework_key(
+            "SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT"
+        ));
         assert!(!is_framework_key("SEKVENT_POTR"));
         assert!(!is_framework_key("SEKVENT_LOGS"));
         assert!(!is_framework_key("LOG"));
         assert!(FRAMEWORK_KEYS.is_sorted());
+        assert!(FRAMEWORK_PREFIXES.is_sorted());
     }
 
     #[test]

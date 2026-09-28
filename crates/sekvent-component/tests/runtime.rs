@@ -1,0 +1,163 @@
+//! An App run as one unit of the sekvent runtime, and a serialized call
+//! whose serving runtime goes away.
+
+mod support;
+
+use std::pin::pin;
+use std::task::{Context, Waker};
+use std::time::Duration;
+
+use sekvent_component::{Binding, CallContext, ComponentState, ErrorCode};
+use sekvent_runtime::{Runtime, ShutdownReason, Stage, UnitExit};
+use support::fakes::{
+    FakeInventory, HookedInventory, Hooks, LOCAL_BINDINGS, Recorder, build_inventory, build_with,
+    source,
+};
+use support::inventory::{InventoryError, InventoryHandle, ReserveRequest};
+
+fn reserve() -> ReserveRequest {
+    ReserveRequest {
+        order_id: "o1".into(),
+        sku: "sku-1".into(),
+        quantity: 1,
+    }
+}
+
+fn hooked(recorder: &Recorder, fail_start: bool, fail_stop: bool) -> sekvent_component::App {
+    let mut hooks = Hooks::new("inventory", recorder);
+    hooks.fail_start = fail_start;
+    hooks.fail_stop = fail_stop;
+    build_with(&source(Binding::Local, &[]), |builder| {
+        InventoryHandle::install_with_lifecycle(builder, move |_| {
+            Ok(HookedInventory {
+                inner: FakeInventory::stock(10),
+                hooks,
+            })
+        })
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_runtime_starts_serves_and_stops_the_app() {
+    for binding in LOCAL_BINDINGS {
+        let app = build_inventory(binding, &[], FakeInventory::stock(10)).unwrap();
+        let runtime = app
+            .register(Runtime::builder().without_signals())
+            .build()
+            .unwrap();
+        let handle = runtime.start().await.unwrap();
+        assert_eq!(app.state("inventory"), Some(ComponentState::Serving));
+        assert!(handle.health().is_ready(), "{binding}");
+
+        let inventory = app.handle::<InventoryHandle>().unwrap();
+        let reply = inventory
+            .reserve(&CallContext::new(), reserve())
+            .await
+            .unwrap();
+        assert_eq!(reply.remaining, 9, "{binding}");
+
+        handle.shutdown();
+        let report = handle.wait().await.unwrap();
+        assert_eq!(report.reason, ShutdownReason::Requested);
+        let unit = report.unit("components").unwrap();
+        assert_eq!(unit.stage, Stage::Components);
+        assert_eq!(unit.exit, UnitExit::Completed);
+        assert_eq!(app.state("inventory"), Some(ComponentState::Stopped));
+        let after = inventory
+            .reserve(&CallContext::new(), reserve())
+            .await
+            .unwrap_err();
+        assert!(matches!(after, InventoryError::Other(_)), "{after:?}");
+    }
+}
+
+#[tokio::test]
+async fn hooks_run_once_each_under_the_runtime() {
+    let recorder = Recorder::default();
+    let app = hooked(&recorder, false, false);
+    let handle = app
+        .register(Runtime::builder().without_signals())
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    assert_eq!(recorder.events(), ["start inventory"]);
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    assert_eq!(recorder.events(), ["start inventory", "stop inventory"]);
+}
+
+#[tokio::test]
+async fn a_failed_start_fails_the_runtime() {
+    let recorder = Recorder::default();
+    let app = hooked(&recorder, true, false);
+    let error = app
+        .register(Runtime::builder().without_signals())
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Unavailable, "{error:?}");
+    assert_eq!(error.metadata()["component"], "inventory");
+    assert_eq!(app.state("inventory"), Some(ComponentState::Stopped));
+    assert_eq!(recorder.events(), ["start inventory"]);
+}
+
+#[tokio::test]
+async fn a_failed_stop_hook_fails_the_run() {
+    let recorder = Recorder::default();
+    let app = hooked(&recorder, false, true);
+    let handle = app
+        .register(Runtime::builder().without_signals())
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    handle.shutdown();
+    let error = handle.wait().await.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Internal, "{error:?}");
+    assert_eq!(error.metadata()["component"], "inventory");
+    assert_eq!(app.state("inventory"), Some(ComponentState::Stopped));
+}
+
+/// The serving task is spawned on a second runtime that never runs it and is
+/// then shut down, so the caller sees the task cancelled rather than
+/// panicked.
+#[test]
+fn a_serialized_call_is_cancelled_when_its_serving_runtime_shuts_down() {
+    let driver = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let app = build_inventory(Binding::LocalSerialized, &[], FakeInventory::stock(10)).unwrap();
+    driver.block_on(app.start()).unwrap();
+    let inventory = app.handle::<InventoryHandle>().unwrap();
+    let cx = CallContext::new();
+    let mut call = pin!(inventory.reserve(&cx, reserve()));
+
+    let serving = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    {
+        let _entered = serving.enter();
+        let mut poll = Context::from_waker(Waker::noop());
+        assert!(call.as_mut().poll(&mut poll).is_pending());
+    }
+    drop(serving);
+
+    let error = driver.block_on(call).unwrap_err();
+    let InventoryError::Other(error) = error else {
+        panic!("expected Other, got {error:?}");
+    };
+    assert_eq!(error.code(), ErrorCode::Cancelled, "{error:?}");
+    assert_eq!(error.metadata()["component"], "inventory");
+    assert_eq!(error.metadata()["method"], "reserve");
+
+    driver.block_on(app.stop(Duration::ZERO)).unwrap();
+    assert_eq!(app.state("inventory"), Some(ComponentState::Stopped));
+}

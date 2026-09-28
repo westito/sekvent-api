@@ -1,6 +1,6 @@
 ---
 name: sekvent
-description: Write or change code in a Rust backend built on the sekvent framework (a workspace with `sekvent.toml` and a `sekvent` dependency). Use when adding a config struct, an error, a gRPC or REST endpoint, a background worker, an outbound HTTP client with retries or a breaker, a database pool, a JWT login, service-to-service authentication, a container-backed test or protobuf codegen — and before hand-rolling any of those, since sekvent already has them. Gives the crate map, copy-ready recipes with the real API names, and the pitfalls (secrets in logs, fail-open defaults, missing deadlines, retrying non-idempotent calls). For creating a project use `sekvent-new-project`; for moving an existing backend onto sekvent use `sekvent-migrate`.
+description: Write or change code in a Rust backend built on the sekvent framework (a workspace with `sekvent.toml` and a `sekvent` dependency). Use when adding a config struct, an error, a gRPC or REST endpoint, a background worker, an outbound HTTP client with retries or a breaker, a database pool, a JWT login, service-to-service authentication, a container-backed test, protobuf codegen or a component (a trait that runs in-process now and can move to its own service later) — and before hand-rolling any of those, since sekvent already has them. Gives the crate map, copy-ready recipes with the real API names, and the pitfalls (secrets in logs, fail-open defaults, missing deadlines, retrying non-idempotent calls). For creating a project use `sekvent-new-project`; for moving an existing backend onto sekvent use `sekvent-migrate`.
 ---
 
 # Building on sekvent
@@ -10,7 +10,8 @@ focused libraries behind features, plus the `cargo sekvent` CLI. Most service
 code needs `use sekvent::prelude::*;` (`AppError`, `ErrorCode`, `CallContext`,
 `Secret`, `EnvConfig`, `FromConfig`, `Runtime`, `RuntimeBuilder`,
 `RuntimeHandle`, `Server`, `ServerBuilder`, `Stage`, `UnitPolicy`,
-`UnitContext`, `Ctx`, `ShutdownTrigger`).
+`UnitContext`, `Ctx`, `ShutdownTrigger`; with the `component` feature also
+`App`, `ComponentError`, `Lifecycle`).
 
 Where commands run is the `build-on-rtx` skill's business: compile, lint and
 test through `cargo sekvent check|clippy|test|gate|coverage` (forwarded to the
@@ -32,6 +33,7 @@ skill.
 | Service-to-service tokens | `link` | `link`; `link-axum`, `link-tonic` |
 | Outbound HTTP, OAuth 2.0 client credentials | `client` | `client` |
 | Pools, migrations, list filters | `db` | `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` |
+| A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; with `runtime` for `App::register` |
 | Postgres/MySQL test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
 
@@ -305,6 +307,134 @@ pub mod proto { include!(concat!(env!("OUT_DIR"), "/sekvent_protos.rs")); }   //
 Generated code is included with the lint allowances it needs; never commit
 generated `.rs`. The package `sekvent.v1` is reserved. `protoc` must be on
 `PATH` (or `PROTOC`).
+
+### Components
+
+A component is a trait with a protobuf contract; callers hold its generated
+`XHandle` and never know whether calls stay in-process (`local`) or cross a
+serialization boundary (`local-serialized`: prost encode, separate task,
+decode). Milestone C1: `#[call]` methods only; `grpc` parses but fails the
+build as unavailable. Spec: `docs/design/component-c1.md`; full example:
+`examples/shop`. Facade feature `component` (add `runtime` for
+`App::register`).
+
+Declare it in an `-api` crate (messages from `sekvent-proto-build`
+`.messages_only()`, the trait, the error):
+
+```rust
+use sekvent::prelude::*;                                  // App, ComponentError, Lifecycle, CallContext, AppError
+pub mod proto { include!(concat!(env!("OUT_DIR"), "/sekvent_protos.rs")); }
+use proto::shop::inventory::v1::{ReserveReply, ReserveRequest};
+
+#[derive(Debug, ComponentError)]
+#[component_error(domain = "shop.inventory.v1")]          // optional; decoding then requires it
+pub enum InventoryError {
+    #[reason("OUT_OF_STOCK", code = FailedPrecondition, message = "only {available} of {sku} left")]
+    OutOfStock { sku: String, available: u32 },           // fields travel as metadata (Display + FromStr)
+    #[other]
+    Other(AppError),                                      // unknown reasons and framework errors land here
+}
+
+#[sekvent::component(name = "inventory", package = "shop.inventory.v1")]
+pub trait Inventory: Send + Sync + 'static {
+    /// Reserve stock for an order.
+    #[call(idempotent, timeout = "2s", bulkhead = 16)]
+    async fn reserve(&self, cx: &CallContext, req: ReserveRequest)
+        -> Result<ReserveReply, InventoryError>;
+}
+// generates InventoryHandle (Clone): .reserve(&cx, req), ::install, ::install_with_lifecycle, .binding()
+```
+
+- Every method: `async fn m(&self, cx: &CallContext, req: Req) -> Result<Rep, E>`;
+  `Req`/`Rep` are prost messages, `E` implements `ComponentError` (or is
+  `AppError`). `local_only` components take plain Rust types and need no
+  `package`; `remote_only` ones have `install_remote` and cannot build
+  until C2.
+- The derive gives `From<E> for AppError` and `From<AppError> for E`; do not
+  add another `From<AppError>`.
+
+Implement with plain `async fn`s, and wire with constructor injection:
+
+```rust
+impl Inventory for InventoryService {
+    async fn reserve(&self, cx: &CallContext, req: ReserveRequest) -> Result<ReserveReply, InventoryError> { … }
+}
+
+let mut builder = App::builder(&sekvent::config::EnvSource);
+InventoryHandle::install(&mut builder, move |_deps| Ok(InventoryService::new(stock)))?;
+NotificationsHandle::install_with_lifecycle(&mut builder, |_deps| Ok(NotificationsService::new()))?; // runs Lifecycle::on_start/on_stop
+OrdersHandle::install(&mut builder, |deps| Ok(OrdersService::new(
+    deps.handle::<InventoryHandle>()?,                 // only components installed earlier
+    deps.handle::<NotificationsHandle>()?,
+)))?;
+let app = builder.build()?;                            // BuildError names the key, never the value
+app.register(Runtime::builder()).build()?.run().await?; // one unit in Stage::Components
+// or standalone: app.start().await?; …; app.stop(grace).await?;
+let orders = app.handle::<OrdersHandle>()?;            // for ingress code and tests
+```
+
+- Factories run in `build()`, in install order, only for local bindings;
+  shared resources go in with `builder.provide(value)?` and out with
+  `deps.resource::<T>()?`. Give each component its own pool (a newtype),
+  never a shared one.
+- Components start in install order and stop in reverse. Stopping drains:
+  new calls get `UNAVAILABLE`/`COMPONENT_DRAINING`, in-flight calls finish
+  within the grace.
+- Per call: a cancelled or expired context is rejected before any work;
+  the method timeout is capped by the caller's deadline (`DEADLINE_EXCEEDED`);
+  a full bulkhead sheds at once (`RESOURCE_EXHAUSTED`/`BULKHEAD_FULL`, no
+  queue). Reason constants: `sekvent::component::reasons`.
+- The callee sees `cx.caller() == trusted("local")` with request id,
+  subject, tenant and idempotency key kept.
+
+Configuration keys (all optional; unknown keys under `SEKVENT_COMPONENT_`,
+malformed values and zeros fail the build):
+
+| Key | Values |
+|---|---|
+| `SEKVENT_COMPONENT_BINDING` | `local` (default), `local-serialized`, `grpc` (unavailable in C1) — all standard components |
+| `SEKVENT_COMPONENT_<C>_BINDING` | same, one component |
+| `SEKVENT_COMPONENT_<C>_TIMEOUT`, `SEKVENT_COMPONENT_<C>_<M>_TIMEOUT` | `250ms`, `2s`, or whole seconds |
+| `SEKVENT_COMPONENT_<C>_BULKHEAD_MAX_CONCURRENT`, `SEKVENT_COMPONENT_<C>_<M>_BULKHEAD_MAX_CONCURRENT` | integer ≥ 1 |
+
+`<C>`/`<M>` are the component and method names upper-cased
+(`SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT`). Precedence: method key,
+component key, `#[call]` attribute.
+
+Test every scenario under both local bindings in one `cargo test`, so a type
+that does not survive the wire fails early:
+
+```rust
+#[derive(Debug, Clone, Copy)]
+enum Profile { MonolithLocal, MonolithSerialized }
+impl Profile {
+    fn source(self) -> MapSource {
+        match self {
+            Self::MonolithLocal => MapSource::new(),
+            Self::MonolithSerialized => MapSource::new().with("SEKVENT_COMPONENT_BINDING", "local-serialized"),
+        }
+    }
+}
+
+#[rstest]
+#[case::monolith_local(Profile::MonolithLocal)]
+#[case::monolith_serialized(Profile::MonolithSerialized)]
+#[tokio::test(start_paused = true)]                    // paused clock for deadline tests
+async fn reserve_times_out(#[case] profile: Profile) {
+    let source = profile.source().with("SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT", "50ms");
+    let mut builder = App::builder(&source);
+    InventoryHandle::install(&mut builder, |_deps| Ok(PendingInventory)).unwrap(); // fakes go through install too
+    let app = builder.build().unwrap();
+    app.start().await.unwrap();
+    let error = app.handle::<InventoryHandle>().unwrap().reserve(&CallContext::new(), req).await.unwrap_err();
+    // InventoryError::Other(e) with e.code() == ErrorCode::DeadlineExceeded
+}
+```
+
+Caller deadlines in paused-clock tests come from the tokio clock:
+`cx.with_deadline((tokio::time::Instant::now() + d).into_std())`, not
+`with_timeout`. Signal entry and exit from fakes with channels, a
+`Semaphore` or a `oneshot` fired from a `Drop` guard; never sleep.
 
 ## Pitfalls
 

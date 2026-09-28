@@ -1,0 +1,5 @@
+error: timeout must be a positive duration such as "2s" or "250ms"
+ --> tests/ui/fail/m5_bad_timeout.rs:3:22
+  |
+3 |     #[call(timeout = "0s")]
+  |                      ^^^^

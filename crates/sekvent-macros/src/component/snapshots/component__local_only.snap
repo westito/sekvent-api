@@ -1,0 +1,183 @@
+---
+source: crates/sekvent-macros/src/component/tests.rs
+expression: text
+---
+pub trait Notes: ::core::marker::Send + ::core::marker::Sync + 'static {
+    /// Store a note and return how many are stored.
+    fn add(
+        &self,
+        cx: &CallContext,
+        req: String,
+    ) -> impl ::core::future::Future<
+        Output = Result<usize, AppError>,
+    > + ::core::marker::Send;
+    /// Count the stored notes.
+    fn count(
+        &self,
+        _: &CallContext,
+        _: (),
+    ) -> impl ::core::future::Future<
+        Output = Result<usize, AppError>,
+    > + ::core::marker::Send;
+}
+#[doc(hidden)]
+pub trait __NotesDyn: ::core::marker::Send + ::core::marker::Sync + 'static {
+    fn __add<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: String,
+    ) -> ::sekvent_component::__private::BoxFuture<'a, Result<usize, AppError>>;
+    fn __count<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: (),
+    ) -> ::sekvent_component::__private::BoxFuture<'a, Result<usize, AppError>>;
+}
+#[allow(clippy::all, clippy::pedantic)]
+impl<T: Notes> __NotesDyn for T {
+    fn __add<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: String,
+    ) -> ::sekvent_component::__private::BoxFuture<'a, Result<usize, AppError>> {
+        ::std::boxed::Box::pin(<T as Notes>::add(self, cx, req))
+    }
+    fn __count<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: (),
+    ) -> ::sekvent_component::__private::BoxFuture<'a, Result<usize, AppError>> {
+        ::std::boxed::Box::pin(<T as Notes>::count(self, cx, req))
+    }
+}
+/// Cloneable handle to the [`Notes`] component (`notes`).
+///
+/// Get it from `Deps::handle` in a factory or from `App::handle`; the App
+/// builder decides whether its calls run in-process or across a
+/// serialization boundary.
+#[derive(Clone, Debug)]
+pub struct NotesHandle(::sekvent_component::__private::Endpoint<dyn __NotesDyn>);
+#[allow(clippy::all, clippy::pedantic)]
+impl NotesHandle {
+    #[doc(hidden)]
+    pub const __METHODS: &'static [::sekvent_component::MethodDescriptor] = &[
+        ::sekvent_component::MethodDescriptor::call("add", "Add").with_bulkhead(4u32),
+        ::sekvent_component::MethodDescriptor::call("count", "Count").with_idempotent(),
+    ];
+    /// Store a note and return how many are stored.
+    pub fn add<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: String,
+    ) -> impl ::core::future::Future<
+        Output = Result<usize, AppError>,
+    > + ::core::marker::Send + 'a {
+        self.0
+            .call_local(
+                0usize,
+                cx,
+                req,
+                |
+                    imp: ::std::sync::Arc<dyn __NotesDyn>,
+                    cx: ::sekvent_component::CallContext,
+                    req: String|
+                async move { __NotesDyn::__add(&*imp, &cx, req).await },
+            )
+    }
+    /// Count the stored notes.
+    pub fn count<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: (),
+    ) -> impl ::core::future::Future<
+        Output = Result<usize, AppError>,
+    > + ::core::marker::Send + 'a {
+        self.0
+            .call_local(
+                1usize,
+                cx,
+                req,
+                |
+                    imp: ::std::sync::Arc<dyn __NotesDyn>,
+                    cx: ::sekvent_component::CallContext,
+                    req: ()|
+                async move { __NotesDyn::__count(&*imp, &cx, req).await },
+            )
+    }
+    /// The binding this handle's calls use.
+    pub fn binding(&self) -> ::sekvent_component::Binding {
+        self.0.binding()
+    }
+    /// Install the implementation `factory` builds. The factory runs during
+    /// `AppBuilder::build`, in install order, and only when the component is
+    /// bound `local` or `local-serialized`.
+    pub fn install<T, F>(
+        app: &mut ::sekvent_component::AppBuilder<'_>,
+        factory: F,
+    ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
+    where
+        T: Notes,
+        F: ::core::ops::FnOnce(
+                &mut ::sekvent_component::Deps<'_>,
+            ) -> ::core::result::Result<T, ::sekvent_component::AppError>
+            + ::core::marker::Send + 'static,
+    {
+        ::sekvent_component::__private::install_local(
+            app,
+            NotesHandle,
+            move |deps| {
+                let imp: ::std::sync::Arc<dyn __NotesDyn> = ::std::sync::Arc::new(
+                    factory(deps)?,
+                );
+                ::core::result::Result::Ok(
+                    ::sekvent_component::__private::Local::new(imp),
+                )
+            },
+        )
+    }
+    /// Like [`NotesHandle::install`], and also run the implementation's
+    /// `Lifecycle` hooks when the App starts and stops.
+    pub fn install_with_lifecycle<T, F>(
+        app: &mut ::sekvent_component::AppBuilder<'_>,
+        factory: F,
+    ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
+    where
+        T: Notes + ::sekvent_component::Lifecycle,
+        F: ::core::ops::FnOnce(
+                &mut ::sekvent_component::Deps<'_>,
+            ) -> ::core::result::Result<T, ::sekvent_component::AppError>
+            + ::core::marker::Send + 'static,
+    {
+        ::sekvent_component::__private::install_local(
+            app,
+            NotesHandle,
+            move |deps| {
+                let concrete = ::std::sync::Arc::new(factory(deps)?);
+                let imp: ::std::sync::Arc<dyn __NotesDyn> = ::std::sync::Arc::<
+                    T,
+                >::clone(&concrete);
+                ::core::result::Result::Ok(
+                    ::sekvent_component::__private::Local::new(imp)
+                        .with_lifecycle(concrete),
+                )
+            },
+        )
+    }
+}
+#[allow(clippy::all, clippy::pedantic)]
+impl ::sekvent_component::ComponentHandle for NotesHandle {
+    const DESCRIPTOR: &'static ::sekvent_component::ComponentDescriptor = &::sekvent_component::ComponentDescriptor::new(
+            "notes",
+            "Notes",
+            NotesHandle::__METHODS,
+        )
+        .with_mode(::sekvent_component::ComponentMode::LocalOnly);
+}
+const _: () = {
+    ::sekvent_component::__private::assert_local::<String>();
+    ::sekvent_component::__private::assert_local::<usize>();
+    ::sekvent_component::__private::assert_error::<AppError>();
+    ::sekvent_component::__private::assert_local::<()>();
+    ::sekvent_component::__private::assert_local::<usize>();
+    ::sekvent_component::__private::assert_error::<AppError>();
+};

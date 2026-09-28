@@ -1,0 +1,5 @@
+error: missing `code = ...` (an ErrorCode variant such as NotFound)
+ --> tests/ui/fail/d10_missing_code.rs:5:5
+  |
+5 |     #[reason("ORDER_GONE")]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^

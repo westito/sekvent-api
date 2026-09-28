@@ -1,0 +1,5 @@
+error: #[component] applies to a trait
+ --> tests/ui/fail/c1_not_a_trait.rs:2:1
+  |
+2 | pub struct Echo;
+  | ^^^^^^^^^^^^^^^^

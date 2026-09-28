@@ -1,0 +1,5 @@
+error: `Ok` is not an error code
+ --> tests/ui/fail/d12_ok_code.rs:5:35
+  |
+5 |     #[reason("ORDER_GONE", code = Ok)]
+  |                                   ^^

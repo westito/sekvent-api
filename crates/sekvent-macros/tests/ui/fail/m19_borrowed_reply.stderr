@@ -1,0 +1,5 @@
+error: reply and error types cannot contain lifetimes or `impl Trait`
+ --> tests/ui/fail/m19_borrowed_reply.rs:8:17
+  |
+8 |     ) -> Result<&'static str, sekvent_component::AppError>;
+  |                 ^^^^^^^^^^^^

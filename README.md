@@ -18,7 +18,7 @@ sqlx 0.9 and sea-orm 2.0.
 |---|---|---|
 | `sekvent` | — | Facade re-exporting the libraries below behind features, plus `sekvent::prelude` |
 | `sekvent-config` | `config` (default) | `ConfigSource`, `Secret`, readers, `FromConfig`, `#[derive(EnvConfig)]` |
-| `sekvent-macros` | (via `config`) | Procedural macros (`EnvConfig`) |
+| `sekvent-macros` | (via `config`, `component`) | Procedural macros (`EnvConfig`, `component`, `ComponentError`) |
 | `sekvent-error` | `error` (default); `error-http`, `error-grpc` | `ErrorCode`, `AppError`, `WireError`; HTTP and gRPC mappings |
 | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
 | `sekvent-telemetry` | `telemetry` (default) | Tracing init, log ring buffer, request ids, `truncate_for_log` |
@@ -28,6 +28,7 @@ sqlx 0.9 and sea-orm 2.0.
 | `sekvent-link` | `link`; `link-axum`, `link-tonic` | Service-to-service tokens, middleware, interceptors |
 | `sekvent-client` | `client` | Outbound HTTP (reqwest, rustls) with policies, context propagation, OAuth 2.0 client credentials |
 | `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` | Named pools, migrations, distinct-target check, list filters |
+| `sekvent-component` | `component` | Components with `local` and `local-serialized` bindings, the fail-closed `App` builder, lifecycle, per-method deadlines and bulkheads |
 | `sekvent-testing` | not re-exported (`[dev-dependencies]`) | Postgres and MySQL test containers, a reaper, `await_until!` |
 | `sekvent-proto-build` | not re-exported (`[build-dependencies]`) | `build.rs` protobuf codegen on top of `tonic-prost-build` |
 | `cargo-sekvent` | — | The `cargo sekvent` CLI |
@@ -169,12 +170,51 @@ cargo sekvent skills install --dest DIR    # one directory only
 
 Only directories whose name starts with `sekvent` are written or replaced.
 
-## Component model (planned)
+## Component model
 
-A component model is planned: start a feature as a component inside one
-binary and later move it into its own service by configuration, without
-changing call sites. It is not implemented yet; the design is in
-[docs/component-model.md](docs/component-model.md).
+A component is a trait with a protobuf contract. Callers hold a generated
+handle and never know whether the implementation runs in the same task,
+behind a serialization boundary or (later) in another service; the binding
+is chosen by configuration when the App is built. Milestone C1 is
+implemented: `local` and `local-serialized` bindings, a fail-closed App
+builder with constructor injection, lifecycle hooks with draining, and
+per-method deadlines and bulkheads. gRPC transport, retries and queues
+follow in later milestones.
+
+```rust
+use sekvent::prelude::*;
+
+#[derive(Debug, ComponentError)]
+#[component_error(domain = "shop.inventory.v1")]
+pub enum InventoryError {
+    #[reason("OUT_OF_STOCK", code = FailedPrecondition, message = "only {available} of {sku} left")]
+    OutOfStock { sku: String, available: u32 },
+    #[other]
+    Other(AppError),
+}
+
+#[sekvent::component(name = "inventory", package = "shop.inventory.v1")]
+pub trait Inventory: Send + Sync + 'static {
+    /// Reserve stock for an order.
+    #[call(idempotent, timeout = "2s", bulkhead = 16)]
+    async fn reserve(&self, cx: &CallContext, req: ReserveRequest)
+        -> Result<ReserveReply, InventoryError>;
+}
+
+// Wiring: factories run in install order; dependencies come in as handles.
+let mut builder = App::builder(&sekvent::config::EnvSource);
+InventoryHandle::install(&mut builder, |_deps| Ok(InventoryService::new(stock)))?;
+OrdersHandle::install(&mut builder, |deps| Ok(OrdersService::new(deps.handle::<InventoryHandle>()?)))?;
+let app = builder.build()?;          // SEKVENT_COMPONENT_BINDING=local-serialized moves every call behind prost
+app.start().await?;
+```
+
+Enable it with the facade feature `component` (plus `runtime` for
+`App::register`, which runs every component as one runtime unit). The
+design is in [docs/component-model.md](docs/component-model.md), the C1
+specification in [docs/design/component-c1.md](docs/design/component-c1.md),
+and [examples/shop](examples/shop) is a complete three-component example
+whose tests run under both local bindings.
 
 ## License
 

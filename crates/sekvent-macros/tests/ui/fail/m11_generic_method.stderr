@@ -1,0 +1,5 @@
+error: component methods cannot have generic parameters, lifetimes or a where clause
+ --> tests/ui/fail/m11_generic_method.rs:4:18
+  |
+4 |     async fn ping<T>(
+  |                  ^^^

@@ -1,0 +1,17 @@
+error: use named fields (they become error metadata keys) or no fields
+ --> tests/ui/fail/d7_marked_twice.rs:7:10
+  |
+7 |     Other(sekvent_component::AppError),
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: a variant has either one #[reason(...)] or #[other]
+ --> tests/ui/fail/d7_marked_twice.rs:6:5
+  |
+6 |     #[other]
+  |     ^^^^^^^^
+
+error: exactly one variant needs #[other] to catch unknown reasons
+ --> tests/ui/fail/d7_marked_twice.rs:4:10
+  |
+4 | pub enum OrdersError {
+  |          ^^^^^^^^^^^

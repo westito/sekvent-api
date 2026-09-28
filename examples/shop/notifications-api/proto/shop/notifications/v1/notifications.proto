@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+// Messages of the notifications component. The component itself is declared
+// in Rust (`notifications_api::Notifications`).
+package shop.notifications.v1;
+
+// Notify a customer about an order, using a named template.
+message NotifyRequest {
+  string customer_id = 1;
+  string order_id = 2;
+  string template = 3;
+}
+
+// The id of the stored notification.
+message NotifyReply {
+  string notification_id = 1;
+}
+
+// List the notifications sent to a customer.
+message SentRequest {
+  string customer_id = 1;
+}
+
+// The notifications sent to a customer, oldest first.
+message SentReply {
+  repeated Notification notifications = 1;
+}
+
+// One stored notification.
+message Notification {
+  string notification_id = 1;
+  string customer_id = 2;
+  string order_id = 3;
+  string template = 4;
+  // The tenant of the call that sent it, empty when the call had none.
+  string tenant = 5;
+}

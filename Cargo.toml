@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = [
+    "crates/*",
+    "examples/shop/inventory-api",
+    "examples/shop/inventory",
+    "examples/shop/notifications-api",
+    "examples/shop/notifications",
+    "examples/shop/orders-api",
+    "examples/shop/orders",
+    "examples/shop/shop",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,6 +34,7 @@ sekvent-client = { path = "crates/sekvent-client" }
 sekvent-db = { path = "crates/sekvent-db" }
 sekvent-testing = { path = "crates/sekvent-testing" }
 sekvent-proto-build = { path = "crates/sekvent-proto-build" }
+sekvent-component = { path = "crates/sekvent-component" }
 
 # --- async runtime ---
 tokio = { version = "1.53.1", features = ["full"] }
@@ -92,6 +102,7 @@ syn = { version = "3.0.6", features = ["full", "extra-traits"] }
 quote = "1.0.47"
 proc-macro2 = "1.0.107"
 proc-macro-crate = "3.5.0"
+prettyplease = "0.3.0"
 
 # --- tests / tooling ---
 # NOT testcontainers-modules: 0.15 requires testcontainers ^0.27, and the
@@ -119,6 +130,8 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+# Component traits are implemented with `async fn` whether or not a body awaits.
+unused_async_trait_impl = "allow"
 
 # Password hashing is memory-hard on purpose; unoptimised it dominates test time.
 [profile.dev.package.argon2]

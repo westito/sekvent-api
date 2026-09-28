@@ -1,0 +1,5 @@
+error: package must be dot-separated lowercase segments such as `shop.inventory.v1`
+ --> tests/ui/fail/c5_bad_package.rs:1:57
+  |
+1 | #[sekvent_component::component(name = "echo", package = "Check.Echo")]
+  |                                                         ^^^^^^^^^^^^

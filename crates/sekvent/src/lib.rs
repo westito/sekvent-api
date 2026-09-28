@@ -16,6 +16,7 @@
 //! | [`link`] | `sekvent-link` | `link` | service-to-service tokens, middleware, interceptors |
 //! | [`client`] | `sekvent-client` | `client` | outbound HTTP with policy, context propagation, OAuth 2.0 |
 //! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, list filters |
+//! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local and serialized bindings |
 //!
 //! # Sub-features
 //!
@@ -31,6 +32,8 @@
 //! - `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`,
 //!   `db-sea-orm-mysql`: database backends.
 //! - `db-migrate`, `db-sea-orm-migrate`: migrations on boot.
+//! - `component` also turns on `config`, `error` and `context`; with
+//!   `runtime` on as well, `App::register` runs the App as a runtime unit.
 //! - `full`: everything above.
 //!
 //! # Not re-exported
@@ -47,7 +50,16 @@
 //!
 //! [`prelude`] brings the handful of names nearly every service touches:
 //! `AppError`, `ErrorCode`, `CallContext`, `Secret`, `EnvConfig`,
-//! `FromConfig` and the runtime and server builders.
+//! `FromConfig` and the runtime and server builders, and with `component`
+//! the `App`, the `ComponentError` trait and derive, and `Lifecycle`.
+//!
+//! # Components
+//!
+//! With `component`, `#[sekvent::component(...)]` declares a component and
+//! `#[derive(sekvent::ComponentError)]` its typed error; the generated code
+//! finds its runtime at `sekvent::component` when `sekvent` is the only
+//! dependency. The module [`component`](mod@component) and the attribute
+//! [`component`](macro@component) share the name in different namespaces.
 
 #![forbid(unsafe_code)]
 
@@ -98,6 +110,16 @@ pub use sekvent_client as client;
 #[cfg(feature = "db")]
 pub use sekvent_db as db;
 
+/// Components: the App builder, bindings, lifecycle and the support code
+/// of the generated handles.
+#[cfg(feature = "component")]
+pub use sekvent_component as component;
+
+/// `#[component(...)]` on a trait; the `App`; the `ComponentError` trait and
+/// its derive.
+#[cfg(feature = "component")]
+pub use sekvent_component::{App, ComponentError, component};
+
 /// The names nearly every service uses: `use sekvent::prelude::*;`.
 pub mod prelude {
     #[cfg(feature = "config")]
@@ -114,4 +136,7 @@ pub mod prelude {
         Ctx, Runtime, RuntimeBuilder, RuntimeHandle, Server, ServerBuilder, ShutdownTrigger, Stage,
         UnitContext, UnitPolicy,
     };
+
+    #[cfg(feature = "component")]
+    pub use sekvent_component::{App, ComponentError, Lifecycle};
 }

@@ -1,0 +1,5 @@
+error: use named fields (they become error metadata keys) or no fields
+ --> tests/ui/fail/d13_tuple_variant.rs:6:9
+  |
+6 |     Gone(String),
+  |         ^^^^^^^^

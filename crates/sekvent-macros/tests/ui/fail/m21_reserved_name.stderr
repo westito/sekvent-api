@@ -1,0 +1,5 @@
+error: method name `install` is reserved on the generated handle
+ --> tests/ui/fail/m21_reserved_name.rs:4:14
+  |
+4 |     async fn install(
+  |              ^^^^^^^

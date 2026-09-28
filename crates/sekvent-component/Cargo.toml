@@ -1,0 +1,38 @@
+[package]
+name = "sekvent-component"
+description = "Components with local and serialized bindings for sekvent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["macros"]
+# `component` attribute and `ComponentError` derive, re-exported from sekvent-macros.
+macros = ["dep:sekvent-macros"]
+# `App::register`: run all components as one sekvent-runtime unit.
+runtime = ["dep:sekvent-runtime"]
+
+[dependencies]
+sekvent-config = { workspace = true }
+sekvent-error = { workspace = true }
+sekvent-context = { workspace = true }
+sekvent-resilience = { workspace = true }
+sekvent-macros = { workspace = true, optional = true }
+# Path, not workspace: keeps sekvent-runtime's default grpc-web feature off.
+sekvent-runtime = { path = "../sekvent-runtime", default-features = false, optional = true }
+bytes = { workspace = true }
+http = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+sekvent-component = { path = ".", features = ["runtime"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

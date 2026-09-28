@@ -1,0 +1,19 @@
+[package]
+name = "orders"
+description = "The example shop's orders component: in-memory orders that call inventory and notifications."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+inventory-api = { path = "../inventory-api" }
+notifications-api = { path = "../notifications-api" }
+orders-api = { path = "../orders-api" }
+sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

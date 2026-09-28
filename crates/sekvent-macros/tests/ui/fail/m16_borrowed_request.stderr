@@ -1,0 +1,5 @@
+error: the request must be an owned type without lifetimes or `impl Trait`
+ --> tests/ui/fail/m16_borrowed_request.rs:7:14
+  |
+7 |         req: &str,
+  |              ^^^^
