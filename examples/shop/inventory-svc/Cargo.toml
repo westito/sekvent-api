@@ -1,0 +1,18 @@
+[package]
+name = "inventory-svc"
+description = "The example shop's inventory as its own service: the inventory component served over gRPC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+inventory = { path = "../inventory" }
+inventory-api = { path = "../inventory-api" }
+sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component", "component-grpc", "config", "runtime"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

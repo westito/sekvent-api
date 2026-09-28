@@ -1,0 +1,19 @@
+error[E0080]: evaluation panicked: component contract: the proto service is not <package>.<Trait>; check package and proto
+  --> tests/ui/fail/p6_package_mismatch.rs:39:1
+   |
+39 | #[sekvent_component::component(name = "echo", package = "check.echo.v2", proto = "crate::proto")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
+   |
+note: inside `sekvent_component::__private::assert_service`
+  --> $RUST/core/src/panic.rs
+   |
+   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/crates/sekvent-component/src/contract.rs
+   |
+   | /     assert!(
+   | |         str_eq(proto.0, service),
+   | |         "component contract: the proto service is not <package>.<Trait>; check package and proto"
+   | |     );
+   | |_____- in this macro invocation

@@ -1,8 +1,16 @@
 syntax = "proto3";
 
-// Messages of the orders component. The component itself is declared in Rust
-// (`orders_api::Orders`).
+// Contract of the orders component, checked against the Rust trait
+// `orders_api::Orders` at compile time.
 package shop.orders.v1;
+
+// Placing and reading orders.
+service Orders {
+  // Place an order: reserve its stock, notify the customer and store it.
+  rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderReply);
+  // Read one order.
+  rpc GetOrder(GetOrderRequest) returns (Order);
+}
 
 // Place an order for `quantity` units of `sku`.
 message PlaceOrderRequest {

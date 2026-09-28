@@ -4,6 +4,7 @@ members = [
     "crates/*",
     "examples/shop/inventory-api",
     "examples/shop/inventory",
+    "examples/shop/inventory-svc",
     "examples/shop/notifications-api",
     "examples/shop/notifications",
     "examples/shop/orders-api",
@@ -53,6 +54,8 @@ tonic-health = "0.14.6"
 prost = "0.14.4"
 prost-types = "0.14.4"
 prost-build = "0.14.4"
+# Pure-Rust protobuf compiler: contract tooling reads protos without protoc.
+protox = "0.9.1"
 
 # --- HTTP ---
 axum = "0.8.9"

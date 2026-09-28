@@ -1,7 +1,8 @@
 //! The reference component of the C1 spec (section 3.4), expanded by hand
-//! exactly as `#[component]` expands it, with hand-written prost messages and
-//! a hand-expanded `#[derive(ComponentError)]` (section 3.7), so the
-//! framework is tested without the macro.
+//! exactly as `#[component]` expands it (with the C2 contract check of C2
+//! section 5.2), with hand-written prost messages, a hand-written service
+//! contract and a hand-expanded `#[derive(ComponentError)]` (C1 section 3.7),
+//! so the framework is tested without the macro.
 #![allow(dead_code, missing_docs)]
 
 use sekvent_component::{AppError, CallContext};
@@ -42,6 +43,50 @@ pub struct ReleaseRequest {
 pub struct ReleaseReply {
     #[prost(bool, tag = "1")]
     pub released: bool,
+}
+
+impl prost::Name for ReserveRequest {
+    const NAME: &'static str = "ReserveRequest";
+    const PACKAGE: &'static str = "shop.inventory.v1";
+}
+
+impl prost::Name for ReserveReply {
+    const NAME: &'static str = "ReserveReply";
+    const PACKAGE: &'static str = "shop.inventory.v1";
+}
+
+impl prost::Name for ReleaseRequest {
+    const NAME: &'static str = "ReleaseRequest";
+    const PACKAGE: &'static str = "shop.inventory.v1";
+}
+
+impl prost::Name for ReleaseReply {
+    const NAME: &'static str = "ReleaseReply";
+    const PACKAGE: &'static str = "shop.inventory.v1";
+}
+
+/// What `sekvent-proto-build` would generate for the package's service.
+pub mod proto {
+    /// Contract of `shop.inventory.v1.Inventory`, checked by `#[component(proto = …)]`.
+    #[doc(hidden)]
+    #[allow(non_upper_case_globals, dead_code)]
+    pub const __sekvent_service_Inventory: (&str, &[(&str, &str, &str, bool)]) = (
+        "shop.inventory.v1.Inventory",
+        &[
+            (
+                "Reserve",
+                "shop.inventory.v1.ReserveRequest",
+                "shop.inventory.v1.ReserveReply",
+                false,
+            ),
+            (
+                "Release",
+                "shop.inventory.v1.ReleaseRequest",
+                "shop.inventory.v1.ReleaseReply",
+                false,
+            ),
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +222,11 @@ impl ::core::convert::From<InventoryError> for ::sekvent_component::AppError {
 }
 
 // ---------------------------------------------------------------------------
-// #[sekvent::component(name = "inventory", package = "shop.inventory.v1")]
+// #[sekvent::component(
+//     name = "inventory",
+//     package = "shop.inventory.v1",
+//     proto = "crate::support::inventory::proto"
+// )]
 // pub trait Inventory: Send + Sync + 'static { ... }
 // ---------------------------------------------------------------------------
 
@@ -409,6 +458,20 @@ const _: () = {
     ::sekvent_component::__private::assert_error::<InventoryError>();
 };
 
+const _: () = ::sekvent_component::__private::assert_service(
+    crate::support::inventory::proto::__sekvent_service_Inventory,
+    "shop.inventory.v1.Inventory",
+    2usize,
+);
+const _: () = ::sekvent_component::__private::assert_rpc::<ReserveRequest, ReserveReply>(
+    crate::support::inventory::proto::__sekvent_service_Inventory,
+    "Reserve",
+);
+const _: () = ::sekvent_component::__private::assert_rpc::<ReleaseRequest, ReleaseReply>(
+    crate::support::inventory::proto::__sekvent_service_Inventory,
+    "Release",
+);
+
 // ---------------------------------------------------------------------------
 // Not part of the expansion: lets tests pair the handle with another
 // dispatcher (the handle's constructor is private to this module, as it is
@@ -431,4 +494,12 @@ pub fn install_with_dispatch<T: Inventory>(
 /// The generated dispatcher of an implementation, for byte-level tests.
 pub fn dispatcher<T: Inventory>(imp: T) -> __InventoryDispatcher {
     __InventoryDispatcher(::std::sync::Arc::new(imp))
+}
+
+/// Declare the component as `install_remote` does for a `remote_only`
+/// component: no factory, bound to a remote transport.
+pub fn install_remote(
+    app: &mut ::sekvent_component::AppBuilder<'_>,
+) -> ::core::result::Result<(), ::sekvent_component::BuildError> {
+    ::sekvent_component::__private::install_remote(app, InventoryHandle)
 }

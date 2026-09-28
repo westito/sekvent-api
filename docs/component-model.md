@@ -1,17 +1,22 @@
 # The sekvent component model
 
-> **Status: milestone C1 implemented.** The `local` and `local-serialized`
-> bindings, `#[call]` methods, the fail-closed App builder, lifecycle hooks
-> with draining, per-method timeouts and bulkheads, `ComponentError` and the
-> `local_only` / `remote_only` modes are in `sekvent-component` (facade
-> feature `component`); the exact C1 API, key grammar and semantics are in
-> [design/component-c1.md](design/component-c1.md), which wins where it is
-> more specific than this document, and [examples/shop](../examples/shop)
-> shows them end to end. Everything from milestone C2 on (see the roadmap
-> below) is still planned: names and syntax shown for it are illustrative.
-> The `cargo sekvent` subcommand names `component`, `contract`, `extract`,
-> `queue` and `schedule` are reserved for this work; today they exit with
-> status 2.
+> **Status: milestones C1 and C2 implemented.** C1: the `local` and
+> `local-serialized` bindings, `#[call]` methods, the fail-closed App
+> builder, lifecycle hooks with draining, per-method timeouts and bulkheads,
+> `ComponentError` and the `local_only` / `remote_only` modes, in
+> `sekvent-component` (facade feature `component`); see
+> [design/component-c1.md](design/component-c1.md). C2: the `grpc` binding
+> and serving components over gRPC (facade feature `component-grpc`), link
+> authentication, retries, circuit breakers, named policies, bulkhead
+> queues, the call-hop limit, proto-first contracts checked at compile time,
+> and `cargo sekvent contract emit | check`; see
+> [design/component-c2.md](design/component-c2.md). The specs win where they
+> are more specific than this document, and
+> [examples/shop](../examples/shop) shows them end to end, including a
+> split topology. Everything from milestone C3 on (see the roadmap below) is
+> still planned: names and syntax shown for it are illustrative. The
+> `cargo sekvent` subcommand names `component`, `extract`, `queue` and
+> `schedule` are reserved for this work; today they exit with status 2.
 
 ## Goal
 
@@ -34,8 +39,8 @@ flowchart LR
     handle -->|local| impl["Billing implementation"]
     handle -->|local-serialized| codec["encode → separate task → decode"]
     codec --> dispatch
-    handle -->|grpc| client["tonic client"]
-    client -->|network, link token| server["tonic server"]
+    handle -->|grpc| client["generic gRPC client"]
+    client -->|network, link token| server["generic gRPC service"]
     server --> dispatch
     handle -->|db-queue| outbox[("SQL outbox<br/>same transaction")]
     outbox --> consumer["consumer / relay"]
@@ -48,11 +53,25 @@ flowchart LR
 
 ## Declaring a component
 
+```proto
+// billing-api/proto/billing/v1/billing.proto
+syntax = "proto3";
+package billing.v1;
+
+import "google/protobuf/empty.proto";
+
+service Billing {
+  rpc GetInvoice(GetInvoiceRequest) returns (Invoice);
+  rpc Quote(QuoteRequest) returns (Quote);
+  rpc IssueInvoice(IssueInvoice) returns (google.protobuf.Empty);
+}
+```
+
 ```rust
 use sekvent::prelude::*;
 use billing_api::proto::{GetInvoiceRequest, Invoice, IssueInvoice, QuoteRequest, Quote};
 
-#[sekvent::component(name = "billing", package = "billing.v1")]
+#[sekvent::component(name = "billing", package = "billing.v1", proto = "crate::proto::billing::v1")]
 pub trait Billing: Send + Sync + 'static {
     /// Synchronous request/reply.
     #[call(idempotent, timeout = "2s")]
@@ -71,12 +90,19 @@ pub trait Billing: Send + Sync + 'static {
 }
 ```
 
-From the trait the macro generates:
+(`#[async_call]` and `#[deferred]` are C3; the example shows where they
+will sit.) From the trait the macro generates:
 
 - `BillingHandle`: a cheap, cloneable handle that callers store and inject;
 - a dispatcher that decodes a request, calls the implementation and encodes
   the reply;
-- a tonic unary client and server for the `billing.v1` package.
+- compile-time checks that the trait and the proto's `Billing` service agree
+  exactly: the service name `<package>.<Trait>`, one RPC per method named
+  after it in UpperCamelCase, and each RPC's request and reply types.
+
+No per-component tonic code is generated: one generic byte-level gRPC
+client and service carry every component over the standard
+`/<package>.<Trait>/<Rpc>` paths, reusing the dispatcher.
 
 ### Method rules
 
@@ -149,27 +175,44 @@ topics are declared and subscribed to is settled in milestone C3.
 | `idempotent` | method | The method may be retried; required for any automatic retry |
 | `timeout = "…"` | method | Default deadline, capped by the caller's own deadline |
 | `bulkhead = N` | method or component | At most `N` concurrent executions; excess is shed with `RESOURCE_EXHAUSTED` |
-| `#[component(local_only)]` | component | The on-ramp: in-process only, no contract checks yet; the App builder rejects any remote binding |
+| `#[component(proto = "…")]` | component | The module generated for the component's proto package; required unless `local_only` |
+| `#[component(local_only)]` | component | The on-ramp: in-process only, no contract (and no `proto`); the App builder rejects any remote binding |
 | `#[component(remote_only)]` | component | Never runs in this binary; the App builder rejects a local binding |
 
 `local_only` lets a feature start as a component before its contract is
-stable. Removing the flag is what opts it into contract checks and remote
-bindings.
+stable. Removing the flag and adding the proto `service` with
+`proto = "…"` is what opts it into contract checks and remote bindings.
 
 ## Contracts and the wire
 
 - The wire format is protobuf from day one, even for components that only
   ever run locally, so that extraction never needs a serialization change.
 - Each component has one **`-api` crate** (`billing-api`) holding the
-  `.proto`-generated messages, the trait, the error type and the generated
-  handle. Callers depend only on the `-api` crate; the implementation lives
-  in its own crate.
-- `cargo sekvent contract emit` (planned) writes a baseline of every
-  component contract; `cargo sekvent contract check` (planned) compares the
-  current contracts with the baseline and fails on breaking changes
-  (removed or renumbered fields, changed types, removed methods or reasons).
-- A breaking change means a new package: `billing.v2` is served alongside
-  `billing.v1` until every caller has moved.
+  `.proto` file, the generated messages, the trait, the error type and the
+  generated handle. Callers depend only on the `-api` crate; the
+  implementation lives in its own crate.
+- **The proto is the contract.** The `.proto` declares the component's
+  `service` next to its messages; `sekvent-proto-build` emits a constant
+  describing each service, and `#[component(proto = …)]` checks the trait
+  against it at compile time, so the trait and the proto cannot drift. The
+  wire is plain gRPC: a client generated from the `.proto` by any toolchain
+  calls a sekvent server, and a sekvent `grpc` binding can call any server
+  implementing the service.
+- `cargo sekvent contract emit` compiles the protos in-process (pure-Rust
+  `protox`: no `protoc`, no Rust build) and writes one canonical JSON
+  baseline per service; `cargo sekvent contract check` compares the current
+  protos with the baselines and fails on wire-breaking changes: a removed
+  service or RPC, a changed request or reply type or streaming flag, a
+  removed field or enum number that is not reserved, a changed field type,
+  cardinality or oneof membership, a dropped reservation, an enum turning
+  open or closed. New services, RPCs, fields and values, and renames, are
+  compatible (the binary wire carries numbers only). `[contract]` in
+  `sekvent.toml` lists the proto roots and adds the check to the gate.
+- Error reasons live in Rust (`ComponentError`) and are outside `contract
+  check`; an unknown reason always decodes into the `#[other]` variant.
+- A breaking change means a new package: `billing.v2` is a second
+  component served alongside `billing.v1` from the same binary until every
+  caller has moved; then v1 and its baseline are deleted.
 
 ## Bindings
 
@@ -177,7 +220,7 @@ bindings.
 |---|---|
 | `local` | Direct call on the implementation; no encoding |
 | `local-serialized` | The request is encoded, the `CallContext` goes through the header codec, the call runs on a separate task and the reply or error is encoded and decoded back; the task is aborted when the caller drops the future |
-| `grpc` | tonic unary call to a remote service, authenticated with a link token |
+| `grpc` | Unary gRPC call to the component's endpoint (plaintext HTTP/2), authenticated with a link token; the request context travels as headers (`grpc-timeout`, request id, trace, idempotency key, hop count) |
 | `db-queue` | SQL outbox and consumer in the component's database (see Bus) |
 | `grpc-push` | A relay reads the outbox and pushes messages to the remote service's `Deliver` RPC |
 | `nats` | NATS JetStream (later milestone) |
@@ -189,8 +232,30 @@ headers, error mapping, cancellation — without a network. It is the
 long before anyone extracts a service.
 
 Bindings are chosen per component through reserved `SEKVENT_` configuration
-keys (for example a binding, an endpoint URL and a link name per component),
-or through a named profile that sets all of them at once.
+keys; every key is accepted under every binding, so one environment serves
+every topology:
+
+| Key | Meaning |
+|---|---|
+| `SEKVENT_COMPONENT_BINDING`, `…_<C>_BINDING` | `local` (default), `local-serialized` or `grpc` |
+| `…_<C>_ENDPOINT` | `http://host:port` of the service hosting the component (required for `grpc`; `https://` is not supported yet) |
+| `…_<C>_LINK` | link name; the binding presents `SEKVENT_LINK_OUTBOUND_<LINK>` (default: the component name) |
+| `…_<C>_AUTH` | `link` (default) or `none` |
+| `…_<C>_SERVE` | `grpc` exposes a locally bound component through `App::grpc_routes()` |
+| `…_<C>_SERVE_AUTH` | `link` (default: only the process's `SEKVENT_LINK_INBOUND_*` tokens are accepted) or `none` |
+| `SEKVENT_COMPONENT_MAX_HOPS` | deepest chain of component calls, default 16 |
+
+A service mounts `App::grpc_routes()` on its `sekvent-runtime` server next
+to any other tonic service; per-component `grpc.health.v1` status follows
+the component's lifecycle, and `App::start` fails with `GRPC_NOT_MOUNTED`
+when an exposed component's routes were never taken. On the serving side
+the caller is the authenticated link; end-user subject and tenant survive
+only for a link named in `SEKVENT_LINK_TRUSTED`.
+
+Every call carries a hop count (`x-sekvent-hops` across the wire); a call
+deeper than `SEKVENT_COMPONENT_MAX_HOPS` fails `FAILED_PRECONDITION` /
+`CALL_DEPTH_EXCEEDED` before anything is sent, which stops accidental call
+cycles.
 
 ## Wiring: the App builder
 
@@ -213,8 +278,10 @@ let app = app.build().await?;   // every misconfiguration is reported here
   the runtime.
 - The builder fails closed. Every misconfiguration is an error that names
   the variable to fix, never a secret value:
-  - a remote binding without a link token, unless the configuration says
-    `auth = none` explicitly;
+  - a remote binding without an endpoint or a link token, unless
+    `…_<C>_AUTH=none` says so explicitly;
+  - a component exposed over gRPC without any inbound link token, unless
+    `…_<C>_SERVE_AUTH=none`;
   - unknown component configuration keys;
   - installing the same component twice;
   - two components sharing one link token;
@@ -237,20 +304,38 @@ Policies depend on the binding:
 
 | Binding | Policy |
 |---|---|
-| local | deadline, bulkhead, load shedding |
-| remote (`grpc`) | the above, plus a budgeted retry (idempotent methods only, deadline-aware) and a circuit breaker per endpoint |
+| local | deadline, bulkhead (with an optional bounded queue), load shedding |
+| remote (`grpc`) | the deadline across the hop, plus a budgeted retry (`idempotent` methods only, deadline-aware, capped by `Retry-After`) and a circuit breaker per remote component; bulkheads act where the component runs |
 | queue (`db-queue`, `nats`) | a bounded number of attempts, then a dead letter; `UNAVAILABLE` from the handler pauses consumption without spending an attempt |
 
 The circuit breaker is sekvent's own (`sekvent-resilience`) and trips only
 on `UNAVAILABLE`, `DEADLINE_EXCEEDED` and `RESOURCE_EXHAUSTED`; business
-errors never open it.
+errors never open it. While open, calls fail at once with `UNAVAILABLE` /
+`CIRCUIT_OPEN`.
+
+Remote defaults: three attempts for `idempotent` methods (exponential
+backoff, a retry budget of 20 % plus 10 per second shared by the
+component's methods, a `Retry-After` hint honoured up to 30 s) and a
+breaker over the last 20 calls that opens at a 50 % failure rate once 10
+calls were seen, stays open 30 s and then lets 3 probes through.
+`RETRY_MAX_ATTEMPTS=1` and `BREAKER_ENABLED=false` switch them off.
+`TIMEOUT` is the deadline of the whole call, retries included; configuration
+never makes a method retryable.
 
 Policy precedence, lowest to highest:
 
-1. the attribute default in code (`timeout`, `bulkhead`, `idempotent`);
-2. a named policy from configuration;
-3. a component-level override;
-4. a method-level override.
+1. the framework default (remote bindings only);
+2. the attribute default in code (`timeout`, `bulkhead`);
+3. a named policy, `SEKVENT_POLICY_<NAME>_*`, referenced by
+   `…_<C>_<M>_POLICY` or else `…_<C>_POLICY`;
+4. a component-level override, `…_<C>_<FIELD>`;
+5. a method-level override, `…_<C>_<M>_<FIELD>`.
+
+Fields: `TIMEOUT`, `BULKHEAD_MAX_CONCURRENT`, `BULKHEAD_MAX_QUEUE`,
+`BULKHEAD_QUEUE_TIMEOUT` and the `RETRY_*` fields per method or component;
+`RETRY_BUDGET_*` and `BREAKER_*` per component only, because their state
+belongs to the endpoint. A reference to a policy with no keys, or a
+`SEKVENT_POLICY_*` key no referenced policy uses, fails the build.
 
 ## Schedule
 
@@ -312,7 +397,7 @@ Call sites do not change: callers already hold the handle.
 | Milestone | Scope |
 |---|---|
 | C1 (implemented) | `local` and `local-serialized` bindings, `#[call]`, the App builder, timeout and bulkhead, `ComponentError`, `local_only` / `remote_only`, an `examples/shop` workspace |
-| C2 | `grpc` binding with link authentication, circuit breaker and retry, `contract emit` / `contract check`, a `split-grpc` CI profile |
+| C2 (implemented) | `grpc` binding and serving with link authentication, circuit breaker, retry and named policies, the hop limit, proto-first contracts with `contract emit` / `contract check`, a `split-grpc` profile in `examples/shop` |
 | C3 | The bus (SQL outbox, inbox, relay), `#[async_call]`, `#[deferred]`, topics |
 | C4 | Schedule |
 | C5 | NATS JetStream, `extract` |

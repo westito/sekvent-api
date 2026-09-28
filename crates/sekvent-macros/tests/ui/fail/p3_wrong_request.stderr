@@ -1,0 +1,19 @@
+error[E0080]: evaluation panicked: component contract: this method's request type is not the RPC's input type
+  --> tests/ui/fail/p3_wrong_request.rs:39:1
+   |
+39 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
+   |
+note: inside `sekvent_component::__private::assert_rpc::<PingRequest, PingReply>`
+  --> $RUST/core/src/panic.rs
+   |
+   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/crates/sekvent-component/src/contract.rs
+   |
+   | /             assert!(
+   | |                 full_name_eq(request, Req::PACKAGE, Req::NAME),
+   | |                 "component contract: this method's request type is not the RPC's input type"
+   | |             );
+   | |_____________- in this macro invocation

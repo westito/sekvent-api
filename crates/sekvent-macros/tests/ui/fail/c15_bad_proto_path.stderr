@@ -1,0 +1,11 @@
+error: proto must be a module path such as "crate::proto::shop::inventory::v1"
+ --> tests/ui/fail/c15_bad_proto_path.rs:1:82
+  |
+1 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "check.echo.v1")]
+  |                                                                                  ^^^^^^^^^^^^^^^
+
+error: proto must be a module path such as "crate::proto::shop::inventory::v1"
+  --> tests/ui/fail/c15_bad_proto_path.rs:14:13
+   |
+14 |     proto = "crate::proto::Again<u8>"
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^

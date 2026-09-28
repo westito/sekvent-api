@@ -10,9 +10,10 @@ publish = false
 
 # The only sekvent dependency is the facade, as in a consumer's manifest.
 # A path dependency so `default-features = false` is honoured (see the
-# facade's own manifest for the edition 2024 rule).
+# facade's own manifest for the edition 2024 rule). `component-grpc` checks
+# that the gRPC binding builds from the facade alone.
 [dependencies]
-sekvent = { path = "../sekvent", default-features = false, features = ["config", "component"] }
+sekvent = { path = "../sekvent", default-features = false, features = ["config", "component", "component-grpc"] }
 # `#[derive(prost::Message)]` names `::prost`, so a crate with protobuf
 # messages depends on prost itself.
 prost = { workspace = true }

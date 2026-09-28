@@ -25,6 +25,8 @@ pub struct Seen {
     pub idempotency_key: Option<String>,
     pub caller: Option<(String, bool)>,
     pub deadline: Option<Instant>,
+    pub traceparent: Option<String>,
+    pub hops: u32,
 }
 
 /// Every context an implementation saw, in call order.
@@ -42,6 +44,8 @@ impl Probe {
                 .caller()
                 .map(|caller| (caller.name.clone(), caller.trusted)),
             deadline: cx.deadline(),
+            traceparent: cx.traceparent().map(str::to_owned),
+            hops: cx.hops(),
         };
         self.0
             .lock()
@@ -163,6 +167,58 @@ impl Inventory for FakeInventory {
                 hint: Some("ids start with res-".to_owned()),
             }),
         }
+    }
+}
+
+/// Fails the first `failures` calls of `method` with `error()`, then serves
+/// from real stock. Records every call that reaches it.
+pub struct FlakyInventory {
+    pub probe: Probe,
+    pub method: &'static str,
+    pub failures: Mutex<u32>,
+    pub error: fn() -> AppError,
+    pub stock: FakeInventory,
+}
+
+impl FlakyInventory {
+    pub fn new(method: &'static str, failures: u32, error: fn() -> AppError) -> Self {
+        Self {
+            probe: Probe::default(),
+            method,
+            failures: Mutex::new(failures),
+            error,
+            stock: FakeInventory::stock(100),
+        }
+    }
+
+    fn fail(&self, cx: &CallContext, method: &str) -> Result<(), InventoryError> {
+        self.probe.record(cx);
+        let mut left = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        if method == self.method && *left > 0 {
+            *left -= 1;
+            return Err(InventoryError::Other((self.error)()));
+        }
+        Ok(())
+    }
+}
+
+impl Inventory for FlakyInventory {
+    async fn reserve(
+        &self,
+        cx: &CallContext,
+        req: ReserveRequest,
+    ) -> Result<ReserveReply, InventoryError> {
+        self.fail(cx, "reserve")?;
+        self.stock.reserve(cx, req).await
+    }
+
+    async fn release(
+        &self,
+        cx: &CallContext,
+        req: ReleaseRequest,
+    ) -> Result<ReleaseReply, InventoryError> {
+        self.fail(cx, "release")?;
+        self.stock.release(cx, req).await
     }
 }
 

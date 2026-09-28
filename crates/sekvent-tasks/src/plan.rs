@@ -279,6 +279,8 @@ pub enum Step {
     },
     /// Check `[[gate.boundaries]]` against the dependency graph.
     Boundaries,
+    /// Check the `[contract]` services against their baselines, in-process.
+    Contract,
 }
 
 impl Step {
@@ -287,6 +289,7 @@ impl Step {
         match self {
             Self::Run { name, .. } => name,
             Self::Boundaries => "boundaries",
+            Self::Contract => "contract",
         }
     }
 
@@ -315,7 +318,8 @@ pub fn hook_steps(
         .collect()
 }
 
-/// The full gate: pre hooks, fmt, clippy, test, doc, boundaries, post hooks.
+/// The full gate: pre hooks, fmt, clippy, test, doc, boundaries, contract,
+/// post hooks.
 ///
 /// `harness_env` (run id and label namespace) is added to every command.
 pub fn gate_steps(
@@ -346,6 +350,9 @@ pub fn gate_steps(
     }
     if !gate.boundaries.is_empty() {
         steps.push(Step::Boundaries);
+    }
+    if config.contract.in_gate() {
+        steps.push(Step::Contract);
     }
     steps.extend(hook_steps(
         root,
@@ -429,6 +436,7 @@ mod tests {
             .map(|step| match step {
                 Step::Run { name, cmd } => format!("{name}: {cmd}"),
                 Step::Boundaries => "boundaries".to_owned(),
+                Step::Contract => "contract".to_owned(),
             })
             .collect()
     }
@@ -502,6 +510,7 @@ mod tests {
         };
         config.hooks.pre_gate = vec![vec!["echo".into(), "pre".into()]];
         config.hooks.post_gate = vec![vec!["echo".into(), "post".into()]];
+        config.contract.roots = vec!["orders-api/proto".into()];
         let selection = Selection::new(&meta(), &config.gate).unwrap();
         let harness = vec![("SEKVENT_TEST_RUN_ID".to_owned(), "r1".to_owned())];
         let steps = gate_steps(
@@ -521,6 +530,7 @@ mod tests {
                 "test: cargo test --workspace --exclude vendored --all-features --locked",
                 "doc: cargo doc --workspace --exclude vendored --no-deps --all-features --locked",
                 "boundaries",
+                "contract",
                 "post_gate[0]: echo post",
             ]
         );
@@ -553,6 +563,24 @@ mod tests {
             lines(&steps)[0],
             "clippy: cargo clippy --workspace --no-deps --all-targets --locked -- -D warnings"
         );
+    }
+
+    #[test]
+    fn the_contract_step_needs_roots_and_the_gate_switch() {
+        let names = |config: &Config| -> Vec<String> {
+            let selection = Selection::new(&meta(), &config.gate).unwrap();
+            gate_steps(Path::new("/w"), config, &selection, &EnvMap::new(), &[])
+                .iter()
+                .map(|step| step.name().to_owned())
+                .collect()
+        };
+        let mut config = Config::with_name("orders");
+        assert!(!names(&config).contains(&"contract".to_owned()));
+        config.contract.roots = vec!["orders-api/proto".into()];
+        assert_eq!(names(&config).last().map(String::as_str), Some("contract"));
+        config.contract.gate = false;
+        assert!(!names(&config).contains(&"contract".to_owned()));
+        assert_eq!(Step::Contract.name(), "contract");
     }
 
     #[test]

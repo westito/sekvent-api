@@ -62,7 +62,7 @@ pub fn derive_env_config(input: TokenStream) -> TokenStream {
 /// a generated handle, in-process or across a serialization boundary.
 ///
 /// ```text
-/// #[component(name = "billing", package = "shop.billing.v1")]
+/// #[component(name = "billing", package = "shop.billing.v1", proto = "crate::proto::shop::billing::v1")]
 /// pub trait Billing {
 ///     /// Charge an order.
 ///     #[call(idempotent, timeout = "2s", bulkhead = 16)]
@@ -77,6 +77,13 @@ pub fn derive_env_config(input: TokenStream) -> TokenStream {
 ///   used in configuration keys (`SEKVENT_COMPONENT_BILLING_BINDING`);
 /// - `package = "shop.billing.v1"`: the protobuf package of the messages,
 ///   required unless `local_only`;
+/// - `proto = "crate::proto::shop::billing::v1"`: the module
+///   `sekvent-proto-build` generated for that package, required unless
+///   `local_only` (and forbidden with it). The trait is checked at compile
+///   time against the proto `service` named after it (the constant
+///   `__sekvent_service_<Trait>` in that module): the same full service
+///   name, one unary RPC per method named in `UpperCamelCase`
+///   (`charge` is `Charge`), with the method's request and reply types;
 /// - `local_only`: requests and replies may be any `Send + 'static` type and
 ///   the component can only be bound `local`;
 /// - `remote_only`: the component never runs in this binary and is declared
@@ -88,8 +95,9 @@ pub fn derive_env_config(input: TokenStream) -> TokenStream {
 /// Every method is an `async fn(&self, cx: &CallContext, req: Request) ->
 /// Result<Reply, Error>` marked `#[call]`, optionally with `idempotent`,
 /// `timeout = "<humantime>"` and `bulkhead = <max concurrent calls>`.
-/// Requests and replies are prost messages; each error type implements
-/// `ComponentError`.
+/// Requests and replies are prost messages that implement `prost::Name`
+/// (sekvent-proto-build enables prost's type names); each error type
+/// implements `ComponentError`.
 ///
 /// The macro keeps the trait (its methods become `fn -> impl Future + Send`,
 /// so implementations still write `async fn`) and generates `<Trait>Handle`

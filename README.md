@@ -28,7 +28,7 @@ sqlx 0.9 and sea-orm 2.0.
 | `sekvent-link` | `link`; `link-axum`, `link-tonic` | Service-to-service tokens, middleware, interceptors |
 | `sekvent-client` | `client` | Outbound HTTP (reqwest, rustls) with policies, context propagation, OAuth 2.0 client credentials |
 | `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` | Named pools, migrations, distinct-target check, list filters |
-| `sekvent-component` | `component` | Components with `local` and `local-serialized` bindings, the fail-closed `App` builder, lifecycle, per-method deadlines and bulkheads |
+| `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |
 | `sekvent-testing` | not re-exported (`[dev-dependencies]`) | Postgres and MySQL test containers, a reaper, `await_until!` |
 | `sekvent-proto-build` | not re-exported (`[build-dependencies]`) | `build.rs` protobuf codegen on top of `tonic-prost-build` |
 | `cargo-sekvent` | — | The `cargo sekvent` CLI |
@@ -108,15 +108,17 @@ every section except `[project]` is optional.
 | `[harness]` | Label namespace of test containers and when they count as stale |
 | `[hooks]` | Commands run before and after the gate and coverage |
 | `[tasks.<name>]` | Project tasks for `cargo sekvent run <name>` |
+| `[contract]` | Proto roots, include paths and the baseline directory of `cargo sekvent contract emit` / `check`; `gate = true` adds the check to the gate |
 
 ## Gate and coverage
 
 | Command | What it runs |
 |---|---|
-| `cargo sekvent gate` | `fmt --check`, clippy with warnings denied, tests; optionally `cargo doc` and boundary checks; hooks and test-container cleanup |
+| `cargo sekvent gate` | `fmt --check`, clippy with warnings denied, tests; optionally `cargo doc`, boundary checks and the contract check; hooks and test-container cleanup |
 | `cargo sekvent check` / `clippy` / `test [-- args]` | One step of the gate over the same package selection |
 | `cargo sekvent coverage [--lcov PATH] [--misses PACKAGE]` | Instrumented tests and per-package line coverage floors |
 | `cargo sekvent boundaries` | Check `[[gate.boundaries]]` against the dependency graph |
+| `cargo sekvent contract emit\|check [service…]` | Write component contract baselines from the protos, or check the protos against them for wire-breaking changes (no Rust build, no `protoc`) |
 | `cargo sekvent harness-clean --run ID \| --stale \| --all --yes` | Remove leftover test containers of the label namespace |
 | `cargo sekvent run [task] [args]` | Run a `[tasks.<name>]`; without a name, list them |
 | `cargo sekvent ci generate github\|bitbucket [--force]` | Render the gate-only CI template |
@@ -174,12 +176,13 @@ Only directories whose name starts with `sekvent` are written or replaced.
 
 A component is a trait with a protobuf contract. Callers hold a generated
 handle and never know whether the implementation runs in the same task,
-behind a serialization boundary or (later) in another service; the binding
-is chosen by configuration when the App is built. Milestone C1 is
-implemented: `local` and `local-serialized` bindings, a fail-closed App
-builder with constructor injection, lifecycle hooks with draining, and
-per-method deadlines and bulkheads. gRPC transport, retries and queues
-follow in later milestones.
+behind a serialization boundary or in another service; the binding is
+chosen by configuration when the App is built. Milestones C1 and C2 are
+implemented: `local`, `local-serialized` and `grpc` bindings, a fail-closed
+App builder with constructor injection, lifecycle hooks with draining,
+per-method deadlines and bulkheads, and — on the `grpc` binding — link
+authentication, budgeted retries of idempotent methods, a circuit breaker
+per remote component and named policies. Queues follow in later milestones.
 
 ```rust
 use sekvent::prelude::*;
@@ -193,7 +196,7 @@ pub enum InventoryError {
     Other(AppError),
 }
 
-#[sekvent::component(name = "inventory", package = "shop.inventory.v1")]
+#[sekvent::component(name = "inventory", package = "shop.inventory.v1", proto = "crate::proto::shop::inventory::v1")]
 pub trait Inventory: Send + Sync + 'static {
     /// Reserve stock for an order.
     #[call(idempotent, timeout = "2s", bulkhead = 16)]
@@ -209,12 +212,25 @@ let app = builder.build()?;          // SEKVENT_COMPONENT_BINDING=local-serializ
 app.start().await?;
 ```
 
-Enable it with the facade feature `component` (plus `runtime` for
-`App::register`, which runs every component as one runtime unit). The
-design is in [docs/component-model.md](docs/component-model.md), the C1
-specification in [docs/design/component-c1.md](docs/design/component-c1.md),
-and [examples/shop](examples/shop) is a complete three-component example
-whose tests run under both local bindings.
+The trait's `.proto` declares `service Inventory { rpc Reserve(…) … }`, and
+`proto = "…"` makes the macro check the trait against it at compile time.
+Moving inventory into its own service is configuration: the service sets
+`SEKVENT_COMPONENT_INVENTORY_SERVE=grpc` and mounts `app.grpc_routes()` on
+its `sekvent-runtime` server; callers set
+`SEKVENT_COMPONENT_INVENTORY_BINDING=grpc`, `…_ENDPOINT=http://host:port`
+and a link token. `cargo sekvent contract check` keeps the protos
+wire-compatible with committed baselines.
+
+Enable it with the facade feature `component` (plus `component-grpc` for
+the `grpc` binding and serving, and `runtime` for `App::register`, which
+runs every component as one runtime unit). The design is in
+[docs/component-model.md](docs/component-model.md), the specifications in
+[docs/design/component-c1.md](docs/design/component-c1.md) and
+[docs/design/component-c2.md](docs/design/component-c2.md), and
+[examples/shop](examples/shop) is a complete three-component example whose
+tests run under `monolith-local`, `monolith-serialized` and a `split-grpc`
+topology where inventory runs as its own service
+([split topology](examples/shop/README.md#split-topology)).
 
 ## License
 

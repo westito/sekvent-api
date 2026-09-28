@@ -1,8 +1,8 @@
 use prost_build::{Service, ServiceGenerator};
 
 /// Runs several service generators in order, each appending to the same
-/// buffer. This is how tonic's stubs and any extra hook (for example future
-/// component codegen) share one prost pass.
+/// buffer. This is how the component service contracts, tonic's stubs and
+/// any extra hook share one prost pass.
 pub(crate) struct Chain {
     generators: Vec<Box<dyn ServiceGenerator>>,
 }

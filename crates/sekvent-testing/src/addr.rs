@@ -1,5 +1,5 @@
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use std::fmt::Write as _;
-
 use testcontainers::core::ContainerPort;
 use testcontainers::{ContainerAsync, Image};
 
@@ -53,6 +53,7 @@ pub fn resolve_host(override_value: Option<&str>, reported: &str) -> String {
 
 /// `scheme://user:password@host:port/path`, with the user info
 /// percent-encoded.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 pub(crate) fn server_url(
     scheme: &str,
     user: &str,
@@ -68,6 +69,7 @@ pub(crate) fn server_url(
     )
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 fn encode_userinfo(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -109,6 +111,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
     fn urls_encode_user_info() {
         assert_eq!(
             server_url("postgres", "app", "p@ss:w/rd", "db.test", 5432, "orders"),

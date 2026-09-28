@@ -8,21 +8,23 @@ use std::time::Duration;
 
 use sekvent_context::CallContext;
 use sekvent_error::AppError;
-use sekvent_resilience::{Bulkhead, Timeout};
+use sekvent_resilience::{Bulkhead, PolicySpec, Timeout};
 use tokio::sync::Notify;
 
 use crate::{ComponentDescriptor, ComponentState, reasons};
 
 /// The resolved policy of one method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct MethodPolicy {
     /// Time limit of one call; `None` leaves only the caller's deadline.
     pub(crate) timeout: Option<Duration>,
-    /// Cap on concurrent calls; `None` for no cap.
-    pub(crate) bulkhead: Option<u32>,
+    /// Every resolved field (4.3): the bulkhead for the serving side, the
+    /// retries for a remote caller.
+    pub(crate) spec: PolicySpec,
 }
 
-/// One installed, in-process component.
+/// The gate of one installed component and, when it runs in this process,
+/// its serving-side bulkheads.
 #[derive(Debug)]
 pub(crate) struct Server {
     descriptor: &'static ComponentDescriptor,
@@ -32,7 +34,7 @@ pub(crate) struct Server {
 
 #[derive(Debug)]
 struct MethodRuntime {
-    policy: MethodPolicy,
+    timeout: Option<Duration>,
     bulkhead: Option<Bulkhead>,
 }
 
@@ -74,13 +76,23 @@ const fn state_of(code: u8) -> ComponentState {
 
 impl Server {
     /// A server in [`ComponentState::NotStarted`]; `policies` holds one
-    /// entry per method of `descriptor`, in order.
-    pub(crate) fn new(descriptor: &'static ComponentDescriptor, policies: &[MethodPolicy]) -> Self {
+    /// entry per method of `descriptor`, in order. A `remote` component's
+    /// gate has no bulkheads: they belong to the process that serves it.
+    pub(crate) fn new(
+        descriptor: &'static ComponentDescriptor,
+        policies: &[MethodPolicy],
+        remote: bool,
+    ) -> Self {
         let methods = policies
             .iter()
             .map(|policy| MethodRuntime {
-                policy: *policy,
-                bulkhead: policy.bulkhead.and_then(|size| Bulkhead::new(size).ok()),
+                timeout: policy.timeout,
+                // Validated while resolving the configuration.
+                bulkhead: if remote {
+                    None
+                } else {
+                    policy.spec.build_bulkhead().ok().flatten()
+                },
             })
             .collect();
         Self {
@@ -98,13 +110,9 @@ impl Server {
         self.descriptor
     }
 
-    /// The resolved policy of method `method`; the default for an unknown
-    /// index.
-    pub(crate) fn policy(&self, method: usize) -> MethodPolicy {
-        self.methods
-            .get(method)
-            .map(|runtime| runtime.policy)
-            .unwrap_or_default()
+    /// The resolved timeout of method `method`; `None` for an unknown index.
+    pub(crate) fn timeout(&self, method: usize) -> Option<Duration> {
+        self.methods.get(method).and_then(|runtime| runtime.timeout)
     }
 
     pub(crate) fn state(&self) -> ComponentState {
@@ -260,16 +268,21 @@ mod tests {
     const INVENTORY: &ComponentDescriptor =
         &ComponentDescriptor::new("inventory", "Inventory", METHODS);
 
+    fn policy(timeout: Option<Duration>, bulkhead: Option<u32>) -> MethodPolicy {
+        let mut spec = PolicySpec::default();
+        spec.timeout = timeout;
+        spec.bulkhead_max_concurrent = bulkhead;
+        MethodPolicy { timeout, spec }
+    }
+
     fn server(bulkhead: Option<u32>) -> Server {
         Server::new(
             INVENTORY,
             &[
-                MethodPolicy {
-                    timeout: Some(Duration::from_secs(1)),
-                    bulkhead,
-                },
+                policy(Some(Duration::from_secs(1)), bulkhead),
                 MethodPolicy::default(),
             ],
+            false,
         )
     }
 
@@ -301,11 +314,45 @@ mod tests {
     #[test]
     fn policies_by_index() {
         let server = server(Some(2));
-        assert_eq!(server.policy(0).timeout, Some(Duration::from_secs(1)));
-        assert_eq!(server.policy(0).bulkhead, Some(2));
-        assert_eq!(server.policy(1), MethodPolicy::default());
-        assert_eq!(server.policy(9), MethodPolicy::default());
+        assert_eq!(server.timeout(0), Some(Duration::from_secs(1)));
+        assert_eq!(
+            server.methods[0]
+                .bulkhead
+                .as_ref()
+                .map(Bulkhead::max_concurrent),
+            Some(2)
+        );
+        assert_eq!(server.timeout(1), None);
+        assert!(server.methods[1].bulkhead.is_none());
+        assert_eq!(server.timeout(9), None);
         assert_eq!(server.descriptor().name(), "inventory");
+    }
+
+    #[test]
+    fn a_remote_gate_has_no_bulkheads() {
+        let remote = Server::new(
+            INVENTORY,
+            &[policy(None, Some(2)), MethodPolicy::default()],
+            true,
+        );
+        assert!(
+            remote
+                .methods
+                .iter()
+                .all(|method| method.bulkhead.is_none())
+        );
+    }
+
+    #[test]
+    fn bulkheads_keep_their_queue_settings() {
+        let mut queued = policy(None, Some(1));
+        queued.spec.bulkhead_max_queue = Some(1);
+        queued.spec.bulkhead_queue_timeout = Some(Duration::from_secs(1));
+        let server = Server::new(INVENTORY, &[queued, MethodPolicy::default()], false);
+        assert_eq!(
+            server.methods[0].bulkhead.as_ref().map(Bulkhead::max_queue),
+            Some(1)
+        );
     }
 
     #[tokio::test]

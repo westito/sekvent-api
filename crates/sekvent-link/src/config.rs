@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use sekvent_config::{ConfigError, ConfigSource, Secret};
 
-use crate::token::validate_token;
+use crate::token::{same_token, validate_token};
 use crate::{BearerInjector, InboundLink, LinkError, TokenMap};
 
 /// Prefix of inbound token keys: `SEKVENT_LINK_INBOUND_<NAME>`.
@@ -12,6 +12,16 @@ pub const INBOUND_PREFIX: &str = "SEKVENT_LINK_INBOUND_";
 pub const OUTBOUND_PREFIX: &str = "SEKVENT_LINK_OUTBOUND_";
 /// Comma-separated names of the inbound links that are trusted.
 pub const TRUSTED_KEY: &str = "SEKVENT_LINK_TRUSTED";
+
+/// `SEKVENT_LINK_INBOUND_<LINK>` (upper-cased).
+pub fn inbound_key(link: &str) -> String {
+    format!("{INBOUND_PREFIX}{}", link.to_ascii_uppercase())
+}
+
+/// `SEKVENT_LINK_OUTBOUND_<LINK>` (upper-cased).
+pub fn outbound_key(link: &str) -> String {
+    format!("{OUTBOUND_PREFIX}{}", link.to_ascii_uppercase())
+}
 
 /// Service-link configuration read from a [`ConfigSource`].
 ///
@@ -129,8 +139,40 @@ impl LinkConfig {
     /// the expected key.
     pub fn require_outbound(&self, name: &str) -> Result<&BearerInjector, ConfigError> {
         self.outbound(name).ok_or_else(|| ConfigError::Missing {
-            key: format!("{OUTBOUND_PREFIX}{}", name.to_ascii_uppercase()),
+            key: outbound_key(name),
         })
+    }
+
+    /// Fail when two link keys (inbound or outbound) hold the same token, so
+    /// that no token serves two purposes in one process.
+    ///
+    /// [`LinkError::DuplicateToken`] names the two links as `inbound/<link>`
+    /// or `outbound/<link>`, never the token; inbound links come first, then
+    /// outbound ones, each in name order. Tokens are compared in constant
+    /// time, like [`validate_unique`](crate::validate_unique).
+    pub fn check_distinct_tokens(&self) -> Result<(), LinkError> {
+        let links: Vec<(String, &Secret)> = self
+            .inbound
+            .tokens()
+            .map(|(name, token)| (format!("inbound/{name}"), token))
+            .chain(
+                self.outbound
+                    .iter()
+                    .map(|(name, injector)| (format!("outbound/{name}"), injector.token())),
+            )
+            .collect();
+        for (position, (first, left)) in links.iter().enumerate() {
+            if let Some((second, _)) = links[position + 1..]
+                .iter()
+                .find(|(_, right)| same_token(left, right))
+            {
+                return Err(LinkError::DuplicateToken {
+                    first: first.clone(),
+                    second: second.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Names of the configured outbound links.
@@ -365,6 +407,62 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_no_token(&[error]);
+    }
+
+    #[test]
+    fn link_keys_are_upper_cased() {
+        assert_eq!(inbound_key("billing"), "SEKVENT_LINK_INBOUND_BILLING");
+        assert_eq!(inbound_key("Order_2"), "SEKVENT_LINK_INBOUND_ORDER_2");
+        assert_eq!(outbound_key("shipping"), "SEKVENT_LINK_OUTBOUND_SHIPPING");
+        assert_eq!(outbound_key("SHIPPING"), "SEKVENT_LINK_OUTBOUND_SHIPPING");
+    }
+
+    #[test]
+    fn distinct_tokens_pass_the_check() {
+        let source = MapSource::new()
+            .with("SEKVENT_LINK_INBOUND_BILLING", BILLING)
+            .with("SEKVENT_LINK_INBOUND_ORDERS", ORDERS)
+            .with("SEKVENT_LINK_OUTBOUND_SHIPPING", SHIPPING);
+        let config = LinkConfig::from_source(&source).unwrap();
+        assert_eq!(config.check_distinct_tokens(), Ok(()));
+        let empty = LinkConfig::from_source(&MapSource::new()).unwrap();
+        assert_eq!(empty.check_distinct_tokens(), Ok(()));
+    }
+
+    #[test]
+    fn an_inbound_token_reused_outbound_is_refused() {
+        let source = MapSource::new()
+            .with("SEKVENT_LINK_INBOUND_BILLING", BILLING)
+            .with("SEKVENT_LINK_INBOUND_ORDERS", ORDERS)
+            .with("SEKVENT_LINK_OUTBOUND_SHIPPING", ORDERS);
+        let config = LinkConfig::from_source(&source).unwrap();
+        let error = config.check_distinct_tokens().unwrap_err();
+        assert_eq!(
+            error,
+            LinkError::DuplicateToken {
+                first: "inbound/orders".into(),
+                second: "outbound/shipping".into(),
+            }
+        );
+        assert!(!error.to_string().contains(ORDERS), "{error}");
+    }
+
+    #[test]
+    fn two_outbound_links_sharing_a_token_are_refused() {
+        let source = MapSource::new()
+            .with("SEKVENT_LINK_INBOUND_BILLING", BILLING)
+            .with("SEKVENT_LINK_OUTBOUND_SHIPPING", SHIPPING)
+            .with("SEKVENT_LINK_OUTBOUND_ORDERS", SHIPPING);
+        let config = LinkConfig::from_source(&source).unwrap();
+        let error = config.check_distinct_tokens().unwrap_err();
+        assert_eq!(
+            error,
+            LinkError::DuplicateToken {
+                first: "outbound/orders".into(),
+                second: "outbound/shipping".into(),
+            }
+        );
+        assert!(!error.to_string().contains(SHIPPING), "{error}");
     }
 
     #[test]

@@ -126,6 +126,14 @@ impl TokenMap {
         self.entries.is_empty()
     }
 
+    /// Each link's name and token, in insertion order, for comparisons inside
+    /// this crate only.
+    pub(crate) fn tokens(&self) -> impl Iterator<Item = (&str, &Secret)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.identity.name.as_str(), &entry.token))
+    }
+
     /// The identities of all links, in insertion order.
     pub fn identities(&self) -> impl Iterator<Item = &ServiceIdentity> {
         self.entries.iter().map(|entry| &entry.identity)
@@ -196,7 +204,7 @@ pub fn validate_unique(maps: &[(&str, &TokenMap)]) -> Result<(), LinkError> {
     Ok(())
 }
 
-fn same_token(left: &Secret, right: &Secret) -> bool {
+pub(crate) fn same_token(left: &Secret, right: &Secret) -> bool {
     bool::from(left.expose().as_bytes().ct_eq(right.expose().as_bytes()))
 }
 

@@ -1,4 +1,5 @@
-//! Generates the message types of `shop.inventory.v1` from `proto/`.
+//! Generates the message types of `shop.inventory.v1` and its service contract
+//! constant (checked by `#[component(proto = …)]`) from `proto/`.
 
 fn main() {
     sekvent_proto_build::ProtoBuild::new("proto")

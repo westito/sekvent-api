@@ -1,8 +1,20 @@
 syntax = "proto3";
 
-// Messages of the inventory component. The component itself is declared in
-// Rust (`inventory_api::Inventory`); this file only defines what travels.
+// Contract of the inventory component: the service and every message it
+// carries. The Rust trait `inventory_api::Inventory` is checked against the
+// service at compile time, so the two cannot drift apart.
 package shop.inventory.v1;
+
+// Stock and reservations.
+service Inventory {
+  // Reserve stock for an order; reserving again for the same order returns
+  // the existing reservation.
+  rpc Reserve(ReserveRequest) returns (ReserveReply);
+  // Release a reservation, giving its units back.
+  rpc Release(ReleaseRequest) returns (ReleaseReply);
+  // How many units of a SKU are available.
+  rpc Stock(StockRequest) returns (StockReply);
+}
 
 // Reserve `quantity` units of `sku` for an order.
 message ReserveRequest {

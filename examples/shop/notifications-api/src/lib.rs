@@ -6,7 +6,8 @@
 
 #![forbid(unsafe_code)]
 
-/// Messages of the `shop.notifications.v1` package.
+/// Messages of the `shop.notifications.v1` package and the contract of its
+/// `Notifications` service.
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/sekvent_protos.rs"));
 }
@@ -32,7 +33,11 @@ pub enum NotificationsError {
 }
 
 /// Customer notifications about orders.
-#[sekvent::component(name = "notifications", package = "shop.notifications.v1")]
+#[sekvent::component(
+    name = "notifications",
+    package = "shop.notifications.v1",
+    proto = "crate::proto::shop::notifications::v1"
+)]
 pub trait Notifications: Send + Sync + 'static {
     /// Notify a customer about an order.
     #[call(timeout = "1s")]

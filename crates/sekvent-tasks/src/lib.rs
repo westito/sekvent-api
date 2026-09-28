@@ -18,9 +18,10 @@
 //!
 //! Commands that write into the source tree (`new`, `init`, `add`, `deps
 //! sync`, `ci generate`, `agents`, `skills install`, `self-update`, `sdk
-//! update`) always run locally, as do the read-only `deps check`,
-//! `sdk status`, `config show` and `boundaries` (it only reads
-//! `cargo metadata`).
+//! update`, `contract emit`) always run locally, as do the read-only `deps
+//! check`, `sdk status`, `config show`, `boundaries` (it only reads `cargo
+//! metadata`) and `contract check` (it compiles protos in-process, not
+//! Rust).
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +29,7 @@ pub mod agents;
 pub mod boundaries;
 pub mod config;
 pub mod context;
+pub mod contract;
 pub mod coverage;
 pub mod deps;
 pub mod dispatch;

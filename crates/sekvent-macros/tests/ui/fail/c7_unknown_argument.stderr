@@ -1,4 +1,4 @@
-error: unknown component argument `colour`; expected name, package, local_only, remote_only or crate
+error: unknown component argument `colour`; expected name, package, proto, local_only, remote_only or crate
  --> tests/ui/fail/c7_unknown_argument.rs:1:74
   |
 1 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", colour = "red")]

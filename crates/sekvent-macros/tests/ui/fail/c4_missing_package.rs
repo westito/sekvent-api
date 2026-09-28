@@ -1,4 +1,4 @@
-#[sekvent_component::component(name = "echo")]
+#[sekvent_component::component(name = "echo", proto = "crate::proto")]
 pub trait Echo {
     #[call]
     async fn ping(

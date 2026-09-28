@@ -5,8 +5,8 @@ use quote::quote;
 use syn::{DeriveInput, parse_quote};
 
 use super::parse::{
-    borrows_or_impl, bulkhead_value, is_component_name, is_package, is_snake_name, rpc_name,
-    timeout_value,
+    borrows_or_impl, bulkhead_value, is_component_name, is_package, is_snake_name, proto_path,
+    rpc_name, timeout_value,
 };
 
 fn runtime() -> TokenStream {
@@ -18,7 +18,11 @@ fn compact(text: &str) -> String {
 }
 
 fn standard_args() -> TokenStream {
-    quote!(name = "echo", package = "check.echo.v1")
+    quote!(
+        name = "echo",
+        package = "check.echo.v1",
+        proto = "crate::proto"
+    )
 }
 
 fn ping() -> TokenStream {
@@ -93,7 +97,11 @@ fn component_error_snapshot(name: &str, input: &DeriveInput) {
 fn snapshot_standard() {
     component_snapshot(
         "component__standard",
-        quote!(name = "inventory", package = "shop.inventory.v1"),
+        quote!(
+            name = "inventory",
+            package = "shop.inventory.v1",
+            proto = "crate::proto::shop::inventory::v1"
+        ),
         quote! {
             pub trait Inventory: Send + Sync + 'static {
                 /// Reserve stock for an order.
@@ -133,7 +141,12 @@ fn snapshot_local_only() {
 fn snapshot_remote_only() {
     component_snapshot(
         "component__remote_only",
-        quote!(name = "ledger", package = "shop.ledger.v1", remote_only),
+        quote!(
+            name = "ledger",
+            package = "shop.ledger.v1",
+            proto = "::ledger_api::proto::shop::ledger::v1",
+            remote_only
+        ),
         quote! {
             pub(crate) trait Ledger: Send {
                 /// Record an entry.
@@ -354,7 +367,12 @@ fn missing_supertraits_are_added() {
 fn an_explicit_crate_path_replaces_the_runtime_path() {
     let ping = ping();
     let out = match super::expand(
-        quote!(name = "echo", package = "check.echo.v1", crate = "::fw"),
+        quote!(
+            name = "echo",
+            package = "check.echo.v1",
+            proto = "crate::proto",
+            crate = "::fw"
+        ),
         quote!(pub trait Echo { #ping }),
         || panic!("the manifest is not consulted"),
     ) {
@@ -367,6 +385,8 @@ fn an_explicit_crate_path_replaces_the_runtime_path() {
         "impl::fw::ComponentHandleforEchoHandle",
         "impl::fw::__private::Dispatchfor__EchoDispatcher",
         "::fw::__private::assert_wire::<PingRequest>();",
+        "::fw::__private::assert_service(",
+        "::fw::__private::assert_rpc::<PingRequest,PingReply>(",
     ] {
         assert!(out.contains(needle), "missing `{needle}` in {out}");
     }
@@ -439,7 +459,12 @@ fn local_only_descriptors() {
 fn remote_only_has_no_local_install() {
     let ping = ping();
     let out = expand_ok(
-        quote!(name = "echo", package = "check.echo.v1", remote_only),
+        quote!(
+            name = "echo",
+            package = "check.echo.v1",
+            proto = "crate::proto",
+            remote_only
+        ),
         quote!(pub trait Echo { #ping }),
     );
     assert!(
@@ -450,6 +475,203 @@ fn remote_only_has_no_local_install() {
     assert!(!out.contains("install_with_lifecycle"), "{out}");
     assert!(out.contains("impl::sekvent_component::__private::Dispatchfor__EchoDispatcher"));
     assert!(out.contains(".with_mode(::sekvent_component::ComponentMode::RemoteOnly)"));
+    assert!(
+        out.contains(
+            "const_:()=::sekvent_component::__private::assert_service(\
+             crate::proto::__sekvent_service_Echo,\"check.echo.v1.Echo\",1usize,);"
+        ),
+        "{out}"
+    );
+}
+
+// --- contract (proto) -------------------------------------------------------
+
+#[test]
+fn the_contract_checks_every_method_against_the_proto_service() {
+    let out = expand_ok(
+        quote!(
+            name = "orders",
+            package = "shop.orders.v1",
+            proto = "::orders_api::proto::shop::orders::v1"
+        ),
+        quote! {
+            pub trait Orders {
+                #[call]
+                async fn place_order(&self, cx: &CallContext, req: PlaceOrderRequest)
+                    -> Result<PlaceOrderReply, AppError>;
+                #[call(idempotent)]
+                async fn get(&self, cx: &CallContext, req: common::Id)
+                    -> Result<::orders_api::Order, AppError>;
+            }
+        },
+    );
+    let service = "::orders_api::proto::shop::orders::v1::__sekvent_service_Orders";
+    for needle in [
+        format!(
+            "const_:()=::sekvent_component::__private::assert_service({service},\
+             \"shop.orders.v1.Orders\",2usize,);"
+        ),
+        format!(
+            "const_:()=::sekvent_component::__private::assert_rpc::<PlaceOrderRequest,\
+             PlaceOrderReply>({service},\"PlaceOrder\",);"
+        ),
+        format!(
+            "const_:()=::sekvent_component::__private::assert_rpc::<common::Id,\
+             ::orders_api::Order>({service},\"Get\",);"
+        ),
+    ] {
+        assert!(out.contains(&needle), "missing `{needle}` in {out}");
+    }
+}
+
+#[test]
+fn the_contract_follows_the_assertions_and_uses_the_bare_trait_name() {
+    let ping = ping();
+    let out = expand_ok(
+        quote!(
+            name = "echo",
+            package = "check.echo.v1",
+            proto = "super::pb"
+        ),
+        quote!(pub trait r#Echo { #ping }),
+    );
+    let assertions = out
+        .find("assert_wire::<PingRequest>")
+        .unwrap_or_else(|| panic!("no assertions in {out}"));
+    let service = out
+        .find("assert_service(super::pb::__sekvent_service_Echo,\"check.echo.v1.Echo\"")
+        .unwrap_or_else(|| panic!("no contract in {out}"));
+    assert!(assertions < service, "{out}");
+}
+
+#[test]
+fn local_only_has_no_contract() {
+    let out = expand_ok(
+        quote!(name = "notes", package = "a.v1", local_only),
+        quote! {
+            trait Notes {
+                #[call]
+                async fn add(&self, cx: &CallContext, req: String) -> Result<usize, AppError>;
+            }
+        },
+    );
+    assert!(!out.contains("assert_service"), "{out}");
+    assert!(!out.contains("assert_rpc"), "{out}");
+    assert!(!out.contains("__sekvent_service_"), "{out}");
+}
+
+#[test]
+fn proto_paths_are_module_paths() {
+    let parse = |text: &str| {
+        proto_path(&syn::LitStr::new(text, proc_macro2::Span::call_site()))
+            .map(|path| compact(&quote!(#path).to_string()))
+            .map_err(|error| error.to_string())
+    };
+    for (text, parsed) in [
+        (
+            "crate::proto::shop::inventory::v1",
+            "crate::proto::shop::inventory::v1",
+        ),
+        ("::inventory_api::proto", "::inventory_api::proto"),
+        ("super::proto", "super::proto"),
+        ("self::pb", "self::pb"),
+        ("proto", "proto"),
+        (" crate :: proto ", "crate::proto"),
+    ] {
+        assert_eq!(parse(text), Ok(parsed.to_owned()), "{text}");
+    }
+    let bad = "proto must be a module path such as \"crate::proto::shop::inventory::v1\"";
+    for text in [
+        "",
+        "crate::",
+        "crate::proto::",
+        "crate::proto::Service<T>",
+        "crate::proto::{a, b}",
+        "shop.inventory.v1",
+        "crate proto",
+        "1proto",
+        "crate::proto; fn x() {}",
+    ] {
+        assert_eq!(parse(text), Err(bad.to_owned()), "{text:?}");
+    }
+}
+
+#[test]
+fn c13_to_c15_proto_errors() {
+    let ping = ping();
+    let item = quote!(pub trait Echo { #ping });
+    let missing = "missing `proto = \"...\"`: the module generated for the component's proto \
+                   package, such as \"crate::proto::shop::inventory::v1\"; only a local_only \
+                   component may omit it";
+    let on_local_only = "a local_only component has no contract; remove `proto`";
+    let bad = "proto must be a module path such as \"crate::proto::shop::inventory::v1\"";
+    let cases = [
+        (quote!(name = "echo", package = "check.echo.v1"), missing),
+        (
+            quote!(name = "echo", package = "check.echo.v1", remote_only),
+            missing,
+        ),
+        (
+            quote!(name = "echo", proto = "crate::proto", local_only),
+            on_local_only,
+        ),
+        (
+            quote!(
+                name = "echo",
+                package = "check.echo.v1",
+                proto = "check.echo.v1"
+            ),
+            bad,
+        ),
+        (
+            quote!(
+                name = "echo",
+                package = "check.echo.v1",
+                proto = "crate::proto<u8>"
+            ),
+            bad,
+        ),
+        (
+            quote!(
+                name = "echo",
+                package = "check.echo.v1",
+                proto = "crate::proto",
+                proto = "x"
+            ),
+            "duplicate component argument `proto`",
+        ),
+    ];
+    for (args, expected) in cases {
+        assert_error(args, item.clone(), expected);
+    }
+    let all = messages(
+        quote!(
+            name = "echo",
+            package = "check.echo.v1",
+            proto = crate::proto
+        ),
+        item,
+    );
+    assert!(
+        all.iter()
+            .any(|message| message.contains("expected string literal")),
+        "{all:?}"
+    );
+}
+
+#[test]
+fn a_missing_proto_is_the_only_error_of_an_otherwise_valid_component() {
+    let ping = ping();
+    let all = messages(
+        quote!(name = "echo", package = "check.echo.v1"),
+        quote!(pub trait Echo { #ping }),
+    );
+    assert_eq!(all.len(), 1, "{all:?}");
+    let all = messages(
+        quote!(name = "notes", proto = "crate::proto", local_only),
+        quote!(pub trait Notes { #ping }),
+    );
+    assert_eq!(all.len(), 1, "{all:?}");
 }
 
 // --- argument errors (C1-C7) -----------------------------------------------
@@ -502,7 +724,7 @@ fn c2_to_c7_argument_errors() {
         ),
         (
             quote!(name = "echo", colour = "red"),
-            "unknown component argument `colour`; expected name, package, local_only, remote_only or crate",
+            "unknown component argument `colour`; expected name, package, proto, local_only, remote_only or crate",
         ),
         (
             quote!(name = "echo", name = "other"),
@@ -886,7 +1108,7 @@ fn m20_m21_method_names() {
 #[test]
 fn independent_errors_are_combined() {
     let all = messages(
-        quote!(name = "Bad", package = "Bad"),
+        quote!(name = "Bad", package = "Bad", proto = "crate::proto"),
         quote! {
             pub trait Echo<T>: Clone {
                 type Item;

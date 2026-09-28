@@ -14,6 +14,8 @@ default = ["macros"]
 macros = ["dep:sekvent-macros"]
 # `App::register`: run all components as one sekvent-runtime unit.
 runtime = ["dep:sekvent-runtime"]
+# The `grpc` binding and serving components over gRPC.
+grpc = ["dep:sekvent-link", "dep:tonic", "dep:axum", "dep:http-body", "dep:tower", "sekvent-error/grpc"]
 
 [dependencies]
 sekvent-config = { workspace = true }
@@ -21,6 +23,7 @@ sekvent-error = { workspace = true }
 sekvent-context = { workspace = true }
 sekvent-resilience = { workspace = true }
 sekvent-macros = { workspace = true, optional = true }
+sekvent-link = { workspace = true, optional = true }
 # Path, not workspace: keeps sekvent-runtime's default grpc-web feature off.
 sekvent-runtime = { path = "../sekvent-runtime", default-features = false, optional = true }
 bytes = { workspace = true }
@@ -29,10 +32,20 @@ prost = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tonic = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
 
 [dev-dependencies]
-sekvent-component = { path = ".", features = ["runtime"] }
+sekvent-component = { path = ".", features = ["runtime", "grpc"] }
 tokio = { workspace = true, features = ["test-util"] }
+# The interop client.
+tonic-prost = { workspace = true }
+# Reading standard error details in the interop test.
+tonic-types = { workspace = true }
+# Health client in the serving tests.
+tonic-health = { workspace = true }
 
 [lints]
 workspace = true

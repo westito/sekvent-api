@@ -1,8 +1,16 @@
 syntax = "proto3";
 
-// Messages of the notifications component. The component itself is declared
-// in Rust (`notifications_api::Notifications`).
+// Contract of the notifications component, checked against the Rust trait
+// `notifications_api::Notifications` at compile time.
 package shop.notifications.v1;
+
+// Customer notifications about orders.
+service Notifications {
+  // Notify a customer about an order.
+  rpc Notify(NotifyRequest) returns (NotifyReply);
+  // The notifications sent to a customer, oldest first.
+  rpc Sent(SentRequest) returns (SentReply);
+}
 
 // Notify a customer about an order, using a named template.
 message NotifyRequest {

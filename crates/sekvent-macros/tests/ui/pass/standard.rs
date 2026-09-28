@@ -13,10 +13,42 @@ pub struct PingRequest {
     pub text: String,
 }
 
+impl prost::Name for PingRequest {
+    const NAME: &'static str = "PingRequest";
+    const PACKAGE: &'static str = "check.echo.v1";
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct PingReply {
     #[prost(string, tag = "1")]
     pub text: String,
+}
+
+impl prost::Name for PingReply {
+    const NAME: &'static str = "PingReply";
+    const PACKAGE: &'static str = "check.echo.v1";
+}
+
+/// The contract sekvent-proto-build would generate for `check.echo.v1`.
+mod proto {
+    #[allow(non_upper_case_globals)]
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+        "check.echo.v1.Echo",
+        &[
+            (
+                "Ping",
+                "check.echo.v1.PingRequest",
+                "check.echo.v1.PingReply",
+                false,
+            ),
+            (
+                "Twice",
+                "check.echo.v1.PingRequest",
+                "check.echo.v1.PingReply",
+                false,
+            ),
+        ],
+    );
 }
 
 #[derive(Debug, ComponentError)]
@@ -31,7 +63,7 @@ pub enum EchoError {
 }
 
 /// Echoes text back.
-#[component(name = "echo", package = "check.echo.v1")]
+#[component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
 pub trait Echo {
     /// Return the request text.
     #[call(idempotent, timeout = "1s", bulkhead = 4)]

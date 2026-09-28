@@ -1,0 +1,5 @@
+error: a local_only component has no contract; remove `proto`
+ --> tests/ui/fail/c14_proto_on_local_only.rs:1:68
+  |
+1 | #[sekvent_component::component(name = "notes", local_only, proto = "crate::proto")]
+  |                                                                    ^^^^^^^^^^^^^^

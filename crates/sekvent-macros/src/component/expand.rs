@@ -27,6 +27,7 @@ pub(crate) fn generate(args: &Args, component: &Component, krate: &TokenStream) 
     let descriptor = descriptor(args, component, &names, krate);
     let dispatcher = (args.mode != Mode::LocalOnly).then(|| dispatcher(component, &names, krate));
     let assertions = assertions(args.mode, component, krate);
+    let contract = contract(args, component, krate);
     quote! {
         #definition
         #object
@@ -34,6 +35,7 @@ pub(crate) fn generate(args: &Args, component: &Component, krate: &TokenStream) 
         #descriptor
         #dispatcher
         #assertions
+        #contract
     }
 }
 
@@ -395,6 +397,40 @@ fn assertions(mode: Mode, component: &Component, krate: &TokenStream) -> TokenSt
         const _: () = {
             #(#checks)*
         };
+    }
+}
+
+/// The checks tying the trait to the `__sekvent_service_<Trait>` constant
+/// sekvent-proto-build emitted into the `proto` module; nothing for a
+/// `local_only` component, which has no `proto`.
+fn contract(args: &Args, component: &Component, krate: &TokenStream) -> TokenStream {
+    let (Some(proto), Some(package)) = (&args.proto, &args.package) else {
+        return TokenStream::new();
+    };
+    let service_name = component.ident.unraw().to_string();
+    let constant = format_ident!("__sekvent_service_{}", service_name);
+    let full_name = format!("{package}.{service_name}");
+    let count = component.methods.len();
+    let service = quote_spanned! {component.ident.span()=>
+        const _: () = #krate::__private::assert_service(
+            #proto::#constant,
+            #full_name,
+            #count,
+        );
+    };
+    let rpcs = component.methods.iter().map(|method| {
+        let Method { request, reply, .. } = method;
+        let rpc = rpc_name(&method.ident.to_string());
+        quote_spanned! {method.signature=>
+            const _: () = #krate::__private::assert_rpc::<#request, #reply>(
+                #proto::#constant,
+                #rpc,
+            );
+        }
+    });
+    quote! {
+        #service
+        #(#rpcs)*
     }
 }
 

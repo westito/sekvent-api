@@ -356,82 +356,115 @@ impl PolicySpec {
             self.timeout
                 .map_or_else(Timeout::deadline_only, Timeout::new),
         );
-
-        let attempts = self.retry_max_attempts.unwrap_or(1);
-        if attempts == 0 {
-            return Err(PolicyError::new("retry.max_attempts", "must be at least 1"));
-        }
-        if attempts > 1 {
-            let defaults = Backoff::default();
-            let backoff = Backoff::new(
-                self.retry_initial_backoff.unwrap_or(defaults.initial()),
-                self.retry_max_backoff.unwrap_or(defaults.max()),
-                self.retry_multiplier.unwrap_or(defaults.multiplier()),
-                self.retry_jitter.unwrap_or(defaults.jitter()),
-            )?;
-            let budget = RetryBudget::new(
-                self.retry_budget_ratio.unwrap_or(0.2),
-                self.retry_budget_min_per_sec.unwrap_or(10),
-            )?;
-            let mut retry = RetryPolicy::new(attempts, backoff).with_budget(Arc::new(budget));
-            if let Some(max) = self.retry_max_retry_after {
-                retry = retry.with_max_retry_after(max);
-            }
+        if let Some(retry) = self.build_retry()? {
             policy = policy.with_retry(retry);
         }
-
-        if let Some(max_concurrent) = self.bulkhead_max_concurrent {
-            let queue = self.bulkhead_max_queue.unwrap_or(0);
-            if queue > 0
-                && self
-                    .bulkhead_queue_timeout
-                    .is_some_and(|wait| wait.is_zero())
-            {
-                return Err(PolicyError::new(
-                    "bulkhead.queue_timeout",
-                    "must be longer than zero when bulkhead.max_queue is above zero",
-                ));
-            }
-            let wait = self.bulkhead_queue_timeout.unwrap_or(if queue > 0 {
-                Duration::from_secs(1)
-            } else {
-                Duration::ZERO
-            });
-            policy = policy.with_bulkhead(Arc::new(
-                Bulkhead::new(max_concurrent)?.with_queue(queue, wait),
-            ));
+        if let Some(bulkhead) = self.build_bulkhead()? {
+            policy = policy.with_bulkhead(Arc::new(bulkhead));
         }
-
-        if self
-            .breaker_enabled
-            .unwrap_or(self.breaker_failure_rate.is_some())
-        {
-            let defaults = CircuitBreakerConfig::default();
-            let window = self
-                .breaker_window
-                .map_or(defaults.window, BreakerWindowSpec::to_window);
-            let default_min_calls = match window {
-                BreakerWindow::Count { size } => defaults.min_calls.min(size),
-                BreakerWindow::Time { .. } => defaults.min_calls,
-            };
-            let config = CircuitBreakerConfig {
-                window,
-                failure_rate: self.breaker_failure_rate.unwrap_or(defaults.failure_rate),
-                min_calls: self.breaker_min_calls.unwrap_or(default_min_calls),
-                wait_in_open: self.breaker_wait_in_open.unwrap_or(defaults.wait_in_open),
-                permitted_in_half_open: self
-                    .breaker_permitted_in_half_open
-                    .unwrap_or(defaults.permitted_in_half_open),
-            };
-            policy = policy.with_breaker(Arc::new(CircuitBreaker::new(name, config)?));
+        if let Some(breaker) = self.build_breaker(name)? {
+            policy = policy.with_breaker(Arc::new(breaker));
         }
-
         if let Some(permits) = self.rate_limit_permits {
             let window = self.rate_limit_window.unwrap_or(Duration::from_secs(1));
             policy = policy.with_rate_gate(Arc::new(RateGate::new(permits, window)?));
         }
-
         Ok(policy)
+    }
+
+    /// Retries alone; `None` unless `retry_max_attempts` is above 1.
+    ///
+    /// The policy carries a fresh [`RetryBudget`] built from the budget
+    /// fields; replace it with [`RetryPolicy::with_budget`] to share one
+    /// budget between several policies. A `retry_max_attempts` of 0 is an
+    /// error.
+    pub fn build_retry(&self) -> Result<Option<RetryPolicy>, PolicyError> {
+        let attempts = self.retry_max_attempts.unwrap_or(1);
+        if attempts == 0 {
+            return Err(PolicyError::new("retry.max_attempts", "must be at least 1"));
+        }
+        if attempts == 1 {
+            return Ok(None);
+        }
+        let defaults = Backoff::default();
+        let backoff = Backoff::new(
+            self.retry_initial_backoff.unwrap_or(defaults.initial()),
+            self.retry_max_backoff.unwrap_or(defaults.max()),
+            self.retry_multiplier.unwrap_or(defaults.multiplier()),
+            self.retry_jitter.unwrap_or(defaults.jitter()),
+        )?;
+        let budget = RetryBudget::new(
+            self.retry_budget_ratio.unwrap_or(0.2),
+            self.retry_budget_min_per_sec.unwrap_or(10),
+        )?;
+        let mut retry = RetryPolicy::new(attempts, backoff).with_budget(Arc::new(budget));
+        if let Some(max) = self.retry_max_retry_after {
+            retry = retry.with_max_retry_after(max);
+        }
+        Ok(Some(retry))
+    }
+
+    /// The bulkhead alone; `None` without `bulkhead_max_concurrent`.
+    ///
+    /// A `bulkhead_max_queue` above zero lets that many callers wait, each
+    /// for `bulkhead_queue_timeout` (default one second, and then it must be
+    /// longer than zero).
+    pub fn build_bulkhead(&self) -> Result<Option<Bulkhead>, PolicyError> {
+        let Some(max_concurrent) = self.bulkhead_max_concurrent else {
+            return Ok(None);
+        };
+        let queue = self.bulkhead_max_queue.unwrap_or(0);
+        if queue > 0
+            && self
+                .bulkhead_queue_timeout
+                .is_some_and(|wait| wait.is_zero())
+        {
+            return Err(PolicyError::new(
+                "bulkhead.queue_timeout",
+                "must be longer than zero when bulkhead.max_queue is above zero",
+            ));
+        }
+        let wait = self.bulkhead_queue_timeout.unwrap_or(if queue > 0 {
+            Duration::from_secs(1)
+        } else {
+            Duration::ZERO
+        });
+        Ok(Some(Bulkhead::new(max_concurrent)?.with_queue(queue, wait)))
+    }
+
+    /// The breaker alone, named `name`; `None` unless enabled
+    /// (`breaker_enabled`, or else a `breaker_failure_rate`).
+    ///
+    /// Without an explicit `breaker_min_calls`, a call-count window smaller
+    /// than the default minimum lowers the minimum to the window size.
+    pub fn build_breaker(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Option<CircuitBreaker>, PolicyError> {
+        if !self
+            .breaker_enabled
+            .unwrap_or(self.breaker_failure_rate.is_some())
+        {
+            return Ok(None);
+        }
+        let defaults = CircuitBreakerConfig::default();
+        let window = self
+            .breaker_window
+            .map_or(defaults.window, BreakerWindowSpec::to_window);
+        let default_min_calls = match window {
+            BreakerWindow::Count { size } => defaults.min_calls.min(size),
+            BreakerWindow::Time { .. } => defaults.min_calls,
+        };
+        let config = CircuitBreakerConfig {
+            window,
+            failure_rate: self.breaker_failure_rate.unwrap_or(defaults.failure_rate),
+            min_calls: self.breaker_min_calls.unwrap_or(default_min_calls),
+            wait_in_open: self.breaker_wait_in_open.unwrap_or(defaults.wait_in_open),
+            permitted_in_half_open: self
+                .breaker_permitted_in_half_open
+                .unwrap_or(defaults.permitted_in_half_open),
+        };
+        CircuitBreaker::new(name, config).map(Some)
     }
 }
 
@@ -597,6 +630,7 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use sekvent_config::MapSource;
+    use sekvent_context::CallContext;
 
     use super::*;
 
@@ -1034,5 +1068,192 @@ mod tests {
         };
         assert!(disabled.build("x").unwrap().breaker().is_none());
         assert_eq!(BreakerWindowSpec::Calls(7).to_string(), "7");
+    }
+
+    #[test]
+    fn build_retry_alone() {
+        assert!(PolicySpec::default().build_retry().unwrap().is_none());
+        let single = PolicySpec {
+            retry_max_attempts: Some(1),
+            retry_initial_backoff: Some(secs(10)),
+            retry_max_backoff: Some(secs(1)),
+            ..PolicySpec::default()
+        };
+        assert!(
+            single.build_retry().unwrap().is_none(),
+            "one attempt ignores the other retry fields"
+        );
+
+        let retry = PolicySpec {
+            retry_max_attempts: Some(3),
+            retry_initial_backoff: Some(Duration::from_millis(20)),
+            retry_max_backoff: Some(secs(2)),
+            retry_multiplier: Some(3.0),
+            retry_jitter: Some(Jitter::None),
+            retry_budget_ratio: Some(0.5),
+            retry_budget_min_per_sec: Some(4),
+            retry_max_retry_after: Some(secs(7)),
+            ..PolicySpec::default()
+        }
+        .build_retry()
+        .unwrap()
+        .unwrap();
+        assert_eq!(retry.max_attempts(), 3);
+        assert_eq!(retry.backoff().initial(), Duration::from_millis(20));
+        assert_eq!(retry.backoff().max(), secs(2));
+        assert!((retry.backoff().multiplier() - 3.0).abs() < f64::EPSILON);
+        assert_eq!(retry.backoff().jitter(), Jitter::None);
+        assert!(retry.budget().is_some());
+        assert_eq!(retry.max_retry_after(), secs(7));
+
+        let defaults = PolicySpec {
+            retry_max_attempts: Some(2),
+            ..PolicySpec::default()
+        }
+        .build_retry()
+        .unwrap()
+        .unwrap();
+        assert_eq!(defaults.max_attempts(), 2);
+        assert_eq!(defaults.backoff().initial(), Backoff::default().initial());
+        assert_eq!(
+            defaults.max_retry_after(),
+            RetryPolicy::default().max_retry_after()
+        );
+
+        let error = PolicySpec {
+            retry_max_attempts: Some(0),
+            ..PolicySpec::default()
+        }
+        .build_retry()
+        .unwrap_err();
+        assert_eq!(error.parameter(), "retry.max_attempts");
+        let error = PolicySpec {
+            retry_max_attempts: Some(3),
+            retry_budget_ratio: Some(0.0),
+            retry_budget_min_per_sec: Some(0),
+            ..PolicySpec::default()
+        }
+        .build_retry()
+        .unwrap_err();
+        assert_eq!(error.parameter(), "retry_budget.ratio");
+    }
+
+    #[test]
+    fn build_bulkhead_alone() {
+        assert!(PolicySpec::default().build_bulkhead().unwrap().is_none());
+        let queue_only = PolicySpec {
+            bulkhead_max_queue: Some(4),
+            ..PolicySpec::default()
+        };
+        assert!(
+            queue_only.build_bulkhead().unwrap().is_none(),
+            "a queue without a cap builds nothing"
+        );
+
+        let plain = PolicySpec {
+            bulkhead_max_concurrent: Some(3),
+            ..PolicySpec::default()
+        }
+        .build_bulkhead()
+        .unwrap()
+        .unwrap();
+        assert_eq!(plain.max_concurrent(), 3);
+        assert_eq!(plain.max_queue(), 0);
+
+        let queued = PolicySpec {
+            bulkhead_max_concurrent: Some(2),
+            bulkhead_max_queue: Some(5),
+            bulkhead_queue_timeout: Some(Duration::from_millis(100)),
+            ..PolicySpec::default()
+        }
+        .build_bulkhead()
+        .unwrap()
+        .unwrap();
+        assert_eq!(queued.max_concurrent(), 2);
+        assert_eq!(queued.max_queue(), 5);
+
+        for spec in [
+            PolicySpec {
+                bulkhead_max_concurrent: Some(0),
+                ..PolicySpec::default()
+            },
+            PolicySpec {
+                bulkhead_max_concurrent: Some(1),
+                bulkhead_max_queue: Some(1),
+                bulkhead_queue_timeout: Some(Duration::ZERO),
+                ..PolicySpec::default()
+            },
+        ] {
+            assert!(
+                spec.build_bulkhead()
+                    .unwrap_err()
+                    .parameter()
+                    .starts_with("bulkhead.")
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_built_bulkhead_queue_waits_then_sheds() {
+        let bulkhead = PolicySpec {
+            bulkhead_max_concurrent: Some(1),
+            bulkhead_max_queue: Some(1),
+            ..PolicySpec::default()
+        }
+        .build_bulkhead()
+        .unwrap()
+        .unwrap();
+        let ctx = CallContext::new();
+        let held = bulkhead.acquire(&ctx).await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        let error = bulkhead.acquire(&ctx).await.unwrap_err();
+        assert_eq!(error.reason(), Some("BULKHEAD_FULL"));
+        assert_eq!(
+            started.elapsed(),
+            secs(1),
+            "the default queue wait is one second"
+        );
+        drop(held);
+        assert!(bulkhead.acquire(&ctx).await.is_ok());
+    }
+
+    #[test]
+    fn build_breaker_alone() {
+        assert!(PolicySpec::default().build_breaker("x").unwrap().is_none());
+        let disabled = PolicySpec {
+            breaker_failure_rate: Some(0.5),
+            breaker_enabled: Some(false),
+            ..PolicySpec::default()
+        };
+        assert!(disabled.build_breaker("x").unwrap().is_none());
+
+        let by_rate = PolicySpec {
+            breaker_failure_rate: Some(0.5),
+            ..PolicySpec::default()
+        }
+        .build_breaker("component:inventory")
+        .unwrap()
+        .unwrap();
+        assert_eq!(by_rate.name(), "component:inventory");
+
+        let small_window = PolicySpec {
+            breaker_enabled: Some(true),
+            breaker_window: Some(BreakerWindowSpec::Calls(4)),
+            ..PolicySpec::default()
+        }
+        .build_breaker(String::from("orders"))
+        .unwrap()
+        .unwrap();
+        assert!(format!("{small_window:?}").contains("min_calls: 4"));
+
+        let error = PolicySpec {
+            breaker_enabled: Some(true),
+            breaker_min_calls: Some(0),
+            ..PolicySpec::default()
+        }
+        .build_breaker("x")
+        .unwrap_err();
+        assert_eq!(error.parameter(), "breaker.min_calls");
     }
 }

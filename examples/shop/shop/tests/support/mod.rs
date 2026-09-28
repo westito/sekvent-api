@@ -1,4 +1,11 @@
-//! Profiles, App helpers and fake inventories shared by the shop's tests.
+//! Profiles, topologies and fake inventories shared by the shop's tests.
+//!
+//! A test names a [`Profile`] and gets a started [`Shop`]. Under the
+//! monolith profiles every component runs in the test's App; under
+//! [`Profile::SplitGrpc`] inventory runs in a second App, served over gRPC
+//! on an ephemeral loopback port by `inventory-svc`, and the test's App binds
+//! it `grpc`. Both Apps live in the test process, so fakes installed as
+//! inventory still report to the test through channels.
 
 #![allow(
     dead_code,
@@ -7,8 +14,13 @@
 
 pub(crate) mod fakes;
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use inventory_api::{Inventory, InventoryHandle};
 use sekvent::component::{App, AppBuilder, Binding, BuildError};
-use sekvent::config::MapSource;
+use sekvent::config::{ConfigError, MapSource};
+use sekvent::runtime::{Runtime, RuntimeHandle};
 use shop::ShopOptions;
 
 /// The key that selects the binding of every component.
@@ -18,6 +30,24 @@ pub(crate) const RESERVE_TIMEOUT_KEY: &str = "SEKVENT_COMPONENT_INVENTORY_RESERV
 /// Bulkhead override of `inventory.reserve`.
 pub(crate) const RESERVE_BULKHEAD_KEY: &str =
     "SEKVENT_COMPONENT_INVENTORY_RESERVE_BULKHEAD_MAX_CONCURRENT";
+/// The deepest chain of component calls a process accepts.
+pub(crate) const MAX_HOPS_KEY: &str = "SEKVENT_COMPONENT_MAX_HOPS";
+/// Whether the caller presents its link token to inventory.
+pub(crate) const INVENTORY_AUTH_KEY: &str = "SEKVENT_COMPONENT_INVENTORY_AUTH";
+/// The token the shop presents to inventory under [`Profile::SplitGrpc`].
+pub(crate) const OUTBOUND_KEY: &str = "SEKVENT_LINK_OUTBOUND_INVENTORY";
+
+/// The link token of the split topology: canonical, 40 characters.
+pub(crate) const TOKEN: &str = "0123456789abcdefghijklmnopqrstuvwxyzABCD";
+/// A second well-formed token, which the service does not expect.
+pub(crate) const OTHER_TOKEN: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd";
+/// The link name the service knows the shop by.
+pub(crate) const SHOP_LINK: &str = "shop";
+/// Full gRPC service name of inventory.
+pub(crate) const INVENTORY_SERVICE: &str = "shop.inventory.v1.Inventory";
+
+/// Every component the shop installs, in install order.
+pub(crate) const COMPONENTS: [&str; 3] = ["inventory", "notifications", "orders"];
 
 /// The SKU the tests order.
 pub(crate) const SKU: &str = "sku-apple";
@@ -28,31 +58,98 @@ pub(crate) const CUSTOMER: &str = "cust-1";
 /// A customer who opted out of notifications.
 pub(crate) const BLOCKED_CUSTOMER: &str = "cust-blocked";
 
+/// Longest a real-clock test may run before it counts as hung.
+pub(crate) const HANG_GUARD: Duration = Duration::from_secs(30);
+
 /// How the components of one test are bound.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Profile {
     /// Every component in-process with direct calls.
     MonolithLocal,
     /// Every component in-process behind a serialization boundary.
     MonolithSerialized,
+    /// Inventory in its own App behind gRPC on loopback; the rest local.
+    SplitGrpc,
 }
 
 impl Profile {
-    /// `monolith-local`: no keys (`local` is the default);
-    /// `monolith-serialized`: `SEKVENT_COMPONENT_BINDING=local-serialized`.
-    pub(crate) fn source(self) -> MapSource {
+    /// The binding `component` gets in the test's App under this profile.
+    pub(crate) fn binding_of(self, component: &str) -> Binding {
         match self {
-            Self::MonolithLocal => MapSource::new(),
-            Self::MonolithSerialized => MapSource::new().with(BINDING_KEY, "local-serialized"),
+            Self::MonolithSerialized => Binding::LocalSerialized,
+            Self::SplitGrpc if component == "inventory" => Binding::Grpc,
+            Self::MonolithLocal | Self::SplitGrpc => Binding::Local,
         }
     }
 
-    /// The binding every component gets under this profile.
-    pub(crate) fn binding(self) -> Binding {
-        match self {
-            Self::MonolithLocal => Binding::Local,
-            Self::MonolithSerialized => Binding::LocalSerialized,
+    /// Whether the profile's timed tests run on tokio's paused clock. A
+    /// socket needs the real clock: auto-advance would fire timers while
+    /// loopback I/O is still pending.
+    pub(crate) fn paused(self) -> bool {
+        !matches!(self, Self::SplitGrpc)
+    }
+}
+
+/// The link between the shop and the inventory service under
+/// [`Profile::SplitGrpc`]. The default is the working configuration; the
+/// remote fault tests change one part of it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LinkSetup {
+    /// The token the service accepts from the shop.
+    pub(crate) inbound: &'static str,
+    /// The token the shop presents; `None` leaves [`OUTBOUND_KEY`] unset.
+    pub(crate) outbound: Option<&'static str>,
+    /// Whether the service trusts the shop with subject and tenant.
+    pub(crate) trusted: bool,
+}
+
+impl Default for LinkSetup {
+    fn default() -> Self {
+        Self {
+            inbound: TOKEN,
+            outbound: Some(TOKEN),
+            trusted: true,
         }
+    }
+}
+
+/// The inventory service of a split topology: its App, bound `local`, run
+/// by a runtime with the App's `components` unit and the gRPC listener.
+pub(crate) struct InventoryService {
+    /// The service's App.
+    pub(crate) app: App,
+    /// The service's runtime.
+    pub(crate) runtime: RuntimeHandle,
+    /// Where the service listens.
+    pub(crate) addr: SocketAddr,
+}
+
+/// A topology: the caller-side App and, under [`Profile::SplitGrpc`], the
+/// inventory service.
+pub(crate) struct Shop {
+    /// The App the test calls through: orders and notifications run here,
+    /// and inventory too unless the profile splits it out.
+    pub(crate) app: App,
+    service: Option<InventoryService>,
+}
+
+impl Shop {
+    /// The App inventory runs in.
+    pub(crate) fn inventory_app(&self) -> &App {
+        self.service
+            .as_ref()
+            .map_or(&self.app, |service| &service.app)
+    }
+
+    /// The inventory service, under [`Profile::SplitGrpc`].
+    pub(crate) fn service(&self) -> Option<&InventoryService> {
+        self.service.as_ref()
+    }
+
+    /// Take the inventory service out, to shut its runtime down and wait
+    /// for it.
+    pub(crate) fn take_service(&mut self) -> Option<InventoryService> {
+        self.service.take()
     }
 }
 
@@ -64,59 +161,236 @@ pub(crate) fn options() -> ShopOptions {
     }
 }
 
-/// Build with `install` and assert every component's binding equals
-/// `profile.binding()`, without starting.
-pub(crate) fn built(
-    source: &MapSource,
+fn source_of(extra: &[(&str, &str)]) -> MapSource {
+    extra.iter().copied().collect()
+}
+
+/// The inventory service's configuration: `extra`, then inventory exposed
+/// over gRPC and the shop's inbound link.
+pub(crate) fn service_source(extra: &[(&str, &str)], link: LinkSetup) -> MapSource {
+    let mut source = source_of(extra);
+    source.set("SEKVENT_COMPONENT_INVENTORY_SERVE", "grpc");
+    source.set("SEKVENT_LINK_INBOUND_SHOP", link.inbound);
+    if link.trusted {
+        source.set("SEKVENT_LINK_TRUSTED", SHOP_LINK);
+    }
+    source
+}
+
+/// The caller's configuration: `extra`, then the profile's keys. Under
+/// [`Profile::SplitGrpc`] those are the `grpc` binding of inventory at
+/// `service`, the outbound token, and 1 ms retry backoff without jitter so
+/// retries are quick and predictable.
+pub(crate) fn caller_source(
     profile: Profile,
-    install: impl FnOnce(&mut AppBuilder<'_>) -> Result<(), BuildError>,
-) -> App {
+    extra: &[(&str, &str)],
+    link: LinkSetup,
+    service: Option<SocketAddr>,
+) -> MapSource {
+    let mut source = source_of(extra);
+    match profile {
+        Profile::MonolithLocal => {}
+        Profile::MonolithSerialized => source.set(BINDING_KEY, "local-serialized"),
+        Profile::SplitGrpc => {
+            let addr = service.expect("the split profile needs the service's address");
+            source.set("SEKVENT_COMPONENT_INVENTORY_BINDING", "grpc");
+            source.set(
+                "SEKVENT_COMPONENT_INVENTORY_ENDPOINT",
+                format!("http://{addr}"),
+            );
+            if let Some(token) = link.outbound {
+                source.set(OUTBOUND_KEY, token);
+            }
+            source.set("SEKVENT_COMPONENT_INVENTORY_RETRY_INITIAL_BACKOFF", "1ms");
+            source.set("SEKVENT_COMPONENT_INVENTORY_RETRY_MAX_BACKOFF", "1ms");
+            source.set("SEKVENT_COMPONENT_INVENTORY_RETRY_JITTER", "none");
+        }
+    }
+    source
+}
+
+/// Build an App from `source` with `inventory` installed, bind it to an
+/// ephemeral loopback port with `inventory-svc` and start its runtime.
+pub(crate) async fn start_service(
+    source: &MapSource,
+    inventory: impl FnOnce(&mut AppBuilder<'_>) -> Result<(), BuildError>,
+) -> InventoryService {
     let mut builder = App::builder(source);
-    install(&mut builder).expect("the components install");
-    let app = builder.build().expect("the App builds");
-    for component in app.components() {
+    inventory(&mut builder).expect("the service's inventory installs");
+    let app = builder.build().expect("the service's App builds");
+    assert_eq!(app.binding("inventory"), Some(Binding::Local));
+
+    let loopback: SocketAddr = "127.0.0.1:0".parse().expect("a socket address");
+    let server = inventory_svc::bind(&app, loopback)
+        .await
+        .expect("the service binds a loopback port");
+    let addr = server.local_addr();
+    let runtime = Runtime::builder()
+        .without_signals()
+        .shutdown_delay(Duration::ZERO);
+    let runtime = inventory_svc::runtime(&app, server, runtime)
+        .build()
+        .expect("the service's runtime builds")
+        .start()
+        .await
+        .expect("the service starts");
+    InventoryService { app, runtime, addr }
+}
+
+/// Build a topology without starting the caller's App.
+///
+/// Under [`Profile::SplitGrpc`] the service is started first, with
+/// `inventory`; otherwise `inventory` is installed in the caller's App.
+/// `extra` keys go to every process; notifications and orders are installed
+/// on the caller side. Asserts every component's binding against the
+/// profile.
+pub(crate) async fn try_build(
+    profile: Profile,
+    extra: &[(&str, &str)],
+    link: LinkSetup,
+    inventory: impl FnOnce(&mut AppBuilder<'_>) -> Result<(), BuildError>,
+) -> Result<Shop, BuildError> {
+    let mut local_inventory = Some(inventory);
+    let service = if profile == Profile::SplitGrpc {
+        let install = local_inventory.take().expect("inventory is installed once");
+        Some(start_service(&service_source(extra, link), install).await)
+    } else {
+        None
+    };
+
+    let source = caller_source(
+        profile,
+        extra,
+        link,
+        service.as_ref().map(|service| service.addr),
+    );
+    let mut builder = App::builder(&source);
+    match local_inventory {
+        Some(install) => install(&mut builder)?,
+        // Bound `grpc`, the factory never runs; the stock is the service's.
+        None => shop::install_inventory(&mut builder, Vec::new())?,
+    }
+    shop::install_notifications(&mut builder, options().blocked_customers)?;
+    shop::install_orders(&mut builder)?;
+    let app = builder.build()?;
+    for component in COMPONENTS {
         assert_eq!(
             app.binding(component),
-            Some(profile.binding()),
+            Some(profile.binding_of(component)),
             "binding of {component} under {profile:?}"
         );
     }
-    app
+    Ok(Shop { app, service })
 }
 
-/// Build with `install`, assert every component's binding equals
-/// `profile.binding()`, start.
-pub(crate) async fn started(
-    source: &MapSource,
+/// [`try_build`] with the default link, expecting success.
+pub(crate) async fn build(
     profile: Profile,
-    install: impl FnOnce(&mut AppBuilder<'_>) -> Result<(), BuildError>,
-) -> App {
-    let app = built(source, profile, install);
-    app.start().await.expect("the App starts");
-    app
+    extra: &[(&str, &str)],
+    inventory: impl FnOnce(&mut AppBuilder<'_>) -> Result<(), BuildError>,
+) -> Shop {
+    try_build(profile, extra, LinkSetup::default(), inventory)
+        .await
+        .expect("the caller's App builds")
+}
+
+/// A started topology with the default link; see [`try_build`].
+pub(crate) async fn start(
+    profile: Profile,
+    extra: &[(&str, &str)],
+    inventory: impl FnOnce(&mut AppBuilder<'_>) -> Result<(), BuildError>,
+) -> Shop {
+    start_with(profile, extra, LinkSetup::default(), inventory).await
+}
+
+/// A started topology with `link`; see [`try_build`].
+pub(crate) async fn start_with(
+    profile: Profile,
+    extra: &[(&str, &str)],
+    link: LinkSetup,
+    inventory: impl FnOnce(&mut AppBuilder<'_>) -> Result<(), BuildError>,
+) -> Shop {
+    let shop = try_build(profile, extra, link, inventory)
+        .await
+        .expect("the caller's App builds");
+    shop.app.start().await.expect("the caller's App starts");
+    shop
+}
+
+/// Install `inventory` in place of the real inventory.
+pub(crate) fn fake<T: Inventory>(
+    inventory: T,
+) -> impl FnOnce(&mut AppBuilder<'_>) -> Result<(), BuildError> {
+    move |app: &mut AppBuilder<'_>| InventoryHandle::install(app, move |_deps| Ok(inventory))
+}
+
+/// The real inventory with the stock of [`options`].
+pub(crate) fn real_inventory(app: &mut AppBuilder<'_>) -> Result<(), BuildError> {
+    shop::install_inventory(app, options().stock)
 }
 
 /// The whole shop with [`options`], started.
-pub(crate) async fn started_shop(profile: Profile) -> App {
-    started(&profile.source(), profile, |app| {
-        shop::install(app, options())
-    })
-    .await
+pub(crate) async fn started_shop(profile: Profile) -> Shop {
+    start(profile, &[], real_inventory).await
 }
 
-/// The shop with `inventory` in place of the real inventory, started.
-pub(crate) async fn shop_with_inventory<T>(
-    source: &MapSource,
+/// The shop with `inventory` in place of the real inventory, started with
+/// `extra` keys.
+pub(crate) async fn shop_with_inventory<T: Inventory>(
     profile: Profile,
+    extra: &[(&str, &str)],
     inventory: T,
-) -> App
-where
-    T: inventory_api::Inventory,
-{
-    started(source, profile, move |app| {
-        inventory_api::InventoryHandle::install(app, move |_deps| Ok(inventory))?;
-        shop::install_notifications(app, options().blocked_customers)?;
-        shop::install_orders(app)
-    })
-    .await
+) -> Shop {
+    start(profile, extra, fake(inventory)).await
+}
+
+/// Assert `at_least <= elapsed`, and `elapsed < below` on the paused clock.
+/// On the real clock loopback timing is not exact, so only the lower bound
+/// holds; the structural assertions carry the test.
+pub(crate) fn assert_elapsed(
+    profile: Profile,
+    elapsed: Duration,
+    at_least: Duration,
+    below: Duration,
+) {
+    assert!(
+        elapsed >= at_least,
+        "{elapsed:?} under {profile:?}: expected at least {at_least:?}"
+    );
+    if profile.paused() {
+        assert!(
+            elapsed < below,
+            "{elapsed:?} under {profile:?}: expected less than {below:?}"
+        );
+    }
+}
+
+/// Assert that no time passed on the paused clock; nothing on the real one.
+pub(crate) fn assert_no_wait(profile: Profile, elapsed: Duration) {
+    if profile.paused() {
+        assert_eq!(elapsed, Duration::ZERO, "time passed under {profile:?}");
+    }
+}
+
+/// Run a real-clock test body, failing it after [`HANG_GUARD`].
+pub(crate) async fn guarded<F: Future>(test: F) -> F::Output {
+    tokio::time::timeout(HANG_GUARD, test)
+        .await
+        .expect("the test finished within the hang guard")
+}
+
+/// The keys of every `Missing` configuration error in `error`.
+pub(crate) fn missing_keys(error: &BuildError) -> Vec<String> {
+    fn config(error: &ConfigError) -> Vec<String> {
+        match error {
+            ConfigError::Missing { key, .. } => vec![key.clone()],
+            ConfigError::Multiple(errors) => errors.iter().flat_map(config).collect(),
+            _ => Vec::new(),
+        }
+    }
+    match error {
+        BuildError::Config(error) => config(error),
+        BuildError::Multiple(errors) => errors.iter().flat_map(missing_keys).collect(),
+        _ => Vec::new(),
+    }
 }

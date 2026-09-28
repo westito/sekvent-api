@@ -1,8 +1,20 @@
-#![allow(dead_code)]
+#![allow(dead_code, non_upper_case_globals)]
 
 pub struct Plain;
 
-#[sekvent_component::component(name = "echo", package = "check.echo.v1")]
+mod proto {
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+        "check.echo.v1.Echo",
+        &[(
+            "Ping",
+            "check.echo.v1.Plain",
+            "google.protobuf.StringValue",
+            false,
+        )],
+    );
+}
+
+#[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
 pub trait Echo {
     #[call]
     async fn ping(

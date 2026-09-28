@@ -19,6 +19,10 @@
 //! | `SEKVENT_LINK_OUTBOUND_<NAME>` | token we present when calling `<name>` |
 //! | `SEKVENT_LINK_TRUSTED` | comma-separated inbound links that may assert end-user identity |
 //!
+//! A process that must not let one token serve two purposes (say, accepted
+//! from one link and presented to another) also calls
+//! [`LinkConfig::check_distinct_tokens`].
+//!
 //! # Features
 //!
 //! - `axum`: `require_service`, an inbound middleware for
@@ -37,7 +41,9 @@ mod inbound;
 mod outbound;
 mod token;
 
-pub use config::{INBOUND_PREFIX, LinkConfig, OUTBOUND_PREFIX, TRUSTED_KEY};
+pub use config::{
+    INBOUND_PREFIX, LinkConfig, OUTBOUND_PREFIX, TRUSTED_KEY, inbound_key, outbound_key,
+};
 pub use error::LinkError;
 #[cfg(feature = "tonic")]
 pub use inbound::ServiceTokenInterceptor;

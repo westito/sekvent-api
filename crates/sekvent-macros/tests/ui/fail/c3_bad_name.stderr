@@ -1,5 +1,5 @@
 error: component name must match [a-z][a-z0-9_]*, without `__` or a trailing `_`, at most 48 characters
  --> tests/ui/fail/c3_bad_name.rs:1:39
   |
-1 | #[sekvent_component::component(name = "Echo__Service", package = "check.echo.v1")]
+1 | #[sekvent_component::component(name = "Echo__Service", package = "check.echo.v1", proto = "crate::proto")]
   |                                       ^^^^^^^^^^^^^^^

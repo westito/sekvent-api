@@ -80,12 +80,15 @@ pub const FRAMEWORK_KEYS: &[&str] = &[
 ///   components);
 /// - `SEKVENT_LINK_INBOUND_` and `SEKVENT_LINK_OUTBOUND_`: one service-link
 ///   token per link name (`sekvent-link` validates the names and tokens);
+/// - `SEKVENT_POLICY_`: named resilience policies (`sekvent-component`
+///   validates them against the policies components reference);
 /// - `SEKVENT_TEST_`: test-only settings such as `SEKVENT_TEST_RUN_ID` and
 ///   `SEKVENT_TEST_POSTGRES_IMAGE` (`sekvent-testing`, `cargo sekvent`).
 pub const FRAMEWORK_PREFIXES: &[&str] = &[
     "SEKVENT_COMPONENT_",
     "SEKVENT_LINK_INBOUND_",
     "SEKVENT_LINK_OUTBOUND_",
+    "SEKVENT_POLICY_",
     "SEKVENT_TEST_",
 ];
 
@@ -862,6 +865,7 @@ mod tests {
         }
         assert!(is_framework_key("SEKVENT_LINK_INBOUND_BILLING"));
         assert!(is_framework_key("SEKVENT_LINK_OUTBOUND_ORDERS"));
+        assert!(is_framework_key("SEKVENT_POLICY_REMOTE_TIMEOUT"));
         assert!(is_framework_key("SEKVENT_TEST_RUN_ID"));
         assert!(is_framework_key("SEKVENT_TEST_POSTGRES_IMAGE"));
         assert!(is_framework_key("SEKVENT_COMPONENT_BINDING"));

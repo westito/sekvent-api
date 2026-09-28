@@ -132,3 +132,12 @@ const _: () = {
     ::sekvent_component::__private::assert_wire::<RecordReply>();
     ::sekvent_component::__private::assert_error::<LedgerError>();
 };
+const _: () = ::sekvent_component::__private::assert_service(
+    ::ledger_api::proto::shop::ledger::v1::__sekvent_service_Ledger,
+    "shop.ledger.v1.Ledger",
+    1usize,
+);
+const _: () = ::sekvent_component::__private::assert_rpc::<
+    RecordRequest,
+    RecordReply,
+>(::ledger_api::proto::shop::ledger::v1::__sekvent_service_Ledger, "Record");

@@ -5,17 +5,19 @@ use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sekvent_config::ConfigSource;
 use sekvent_error::AppError;
 use tokio::sync::watch;
 
-use crate::config::{self, Entry};
+use crate::__private::Dispatch;
+use crate::config::{self, Entry, Resolved, Settings};
 use crate::lifecycle::LifecycleDyn;
 use crate::link::Link;
 use crate::server::Server;
-use crate::{Binding, BuildError, ComponentDescriptor, ComponentHandle};
+use crate::{Binding, BuildError, ComponentDescriptor, ComponentHandle, reasons};
 
 /// Where a component is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +37,8 @@ pub enum ComponentState {
 pub(crate) struct Built {
     pub(crate) handle: Box<dyn Any + Send + Sync>,
     pub(crate) lifecycle: Option<Arc<dyn LifecycleDyn>>,
+    /// The byte-level dispatcher, which serving over gRPC needs.
+    pub(crate) dispatch: Option<Arc<dyn Dispatch>>,
 }
 
 /// A type-erased factory: builds the implementation and the handle for the
@@ -50,11 +54,16 @@ where
     Box::new(factory)
 }
 
+/// Makes the handle of a component bound to a remote transport; `None` when
+/// the link has no remote client.
+pub(crate) type RemoteFactory = Box<dyn FnOnce(Arc<Link>) -> Option<Handle> + Send>;
+
 struct Install {
     descriptor: &'static ComponentDescriptor,
     handle_type: TypeId,
     /// `None` for a `remote_only` component.
     factory: Option<Factory>,
+    remote: RemoteFactory,
 }
 
 struct Resource {
@@ -62,7 +71,7 @@ struct Resource {
     value: Box<dyn Any + Send + Sync>,
 }
 
-type Handle = Box<dyn Any + Send + Sync>;
+pub(crate) type Handle = Box<dyn Any + Send + Sync>;
 
 /// Collects components and resources, then builds an [`App`].
 ///
@@ -101,6 +110,7 @@ impl AppBuilder<'_> {
     pub(crate) fn install<H: ComponentHandle>(
         &mut self,
         factory: Option<Factory>,
+        remote: RemoteFactory,
     ) -> Result<(), BuildError> {
         let descriptor = H::DESCRIPTOR;
         let handle_type = TypeId::of::<H>();
@@ -115,6 +125,7 @@ impl AppBuilder<'_> {
             descriptor,
             handle_type,
             factory,
+            remote,
         });
         Ok(())
     }
@@ -135,58 +146,75 @@ impl AppBuilder<'_> {
                 remote: install.factory.is_none(),
             })
             .collect();
-        let resolved = config::resolve(self.source, &entries)?;
+        let settings = config::resolve(self.source, &entries)?;
         let installed: Vec<(TypeId, &'static ComponentDescriptor)> = self
             .installs
             .iter()
             .map(|install| (install.handle_type, install.descriptor))
             .collect();
+        let mut remotes = Remotes::new(&settings);
 
         let mut handles: Vec<Option<Handle>> = Vec::with_capacity(self.installs.len());
         let mut parts = Vec::with_capacity(self.installs.len());
-        for (position, (install, resolved)) in self.installs.into_iter().zip(resolved).enumerate() {
-            let name = install.descriptor.name();
-            let Some(factory) = install.factory else {
-                handles.push(None);
-                continue;
+        let mut exposed = Vec::new();
+        for (position, (install, resolved)) in self
+            .installs
+            .into_iter()
+            .zip(&settings.components)
+            .enumerate()
+        {
+            let descriptor = install.descriptor;
+            let name = descriptor.name();
+            let remote = resolved.binding == Binding::Grpc;
+            let server = Arc::new(Server::new(descriptor, &resolved.policies, remote));
+            let link = Link::new(resolved.binding, Arc::clone(&server), settings.max_hops);
+            let built = if remote {
+                let link = remotes.attach(link, descriptor, resolved)?;
+                let handle = (install.remote)(Arc::new(link)).ok_or_else(|| {
+                    BuildError::BindingUnavailable {
+                        component: name.to_owned(),
+                        binding: resolved.binding,
+                        key: resolved.key.clone(),
+                    }
+                })?;
+                Built {
+                    handle,
+                    lifecycle: None,
+                    dispatch: None,
+                }
+            } else {
+                // A component without a factory is remote_only and resolves
+                // to a remote binding only.
+                let Some(factory) = install.factory else {
+                    handles.push(None);
+                    continue;
+                };
+                let mut deps = Deps {
+                    component: name,
+                    binding: resolved.binding,
+                    position,
+                    installed: &installed,
+                    built: &handles,
+                    resources: &self.resources,
+                    source: self.source,
+                };
+                factory(&mut deps, Arc::new(link)).map_err(|source| BuildError::Factory {
+                    component: name.to_owned(),
+                    source,
+                })?
             };
-            let server = Arc::new(Server::new(install.descriptor, &resolved.policies));
-            let link = Arc::new(Link::new(resolved.binding, Arc::clone(&server)));
-            let mut deps = Deps {
-                component: name,
-                binding: resolved.binding,
-                position,
-                installed: &installed,
-                built: &handles,
-                resources: &self.resources,
-                source: self.source,
-            };
-            let built = factory(&mut deps, link).map_err(|source| BuildError::Factory {
-                component: name.to_owned(),
-                source,
-            })?;
-            tracing::debug!(
-                component = name,
-                binding = %resolved.binding,
-                key = %resolved.key,
-                "component built"
-            );
-            for (method, policy) in install.descriptor.methods().iter().zip(&resolved.policies) {
-                tracing::debug!(
-                    component = name,
-                    method = method.name(),
-                    timeout = ?policy.timeout,
-                    bulkhead = ?policy.bulkhead,
-                    "method policy"
-                );
+            log_built(descriptor, resolved);
+            if let Some(serve) = &resolved.serve {
+                exposed.push(expose(
+                    &settings,
+                    descriptor,
+                    serve,
+                    &server,
+                    built.dispatch.clone(),
+                )?);
             }
             handles.push(Some(built.handle));
-            parts.push((
-                install.descriptor,
-                resolved.binding,
-                server,
-                built.lifecycle,
-            ));
+            parts.push((descriptor, resolved.binding, server, built.lifecycle));
         }
 
         let components = parts
@@ -205,10 +233,175 @@ impl AppBuilder<'_> {
         Ok(App {
             inner: Arc::new(Inner {
                 components,
+                exposed,
+                mounted: AtomicBool::new(false),
                 phase: watch::Sender::new(Phase::Built),
             }),
         })
     }
+}
+
+/// Log the binding and the method policies a component was built with.
+fn log_built(descriptor: &ComponentDescriptor, resolved: &Resolved) {
+    let name = descriptor.name();
+    tracing::debug!(
+        component = name,
+        binding = %resolved.binding,
+        key = %resolved.key,
+        "component built"
+    );
+    for (method, policy) in descriptor.methods().iter().zip(&resolved.policies) {
+        tracing::debug!(
+            component = name,
+            method = method.name(),
+            timeout = ?policy.timeout,
+            bulkhead = ?policy.spec.bulkhead_max_concurrent,
+            retry_max_attempts = ?policy.spec.retry_max_attempts,
+            "method policy"
+        );
+    }
+}
+
+/// Builds the remote clients of `grpc`-bound components, sharing one
+/// channel per endpoint.
+struct Remotes<'s> {
+    #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+    settings: &'s Settings,
+    #[cfg(feature = "grpc")]
+    channels: crate::grpc::ChannelCache,
+}
+
+impl<'s> Remotes<'s> {
+    fn new(settings: &'s Settings) -> Self {
+        Self {
+            settings,
+            #[cfg(feature = "grpc")]
+            channels: crate::grpc::ChannelCache::default(),
+        }
+    }
+
+    /// Give `link` the remote client its component's settings describe.
+    #[cfg(feature = "grpc")]
+    fn attach(
+        &mut self,
+        link: Link,
+        descriptor: &'static ComponentDescriptor,
+        resolved: &Resolved,
+    ) -> Result<Link, BuildError> {
+        use crate::grpc::client::RemoteClient;
+
+        let name = descriptor.name();
+        let failed = |source: AppError| BuildError::Factory {
+            component: name.to_owned(),
+            source,
+        };
+        let Some(remote) = &resolved.remote else {
+            return Ok(link);
+        };
+        let channel = self.channels.channel(&remote.endpoint).map_err(|error| {
+            failed(
+                AppError::unavailable(format!("component {name} has an unusable endpoint"))
+                    .with_source(error),
+            )
+        })?;
+        let bearer = if remote.auth {
+            self.settings
+                .links
+                .as_ref()
+                .and_then(|links| links.outbound(&remote.link))
+                .cloned()
+        } else {
+            None
+        };
+        let client = RemoteClient::new(
+            descriptor,
+            channel,
+            bearer,
+            &resolved.policies,
+            &resolved.component,
+        )
+        .map_err(failed)?;
+        Ok(link.with_remote(Arc::new(client)))
+    }
+
+    /// Without the `grpc` feature no component resolves to a remote
+    /// binding.
+    #[cfg(not(feature = "grpc"))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn attach(
+        &mut self,
+        link: Link,
+        _descriptor: &'static ComponentDescriptor,
+        _resolved: &Resolved,
+    ) -> Result<Link, BuildError> {
+        Ok(link)
+    }
+}
+
+/// One component exposed over gRPC.
+struct Exposed {
+    component: &'static str,
+    /// Its `SERVE` key.
+    key: String,
+    /// Its full gRPC service name.
+    service: String,
+    #[cfg(feature = "grpc")]
+    served: Arc<crate::grpc::service::Served>,
+}
+
+/// Prepare serving `descriptor` over gRPC through `server` and `dispatch`.
+#[cfg(feature = "grpc")]
+fn expose(
+    settings: &Settings,
+    descriptor: &'static ComponentDescriptor,
+    serve: &config::Serve,
+    server: &Arc<Server>,
+    dispatch: Option<Arc<dyn Dispatch>>,
+) -> Result<Exposed, BuildError> {
+    let Some(dispatch) = dispatch else {
+        return Err(BuildError::NotServable {
+            component: descriptor.name().to_owned(),
+            key: serve.key.clone(),
+            reason: "its implementation has no byte-level dispatcher",
+        });
+    };
+    let inbound = if serve.auth {
+        settings
+            .links
+            .as_ref()
+            .map(|links| Arc::clone(links.inbound()))
+    } else {
+        None
+    };
+    Ok(Exposed {
+        component: descriptor.name(),
+        key: serve.key.clone(),
+        service: crate::grpc::service_name(descriptor),
+        served: Arc::new(crate::grpc::service::Served::new(
+            Arc::clone(server),
+            dispatch,
+            inbound,
+            settings.max_hops,
+        )),
+    })
+}
+
+/// Without the `grpc` feature nothing resolves to be served.
+#[cfg(not(feature = "grpc"))]
+fn expose(
+    _settings: &Settings,
+    descriptor: &'static ComponentDescriptor,
+    serve: &config::Serve,
+    _server: &Arc<Server>,
+    _dispatch: Option<Arc<dyn Dispatch>>,
+) -> Result<Exposed, BuildError> {
+    Ok(Exposed {
+        component: descriptor.name(),
+        key: serve.key.clone(),
+        service: descriptor
+            .full_service_name()
+            .unwrap_or_else(|| descriptor.service().to_owned()),
+    })
 }
 
 impl fmt::Debug for AppBuilder<'_> {
@@ -341,6 +534,10 @@ struct Component {
 
 struct Inner {
     components: Vec<Component>,
+    /// The components exposed over gRPC, in install order.
+    exposed: Vec<Exposed>,
+    /// Whether [`App::grpc_routes`] was called.
+    mounted: AtomicBool,
     phase: watch::Sender<Phase>,
 }
 
@@ -396,14 +593,38 @@ impl App {
             .collect()
     }
 
+    /// Full gRPC service names of the components exposed over gRPC
+    /// (`SEKVENT_COMPONENT_<C>_SERVE=grpc`), in install order. Empty without
+    /// the `grpc` feature.
+    pub fn grpc_services(&self) -> Vec<String> {
+        self.inner
+            .exposed
+            .iter()
+            .map(|exposed| exposed.service.clone())
+            .collect()
+    }
+
+    /// tonic routes serving every exposed component, for
+    /// `sekvent_runtime::ServerBuilder::grpc_routes` (or tonic's own
+    /// server). Empty when nothing is exposed. Calling it marks the routes
+    /// mounted.
+    #[cfg(feature = "grpc")]
+    pub fn grpc_routes(&self) -> tonic::service::Routes {
+        self.inner.mounted.store(true, Ordering::SeqCst);
+        crate::grpc::service::routes(self.inner.exposed.iter().map(|exposed| &exposed.served))
+    }
+
     /// Run every component's `on_start` hook in install order, opening each
     /// component for calls once its hook succeeded.
     ///
     /// On the first failure the components already started are stopped in
     /// reverse order, the App is stopped, and the error is returned with
     /// `component` metadata. Starting an App twice, or after
-    /// [`stop`](Self::stop), is `FAILED_PRECONDITION`.
+    /// [`stop`](Self::stop), is `FAILED_PRECONDITION`; so is starting one
+    /// whose exposed components' gRPC routes were never taken (reason
+    /// `GRPC_NOT_MOUNTED`), before any component starts.
     pub async fn start(&self) -> Result<(), AppError> {
+        self.check_mounted()?;
         match self.transition(|phase| (phase == Phase::Built).then_some(Phase::Starting)) {
             Phase::Built => {}
             Phase::Stopping | Phase::Stopped => {
@@ -518,6 +739,23 @@ impl App {
             }
         });
         previous
+    }
+
+    /// `GRPC_NOT_MOUNTED` for the first exposed component when
+    /// [`grpc_routes`](Self::grpc_routes) was never called.
+    fn check_mounted(&self) -> Result<(), AppError> {
+        if self.inner.mounted.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        match self.inner.exposed.first() {
+            None => Ok(()),
+            Some(exposed) => Err(AppError::failed_precondition(format!(
+                "component {} is exposed over gRPC ({}) but App::grpc_routes was never mounted",
+                exposed.component, exposed.key
+            ))
+            .with_reason(reasons::GRPC_NOT_MOUNTED)
+            .with_metadata("component", exposed.component)),
+        }
     }
 
     fn find(&self, name: &str) -> Option<&Component> {

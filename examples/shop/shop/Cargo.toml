@@ -1,6 +1,6 @@
 [package]
 name = "shop"
-description = "The example shop as one binary: inventory, notifications and orders as components."
+description = "The example shop: inventory, notifications and orders as components, in one binary or split by configuration."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,11 +15,13 @@ notifications = { path = "../notifications" }
 notifications-api = { path = "../notifications-api" }
 orders = { path = "../orders" }
 orders-api = { path = "../orders-api" }
-sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component", "config", "runtime"] }
+sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component", "component-grpc", "config", "resilience", "runtime"] }
 tokio = { workspace = true }
 
 [dev-dependencies]
+inventory-svc = { path = "../inventory-svc" }
 rstest = { workspace = true }
+sekvent-testing = { path = "../../../crates/sekvent-testing" }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

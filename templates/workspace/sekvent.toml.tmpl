@@ -79,6 +79,19 @@ post_coverage = []
 # Example:
 # pre_gate = [["cargo", "sekvent", "deps", "check"]]
 
+# Protobuf service contracts. `cargo sekvent contract emit` writes one
+# canonical JSON baseline per `service` found below the roots; `cargo sekvent
+# contract check` (and the gate, while `gate = true`) fails on a change that
+# would break an existing peer on the wire, and on a service without a
+# committed baseline. Protos are compiled in-process: no protoc, no Rust
+# build. Without roots the feature is off.
+#
+# [contract]
+# roots = ["proto"]        # every .proto below each root is compiled
+# includes = []            # extra import directories for every root
+# baseline = "contracts"   # committed baselines, relative to this file
+# gate = true
+
 # Project tasks: `cargo sekvent run <name>`. `remote = true` runs the task on
 # the remote builder like the gate does.
 #

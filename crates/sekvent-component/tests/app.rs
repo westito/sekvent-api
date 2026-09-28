@@ -119,7 +119,7 @@ fn configuration_errors_are_reported_together_and_no_factory_runs() {
 }
 
 #[test]
-fn a_grpc_binding_is_not_available() {
+fn a_grpc_binding_needs_an_endpoint() {
     let config = source(Binding::Grpc, &[]);
     let error = build_with(&config, |builder| {
         InventoryHandle::install(builder, |_| Ok(FakeInventory::stock(1)))
@@ -127,12 +127,39 @@ fn a_grpc_binding_is_not_available() {
     .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "component inventory: binding grpc (set by SEKVENT_COMPONENT_BINDING) is not available in this build"
+        "missing required configuration key SEKVENT_COMPONENT_INVENTORY_ENDPOINT"
     );
 }
 
 #[test]
-fn remote_only_components_cannot_be_built_yet() {
+fn a_grpc_bound_component_runs_no_factory() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let config = source(
+        Binding::Grpc,
+        &[
+            ("SEKVENT_COMPONENT_INVENTORY_ENDPOINT", "http://127.0.0.1:1"),
+            ("SEKVENT_COMPONENT_INVENTORY_AUTH", "none"),
+        ],
+    );
+    let flag = Arc::clone(&ran);
+    let app = build_with(&config, move |builder| {
+        InventoryHandle::install(builder, move |_| {
+            flag.store(true, Ordering::SeqCst);
+            Ok(FakeInventory::stock(1))
+        })
+    })
+    .unwrap();
+    assert!(!ran.load(Ordering::SeqCst));
+    assert_eq!(app.binding("inventory"), Some(Binding::Grpc));
+    assert_eq!(
+        app.handle::<InventoryHandle>().unwrap().binding(),
+        Binding::Grpc
+    );
+    assert!(app.grpc_services().is_empty());
+}
+
+#[test]
+fn remote_only_components_need_a_grpc_binding() {
     let error = build_with(&MapSource::new(), LedgerHandle::install_remote).unwrap_err();
     assert!(
         matches!(&error, BuildError::RemoteOnlyUnbound { component, key }
@@ -147,10 +174,7 @@ fn remote_only_components_cannot_be_built_yet() {
     assert!(
         matches!(
             &error,
-            BuildError::BindingUnavailable {
-                binding: Binding::Grpc,
-                ..
-            }
+            BuildError::Config(ConfigError::Missing { key }) if key == "SEKVENT_COMPONENT_LEDGER_ENDPOINT"
         ),
         "{error}"
     );

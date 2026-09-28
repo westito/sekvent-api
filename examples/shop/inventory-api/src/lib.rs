@@ -7,7 +7,9 @@
 
 #![forbid(unsafe_code)]
 
-/// Messages of the `shop.inventory.v1` package.
+/// Messages of the `shop.inventory.v1` package and the contract of its
+/// `Inventory` service, which `#[component(proto = …)]` checks the trait
+/// against.
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/sekvent_protos.rs"));
 }
@@ -51,7 +53,11 @@ pub enum InventoryError {
 }
 
 /// Stock and reservations.
-#[sekvent::component(name = "inventory", package = "shop.inventory.v1")]
+#[sekvent::component(
+    name = "inventory",
+    package = "shop.inventory.v1",
+    proto = "crate::proto::shop::inventory::v1"
+)]
 pub trait Inventory: Send + Sync + 'static {
     /// Reserve stock for an order. Reserving again for the same order returns
     /// the existing reservation.

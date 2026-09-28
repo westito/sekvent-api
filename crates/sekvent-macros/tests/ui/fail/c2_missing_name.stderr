@@ -1,7 +1,7 @@
 error: missing `name = "..."`
  --> tests/ui/fail/c2_missing_name.rs:1:1
   |
-1 | #[sekvent_component::component(package = "check.echo.v1")]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1 | #[sekvent_component::component(package = "check.echo.v1", proto = "crate::proto")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)

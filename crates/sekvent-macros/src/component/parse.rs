@@ -6,6 +6,7 @@ use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::{ToTokens, quote};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::{
     Attribute, Error, Expr, ExprLit, FnArg, GenericArgument, Ident, ItemTrait, Lit, LitStr, Pat,
     Path, PathArguments, Receiver, ReceiverKind, Result, ReturnType, Safety, Token, TraitItem,
@@ -46,6 +47,9 @@ const BAD_RETURN: &str = "the return type must be Result<Reply, Error>";
 const BAD_REPLY_OR_ERROR: &str = "reply and error types cannot contain lifetimes or `impl Trait`";
 const BAD_METHOD_NAME: &str =
     "method names must be snake_case ([a-z][a-z0-9_]*, without `__` or a trailing `_`)";
+const MISSING_PROTO: &str = "missing `proto = \"...\"`: the module generated for the component's proto package, such as \"crate::proto::shop::inventory::v1\"; only a local_only component may omit it";
+const PROTO_ON_LOCAL_ONLY: &str = "a local_only component has no contract; remove `proto`";
+const BAD_PROTO: &str = "proto must be a module path such as \"crate::proto::shop::inventory::v1\"";
 
 /// Where a component may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +63,9 @@ pub(crate) enum Mode {
 pub(crate) struct Args {
     pub(crate) name: String,
     pub(crate) package: Option<String>,
+    /// `proto = "..."`: the module holding `__sekvent_service_<Trait>`;
+    /// present exactly when the component is not `local_only`.
+    pub(crate) proto: Option<Path>,
     pub(crate) mode: Mode,
     /// `crate = "..."`: where the `sekvent_component` runtime lives.
     pub(crate) krate: Option<Path>,
@@ -78,6 +85,8 @@ pub(crate) struct Component {
 pub(crate) struct Method {
     pub(crate) docs: Vec<Attribute>,
     pub(crate) ident: Ident,
+    /// The signature, for errors about the method's contract.
+    pub(crate) signature: Span,
     /// The arguments as written (`&self, cx: &CallContext, req: Request`).
     pub(crate) inputs: Punctuated<FnArg, Token![,]>,
     /// The type behind the context reference (`CallContext`).
@@ -103,6 +112,7 @@ pub(crate) fn args(tokens: TokenStream) -> Result<Args> {
     let mut errors = Errors::default();
     let mut name: Option<LitStr> = None;
     let mut package: Option<LitStr> = None;
+    let mut proto: Option<LitStr> = None;
     let mut local_only = false;
     let mut remote_only = false;
     let mut krate: Option<LitStr> = None;
@@ -111,13 +121,14 @@ pub(crate) fn args(tokens: TokenStream) -> Result<Args> {
         let taken = match key.as_str() {
             "name" => name.is_some(),
             "package" => package.is_some(),
+            "proto" => proto.is_some(),
             "local_only" => local_only,
             "remote_only" => remote_only,
             "crate" => krate.is_some(),
             _ => {
                 return Err(meta.error(format!(
-                    "unknown component argument `{key}`; expected name, package, local_only, \
-                     remote_only or crate"
+                    "unknown component argument `{key}`; expected name, package, proto, \
+                     local_only, remote_only or crate"
                 )));
             }
         };
@@ -127,6 +138,7 @@ pub(crate) fn args(tokens: TokenStream) -> Result<Args> {
         match key.as_str() {
             "name" => name = Some(meta.value()?.parse()?),
             "package" => package = Some(meta.value()?.parse()?),
+            "proto" => proto = Some(meta.value()?.parse()?),
             "crate" => krate = Some(meta.value()?.parse()?),
             flag => {
                 if local_only || remote_only {
@@ -158,11 +170,24 @@ pub(crate) fn args(tokens: TokenStream) -> Result<Args> {
         Some(lit) if !is_package(&lit.value()) => errors.push(Error::new_spanned(lit, BAD_PACKAGE)),
         _ => {}
     }
+    let proto = match proto {
+        None if !local_only => {
+            errors.push(Error::new(Span::call_site(), MISSING_PROTO));
+            None
+        }
+        Some(lit) if local_only => {
+            errors.push(Error::new_spanned(lit, PROTO_ON_LOCAL_ONLY));
+            None
+        }
+        Some(lit) => errors.take(proto_path(&lit)),
+        None => None,
+    };
     let krate = krate.and_then(|lit| errors.take(lit.parse::<Path>()));
     errors.finish()?;
     Ok(Args {
         name: name.as_ref().map(LitStr::value).unwrap_or_default(),
         package: package.as_ref().map(LitStr::value),
+        proto,
         mode: if local_only {
             Mode::LocalOnly
         } else if remote_only {
@@ -172,6 +197,13 @@ pub(crate) fn args(tokens: TokenStream) -> Result<Args> {
         },
         krate,
     })
+}
+
+/// The module path of `proto = "..."`: `::`-separated identifiers (with
+/// `crate`, `self` or `super` where Rust allows them), no generic arguments.
+pub(crate) fn proto_path(lit: &LitStr) -> Result<Path> {
+    lit.parse_with(Path::parse_mod_style)
+        .map_err(|_| Error::new_spanned(lit, BAD_PROTO))
 }
 
 /// Validate the trait and every method, reporting all problems together.
@@ -306,6 +338,7 @@ fn marker_name(path: &Path) -> Option<&'static str> {
 fn method(function: TraitItemFn) -> Result<Method> {
     let mut errors = Errors::default();
     let ident = function.sig.ident.clone();
+    let signature = function.sig.span();
     let name = ident.to_string();
     if !is_snake_name(&name) {
         errors.push(Error::new_spanned(&ident, BAD_METHOD_NAME));
@@ -326,6 +359,7 @@ fn method(function: TraitItemFn) -> Result<Method> {
     Ok(Method {
         docs,
         ident,
+        signature,
         inputs: function.sig.inputs,
         context,
         request,

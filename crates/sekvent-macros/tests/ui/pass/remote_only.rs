@@ -1,5 +1,5 @@
-//! A remote_only component can be declared, but a C1 build without a remote
-//! transport fails and names the binding key.
+//! A remote_only component checks its contract and can be declared; left
+//! unbound, the build fails and names the binding key.
 
 use sekvent_component::{
     App, AppError, BuildError, CallContext, ComponentHandle, ComponentMode, component,
@@ -12,14 +12,43 @@ pub struct RecordRequest {
     pub entry: String,
 }
 
+impl prost::Name for RecordRequest {
+    const NAME: &'static str = "RecordRequest";
+    const PACKAGE: &'static str = "check.ledger.v1";
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct RecordReply {
     #[prost(uint64, tag = "1")]
     pub sequence: u64,
 }
 
+impl prost::Name for RecordReply {
+    const NAME: &'static str = "RecordReply";
+    const PACKAGE: &'static str = "check.ledger.v1";
+}
+
+/// The contract sekvent-proto-build would generate for `check.ledger.v1`.
+pub mod ledger_proto {
+    #[allow(non_upper_case_globals)]
+    pub const __sekvent_service_Ledger: (&str, &[(&str, &str, &str, bool)]) = (
+        "check.ledger.v1.Ledger",
+        &[(
+            "Record",
+            "check.ledger.v1.RecordRequest",
+            "check.ledger.v1.RecordReply",
+            false,
+        )],
+    );
+}
+
 /// A ledger served by another process.
-#[component(name = "ledger", package = "check.ledger.v1", remote_only)]
+#[component(
+    name = "ledger",
+    package = "check.ledger.v1",
+    proto = "self::ledger_proto",
+    remote_only
+)]
 pub trait Ledger {
     /// Record an entry.
     #[call(idempotent)]

@@ -1,0 +1,19 @@
+error[E0080]: evaluation panicked: component contract: the proto service and the trait declare different sets of RPCs
+  --> tests/ui/fail/p2_extra_rpc.rs:47:1
+   |
+47 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
+   |
+note: inside `sekvent_component::__private::assert_service`
+  --> $RUST/core/src/panic.rs
+   |
+   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/crates/sekvent-component/src/contract.rs
+   |
+   | /     assert!(
+   | |         proto.1.len() == methods,
+   | |         "component contract: the proto service and the trait declare different sets of RPCs"
+   | |     );
+   | |_____- in this macro invocation

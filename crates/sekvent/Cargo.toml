@@ -24,6 +24,8 @@ client = ["dep:sekvent-client"]
 db = ["dep:sekvent-db"]
 # Components need the config source, the error model and the call context.
 component = ["dep:sekvent-component", "config", "error", "context"]
+# The component `grpc` binding and serving components over gRPC.
+component-grpc = ["component", "sekvent-component/grpc"]
 
 # sekvent-error wire mappings.
 error-http = ["error", "sekvent-error/http"]
@@ -60,6 +62,7 @@ full = [
     "client",
     "db",
     "component",
+    "component-grpc",
     "error-http",
     "error-grpc",
     "runtime-grpc-web",

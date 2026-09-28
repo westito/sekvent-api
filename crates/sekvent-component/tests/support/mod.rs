@@ -2,4 +2,5 @@
 #![allow(dead_code, unreachable_pub)]
 
 pub mod fakes;
+pub mod grpc;
 pub mod inventory;

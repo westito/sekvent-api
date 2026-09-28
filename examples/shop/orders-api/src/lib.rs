@@ -8,7 +8,8 @@
 
 #![forbid(unsafe_code)]
 
-/// Messages of the `shop.orders.v1` package.
+/// Messages of the `shop.orders.v1` package and the contract of its `Orders`
+/// service.
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/sekvent_protos.rs"));
 }
@@ -60,7 +61,11 @@ pub enum OrdersError {
 }
 
 /// Placing and reading orders.
-#[sekvent::component(name = "orders", package = "shop.orders.v1")]
+#[sekvent::component(
+    name = "orders",
+    package = "shop.orders.v1",
+    proto = "crate::proto::shop::orders::v1"
+)]
 pub trait Orders: Send + Sync + 'static {
     /// Place an order: reserve its stock, notify the customer and store it.
     #[call(timeout = "5s")]

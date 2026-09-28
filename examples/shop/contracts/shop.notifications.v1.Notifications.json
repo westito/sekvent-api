@@ -1,0 +1,118 @@
+{
+  "format": 1,
+  "service": "shop.notifications.v1.Notifications",
+  "file": "shop/notifications/v1/notifications.proto",
+  "rpcs": {
+    "Notify": {
+      "request": "shop.notifications.v1.NotifyRequest",
+      "reply": "shop.notifications.v1.NotifyReply",
+      "client_streaming": false,
+      "server_streaming": false
+    },
+    "Sent": {
+      "request": "shop.notifications.v1.SentRequest",
+      "reply": "shop.notifications.v1.SentReply",
+      "client_streaming": false,
+      "server_streaming": false
+    }
+  },
+  "messages": {
+    "shop.notifications.v1.Notification": {
+      "fields": {
+        "1": {
+          "name": "notification_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "2": {
+          "name": "customer_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "3": {
+          "name": "order_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "4": {
+          "name": "template",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "5": {
+          "name": "tenant",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    },
+    "shop.notifications.v1.NotifyReply": {
+      "fields": {
+        "1": {
+          "name": "notification_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    },
+    "shop.notifications.v1.NotifyRequest": {
+      "fields": {
+        "1": {
+          "name": "customer_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "2": {
+          "name": "order_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "3": {
+          "name": "template",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    },
+    "shop.notifications.v1.SentReply": {
+      "fields": {
+        "1": {
+          "name": "notifications",
+          "type": "message:shop.notifications.v1.Notification",
+          "cardinality": "repeated",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    },
+    "shop.notifications.v1.SentRequest": {
+      "fields": {
+        "1": {
+          "name": "customer_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    }
+  },
+  "enums": {}
+}

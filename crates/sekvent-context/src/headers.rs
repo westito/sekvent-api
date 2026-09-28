@@ -4,7 +4,8 @@
 //! request id or key must be visible ASCII without spaces and of bounded
 //! length, a `traceparent` must have the W3C version-00 shape, and
 //! `subject`/`tenant` survive only when the authenticated caller is a trusted
-//! link. Anything that fails validation is dropped (or, for the request id,
+//! link. The component call depth ([`HOPS`]) is read from any caller: it is
+//! a safety net against call cycles, not identity. Anything that fails validation is dropped (or, for the request id,
 //! replaced) rather than rejected, so a sloppy client still gets served.
 
 use std::time::{Duration, Instant};
@@ -25,6 +26,8 @@ pub const SUBJECT: &str = "x-sekvent-subject";
 pub const TENANT: &str = "x-sekvent-tenant";
 /// Idempotency key.
 pub const IDEMPOTENCY_KEY: &str = "idempotency-key";
+/// Component call depth.
+pub const HOPS: &str = "x-sekvent-hops";
 
 /// Longest accepted request id.
 const MAX_REQUEST_ID_LEN: usize = 128;
@@ -34,6 +37,8 @@ const MAX_VALUE_LEN: usize = 255;
 const MAX_TIMEOUT_DIGITS: usize = 8;
 /// Largest `grpc-timeout` value.
 const MAX_TIMEOUT_VALUE: u128 = 99_999_999;
+/// Most digits a hop count may carry.
+const MAX_HOPS_DIGITS: usize = 4;
 
 /// `grpc-timeout` units from finest to coarsest, with their size in nanoseconds.
 const TIMEOUT_UNITS: [(char, u128); 6] = [
@@ -50,7 +55,8 @@ const TIMEOUT_UNITS: [(char, u128); 6] = [
 /// `caller` is the identity established by authentication (or `None`).
 /// Untrusted callers' `subject`/`tenant` headers are ignored. A missing or
 /// malformed request id is replaced by a fresh one; a malformed
-/// `grpc-timeout` is ignored.
+/// `grpc-timeout` is ignored. The hop count is read from any caller as one
+/// to four ASCII digits; anything else leaves it at 0.
 pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> CallContext {
     let mut ctx = CallContext::new();
     if let Some(id) = token(headers, REQUEST_ID, MAX_REQUEST_ID_LEN) {
@@ -74,6 +80,9 @@ pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> Cal
     if let Some(key) = token(headers, IDEMPOTENCY_KEY, MAX_VALUE_LEN) {
         ctx = ctx.with_idempotency_key(key);
     }
+    if let Some(hops) = header_str(headers, HOPS).and_then(parse_hops) {
+        ctx = ctx.with_hops(hops);
+    }
     if let Some(caller) = caller {
         ctx = ctx.with_caller(caller);
     }
@@ -84,8 +93,9 @@ pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> Cal
 /// `grpc-timeout`). Existing values for these names are replaced.
 ///
 /// A field the context does not carry removes any stale header of that name,
-/// so a reused header map never leaks a previous call's values. An expired
-/// deadline is sent as `1n`, the shortest positive timeout.
+/// so a reused header map never leaks a previous call's values; a hop count
+/// of 0 counts as not carried. An expired deadline is sent as `1n`, the
+/// shortest positive timeout.
 ///
 /// This mirrors the context exactly, idempotency key included, which suits
 /// re-encoding a context. For a request to another service use
@@ -99,13 +109,15 @@ pub fn inject(ctx: &CallContext, headers: &mut HeaderMap) {
     set(headers, SUBJECT, ctx.subject());
     set(headers, TENANT, ctx.tenant());
     set(headers, IDEMPOTENCY_KEY, ctx.idempotency_key());
+    let hops = encode_hops(ctx.hops());
+    set(headers, HOPS, hops.as_deref());
 }
 
 /// Add the context to the headers of an outbound request without touching
 /// what the caller set.
 ///
-/// Request id, `traceparent`, subject and tenant are written only when the
-/// caller has not set that header; nothing is ever removed. The one
+/// Request id, `traceparent`, subject, tenant and a hop count above 0 are
+/// written only when the caller has not set that header; nothing is ever removed. The one
 /// exception is `grpc-timeout`: a caller value longer than the time this
 /// context has left (or one that does not parse) is replaced by the
 /// remaining time, because a callee must never get more time than its
@@ -126,6 +138,8 @@ pub fn propagate(ctx: &CallContext, headers: &mut HeaderMap) {
     set_if_absent(headers, TRACEPARENT, ctx.traceparent());
     set_if_absent(headers, SUBJECT, ctx.subject());
     set_if_absent(headers, TENANT, ctx.tenant());
+    let hops = encode_hops(ctx.hops());
+    set_if_absent(headers, HOPS, hops.as_deref());
 }
 
 /// Encode a duration as a `grpc-timeout` value (at most 8 digits, choosing
@@ -169,6 +183,22 @@ pub fn parse_grpc_timeout(value: &str) -> Option<std::time::Duration> {
         'n' => Duration::from_nanos(amount),
         _ => return None,
     })
+}
+
+/// One to four ASCII digits.
+fn parse_hops(value: &str) -> Option<u32> {
+    if value.is_empty()
+        || value.len() > MAX_HOPS_DIGITS
+        || !value.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// The header value for a hop count; `None` for 0, which is not sent.
+fn encode_hops(hops: u32) -> Option<String> {
+    (hops > 0).then(|| hops.to_string())
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -521,6 +551,53 @@ mod tests {
         let mut absent = HeaderMap::new();
         propagate(&ctx, &mut absent);
         assert_eq!(absent.get_all(GRPC_TIMEOUT).iter().count(), 1);
+    }
+
+    #[test]
+    fn hops_are_read_as_one_to_four_digits_from_any_caller() {
+        for (value, expected) in [("1", 1), ("16", 16), ("0042", 42), ("9999", 9999), ("0", 0)] {
+            for caller in [None, Some(ServiceIdentity::untrusted("web"))] {
+                let ctx = from_headers(&headers(&[(HOPS, value)]), caller);
+                assert_eq!(ctx.hops(), expected, "{value:?}");
+            }
+        }
+        for bad in ["", "10000", "-1", "+1", "1a", "a", " 1", "1.0", "٣"] {
+            assert_eq!(parse_hops(bad), None, "{bad:?}");
+        }
+        for bad in ["", "10000", "-1", "+1", "1a", "abc", "1.0"] {
+            let ctx = from_headers(&headers(&[(HOPS, bad)]), None);
+            assert_eq!(ctx.hops(), 0, "{bad:?}");
+        }
+        let mut non_ascii = HeaderMap::new();
+        non_ascii.insert(HOPS, HeaderValue::from_bytes(b"\xc3\xa9").unwrap());
+        assert_eq!(from_headers(&non_ascii, None).hops(), 0);
+        assert_eq!(from_headers(&HeaderMap::new(), None).hops(), 0);
+    }
+
+    #[test]
+    fn inject_writes_hops_above_zero_and_removes_a_stale_value() {
+        let mut map = HeaderMap::new();
+        inject(&CallContext::new().with_hops(2), &mut map);
+        assert_eq!(map[HOPS], "2");
+        assert_eq!(from_headers(&map, None).hops(), 2);
+
+        inject(&CallContext::new(), &mut map);
+        assert!(map.get(HOPS).is_none(), "a zero count removes the header");
+    }
+
+    #[test]
+    fn propagate_keeps_a_callers_hops_and_skips_zero() {
+        let mut theirs = headers(&[(HOPS, "7")]);
+        propagate(&CallContext::new().with_hops(2), &mut theirs);
+        assert_eq!(theirs[HOPS], "7");
+
+        let mut absent = HeaderMap::new();
+        propagate(&CallContext::new().with_hops(2), &mut absent);
+        assert_eq!(absent[HOPS], "2");
+
+        let mut zero = HeaderMap::new();
+        propagate(&CallContext::new(), &mut zero);
+        assert!(zero.get(HOPS).is_none());
     }
 
     #[test]

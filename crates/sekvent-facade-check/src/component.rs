@@ -1,9 +1,27 @@
 //! A standard component (`echo`) and a `local_only` one (`notes`), declared
-//! through the facade alone.
+//! through the facade alone. `echo`'s contract is the hand-written
+//! [`proto`] module, shaped like sekvent-proto-build's output.
 
 use sekvent::component::BuildError;
 use sekvent::config::ConfigSource;
 use sekvent::prelude::*;
+
+/// What sekvent-proto-build generates for the `check.echo.v1` package,
+/// reduced to the contract of its `Echo` service.
+pub mod proto {
+    /// Contract of `check.echo.v1.Echo`, checked by `#[component(proto = …)]`.
+    #[doc(hidden)]
+    #[allow(non_upper_case_globals, dead_code)]
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+        "check.echo.v1.Echo",
+        &[(
+            "Ping",
+            "check.echo.v1.PingRequest",
+            "check.echo.v1.PingReply",
+            false,
+        )],
+    );
+}
 
 /// Text to echo.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -13,12 +31,22 @@ pub struct PingRequest {
     pub text: String,
 }
 
+impl prost::Name for PingRequest {
+    const NAME: &'static str = "PingRequest";
+    const PACKAGE: &'static str = "check.echo.v1";
+}
+
 /// The echoed text.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct PingReply {
     /// The text of the request.
     #[prost(string, tag = "1")]
     pub text: String,
+}
+
+impl prost::Name for PingReply {
+    const NAME: &'static str = "PingReply";
+    const PACKAGE: &'static str = "check.echo.v1";
 }
 
 /// What [`Echo::ping`] can fail with.
@@ -33,7 +61,11 @@ pub enum EchoError {
 }
 
 /// Echoes text back.
-#[sekvent::component(name = "echo", package = "check.echo.v1")]
+#[sekvent::component(
+    name = "echo",
+    package = "check.echo.v1",
+    proto = "crate::component::proto"
+)]
 pub trait Echo: Send + Sync + 'static {
     /// The request's text, unchanged.
     #[call(timeout = "1s")]
@@ -84,12 +116,24 @@ mod tests {
     use std::time::Duration;
 
     use sekvent::component::Binding;
+    use sekvent::component::reasons;
     use sekvent::config::MapSource;
 
     use super::*;
 
+    const INBOUND_TOKEN: &str = "orders-inbound-token-0123456789abcdef";
+    const OUTBOUND_TOKEN: &str = "echo-outbound-token-0123456789abcdefg";
+
     fn bound(binding: Binding) -> MapSource {
         MapSource::new().with("SEKVENT_COMPONENT_BINDING", binding.as_str())
+    }
+
+    /// An `http://` endpoint on which nothing listens.
+    fn closed_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
     }
 
     #[tokio::test]
@@ -135,11 +179,78 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_binding_fails_the_build() {
-        let error = app(&bound(Binding::Grpc)).unwrap_err();
+    fn a_grpc_binding_needs_an_endpoint_and_a_token() {
+        let source = MapSource::new().with("SEKVENT_COMPONENT_ECHO_BINDING", "grpc");
+        let text = app(&source).unwrap_err().to_string();
+        assert!(text.contains("SEKVENT_COMPONENT_ECHO_ENDPOINT"), "{text}");
+
+        let source = source.with("SEKVENT_COMPONENT_ECHO_ENDPOINT", "http://127.0.0.1:50051");
+        let text = app(&source).unwrap_err().to_string();
+        assert!(text.contains("SEKVENT_LINK_OUTBOUND_ECHO"), "{text}");
+        assert!(!text.contains("50051"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_grpc_bound_component_reports_an_unreachable_endpoint() {
+        let source = MapSource::new()
+            .with("SEKVENT_COMPONENT_ECHO_BINDING", "grpc")
+            .with("SEKVENT_COMPONENT_ECHO_ENDPOINT", closed_endpoint())
+            .with("SEKVENT_LINK_OUTBOUND_ECHO", OUTBOUND_TOKEN);
+        let built = app(&source).unwrap();
+        built.start().await.unwrap();
+        let echo = built.handle::<EchoHandle>().unwrap();
+        assert_eq!(echo.binding(), Binding::Grpc);
+
+        let request = PingRequest {
+            text: "hello".to_owned(),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            echo.ping(&CallContext::new(), request),
+        )
+        .await
+        .expect("the call finishes")
+        .unwrap_err();
+        let EchoError::Other(error) = error else {
+            panic!("expected Other, got {error:?}");
+        };
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(error.reason(), Some(reasons::UNREACHABLE));
+
+        built.stop(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_exposed_component_starts_once_its_routes_are_mounted() {
+        let source = MapSource::new()
+            .with("SEKVENT_COMPONENT_ECHO_SERVE", "grpc")
+            .with("SEKVENT_LINK_INBOUND_ORDERS", INBOUND_TOKEN);
+
+        let unmounted = app(&source).unwrap();
+        assert_eq!(unmounted.grpc_services(), ["check.echo.v1.Echo"]);
+        let error = unmounted.start().await.unwrap_err();
+        assert_eq!(error.reason(), Some(reasons::GRPC_NOT_MOUNTED));
+
+        let mounted = app(&source).unwrap();
+        let _routes = mounted.grpc_routes();
+        mounted.start().await.unwrap();
+        mounted.stop(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[test]
+    fn a_local_only_component_cannot_be_served() {
+        let source = MapSource::new()
+            .with("SEKVENT_COMPONENT_NOTES_SERVE", "grpc")
+            .with("SEKVENT_LINK_INBOUND_ORDERS", INBOUND_TOKEN);
+        let error = app(&source).unwrap_err();
+        let text = error.to_string();
         assert!(
-            matches!(error, BuildError::BindingUnavailable { .. }),
-            "{error}"
+            matches!(
+                error,
+                BuildError::NotServable { .. } | BuildError::Multiple(_)
+            ),
+            "{text}"
         );
+        assert!(text.contains("SEKVENT_COMPONENT_NOTES_SERVE"), "{text}");
     }
 }

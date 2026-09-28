@@ -1,0 +1,126 @@
+{
+  "format": 1,
+  "service": "shop.orders.v1.Orders",
+  "file": "shop/orders/v1/orders.proto",
+  "rpcs": {
+    "GetOrder": {
+      "request": "shop.orders.v1.GetOrderRequest",
+      "reply": "shop.orders.v1.Order",
+      "client_streaming": false,
+      "server_streaming": false
+    },
+    "PlaceOrder": {
+      "request": "shop.orders.v1.PlaceOrderRequest",
+      "reply": "shop.orders.v1.PlaceOrderReply",
+      "client_streaming": false,
+      "server_streaming": false
+    }
+  },
+  "messages": {
+    "shop.orders.v1.GetOrderRequest": {
+      "fields": {
+        "1": {
+          "name": "order_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    },
+    "shop.orders.v1.Order": {
+      "fields": {
+        "1": {
+          "name": "order_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "2": {
+          "name": "customer_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "3": {
+          "name": "sku",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "4": {
+          "name": "quantity",
+          "type": "uint32",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "5": {
+          "name": "status",
+          "type": "enum:shop.orders.v1.OrderStatus",
+          "cardinality": "singular",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    },
+    "shop.orders.v1.PlaceOrderReply": {
+      "fields": {
+        "1": {
+          "name": "order_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "2": {
+          "name": "reservation_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    },
+    "shop.orders.v1.PlaceOrderRequest": {
+      "fields": {
+        "1": {
+          "name": "customer_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "2": {
+          "name": "sku",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null
+        },
+        "3": {
+          "name": "quantity",
+          "type": "uint32",
+          "cardinality": "singular",
+          "oneof": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": []
+    }
+  },
+  "enums": {
+    "shop.orders.v1.OrderStatus": {
+      "values": {
+        "0": [
+          "ORDER_STATUS_UNSPECIFIED"
+        ],
+        "1": [
+          "ORDER_STATUS_PLACED"
+        ]
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "closed": false
+    }
+  }
+}

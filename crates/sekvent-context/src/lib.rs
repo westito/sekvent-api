@@ -57,6 +57,7 @@ pub struct CallContext {
     tenant: Option<String>,
     idempotency_key: Option<String>,
     traceparent: Option<String>,
+    hops: u32,
 }
 
 impl Default for CallContext {
@@ -78,6 +79,7 @@ impl CallContext {
             tenant: None,
             idempotency_key: None,
             traceparent: None,
+            hops: 0,
         }
     }
 
@@ -143,6 +145,13 @@ impl CallContext {
         self
     }
 
+    /// Set how many component calls led to this one.
+    #[must_use]
+    pub fn with_hops(mut self, hops: u32) -> Self {
+        self.hops = hops;
+        self
+    }
+
     /// Request id.
     pub fn request_id(&self) -> &str {
         &self.request_id
@@ -188,9 +197,13 @@ impl CallContext {
     pub fn traceparent(&self) -> Option<&str> {
         self.traceparent.as_deref()
     }
+    /// How many component calls led to this one (0 at the edge).
+    pub fn hops(&self) -> u32 {
+        self.hops
+    }
 
-    /// A child for an outbound call: same identity and deadline, a child
-    /// cancellation token, and the caller cleared (the callee learns its
+    /// A child for an outbound call: same identity, deadline and hop count, a
+    /// child cancellation token, and the caller cleared (the callee learns its
     /// caller from authentication, not from us).
     #[must_use]
     pub fn child(&self) -> Self {
@@ -203,11 +216,12 @@ impl CallContext {
             tenant: self.tenant.clone(),
             idempotency_key: self.idempotency_key.clone(),
             traceparent: self.traceparent.clone(),
+            hops: self.hops,
         }
     }
 
-    /// A context for work queued beyond this call's lifetime: identity and
-    /// trace are kept, deadline and cancellation are not.
+    /// A context for work queued beyond this call's lifetime: identity, trace
+    /// and hop count are kept, deadline and cancellation are not.
     #[must_use]
     pub fn detached(&self) -> Self {
         Self {
@@ -219,6 +233,7 @@ impl CallContext {
             tenant: self.tenant.clone(),
             idempotency_key: self.idempotency_key.clone(),
             traceparent: self.traceparent.clone(),
+            hops: self.hops,
         }
     }
 
@@ -245,6 +260,7 @@ mod tests {
             .with_tenant("tenant-a")
             .with_idempotency_key("order-42")
             .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .with_hops(3)
     }
 
     #[test]
@@ -273,6 +289,7 @@ mod tests {
         assert_eq!(ctx.tenant(), None);
         assert_eq!(ctx.idempotency_key(), None);
         assert_eq!(ctx.traceparent(), None);
+        assert_eq!(ctx.hops(), 0);
     }
 
     #[test]
@@ -287,6 +304,8 @@ mod tests {
             ctx.traceparent(),
             Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         );
+        assert_eq!(ctx.hops(), 3);
+        assert_eq!(ctx.with_hops(0).hops(), 0, "the hop count is replaced");
     }
 
     #[test]
@@ -363,6 +382,7 @@ mod tests {
         assert_eq!(child.tenant(), parent.tenant());
         assert_eq!(child.idempotency_key(), parent.idempotency_key());
         assert_eq!(child.traceparent(), parent.traceparent());
+        assert_eq!(child.hops(), 3);
     }
 
     #[tokio::test]
@@ -393,6 +413,7 @@ mod tests {
         assert_eq!(detached.tenant(), Some("tenant-a"));
         assert_eq!(detached.idempotency_key(), Some("order-42"));
         assert_eq!(detached.traceparent(), parent.traceparent());
+        assert_eq!(detached.hops(), 3);
     }
 
     #[test]

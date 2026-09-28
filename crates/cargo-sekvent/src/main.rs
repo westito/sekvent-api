@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use sekvent_tasks::config::{ConfigError, Project, find_project_root, find_workspace_root};
+use sekvent_tasks::contract;
 use sekvent_tasks::dispatch::{self, External};
 use sekvent_tasks::gate::{self, CoverageOptions, SingleStep};
 use sekvent_tasks::harness::{self, CleanScope, DockerSweeper, Sweeper};
@@ -58,6 +59,12 @@ enum Command {
     },
     /// Check [[gate.boundaries]] against the dependency graph.
     Boundaries,
+    /// Protobuf service contracts of the [contract] roots: write baselines or
+    /// check wire compatibility (compiles protos in-process: runs here).
+    Contract {
+        #[command(subcommand)]
+        command: ContractCommand,
+    },
     /// Remove test containers of the configured label namespace.
     HarnessClean(HarnessCleanArgs),
     /// Run a custom [tasks.<name>]; without a name, list them.
@@ -277,6 +284,21 @@ enum ConfigCommand {
     Show,
 }
 
+#[derive(Debug, Subcommand)]
+enum ContractCommand {
+    /// Write the canonical baselines of every service, or of those named.
+    Emit {
+        /// Full service names, e.g. `billing.v1.Billing` (default: all).
+        services: Vec<String>,
+    },
+    /// Compare the services with their baselines; exit 1 on a breaking
+    /// change or a missing baseline.
+    Check {
+        /// Full service names, e.g. `billing.v1.Billing` (default: all).
+        services: Vec<String>,
+    },
+}
+
 /// What every handler gets.
 struct Env<'a> {
     cwd: PathBuf,
@@ -360,6 +382,7 @@ fn run(env: &Env<'_>, command: Command) -> anyhow::Result<i32> {
             env.compiling(|ctx| gate::coverage(ctx, &options))
         }
         Command::Boundaries => gate::boundaries(&env.context()?),
+        Command::Contract { command } => contract_command(env, command),
         Command::HarnessClean(args) => harness_clean(env, args),
         Command::Run { task: None, .. } => {
             print!("{}", dispatch::list_tasks(&env.project()?.config.tasks));
@@ -447,6 +470,17 @@ fn harness_clean(env: &Env<'_>, args: HarnessCleanArgs) -> anyhow::Result<i32> {
         );
         Ok(0)
     })
+}
+
+fn contract_command(env: &Env<'_>, command: ContractCommand) -> anyhow::Result<i32> {
+    let project = env.project()?;
+    let config = &project.config.contract;
+    match command {
+        ContractCommand::Emit { services } => contract::run_emit(&project.root, config, &services),
+        ContractCommand::Check { services } => {
+            contract::run_check(&project.root, config, &services)
+        }
+    }
 }
 
 fn new(env: &Env<'_>, args: NewArgs) -> anyhow::Result<i32> {
@@ -589,6 +623,37 @@ mod tests {
             };
             assert_eq!(args, [name, "--flag"]);
         }
+    }
+
+    #[test]
+    fn contract_is_a_command_with_emit_and_check() {
+        let cli = parse(&["cargo-sekvent", "sekvent", "contract", "emit"]).unwrap();
+        let Command::Contract {
+            command: ContractCommand::Emit { services },
+        } = cli.command
+        else {
+            panic!("expected contract emit");
+        };
+        assert!(services.is_empty());
+
+        let cli = parse(&[
+            "cargo-sekvent",
+            "contract",
+            "check",
+            "billing.v1.Billing",
+            "orders.v1.Orders",
+        ])
+        .unwrap();
+        let Command::Contract {
+            command: ContractCommand::Check { services },
+        } = cli.command
+        else {
+            panic!("expected contract check");
+        };
+        assert_eq!(services, ["billing.v1.Billing", "orders.v1.Orders"]);
+
+        assert!(parse(&["cargo-sekvent", "contract"]).is_err());
+        assert!(parse(&["cargo-sekvent", "contract", "diff"]).is_err());
     }
 
     #[test]

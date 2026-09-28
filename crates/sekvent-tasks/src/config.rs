@@ -25,6 +25,10 @@ pub const DEFAULT_TEST_THREADS: u32 = 8;
 /// Default age after which another run's harness containers count as stale.
 pub const DEFAULT_STALE_AFTER: &str = "6h";
 
+/// Default directory of the committed contract baselines, relative to
+/// `sekvent.toml`.
+pub const DEFAULT_CONTRACT_BASELINE: &str = "contracts";
+
 /// Why `sekvent.toml` could not be used.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -88,6 +92,9 @@ pub struct Config {
     /// `[hooks]`: commands run around the gate and coverage.
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// `[contract]`: protobuf service contracts and their baselines.
+    #[serde(default)]
+    pub contract: ContractConfig,
     /// `[tasks.<name>]`: custom tasks for `cargo sekvent run <name>`.
     #[serde(default)]
     pub tasks: BTreeMap<String, TaskConfig>,
@@ -313,6 +320,42 @@ pub struct TaskConfig {
     pub description: Option<String>,
 }
 
+/// `[contract]`: the `.proto` services checked by `cargo sekvent contract`.
+///
+/// With no `roots` the feature is off.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContractConfig {
+    /// Directories, relative to `sekvent.toml`; every `.proto` below each
+    /// is compiled and every service in them is a contract.
+    pub roots: Vec<PathBuf>,
+    /// Extra import directories for every root.
+    pub includes: Vec<PathBuf>,
+    /// Directory of the committed baselines, relative to `sekvent.toml`.
+    pub baseline: PathBuf,
+    /// Run `contract check` in `cargo sekvent gate` when `roots` is not
+    /// empty.
+    pub gate: bool,
+}
+
+impl Default for ContractConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            includes: Vec::new(),
+            baseline: PathBuf::from(DEFAULT_CONTRACT_BASELINE),
+            gate: true,
+        }
+    }
+}
+
+impl ContractConfig {
+    /// The gate runs `contract check`: roots are configured and `gate` is on.
+    pub fn in_gate(&self) -> bool {
+        self.gate && !self.roots.is_empty()
+    }
+}
+
 impl Config {
     /// A configuration with every default and the given project name.
     pub fn with_name(name: &str) -> Self {
@@ -325,6 +368,7 @@ impl Config {
             coverage: CoverageConfig::default(),
             harness: HarnessConfig::default(),
             hooks: HooksConfig::default(),
+            contract: ContractConfig::default(),
             tasks: BTreeMap::new(),
         }
     }
@@ -428,6 +472,31 @@ impl Config {
                     "must not be empty".into(),
                 ));
             }
+        }
+        self.validate_contract(path)
+    }
+
+    fn validate_contract(&self, path: &Path) -> Result<(), ConfigError> {
+        let invalid = |key: &str, reason: &str| ConfigError::Invalid {
+            path: path.to_owned(),
+            key: key.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let contract = &self.contract;
+        for (key, dirs) in [
+            ("contract.roots", &contract.roots),
+            ("contract.includes", &contract.includes),
+        ] {
+            if dirs.iter().any(|dir| dir.as_os_str().is_empty()) {
+                return Err(invalid(key, "must not contain empty paths"));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            if !dirs.iter().all(|dir| seen.insert(dir)) {
+                return Err(invalid(key, "must not repeat a path"));
+            }
+        }
+        if contract.baseline.as_os_str().is_empty() {
+            return Err(invalid("contract.baseline", "must not be empty"));
         }
         Ok(())
     }
@@ -536,6 +605,12 @@ post_gate = [["echo", "post"]]
 pre_coverage = [["true"]]
 post_coverage = [["true"], ["echo", "done"]]
 
+[contract]
+roots = ["crates/orders-api/proto"]
+includes = ["third_party/proto"]
+baseline = "api/contracts"
+gate = false
+
 [tasks.seed]
 run = ["cargo", "run", "-p", "orders", "--bin", "seed", "--"]
 remote = true
@@ -585,6 +660,16 @@ description = "Seed the dev database"
         assert!(seed.remote);
         assert_eq!(seed.description.as_deref(), Some("Seed the dev database"));
         assert_eq!(seed.run[0], "cargo");
+        assert_eq!(
+            config.contract,
+            ContractConfig {
+                roots: vec!["crates/orders-api/proto".into()],
+                includes: vec!["third_party/proto".into()],
+                baseline: "api/contracts".into(),
+                gate: false,
+            }
+        );
+        assert!(!config.contract.in_gate());
     }
 
     #[test]
@@ -605,6 +690,18 @@ description = "Seed the dev database"
         );
         assert!(!config.harness.docker_tests);
         assert!(config.tasks.is_empty());
+        assert!(config.contract.roots.is_empty());
+        assert!(config.contract.includes.is_empty());
+        assert_eq!(config.contract.baseline, PathBuf::from("contracts"));
+        assert!(config.contract.gate);
+        assert!(!config.contract.in_gate());
+    }
+
+    #[test]
+    fn contract_roots_switch_the_gate_step_on() {
+        let config = parse("[project]\nname = \"x\"\n[contract]\nroots = [\"a/proto\"]\n").unwrap();
+        assert!(config.contract.in_gate());
+        assert_eq!(config.contract.baseline, PathBuf::from("contracts"));
     }
 
     #[test]
@@ -626,6 +723,7 @@ description = "Seed the dev database"
             "[project]\nname = \"x\"\n[harness]\ndocker_test = true\n",
             "[project]\nname = \"x\"\n[hooks]\npre_test = []\n",
             "[project]\nname = \"x\"\n[tasks.a]\nrun = [\"a\"]\nenv = {}\n",
+            "[project]\nname = \"x\"\n[contract]\nroot = [\"a\"]\n",
             "[project]\nname = \"x\"\n[unknown]\n",
         ] {
             let error = parse(text).unwrap_err();
@@ -668,6 +766,11 @@ description = "Seed the dev database"
             ("[hooks]\npre_gate = [[]]", "hooks.pre_gate"),
             ("[tasks.a]\nrun = []", "tasks.a.run"),
             ("[remote]\nrrb = \"\"", "remote.rrb"),
+            ("[contract]\nroots = [\"\"]", "contract.roots"),
+            ("[contract]\nroots = [\"a\", \"a\"]", "contract.roots"),
+            ("[contract]\nincludes = [\"\"]", "contract.includes"),
+            ("[contract]\nincludes = [\"b\", \"b\"]", "contract.includes"),
+            ("[contract]\nbaseline = \"\"", "contract.baseline"),
         ] {
             let text = format!("[project]\nname = \"x\"\n{text}\n");
             match parse(&text) {

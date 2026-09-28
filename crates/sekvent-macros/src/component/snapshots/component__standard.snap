@@ -250,3 +250,16 @@ const _: () = {
     ::sekvent_component::__private::assert_wire::<ReleaseReply>();
     ::sekvent_component::__private::assert_error::<InventoryError>();
 };
+const _: () = ::sekvent_component::__private::assert_service(
+    crate::proto::shop::inventory::v1::__sekvent_service_Inventory,
+    "shop.inventory.v1.Inventory",
+    2usize,
+);
+const _: () = ::sekvent_component::__private::assert_rpc::<
+    ReserveRequest,
+    ReserveReply,
+>(crate::proto::shop::inventory::v1::__sekvent_service_Inventory, "Reserve");
+const _: () = ::sekvent_component::__private::assert_rpc::<
+    ReleaseRequest,
+    ReleaseReply,
+>(crate::proto::shop::inventory::v1::__sekvent_service_Inventory, "Release");

@@ -5,7 +5,9 @@
 //! runtime through `sekvent::config`, and `#[sekvent::component]` and
 //! `#[derive(sekvent::ComponentError)]` (in [`component`]) theirs through
 //! `sekvent::component`. If a macro ever names a crate the consumer does not
-//! depend on, this crate stops compiling. It is not published.
+//! depend on, this crate stops compiling. The facade's `component-grpc`
+//! feature is on, so the gRPC binding and serving are checked through the
+//! facade as well. It is not published.
 
 #![forbid(unsafe_code)]
 

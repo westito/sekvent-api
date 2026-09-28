@@ -208,6 +208,141 @@ fn both_runs_tonic_and_the_hook() {
     assert!(out.path().join("all.rs").exists());
 }
 
+/// `text` without whitespace or trailing commas, so generated code compares
+/// the same whether or not prost formatted it.
+fn compact(text: &str) -> String {
+    let dense: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    dense.replace(",]", "]").replace(",)", ")")
+}
+
+/// A package with two services, a streaming RPC and a type from another
+/// package, importing the fixtures' `common.v1`.
+fn contract_fixture(dir: &Path) {
+    fs::create_dir_all(dir.join("ledger/v1")).unwrap();
+    fs::write(
+        dir.join("ledger/v1/ledger.proto"),
+        "syntax = \"proto3\";\n\
+         package ledger.v1;\n\
+         import \"common/v1/money.proto\";\n\
+         message Entry { string id = 1; common.v1.Money amount = 2; }\n\
+         message GetEntryRequest { string id = 1; }\n\
+         message Ack {}\n\
+         service Entries {\n\
+           rpc GetEntry(GetEntryRequest) returns (Entry);\n\
+           rpc Balance(GetEntryRequest) returns (common.v1.Money);\n\
+           rpc Follow(GetEntryRequest) returns (stream Entry);\n\
+         }\n\
+         service Audit { rpc Record(Entry) returns (Ack); }\n",
+    )
+    .unwrap();
+}
+
+const ENTRIES_CONTRACT: &str = r#"
+    /// Contract of `ledger.v1.Entries`, checked by `#[component(proto = …)]`.
+    #[doc(hidden)]
+    #[allow(non_upper_case_globals, dead_code)]
+    pub const __sekvent_service_Entries: (&str, &[(&str, &str, &str, bool)]) = (
+        "ledger.v1.Entries",
+        &[
+            ("GetEntry", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", false),
+            ("Balance", "ledger.v1.GetEntryRequest", "common.v1.Money", false),
+            ("Follow", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", true),
+        ],
+    );
+"#;
+
+const AUDIT_CONTRACT: &str = r#"
+    pub const __sekvent_service_Audit: (&str, &[(&str, &str, &str, bool)]) = (
+        "ledger.v1.Audit",
+        &[("Record", "ledger.v1.Entry", "ledger.v1.Ack", false)],
+    );
+"#;
+
+#[test]
+fn messages_only_emits_a_contract_per_service() {
+    if !protoc_available() {
+        return;
+    }
+    let src = tempfile::tempdir().unwrap();
+    contract_fixture(src.path());
+    let out = tempfile::tempdir().unwrap();
+    ProtoBuild::new(src.path())
+        .include(fixtures())
+        .messages_only()
+        .out_dir(out.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+
+    let ledger = compact(&read(&out.path().join("ledger.v1.rs")));
+    assert!(ledger.contains(&compact(ENTRIES_CONTRACT)), "{ledger}");
+    assert!(ledger.contains(&compact(AUDIT_CONTRACT)), "{ledger}");
+    assert!(!ledger.contains("sekvent_component"), "{ledger}");
+    assert!(!ledger.contains("entries_server"), "{ledger}");
+    let common = read(&out.path().join("common.v1.rs"));
+    assert!(!common.contains("__sekvent_service_"), "{common}");
+}
+
+#[test]
+fn both_emits_contracts_next_to_the_stubs() {
+    if !protoc_available() {
+        return;
+    }
+    let out = tempfile::tempdir().unwrap();
+    ProtoBuild::new(fixtures())
+        .both()
+        .out_dir(out.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+
+    let billing = read(&out.path().join("billing.v1.rs"));
+    assert!(billing.contains("invoices_server"));
+    assert!(
+        compact(&billing).contains(&compact(
+            r#"pub const __sekvent_service_Invoices: (&str, &[(&str, &str, &str, bool)]) = (
+                "billing.v1.Invoices",
+                &[("GetInvoice", "billing.v1.GetInvoiceRequest", "billing.v1.Invoice", false)],
+            );"#
+        )),
+        "{billing}"
+    );
+}
+
+#[test]
+fn contracts_can_be_turned_off_and_services_only_never_emits_them() {
+    if !protoc_available() {
+        return;
+    }
+    let src = tempfile::tempdir().unwrap();
+    contract_fixture(src.path());
+    let off = tempfile::tempdir().unwrap();
+    ProtoBuild::new(src.path())
+        .include(fixtures())
+        .messages_only()
+        .service_contracts(false)
+        .out_dir(off.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+    let ledger = read(&off.path().join("ledger.v1.rs"));
+    assert!(ledger.contains("pub struct Entry"));
+    assert!(!ledger.contains("__sekvent_service_"), "{ledger}");
+
+    let services = tempfile::tempdir().unwrap();
+    ProtoBuild::new(src.path())
+        .include(fixtures())
+        .files(["ledger/v1/ledger.proto"])
+        .services_only("::ledger_proto")
+        .out_dir(services.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+    let ledger = read(&services.path().join("ledger.v1.rs"));
+    assert!(ledger.contains("entries_server"));
+    assert!(!ledger.contains("__sekvent_service_"), "{ledger}");
+}
+
 #[test]
 fn a_syntax_error_is_a_compile_error() {
     if !protoc_available() {

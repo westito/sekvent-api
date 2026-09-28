@@ -1,0 +1,28 @@
+error[E0277]: `PingRequest` has no protobuf type name
+  --> tests/ui/fail/p7_message_without_name.rs:40:14
+   |
+40 |         req: PingRequest,
+   |              ^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Name` is not implemented for `PingRequest`
+  --> tests/ui/fail/p7_message_without_name.rs:6:1
+   |
+ 6 | pub struct PingRequest {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   = note: compile the messages with sekvent-proto-build, which enables prost's type names, or implement `prost::Name`
+   = help: the following other types implement trait `Name`:
+             ()
+             PingReply
+             String
+             Vec<u8>
+             bool
+             f32
+             f64
+             i32
+           and $N others
+   = note: required for `PingRequest` to implement `sekvent_component::__private::ContractMessage`
+note: required by a bound in `sekvent_component::__private::assert_rpc`
+  --> $WORKSPACE/crates/sekvent-component/src/contract.rs
+   |
+   | pub const fn assert_rpc<Req: ContractMessage, Rep: ContractMessage>(
+   |                              ^^^^^^^^^^^^^^^ required by this bound in `assert_rpc`

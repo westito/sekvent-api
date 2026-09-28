@@ -94,3 +94,9 @@ environment, not to this template.
 - `cargo sekvent sdk update` moves to the newest sekvent and its pinned set;
   `cargo sekvent deps check` reports drift.
 - `cargo sekvent agents` refreshes the sekvent section of `AGENTS.md`.
+- Split a feature into a component (an `-api` crate with the `.proto`
+  `service`, the trait and the error) to keep it in-process now and move it
+  into its own service later by configuration; see the `sekvent` skill.
+  Then add its proto directory to `[contract] roots` in `sekvent.toml`, run
+  `cargo sekvent contract emit` and commit the baselines, so the gate checks
+  the contract stays wire-compatible.

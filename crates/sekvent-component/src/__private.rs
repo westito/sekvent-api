@@ -14,7 +14,7 @@ pub use prost;
 use sekvent_context::CallContext;
 use sekvent_error::AppError;
 
-use crate::app::{Built, erase};
+use crate::app::{Built, Handle, RemoteFactory, erase};
 use crate::lifecycle::LifecycleDyn;
 use crate::link::Route;
 use crate::{
@@ -22,6 +22,7 @@ use crate::{
     Lifecycle, reasons,
 };
 
+pub use crate::contract::{ContractMessage, ProtoRpc, ProtoService, assert_rpc, assert_service};
 pub use crate::link::Endpoint;
 
 /// A boxed, sendable future.
@@ -158,8 +159,8 @@ where
     let build = erase(move |deps, link| {
         let local = factory(deps)?;
         let route = match link.binding() {
-            Binding::LocalSerialized => match local.dispatch {
-                Some(dispatch) => Route::Serialized(dispatch),
+            Binding::LocalSerialized => match &local.dispatch {
+                Some(dispatch) => Route::Serialized(Arc::clone(dispatch)),
                 None => {
                     return Err(AppError::failed_precondition(format!(
                         "component {} has no serialized dispatcher and can only be bound local",
@@ -172,13 +173,14 @@ where
         Ok(Built {
             handle: Box::new(make_handle(Endpoint::new(link, route))),
             lifecycle: local.lifecycle,
+            dispatch: local.dispatch,
         })
     });
-    app.install::<H>(Some(build))
+    app.install::<H>(Some(build), remote_factory(make_handle))
 }
 
 /// Declare a `remote_only` component. It has no factory; it must be bound to
-/// a remote transport, which this build does not have.
+/// a remote transport (`grpc`).
 pub fn install_remote<H, D>(
     app: &mut AppBuilder<'_>,
     make_handle: fn(Endpoint<D>) -> H,
@@ -187,9 +189,18 @@ where
     H: ComponentHandle,
     D: ?Sized + Send + Sync + 'static,
 {
-    // Remote transports arrive with C2; until then the handle is never built.
-    let _ = make_handle;
-    app.install::<H>(None)
+    app.install::<H>(None, remote_factory(make_handle))
+}
+
+/// The handle of a component whose calls go to another process.
+fn remote_factory<H, D>(make_handle: fn(Endpoint<D>) -> H) -> RemoteFactory
+where
+    H: ComponentHandle,
+    D: ?Sized + Send + Sync + 'static,
+{
+    Box::new(move |link| {
+        Endpoint::remote(link).map(|endpoint| -> Handle { Box::new(make_handle(endpoint)) })
+    })
 }
 
 /// Whether `error` carries `reason` and, when `domain` is `Some`, that

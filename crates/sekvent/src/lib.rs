@@ -16,7 +16,7 @@
 //! | [`link`] | `sekvent-link` | `link` | service-to-service tokens, middleware, interceptors |
 //! | [`client`] | `sekvent-client` | `client` | outbound HTTP with policy, context propagation, OAuth 2.0 |
 //! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, list filters |
-//! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local and serialized bindings |
+//! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local, serialized and gRPC bindings |
 //!
 //! # Sub-features
 //!
@@ -34,6 +34,8 @@
 //! - `db-migrate`, `db-sea-orm-migrate`: migrations on boot.
 //! - `component` also turns on `config`, `error` and `context`; with
 //!   `runtime` on as well, `App::register` runs the App as a runtime unit.
+//! - `component-grpc`: the component `grpc` binding and serving components
+//!   over gRPC (`App::grpc_routes`).
 //! - `full`: everything above.
 //!
 //! # Not re-exported

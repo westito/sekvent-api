@@ -1,0 +1,16 @@
+# cargo sekvent — configuration of the example shop.
+#
+# The shop's crates are members of the sekvent workspace, so the gate runs
+# from the repository root; this file configures the contract baselines of
+# the shop's components.
+
+[project]
+name = "shop"
+
+[contract]
+# Every service declared in the .proto files below these directories is a
+# contract; `cargo sekvent contract check` compares each with its baseline.
+roots = ["inventory-api/proto", "notifications-api/proto", "orders-api/proto"]
+# Committed baselines, one JSON file per service, written by
+# `cargo sekvent contract emit`.
+baseline = "contracts"

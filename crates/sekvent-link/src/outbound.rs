@@ -20,6 +20,7 @@ use crate::token::validate_token;
 #[derive(Clone)]
 pub struct BearerInjector {
     link: String,
+    token: Secret,
     value: HeaderValue,
     #[cfg(feature = "tonic")]
     metadata: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
@@ -43,6 +44,7 @@ impl BearerInjector {
         };
         Ok(Self {
             link,
+            token: token.clone(),
             value,
             #[cfg(feature = "tonic")]
             metadata,
@@ -52,6 +54,11 @@ impl BearerInjector {
     /// The link this injector authenticates to.
     pub fn link(&self) -> &str {
         &self.link
+    }
+
+    /// The presented token, for comparisons inside this crate only.
+    pub(crate) fn token(&self) -> &Secret {
+        &self.token
     }
 
     /// Set the `Authorization` header, replacing any existing one.
@@ -160,6 +167,7 @@ mod tests {
     fn debug_shows_the_link_only() {
         let injector = injector();
         assert_eq!(injector.link(), "billing");
+        assert_eq!(injector.token().expose(), TOKEN);
         let debug = format!("{injector:?}");
         assert!(debug.contains("billing"));
         assert!(!debug.contains(TOKEN));

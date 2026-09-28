@@ -140,6 +140,7 @@ line. The `sekvent` skill has the recipes with real API names.
 | `tonic-build`/`prost-build` calls in `build.rs` | `sekvent_proto_build::ProtoBuild` (`messages_only` / `services_only` for split proto crates) |
 | custom lifecycle, signal handling, health routes | `Runtime::builder()` units and `Server::builder()`; `/livez`, `/readyz`, `/healthz` and `grpc.health.v1` come built in |
 | shared-secret checks between services | `sekvent::link` tokens (`SEKVENT_LINK_*`) with `link-axum` / `link-tonic` |
+| an internal module called through a trait, or two services that talk over hand-written gRPC clients | a component (`#[sekvent::component(…, proto = "…")]`, the `.proto` `service` as its contract): `local` in one binary, `grpc` across processes by configuration (`component-grpc`); keep existing public gRPC APIs as they are and move only internal calls |
 
 Rules while replacing:
 

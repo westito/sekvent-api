@@ -1,0 +1,16 @@
+error[E0080]: evaluation panicked: component contract: the proto service has no RPC named after this method
+  --> tests/ui/fail/p1_method_without_rpc.rs:47:1
+   |
+47 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
+   |
+note: inside `sekvent_component::__private::assert_rpc::<PingRequest, PingReply>`
+  --> $RUST/core/src/panic.rs
+   |
+   |         $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/crates/sekvent-component/src/contract.rs
+   |
+   |     panic!("component contract: the proto service has no RPC named after this method");
+   |     ---------------------------------------------------------------------------------- in this macro invocation

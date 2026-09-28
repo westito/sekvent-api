@@ -79,3 +79,23 @@ async fn an_app_registers_with_the_runtime() {
     let report = handle.wait().await.unwrap();
     assert!(report.unit("components").is_some());
 }
+
+#[test]
+fn the_module_exports_the_c2_keys() {
+    assert_eq!(
+        sekvent::component::MAX_HOPS_KEY,
+        "SEKVENT_COMPONENT_MAX_HOPS"
+    );
+    assert_eq!(sekvent::component::DEFAULT_MAX_HOPS, 16);
+    assert_eq!(sekvent::component::POLICY_PREFIX, "SEKVENT_POLICY_");
+    assert!(empty(&MapSource::new()).unwrap().grpc_services().is_empty());
+}
+
+#[cfg(feature = "component-grpc")]
+#[tokio::test]
+async fn grpc_routes_are_available_with_component_grpc() {
+    let app = empty(&MapSource::new()).unwrap();
+    let _routes = app.grpc_routes();
+    app.start().await.unwrap();
+    app.stop(Duration::ZERO).await.unwrap();
+}

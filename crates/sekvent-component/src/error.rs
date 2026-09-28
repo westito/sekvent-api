@@ -107,6 +107,16 @@ pub enum BuildError {
         /// The component's binding key.
         key: String,
     },
+    /// A component cannot be exposed over gRPC as configured.
+    #[error("component {component} cannot be served over gRPC ({key}): {reason}")]
+    NotServable {
+        /// The component name.
+        component: String,
+        /// The key that asks for it.
+        key: String,
+        /// Why not.
+        reason: &'static str,
+    },
     /// A factory returned an error.
     #[error("component {component} failed to build: {source}")]
     Factory {
@@ -264,6 +274,15 @@ mod tests {
                 },
                 "component ledger is remote_only; set SEKVENT_COMPONENT_LEDGER_BINDING \
                  to a remote binding",
+            ),
+            (
+                BuildError::NotServable {
+                    component: "notes".into(),
+                    key: "SEKVENT_COMPONENT_NOTES_SERVE".into(),
+                    reason: "it is local_only",
+                },
+                "component notes cannot be served over gRPC (SEKVENT_COMPONENT_NOTES_SERVE): \
+                 it is local_only",
             ),
             (
                 BuildError::Multiple(vec![duplicate("a"), duplicate("b")]),

@@ -16,7 +16,7 @@ use crate::process::Cmd;
 pub const REMOTE_COMMAND: &str = crate::remote_build::COMMAND_NAME;
 
 /// Subcommand names held for the component model.
-pub const RESERVED: [&str; 5] = ["component", "contract", "extract", "queue", "schedule"];
+pub const RESERVED: [&str; 4] = ["component", "extract", "queue", "schedule"];
 
 /// Exit code of a reserved subcommand.
 pub const RESERVED_EXIT: i32 = 2;
@@ -234,6 +234,7 @@ mod tests {
         }
         assert_eq!(classify_external("release", true), External::Xtask);
         assert_eq!(classify_external("release", false), External::Help);
+        assert!(!is_reserved("contract"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use anyhow::{Context as _, bail};
 
 use crate::boundaries;
 use crate::context::Context;
+use crate::contract;
 use crate::coverage::{self, Export};
 use crate::harness::HarnessSession;
 use crate::metadata::Metadata;
@@ -32,6 +33,7 @@ pub fn run_steps(
                 let meta = meta.context("the boundary check needs the dependency graph")?;
                 boundaries::print_report(&boundaries::check(meta, &ctx.config.gate.boundaries)?)
             }
+            Step::Contract => contract::run_check(&ctx.root, &ctx.config.contract, &[])?,
         };
         if ctx.is_interrupted() {
             eprintln!("==> {label}: interrupted");
@@ -65,7 +67,8 @@ fn selection(ctx: &Context<'_>, with_deps: bool) -> anyhow::Result<(Metadata, Se
     Ok((meta, selection))
 }
 
-/// `cargo sekvent gate`: hooks, fmt, clippy, test, doc and boundaries.
+/// `cargo sekvent gate`: hooks, fmt, clippy, test, doc, boundaries and
+/// contract.
 pub fn gate(ctx: &Context<'_>) -> anyhow::Result<i32> {
     if let Some(hint) = sdk::update_hint(ctx.runner, &ctx.root, &ctx.env) {
         println!("{hint}");
@@ -599,5 +602,35 @@ mod tests {
         assert_eq!(boundaries(&ctx).unwrap(), 0);
         assert!(runner.calls().is_empty());
         assert!(run_steps(&ctx, "gate", &[Step::Boundaries], None).is_err());
+    }
+
+    #[test]
+    fn the_contract_step_runs_in_process_after_the_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let proto = dir.path().join("orders-api/proto/orders.proto");
+        std::fs::create_dir_all(proto.parent().unwrap()).unwrap();
+        std::fs::write(
+            &proto,
+            "syntax = \"proto3\";\npackage orders.v1;\n\
+             service Orders { rpc Get(Id) returns (Id); }\nmessage Id { string id = 1; }\n",
+        )
+        .unwrap();
+        let mut config = config();
+        config.contract.roots = vec!["orders-api/proto".into()];
+        let runner = FakeRunner::default();
+        runner.push_output(METADATA);
+        let sweeper = FakeSweeper::default();
+        let ctx = Context {
+            root: dir.path().to_owned(),
+            ..context(config.clone(), &runner, &sweeper)
+        };
+        assert_eq!(gate(&ctx).unwrap(), 1, "no baseline yet");
+        assert_eq!(runner.lines().len(), 4, "the contract step spawns nothing");
+
+        crate::contract::emit(dir.path(), &config.contract, &[]).unwrap();
+        assert_eq!(run_steps(&ctx, "gate", &[Step::Contract], None).unwrap(), 0);
+
+        std::fs::write(&proto, "syntax = \"proto3\";\nmessage {\n").unwrap();
+        assert!(run_steps(&ctx, "gate", &[Step::Contract], None).is_err());
     }
 }

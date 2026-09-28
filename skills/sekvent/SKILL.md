@@ -33,7 +33,7 @@ skill.
 | Service-to-service tokens | `link` | `link`; `link-axum`, `link-tonic` |
 | Outbound HTTP, OAuth 2.0 client credentials | `client` | `client` |
 | Pools, migrations, list filters | `db` | `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` |
-| A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; with `runtime` for `App::register` |
+| A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; `component-grpc` for the `grpc` binding and serving; `runtime` for `App::register` |
 | Postgres/MySQL test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
 
@@ -305,21 +305,38 @@ pub mod proto { include!(concat!(env!("OUT_DIR"), "/sekvent_protos.rs")); }   //
 ```
 
 Generated code is included with the lint allowances it needs; never commit
-generated `.rs`. The package `sekvent.v1` is reserved. `protoc` must be on
+generated `.rs`. The package `sekvent.v1` and the names `__sekvent_*` are
+reserved. `messages_only()` and `both()` also emit one
+`__sekvent_service_<Service>` constant per proto `service`, which
+`#[component(proto = …)]` checks (`.service_contracts(false)` turns it off). `protoc` must be on
 `PATH` (or `PROTOC`).
 
 ### Components
 
 A component is a trait with a protobuf contract; callers hold its generated
-`XHandle` and never know whether calls stay in-process (`local`) or cross a
+`XHandle` and never know whether calls stay in-process (`local`), cross a
 serialization boundary (`local-serialized`: prost encode, separate task,
-decode). Milestone C1: `#[call]` methods only; `grpc` parses but fails the
-build as unavailable. Spec: `docs/design/component-c1.md`; full example:
-`examples/shop`. Facade feature `component` (add `runtime` for
-`App::register`).
+decode) or go to another process (`grpc`). Milestones C1 and C2: `#[call]`
+methods only (no `#[async_call]`/`#[deferred]` yet). Specs:
+`docs/design/component-c1.md`, `docs/design/component-c2.md`; full example
+with a split topology: `examples/shop`. Facade features `component`,
+`component-grpc` (the `grpc` binding and `App::grpc_routes`), `runtime`
+(`App::register`).
 
-Declare it in an `-api` crate (messages from `sekvent-proto-build`
-`.messages_only()`, the trait, the error):
+Declare it in an `-api` crate: the `.proto` with the component's `service`,
+the messages from `sekvent-proto-build` `.messages_only()`, the trait, the
+error. The proto is the contract:
+
+```proto
+// proto/shop/inventory/v1/inventory.proto
+syntax = "proto3";
+package shop.inventory.v1;
+service Inventory {                                    // <Trait>, in package = "…"
+  rpc Reserve(ReserveRequest) returns (ReserveReply);  // one RPC per method, UpperCamelCase
+}
+message ReserveRequest { string order_id = 1; string sku = 2; uint32 quantity = 3; }
+message ReserveReply { string reservation_id = 1; uint32 remaining = 2; }
+```
 
 ```rust
 use sekvent::prelude::*;                                  // App, ComponentError, Lifecycle, CallContext, AppError
@@ -335,7 +352,11 @@ pub enum InventoryError {
     Other(AppError),                                      // unknown reasons and framework errors land here
 }
 
-#[sekvent::component(name = "inventory", package = "shop.inventory.v1")]
+#[sekvent::component(
+    name = "inventory",
+    package = "shop.inventory.v1",
+    proto = "crate::proto::shop::inventory::v1",          // the generated module; checked at compile time
+)]
 pub trait Inventory: Send + Sync + 'static {
     /// Reserve stock for an order.
     #[call(idempotent, timeout = "2s", bulkhead = 16)]
@@ -348,8 +369,13 @@ pub trait Inventory: Send + Sync + 'static {
 - Every method: `async fn m(&self, cx: &CallContext, req: Req) -> Result<Rep, E>`;
   `Req`/`Rep` are prost messages, `E` implements `ComponentError` (or is
   `AppError`). `local_only` components take plain Rust types and need no
-  `package`; `remote_only` ones have `install_remote` and cannot build
-  until C2.
+  `package` or `proto` (and must not have `proto`); `remote_only` ones have
+  `install_remote` and must be bound `grpc`.
+- `proto` is required for standard and `remote_only` components. The macro
+  fails to compile (`component contract: …`) when the proto service is not
+  `<package>.<Trait>`, when the RPC set differs from the methods, or when a
+  method's request or reply is not its RPC's input or output type. Change
+  trait and proto together.
 - The derive gives `From<E> for AppError` and `From<AppError> for E`; do not
   add another `From<AppError>`.
 
@@ -384,25 +410,99 @@ let orders = app.handle::<OrdersHandle>()?;            // for ingress code and t
   the method timeout is capped by the caller's deadline (`DEADLINE_EXCEEDED`);
   a full bulkhead sheds at once (`RESOURCE_EXHAUSTED`/`BULKHEAD_FULL`, no
   queue). Reason constants: `sekvent::component::reasons`.
-- The callee sees `cx.caller() == trusted("local")` with request id,
-  subject, tenant and idempotency key kept.
+- Locally, the callee sees `cx.caller() == trusted("local")` with request
+  id, subject, tenant and idempotency key kept. Over gRPC the caller is the
+  authenticated link; subject and tenant survive only for a link listed in
+  `SEKVENT_LINK_TRUSTED`.
+- Every call counts a hop; a chain deeper than `SEKVENT_COMPONENT_MAX_HOPS`
+  (default 16) fails `FAILED_PRECONDITION`/`CALL_DEPTH_EXCEEDED` before
+  anything is sent. It catches call cycles; it is not a security control.
 
-Configuration keys (all optional; unknown keys under `SEKVENT_COMPONENT_`,
-malformed values and zeros fail the build):
+Serving a component over gRPC is configuration plus one line of wiring: the
+hosting process mounts `app.grpc_routes()` on its server (next to any other
+tonic service) and the environment exposes the component:
+
+```rust
+let app = builder.build()?;                            // SEKVENT_COMPONENT_INVENTORY_SERVE=grpc
+let server = Server::builder()
+    .grpc_routes(app.grpc_routes())                    // every exposed component; required, else start() fails GRPC_NOT_MOUNTED
+    .bind(addr)
+    .await?;
+app.register(Runtime::builder())
+    .unit("grpc", Stage::Ingress, UnitPolicy::default(), server.into_unit())
+    .build()?
+    .run()
+    .await?;
+// grpc.health.v1 reports "shop.inventory.v1.Inventory" SERVING while the component runs
+```
+
+The caller installs the component exactly as before (`InventoryHandle::install`);
+bound `grpc`, its factory never runs. The wire is plain gRPC on
+`/<package>.<Trait>/<Rpc>`, so a client generated from the `.proto` by any
+toolchain can call the server with `authorization: Bearer <token>`.
+
+Configuration keys (all optional unless noted; unknown keys under
+`SEKVENT_COMPONENT_` and `SEKVENT_POLICY_`, malformed values and zeros fail
+the build; every key is accepted under every binding, so one environment
+works for every topology):
 
 | Key | Values |
 |---|---|
-| `SEKVENT_COMPONENT_BINDING` | `local` (default), `local-serialized`, `grpc` (unavailable in C1) — all standard components |
+| `SEKVENT_COMPONENT_BINDING` | `local` (default), `local-serialized`, `grpc` — all standard components |
 | `SEKVENT_COMPONENT_<C>_BINDING` | same, one component |
-| `SEKVENT_COMPONENT_<C>_TIMEOUT`, `SEKVENT_COMPONENT_<C>_<M>_TIMEOUT` | `250ms`, `2s`, or whole seconds |
-| `SEKVENT_COMPONENT_<C>_BULKHEAD_MAX_CONCURRENT`, `SEKVENT_COMPONENT_<C>_<M>_BULKHEAD_MAX_CONCURRENT` | integer ≥ 1 |
+| `SEKVENT_COMPONENT_<C>_ENDPOINT` | `http://host:port` (required for `grpc`; `https://` is rejected — plaintext on a private network or behind a TLS-terminating mesh) |
+| `SEKVENT_COMPONENT_<C>_LINK` | link name (default: the component name); the binding presents `SEKVENT_LINK_OUTBOUND_<LINK>` (required unless `AUTH=none`) |
+| `SEKVENT_COMPONENT_<C>_AUTH` | `link` (default) or `none` (logged at `warn!`) |
+| `SEKVENT_COMPONENT_<C>_SERVE` | `none` (default) or `grpc`: expose a locally bound component |
+| `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link` (default: needs at least one `SEKVENT_LINK_INBOUND_<CALLER>`) or `none` |
+| `SEKVENT_COMPONENT_MAX_HOPS` | 1–1000, default 16 |
+| `SEKVENT_COMPONENT_<C>_POLICY`, `SEKVENT_COMPONENT_<C>_<M>_POLICY` | a named policy `<N>` |
+| `SEKVENT_POLICY_<N>_<FIELD>` | fields of a named policy |
+| `SEKVENT_COMPONENT_<C>_<FIELD>`, `SEKVENT_COMPONENT_<C>_<M>_<FIELD>` | component defaults, one method |
 
-`<C>`/`<M>` are the component and method names upper-cased
-(`SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT`). Precedence: method key,
-component key, `#[call]` attribute.
+Fields (grammar of `PolicySpec::from_config`): `TIMEOUT` (`250ms`, `2s`;
+the whole call's deadline, retries included), `BULKHEAD_MAX_CONCURRENT`,
+`BULKHEAD_MAX_QUEUE`, `BULKHEAD_QUEUE_TIMEOUT` (act where the component
+runs), `RETRY_MAX_ATTEMPTS`, `RETRY_INITIAL_BACKOFF`, `RETRY_MAX_BACKOFF`,
+`RETRY_MULTIPLIER`, `RETRY_JITTER`, `RETRY_MAX_RETRY_AFTER` (`grpc` caller,
+`idempotent` methods only), and component-only `RETRY_BUDGET_RATIO`,
+`RETRY_BUDGET_MIN_PER_SEC`, `BREAKER_ENABLED`, `BREAKER_FAILURE_RATE`,
+`BREAKER_WINDOW`, `BREAKER_MIN_CALLS`, `BREAKER_WAIT_IN_OPEN`,
+`BREAKER_PERMITTED_IN_HALF_OPEN` (one breaker and budget per remote
+component). `RATE_LIMIT_*` is an unknown key.
 
-Test every scenario under both local bindings in one `cargo test`, so a type
-that does not survive the wire fails early:
+`<C>`/`<M>`/`<N>` are upper-cased names
+(`SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT`, `SEKVENT_POLICY_REMOTE_TIMEOUT`).
+Precedence, lowest first: framework default (remote only: 3 attempts, a
+breaker at 50 % of the last 20 calls, min 10, 30 s open, 3 probes, budget
+20 % + 10/s, `Retry-After` up to 30 s), `#[call]` attribute, named policy
+(the method's `POLICY`, else the component's), component key, method key.
+`RETRY_MAX_ATTEMPTS=1` / `BREAKER_ENABLED=false` switch the defaults off.
+Configuration never makes a method retryable: only `#[call(idempotent)]`.
+
+Remote errors: a server's `AppError` (typed variants included) survives the
+hop unchanged; errors made on the caller side carry `component`/`method`
+metadata: `UNAVAILABLE`/`COMPONENT_UNREACHABLE` (connect refused, reset),
+`UNAVAILABLE`/`CIRCUIT_OPEN` (with `retry_after`), `UNAUTHENTICATED`
+("service authentication required", same answer for a missing or wrong
+token). The breaker trips only on `UNAVAILABLE`, `DEADLINE_EXCEEDED`,
+`RESOURCE_EXHAUSTED`; business errors never open it.
+
+Contracts: `[contract]` in `sekvent.toml` lists the proto roots
+(`roots = ["crates/billing-api/proto"]`, `baseline = "contracts"`,
+`gate = true`). `cargo sekvent contract emit [service…]` writes one
+canonical JSON baseline per service — commit them; `cargo sekvent contract
+check [service…]` fails on wire-breaking changes (a removed RPC or
+unreserved field number, a changed type, cardinality or oneof, a dropped
+reservation) and runs in the gate. Both compile the protos in-process
+(protox: no `protoc`, no Rust build). Renames and additions are compatible.
+A breaking change goes into a new package (`billing.v2`) served alongside
+v1 as a second component; delete v1 and its baseline once no caller uses it.
+
+Test every scenario under every binding in one `cargo test`, so a type that
+does not survive the wire fails early; a `split-grpc` profile runs the
+hosting App in the same test process on `127.0.0.1:0` (see
+`examples/shop/shop/tests/support/mod.rs`):
 
 ```rust
 #[derive(Debug, Clone, Copy)]
@@ -434,7 +534,13 @@ async fn reserve_times_out(#[case] profile: Profile) {
 Caller deadlines in paused-clock tests come from the tokio clock:
 `cx.with_deadline((tokio::time::Instant::now() + d).into_std())`, not
 `with_timeout`. Signal entry and exit from fakes with channels, a
-`Semaphore` or a `oneshot` fired from a `Drop` guard; never sleep.
+`Semaphore` or a `oneshot` fired from a `Drop` guard; never sleep. Anything
+over a socket (the `split-grpc` profile) runs on the real clock: write the
+timed scenario as one `async fn(profile)`, call it from a
+`start_paused = true` test for the in-process profiles and from a plain
+`#[tokio::test]` twin wrapped in a 30 s `tokio::time::timeout`, and assert
+only lower time bounds there. Observe external state (health, a closed
+listener) with `await_until!`.
 
 ## Pitfalls
 
@@ -451,7 +557,12 @@ Caller deadlines in paused-clock tests come from the tokio clock:
   a timeout.
 - **Retries.** Only idempotent operations, only transient codes, within a
   budget and the deadline. A `POST` without an idempotency key is never
-  retried.
+  retried. Each remote hop retries on its own, so a chain of n hops can
+  multiply load by 3ⁿ: set `RETRY_MAX_ATTEMPTS=1` on inner hops.
+- **Component links.** Never reuse one token for two links or directions
+  (the build refuses it), never set `AUTH=none`/`SERVE_AUTH=none` outside a
+  test, and list a caller in `SEKVENT_LINK_TRUSTED` only when it really
+  vouches for the end user.
 - **Time and randomness.** Inject `Clock` (`SystemClock` / `ManualClock`)
   and seedable RNGs where behaviour depends on them; JWT and login APIs take
   `now_unix_secs` explicitly.

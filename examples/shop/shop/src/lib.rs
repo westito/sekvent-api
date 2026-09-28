@@ -4,8 +4,11 @@
 //! orders receives the other two as handles through constructor injection.
 //! Nothing here chooses a binding: `SEKVENT_COMPONENT_BINDING` (for all
 //! components) or `SEKVENT_COMPONENT_<NAME>_BINDING` (for one) decide at
-//! build time whether calls stay in-process (`local`, the default) or cross
-//! a serialization boundary (`local-serialized`).
+//! build time whether calls stay in-process (`local`, the default), cross a
+//! serialization boundary (`local-serialized`) or go to another process over
+//! gRPC (`grpc`, with `SEKVENT_COMPONENT_<NAME>_ENDPOINT` and a link token).
+//! A component bound `grpc` is installed exactly as before; its factory
+//! simply does not run.
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,13 +26,26 @@
 
 #![forbid(unsafe_code)]
 
+use std::net::SocketAddr;
+
 use inventory::InventoryService;
 use inventory_api::InventoryHandle;
 use notifications::NotificationsService;
 use notifications_api::NotificationsHandle;
 use orders::OrdersService;
 use orders_api::OrdersHandle;
-use sekvent::component::{AppBuilder, BuildError};
+use sekvent::component::{App, AppBuilder, BuildError};
+use sekvent::error::AppError;
+use sekvent::runtime::{RuntimeBuilder, Server, Stage, UnitPolicy};
+
+/// Name of the ingress unit that serves the gRPC listener.
+pub const GRPC_UNIT: &str = "grpc";
+
+/// Key of the address the binary serves gRPC on.
+pub const GRPC_ADDR_KEY: &str = "SHOP_GRPC_ADDR";
+
+/// Address the binary serves gRPC on when [`GRPC_ADDR_KEY`] is unset.
+pub const DEFAULT_GRPC_ADDR: &str = "127.0.0.1:50050";
 
 /// What the shop starts with.
 #[derive(Debug, Clone, Default)]
@@ -86,4 +102,27 @@ pub fn install(app: &mut AppBuilder<'_>, options: ShopOptions) -> Result<(), Bui
     install_inventory(app, options.stock)?;
     install_notifications(app, options.blocked_customers)?;
     install_orders(app)
+}
+
+/// A server on `addr` serving every component the environment exposes
+/// (`SEKVENT_COMPONENT_<NAME>_SERVE=grpc`) and the health endpoints.
+///
+/// With nothing exposed it serves health only; taking the routes is what
+/// lets [`App::start`] accept an exposed component.
+pub async fn bind(app: &App, addr: SocketAddr) -> Result<Server, AppError> {
+    Server::builder()
+        .grpc_routes(app.grpc_routes())
+        .bind(addr)
+        .await
+}
+
+/// The App's `components` unit plus `server` as the ingress unit
+/// [`GRPC_UNIT`].
+pub fn runtime(app: &App, server: Server, runtime: RuntimeBuilder) -> RuntimeBuilder {
+    app.register(runtime).unit(
+        GRPC_UNIT,
+        Stage::Ingress,
+        UnitPolicy::default(),
+        server.into_unit(),
+    )
 }

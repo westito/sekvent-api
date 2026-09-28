@@ -80,10 +80,22 @@
 //! service, appending to the same generated file. Hooks also run in
 //! messages-only mode, where tonic's generator is off.
 //!
-//! # Reserved package
+//! # Component contracts
+//!
+//! In messages-only and combined mode, every proto `service` also gets a
+//! constant `__sekvent_service_<Service>` in its package's module: the
+//! service's full name and, per RPC, the RPC name, the request and reply
+//! full names and whether it streams. `#[component(proto = "…")]` reads it
+//! to check at compile time that a component trait matches its proto
+//! service. The generated code names no sekvent crate.
+//! [`ProtoBuild::service_contracts`] turns it off; services-only mode never
+//! emits it, since the messages crate already has it.
+//!
+//! # Reserved names
 //!
 //! The proto package `sekvent.v1` is reserved for the framework's own
-//! messages. Do not declare it in application protos.
+//! messages. Do not declare it in application protos, and do not name
+//! anything in a proto package `__sekvent_*`.
 //!
 //! # protoc
 //!
@@ -93,6 +105,7 @@
 
 #![forbid(unsafe_code)]
 
+mod contract;
 mod discover;
 mod generator;
 mod wrapper;
@@ -108,6 +121,9 @@ pub const RESERVED_PACKAGE: &str = "sekvent.v1";
 
 /// Default file name of the generated wrapper module.
 pub const DEFAULT_WRAPPER_FILE: &str = "sekvent_protos.rs";
+
+/// Prefix of the service contract constants, `__sekvent_service_<Service>`.
+pub const SERVICE_CONTRACT_PREFIX: &str = "__sekvent_service_";
 
 /// The well-known types' package; prost maps it to `prost_types` itself.
 const WELL_KNOWN_PACKAGE: &str = "google.protobuf";
@@ -194,6 +210,10 @@ pub struct Compiled {
 }
 
 /// A code-generation run, configured builder-style.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent builder toggle, not a state machine"
+)]
 pub struct ProtoBuild {
     root: PathBuf,
     files: Vec<PathBuf>,
@@ -206,6 +226,7 @@ pub struct ProtoBuild {
     type_attributes: Vec<(String, String)>,
     field_attributes: Vec<(String, String)>,
     hooks: Vec<Box<dyn ServiceGenerator>>,
+    service_contracts: bool,
     out_dir: Option<PathBuf>,
     wrapper_file: String,
     emit_rerun: bool,
@@ -229,6 +250,7 @@ impl ProtoBuild {
             type_attributes: Vec::new(),
             field_attributes: Vec::new(),
             hooks: Vec::new(),
+            service_contracts: true,
             out_dir: None,
             wrapper_file: DEFAULT_WRAPPER_FILE.to_owned(),
             emit_rerun: true,
@@ -331,6 +353,14 @@ impl ProtoBuild {
     #[must_use]
     pub fn service_generator_hook(mut self, generator: Box<dyn ServiceGenerator>) -> Self {
         self.hooks.push(generator);
+        self
+    }
+
+    /// Emit the service constants `#[component(proto = …)]` checks (default
+    /// on; only in messages-only and combined mode).
+    #[must_use]
+    pub fn service_contracts(mut self, enable: bool) -> Self {
+        self.service_contracts = enable;
         self
     }
 
@@ -480,6 +510,9 @@ impl ProtoBuild {
             config.file_descriptor_set_path(path);
         }
         let mut generators: Vec<Box<dyn ServiceGenerator>> = Vec::new();
+        if emits_service_contracts(&self.mode, self.service_contracts) {
+            generators.push(Box::new(contract::ServiceContracts));
+        }
         if !matches!(self.mode, Mode::MessagesOnly) && (self.server || self.client) {
             generators.push(
                 tonic_prost_build::configure()
@@ -494,6 +527,13 @@ impl ProtoBuild {
         }
         config
     }
+}
+
+/// Whether `mode` emits the service contract constants when they are
+/// `enabled`: services-only output refers to a messages crate that already
+/// has them.
+fn emits_service_contracts(mode: &Mode, enabled: bool) -> bool {
+    enabled && !matches!(mode, Mode::ServicesOnly { .. })
 }
 
 /// The `extern_path` pairs for `mode`: one per package in services-only
@@ -741,6 +781,20 @@ mod tests {
     }
 
     #[test]
+    fn service_contracts_are_emitted_unless_services_only_or_disabled() {
+        assert!(emits_service_contracts(&Mode::MessagesOnly, true));
+        assert!(emits_service_contracts(&Mode::Both, true));
+        assert!(!emits_service_contracts(&Mode::MessagesOnly, false));
+        assert!(!emits_service_contracts(&Mode::Both, false));
+        let services_only = Mode::ServicesOnly {
+            messages_crate: "::m".to_owned(),
+        };
+        assert!(!emits_service_contracts(&services_only, true));
+        assert!(!emits_service_contracts(&services_only, false));
+        assert_eq!(SERVICE_CONTRACT_PREFIX, "__sekvent_service_");
+    }
+
+    #[test]
     fn builder_options_are_recorded() {
         let build = ProtoBuild::new("proto")
             .files(["a/v1/a.proto"])
@@ -755,7 +809,8 @@ mod tests {
             .out_dir("/tmp/out")
             .wrapper_file("protos.rs")
             .emit_rerun_if_changed(false)
-            .protoc("/usr/bin/protoc");
+            .protoc("/usr/bin/protoc")
+            .service_contracts(false);
         assert_eq!(build.files, [PathBuf::from("proto/a/v1/a.proto")]);
         assert_eq!(build.includes, [PathBuf::from("vendor")]);
         assert_eq!(build.mode, Mode::MessagesOnly);
@@ -768,6 +823,8 @@ mod tests {
         assert_eq!(build.wrapper_file, "protos.rs");
         assert!(!build.emit_rerun);
         assert_eq!(build.protoc.as_deref(), Some(Path::new("/usr/bin/protoc")));
+        assert!(!build.service_contracts);
+        assert!(ProtoBuild::new("p").service_contracts);
         assert_eq!(ProtoBuild::new("p").both().mode, Mode::Both);
         assert_eq!(
             ProtoBuild::new("p").services_only("::m").mode,
