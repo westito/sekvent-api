@@ -23,10 +23,11 @@
 //! # Building
 //!
 //! [`AppBuilder::build`] fails closed: unknown `SEKVENT_COMPONENT_*` keys,
-//! malformed values, unavailable bindings, mode mismatches and colliding keys
-//! are all reported together, naming keys and never values, before any
-//! factory runs. Factories then run in install order and may take the
-//! handles of components installed before them.
+//! malformed values, unavailable bindings, mode mismatches, colliding keys
+//! and two exposed components serving one gRPC service name are all
+//! reported together, naming keys and never values, before any factory
+//! runs. Factories then run in install order and may take the handles of
+//! components installed before them.
 //!
 //! # Configuration
 //!
@@ -66,10 +67,14 @@
 //! # Lifecycle
 //!
 //! [`App::start`] runs the optional [`Lifecycle`] hooks in install order and
-//! [`App::stop`] drains and stops the components in reverse order. With the
-//! `runtime` feature, `App::register` runs the whole App as one
-//! `sekvent-runtime` unit and keeps the health of the exposed gRPC services
-//! in step.
+//! [`App::stop`] drains and stops the components in reverse order. Start and
+//! stop never overlap: a stop during the start cancels the `on_start` still
+//! running, and every component that started is stopped exactly once, on a
+//! task of its own, so dropping either future never leaves the App half
+//! started or stuck stopping. With the `runtime` feature, `App::register`
+//! runs the whole App as one `sekvent-runtime` unit, fits its drain within
+//! the runtime's shutdown deadline so the `on_stop` hooks keep time to run,
+//! and keeps the health of the exposed gRPC services in step.
 //!
 //! # Serving over gRPC
 //!
@@ -116,7 +121,8 @@ pub use sekvent_error::{AppError, ErrorCode};
 pub use sekvent_macros::{ComponentError, component};
 
 /// Caller name a component sees for calls made in this process, under both
-/// local bindings.
+/// local bindings. Reserved: no link may be named `local`, so a remote caller
+/// is never mistaken for an in-process one.
 pub const LOCAL_CALLER: &str = "local";
 /// Prefix of every component configuration key.
 pub const CONFIG_PREFIX: &str = "SEKVENT_COMPONENT_";

@@ -206,7 +206,11 @@ impl HttpClient {
     ) -> Result<HttpResponse, AppError> {
         let mut headers = headers.clone();
         if self.inner.propagate_context {
-            sekvent_context::headers::propagate(ctx, &mut headers);
+            if self.inner.sekvent_upstream {
+                sekvent_context::headers::propagate(ctx, &mut headers);
+            } else {
+                sekvent_context::headers::propagate_external(ctx, &mut headers);
+            }
         }
         let mut response = self.send_once(ctx, method, url, &headers, body).await?;
         if response.status() == StatusCode::UNAUTHORIZED
@@ -392,13 +396,18 @@ impl HttpClientBuilder {
         self.clock = clock;
         self
     }
-    /// Whether to send the call context (request id, `grpc-timeout`,
-    /// trace, identity headers) upstream. On by default; turn it off for
-    /// third-party APIs that should not see internal identifiers.
+    /// Whether to send the call context upstream. On by default; turn it
+    /// off for APIs that should not see even the request id.
+    ///
+    /// What is sent depends on [`sekvent_upstream`](Self::sekvent_upstream):
+    /// any upstream gets the request id, the remaining deadline as
+    /// `grpc-timeout` and the trace context
+    /// ([`sekvent_context::headers::propagate_external`]); only a sekvent
+    /// upstream also gets the end-user subject and tenant and the component
+    /// call depth ([`sekvent_context::headers::propagate`]).
     ///
     /// Headers set on the request win over the context, and the context's
-    /// idempotency key is never forwarded (see
-    /// [`sekvent_context::headers::propagate`]): set one per request with
+    /// idempotency key is never forwarded: set one per request with
     /// [`RequestBuilder::header`] when the upstream needs it.
     #[must_use]
     pub fn propagate_context(mut self, propagate: bool) -> Self {
@@ -406,6 +415,11 @@ impl HttpClientBuilder {
         self
     }
     /// Declare that the upstream is a sekvent service (off by default).
+    ///
+    /// When on, the sekvent context headers (subject, tenant, call depth)
+    /// are propagated along with the request id, deadline and trace (see
+    /// [`propagate_context`](Self::propagate_context)); when off, they
+    /// never leave this service.
     ///
     /// When on, a sekvent JSON error body is adopted as the error —
     /// code, message, reason and metadata reach this client's callers — and

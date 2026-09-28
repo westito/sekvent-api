@@ -18,14 +18,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 
 pub use crate::config::ContractConfig;
-pub use model::{Cardinality, Contract, Enum, FORMAT, Field, Message, Rpc};
+pub use model::{Cardinality, Contract, Enum, Extension, FORMAT, Field, Message, Rpc};
 pub use rules::{Finding, compare};
 
 /// The error of `emit` and `check` without `[contract].roots`.
 pub const NOT_CONFIGURED: &str = "no [contract] roots in sekvent.toml";
 
 /// Compile every root and build the contract of each service in them, by
-/// full service name.
+/// full service name. A root that declares no service is an error: roots
+/// exist to hold component services.
 pub fn load(root: &Path, config: &ContractConfig) -> anyhow::Result<BTreeMap<String, Contract>> {
     if config.roots.is_empty() {
         bail!(NOT_CONFIGURED);
@@ -34,13 +35,15 @@ pub fn load(root: &Path, config: &ContractConfig) -> anyhow::Result<BTreeMap<Str
     let mut defined_in: BTreeMap<String, &Path> = BTreeMap::new();
     for dir in &config.roots {
         let compiled = compile::compile_root(root, dir, &config.includes)?;
-        let index = model::TypeIndex::new(&compiled.files);
+        let index = model::TypeIndex::new(&compiled.files, &compiled.bundled);
+        let mut services = 0_usize;
         for file in compiled
             .files
             .iter()
             .filter(|file| compiled.own.contains(file.name()))
         {
             for service in &file.service {
+                services += 1;
                 let contract = index.service_contract(file, service)?;
                 if let Some(first) = defined_in.insert(contract.service.clone(), dir) {
                     bail!(
@@ -52,6 +55,13 @@ pub fn load(root: &Path, config: &ContractConfig) -> anyhow::Result<BTreeMap<Str
                 }
                 contracts.insert(contract.service.clone(), contract);
             }
+        }
+        if services == 0 {
+            bail!(
+                "contract root `{}` declares no service; a contract root holds the .proto \
+                 files of component services",
+                dir.display()
+            );
         }
     }
     Ok(contracts)
@@ -480,6 +490,31 @@ mod tests {
             error.to_string(),
             "service `orders.v1.Orders` is defined in two contract roots: `a` and `b`"
         );
+    }
+
+    #[test]
+    fn a_root_without_services_is_an_error_naming_it() {
+        let (dir, _) = project();
+        write_files(
+            dir.path(),
+            &[(
+                "shared/proto/shared/v1/money.proto",
+                "syntax = \"proto3\";\npackage shared.v1;\nmessage Money { int64 units = 1; }\n",
+            )],
+        );
+        let config = config(&["orders/proto", "shared/proto"], &[]);
+        for error in [
+            load(dir.path(), &config).unwrap_err(),
+            emit(dir.path(), &config, &[]).unwrap_err(),
+            check(dir.path(), &config, &[]).unwrap_err(),
+        ] {
+            assert_eq!(
+                error.to_string(),
+                "contract root `shared/proto` declares no service; a contract root holds the \
+                 .proto files of component services"
+            );
+        }
+        assert!(!dir.path().join("contracts").exists(), "emit wrote nothing");
     }
 
     #[test]

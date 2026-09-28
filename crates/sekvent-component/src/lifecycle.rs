@@ -12,13 +12,15 @@ use crate::__private::BoxFuture;
 /// in-flight calls (or its grace period has passed).
 pub trait Lifecycle: Send + Sync + 'static {
     /// Called once when the App starts, before the component accepts calls.
-    /// An error aborts the start.
+    /// An error aborts the start. When the App is stopped before this
+    /// finishes, the future is dropped and `on_stop` is not called.
     fn on_start(&self) -> impl Future<Output = Result<(), AppError>> + Send {
         async { Ok(()) }
     }
 
     /// Called once when the App stops, after the component stopped accepting
-    /// calls. An error is reported, and the other components still stop.
+    /// calls, and only if `on_start` succeeded. An error is reported, and the
+    /// other components still stop.
     fn on_stop(&self) -> impl Future<Output = Result<(), AppError>> + Send {
         async { Ok(()) }
     }

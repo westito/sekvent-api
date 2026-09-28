@@ -1,7 +1,7 @@
 error[E0277]: `PingRequest` has no protobuf type name
-  --> tests/ui/fail/p7_message_without_name.rs:40:14
+  --> tests/ui/fail/p7_message_without_name.rs:42:14
    |
-40 |         req: PingRequest,
+42 |         req: PingRequest,
    |              ^^^^^^^^^^^ unsatisfied trait bound
    |
 help: the trait `Name` is not implemented for `PingRequest`

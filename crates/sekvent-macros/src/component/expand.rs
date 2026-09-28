@@ -1,11 +1,30 @@
 //! Code generation for `#[component]` (the items of spec section 3.3).
 
-use proc_macro2::{Ident, TokenStream};
+use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 
 use super::parse::{Args, Component, Method, Mode, rpc_name};
+
+/// The generic parameter the expansion introduces for an implementation.
+/// Generic parameters resolve at the call site, so the name must not be
+/// one a user would pick for a type of their own.
+const IMPL: &str = "__SekventImpl";
+/// The generic parameter of an `install` factory.
+const FACTORY: &str = "__SekventFactory";
+
+/// A local variable or parameter of the expansion. The mixed-site span
+/// keeps it apart from the user's items and bindings of the same name, as
+/// in a `macro_rules!` macro, without changing how it reads.
+fn local(name: &str) -> Ident {
+    Ident::new(name, Span::mixed_site())
+}
+
+/// A generic parameter of the expansion.
+fn generic(name: &str) -> Ident {
+    Ident::new(name, Span::call_site())
+}
 
 /// Identifiers of the generated items.
 struct Names {
@@ -76,6 +95,8 @@ fn object_trait(component: &Component, names: &Names, krate: &TokenStream) -> To
     let vis = &component.vis;
     let contract = &component.ident;
     let object = &names.object;
+    let implementation = generic(IMPL);
+    let (cx, req) = (local("cx"), local("req"));
     let signatures: Vec<TokenStream> = component
         .methods
         .iter()
@@ -85,7 +106,7 @@ fn object_trait(component: &Component, names: &Names, krate: &TokenStream) -> To
             let request = &method.request;
             let output = &method.output;
             quote! {
-                fn #hidden<'a>(&'a self, cx: &'a #context, req: #request)
+                fn #hidden<'a>(&'a self, #cx: &'a #context, #req: #request)
                     -> #krate::__private::BoxFuture<'a, #output>
             }
         })
@@ -98,7 +119,7 @@ fn object_trait(component: &Component, names: &Names, krate: &TokenStream) -> To
             let ident = &method.ident;
             quote! {
                 #signature {
-                    ::std::boxed::Box::pin(<T as #contract>::#ident(self, cx, req))
+                    ::std::boxed::Box::pin(<#implementation as #contract>::#ident(self, #cx, #req))
                 }
             }
         });
@@ -109,7 +130,7 @@ fn object_trait(component: &Component, names: &Names, krate: &TokenStream) -> To
         }
 
         #[allow(clippy::all, clippy::pedantic)]
-        impl<T: #contract> #object for T {
+        impl<#implementation: #contract> #object for #implementation {
             #(#bodies)*
         }
     }
@@ -212,15 +233,16 @@ fn handle_method(
     } else {
         quote!(call)
     };
+    let (cx, req, imp) = (local("cx"), local("req"), local("imp"));
     quote! {
         #docs
-        pub fn #ident<'a>(&'a self, cx: &'a #context, req: #request)
+        pub fn #ident<'a>(&'a self, #cx: &'a #context, #req: #request)
             -> impl ::core::future::Future<Output = #output> + ::core::marker::Send + 'a
         {
-            self.0.#route(#index, cx, req,
-                |imp: ::std::sync::Arc<dyn #object>,
-                 cx: #krate::CallContext,
-                 req: #request| async move { #object::#hidden(&*imp, &cx, req).await })
+            self.0.#route(#index, #cx, #req,
+                |#imp: ::std::sync::Arc<dyn #object>,
+                 #cx: #krate::CallContext,
+                 #req: #request| async move { #object::#hidden(&*#imp, &#cx, #req).await })
         }
     }
 }
@@ -232,25 +254,34 @@ fn installs(mode: Mode, component: &Component, names: &Names, krate: &TokenStrea
         object,
         dispatcher,
     } = names;
+    let app = local("app");
     if mode == Mode::RemoteOnly {
         return quote! {
             /// Declare this remote-only component; it must be bound to a remote transport.
-            pub fn install_remote(app: &mut #krate::AppBuilder<'_>)
+            pub fn install_remote(#app: &mut #krate::AppBuilder<'_>)
                 -> ::core::result::Result<(), #krate::BuildError>
             {
-                #krate::__private::install_remote(app, #handle)
+                #krate::__private::install_remote(#app, #handle)
             }
         };
     }
     let contract = &component.ident;
+    let (implementation, factory_type) = (generic(IMPL), generic(FACTORY));
+    let (factory, deps, imp, concrete, dispatch) = (
+        local("factory"),
+        local("deps"),
+        local("imp"),
+        local("concrete"),
+        local("dispatch"),
+    );
     let (make_dispatch, with_dispatch) = if mode == Mode::LocalOnly {
         (None, None)
     } else {
         (
             Some(quote! {
-                let dispatch = ::std::sync::Arc::new(#dispatcher(::std::sync::Arc::clone(&imp)));
+                let #dispatch = ::std::sync::Arc::new(#dispatcher(::std::sync::Arc::clone(&#imp)));
             }),
-            Some(quote!(.with_dispatch(dispatch))),
+            Some(quote!(.with_dispatch(#dispatch))),
         )
     };
     let lifecycle_summary =
@@ -259,39 +290,44 @@ fn installs(mode: Mode, component: &Component, names: &Names, krate: &TokenStrea
         /// Install the implementation `factory` builds. The factory runs during
         /// `AppBuilder::build`, in install order, and only when the component is
         /// bound `local` or `local-serialized`.
-        pub fn install<T, F>(app: &mut #krate::AppBuilder<'_>, factory: F)
-            -> ::core::result::Result<(), #krate::BuildError>
+        pub fn install<#implementation, #factory_type>(
+            #app: &mut #krate::AppBuilder<'_>,
+            #factory: #factory_type,
+        ) -> ::core::result::Result<(), #krate::BuildError>
         where
-            T: #contract,
-            F: ::core::ops::FnOnce(&mut #krate::Deps<'_>)
-                -> ::core::result::Result<T, #krate::AppError>
+            #implementation: #contract,
+            #factory_type: ::core::ops::FnOnce(&mut #krate::Deps<'_>)
+                -> ::core::result::Result<#implementation, #krate::AppError>
                 + ::core::marker::Send + 'static,
         {
-            #krate::__private::install_local(app, #handle, move |deps| {
-                let imp: ::std::sync::Arc<dyn #object> = ::std::sync::Arc::new(factory(deps)?);
+            #krate::__private::install_local(#app, #handle, move |#deps| {
+                let #imp: ::std::sync::Arc<dyn #object> = ::std::sync::Arc::new(#factory(#deps)?);
                 #make_dispatch
                 ::core::result::Result::Ok(
-                    #krate::__private::Local::new(imp) #with_dispatch)
+                    #krate::__private::Local::new(#imp) #with_dispatch)
             })
         }
 
         #[doc = #lifecycle_summary]
         /// `Lifecycle` hooks when the App starts and stops.
-        pub fn install_with_lifecycle<T, F>(app: &mut #krate::AppBuilder<'_>, factory: F)
-            -> ::core::result::Result<(), #krate::BuildError>
+        pub fn install_with_lifecycle<#implementation, #factory_type>(
+            #app: &mut #krate::AppBuilder<'_>,
+            #factory: #factory_type,
+        ) -> ::core::result::Result<(), #krate::BuildError>
         where
-            T: #contract + #krate::Lifecycle,
-            F: ::core::ops::FnOnce(&mut #krate::Deps<'_>)
-                -> ::core::result::Result<T, #krate::AppError>
+            #implementation: #contract + #krate::Lifecycle,
+            #factory_type: ::core::ops::FnOnce(&mut #krate::Deps<'_>)
+                -> ::core::result::Result<#implementation, #krate::AppError>
                 + ::core::marker::Send + 'static,
         {
-            #krate::__private::install_local(app, #handle, move |deps| {
-                let concrete = ::std::sync::Arc::new(factory(deps)?);
-                let imp: ::std::sync::Arc<dyn #object> = ::std::sync::Arc::<T>::clone(&concrete);
+            #krate::__private::install_local(#app, #handle, move |#deps| {
+                let #concrete = ::std::sync::Arc::new(#factory(#deps)?);
+                let #imp: ::std::sync::Arc<dyn #object> =
+                    ::std::sync::Arc::<#implementation>::clone(&#concrete);
                 #make_dispatch
-                ::core::result::Result::Ok(#krate::__private::Local::new(imp)
+                ::core::result::Result::Ok(#krate::__private::Local::new(#imp)
                     #with_dispatch
-                    .with_lifecycle(concrete))
+                    .with_lifecycle(#concrete))
             })
         }
     }
@@ -335,13 +371,20 @@ fn dispatcher(component: &Component, names: &Names, krate: &TokenStream) -> Toke
         object,
         dispatcher,
     } = names;
-    let arms = component.methods.iter().enumerate().map(|(index, method)| {
-        let request = &method.request;
-        let hidden = hidden_name(method);
+    let (method, cx, body, imp, req) = (
+        local("method"),
+        local("cx"),
+        local("body"),
+        local("imp"),
+        local("req"),
+    );
+    let arms = component.methods.iter().enumerate().map(|(index, one)| {
+        let request = &one.request;
+        let hidden = hidden_name(one);
         quote! {
-            #index => #krate::__private::serve(cx, body,
-                move |cx: #krate::CallContext, req: #request| async move {
-                    #object::#hidden(&*imp, &cx, req).await
+            #index => #krate::__private::serve(#cx, #body,
+                move |#cx: #krate::CallContext, #req: #request| async move {
+                    #object::#hidden(&*#imp, &#cx, #req).await
                 }),
         }
     });
@@ -351,16 +394,16 @@ fn dispatcher(component: &Component, names: &Names, krate: &TokenStream) -> Toke
 
         #[allow(clippy::all, clippy::pedantic)]
         impl #krate::__private::Dispatch for #dispatcher {
-            fn dispatch(&self, method: usize, cx: #krate::CallContext,
-                        body: #krate::__private::Bytes)
+            fn dispatch(&self, #method: usize, #cx: #krate::CallContext,
+                        #body: #krate::__private::Bytes)
                 -> #krate::__private::BoxFuture<'static,
                     ::core::result::Result<#krate::__private::Bytes, #krate::AppError>>
             {
-                let imp = ::std::sync::Arc::clone(&self.0);
-                match method {
+                let #imp = ::std::sync::Arc::clone(&self.0);
+                match #method {
                     #(#arms)*
                     _ => #krate::__private::unknown_method(
-                        <#handle as #krate::ComponentHandle>::DESCRIPTOR, method),
+                        <#handle as #krate::ComponentHandle>::DESCRIPTOR, #method),
                 }
             }
         }
@@ -400,9 +443,12 @@ fn assertions(mode: Mode, component: &Component, krate: &TokenStream) -> TokenSt
     }
 }
 
-/// The checks tying the trait to the `__sekvent_service_<Trait>` constant
-/// sekvent-proto-build emitted into the `proto` module; nothing for a
-/// `local_only` component, which has no `proto`.
+/// The checks tying the trait to what sekvent-proto-build emitted into the
+/// `proto` module: the `__sekvent_service_<Trait>` constant (service name,
+/// one RPC per method and no other, unary) and, per method, the
+/// `__sekvent_rpc_<Trait>__<Rpc>` alias of the RPC's Rust request and reply
+/// types, compared by type identity. Nothing for a `local_only` component,
+/// which has no `proto`.
 fn contract(args: &Args, component: &Component, krate: &TokenStream) -> TokenStream {
     let (Some(proto), Some(package)) = (&args.proto, &args.package) else {
         return TokenStream::new();
@@ -410,27 +456,32 @@ fn contract(args: &Args, component: &Component, krate: &TokenStream) -> TokenStr
     let service_name = component.ident.unraw().to_string();
     let constant = format_ident!("__sekvent_service_{}", service_name);
     let full_name = format!("{package}.{service_name}");
-    let count = component.methods.len();
+    let rpcs: Vec<String> = component
+        .methods
+        .iter()
+        .map(|method| rpc_name(&method.ident.to_string()))
+        .collect();
     let service = quote_spanned! {component.ident.span()=>
         const _: () = #krate::__private::assert_service(
             #proto::#constant,
             #full_name,
-            #count,
+            &[#(#rpcs),*],
         );
     };
-    let rpcs = component.methods.iter().map(|method| {
+    let checks = component.methods.iter().zip(&rpcs).map(|(method, rpc)| {
         let Method { request, reply, .. } = method;
-        let rpc = rpc_name(&method.ident.to_string());
+        let types = format_ident!("__sekvent_rpc_{}__{}", service_name, rpc);
         quote_spanned! {method.signature=>
             const _: () = #krate::__private::assert_rpc::<#request, #reply>(
                 #proto::#constant,
                 #rpc,
             );
+            const _: () = #krate::__private::assert_rpc_types::<#request, #reply, #proto::#types>();
         }
     });
     quote! {
         #service
-        #(#rpcs)*
+        #(#checks)*
     }
 }
 

@@ -1,0 +1,20 @@
+error[E0277]: this method's reply type `order::Line` is not the RPC's output type `Line`
+  --> tests/ui/fail/p11_nested_for_top_level.rs:48:17
+   |
+48 |     ) -> Result<order::Line, sekvent_component::AppError>;
+   |                 ^^^^^^^^^^^ the proto service expects `Line` here
+   |
+help: the trait `sekvent_component::__private::SameReply<Line>` is not implemented for `order::Line`
+  --> tests/ui/fail/p11_nested_for_top_level.rs:21:5
+   |
+21 |     pub struct Line {
+   |     ^^^^^^^^^^^^^^^
+   = note: `google.protobuf.Empty` is `()`; a nested message or a message of another package is a different type even when its name matches
+note: required by a bound in `sekvent_component::__private::assert_rpc_types`
+  --> $WORKSPACE/crates/sekvent-component/src/contract.rs
+   |
+   | pub const fn assert_rpc_types<Req, Rep, Rpc>()
+   |              ---------------- required by a bound in this function
+...
+   |     Rep: SameReply<Rpc::Reply>,
+   |          ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `assert_rpc_types`

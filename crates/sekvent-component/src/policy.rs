@@ -4,10 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use sekvent_config::{ConfigError, ConfigSource, Prefixed};
+use sekvent_config::{ConfigError, ConfigSource};
 use sekvent_resilience::{PolicyError, PolicySpec, RetryBudget, RetryPolicy};
 
-use crate::config::key;
+use crate::config::{self, key};
 use crate::server::MethodPolicy;
 use crate::{BuildError, ComponentDescriptor, MethodDescriptor, POLICY_PREFIX};
 
@@ -199,7 +199,7 @@ impl NamedPolicies {
                 component_fields().map(move |field| format!("{prefix}{field}"))
             })
             .collect();
-        sekvent_config::check_reserved(&Prefixed::new(source, POLICY_PREFIX), &known)
+        config::check_unknown(source, POLICY_PREFIX, &known)
     }
 }
 
@@ -575,6 +575,34 @@ mod tests {
             "SEKVENT_POLICY_REMOTE_TIMEUOT".to_owned(),
             "SEKVENT_POLICY_REMOTE_TIMEOUT".to_owned()
         )));
+    }
+
+    #[test]
+    fn policy_keys_of_a_prefixed_source_are_checked_by_their_full_names() {
+        let base: MapSource = [
+            ("APP_SEKVENT_POLICY_REMOTE_TIMEOUT", "1s"),
+            ("APP_SEKVENT_POLICY_REMOTE_TIMEUOT", "1s"),
+            ("APP_SEKVENT_COMPONENT_INVENTORY_POLICY", "remote"),
+            ("SEKVENT_POLICY_OUTSIDE_TIMEOUT", "1s"),
+        ]
+        .into_iter()
+        .collect();
+        let source = sekvent_config::Prefixed::new(&base, "APP_");
+        let mut named = NamedPolicies::default();
+        let mut errors = Vec::new();
+        let resolved = resolve(&source, INVENTORY, &mut named, &mut errors).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(resolved.methods[1].timeout, Some(Duration::from_secs(1)));
+        assert_eq!(
+            named.check_unknown(&source),
+            Err(ConfigError::UnknownKeys {
+                keys: vec!["APP_SEKVENT_POLICY_REMOTE_TIMEUOT".to_owned()],
+                suggestions: vec![(
+                    "APP_SEKVENT_POLICY_REMOTE_TIMEUOT".to_owned(),
+                    "APP_SEKVENT_POLICY_REMOTE_TIMEOUT".to_owned()
+                )],
+            })
+        );
     }
 
     #[test]

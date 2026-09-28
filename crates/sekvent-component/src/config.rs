@@ -15,14 +15,14 @@
 use std::collections::HashMap;
 
 use sekvent_config::__private::opt_value;
-use sekvent_config::{ConfigError, ConfigSource, Prefixed};
+use sekvent_config::{ConfigError, ConfigSource};
 use sekvent_resilience::PolicySpec;
 
 use crate::policy::{self, NamedPolicies};
 use crate::server::MethodPolicy;
 use crate::{
     Binding, BuildError, CONFIG_PREFIX, ComponentDescriptor, ComponentMode, DEFAULT_BINDING_KEY,
-    DEFAULT_MAX_HOPS, MAX_HOPS_KEY,
+    DEFAULT_MAX_HOPS, LOCAL_CALLER, MAX_HOPS_KEY,
 };
 
 const BINDING_EXPECTED: &str = "one of local, local-serialized, grpc";
@@ -44,6 +44,9 @@ const COMPONENT_KEYS: &[&str] = &[
 ];
 /// Largest accepted `SEKVENT_COMPONENT_MAX_HOPS`.
 const MAX_HOPS_LIMIT: u32 = 1000;
+/// Why a link may not be called [`LOCAL_CALLER`].
+const LOCAL_RESERVED: &str =
+    "`local` is reserved for the caller of in-process calls; choose another link name";
 
 /// One installed component, as the configuration sees it.
 #[derive(Debug, Clone, Copy)]
@@ -137,9 +140,7 @@ pub(crate) fn resolve(
 ) -> Result<Settings, BuildError> {
     let mut errors = Vec::new();
     let known = known_keys(entries, &mut errors);
-    if let Err(error) =
-        sekvent_config::check_reserved(&Prefixed::new(source, CONFIG_PREFIX), &known)
-    {
+    if let Err(error) = check_unknown(source, CONFIG_PREFIX, &known) {
         errors.push(error.into());
     }
     let default = match read_binding(source, DEFAULT_BINDING_KEY) {
@@ -155,6 +156,7 @@ pub(crate) fn resolve(
     });
     let mut named = NamedPolicies::default();
     let mut components = Vec::with_capacity(entries.len());
+    let mut served = Vec::new();
     for entry in entries {
         let binding = resolve_binding(source, *entry, default, &mut errors);
         let policies = policy::resolve(source, entry.descriptor, &mut named, &mut errors);
@@ -164,6 +166,9 @@ pub(crate) fn resolve(
             binding.as_ref().map(|(b, _)| *b),
             &mut errors,
         );
+        if let Ok(Some(serve)) = &serve {
+            served.push((entry.descriptor, serve.key.clone()));
+        }
         let remote = read_remote(
             source,
             *entry,
@@ -186,6 +191,7 @@ pub(crate) fn resolve(
     if let Err(error) = named.check_unknown(source) {
         errors.push(error.into());
     }
+    check_services(source, &served, &mut errors);
     #[cfg(feature = "grpc")]
     let links = read_links(source, &components, &mut errors);
     if let Some(error) = BuildError::combine(errors) {
@@ -197,6 +203,87 @@ pub(crate) fn resolve(
         max_hops,
         #[cfg(feature = "grpc")]
         links,
+    })
+}
+
+/// Two exposed components with one gRPC service name would claim the same
+/// routes: the second is a configuration error naming both. `served` holds
+/// each exposed component and its `SERVE` key, in install order.
+fn check_services(
+    source: &dyn ConfigSource,
+    served: &[(&'static ComponentDescriptor, String)],
+    errors: &mut Vec<BuildError>,
+) {
+    let mut seen: Vec<(String, &ComponentDescriptor, &str)> = Vec::new();
+    for (descriptor, key) in served {
+        let service = descriptor
+            .full_service_name()
+            .unwrap_or_else(|| descriptor.service().to_owned());
+        let Some(&(_, first, first_key)) = seen.iter().find(|(name, ..)| *name == service) else {
+            seen.push((service, *descriptor, key.as_str()));
+            continue;
+        };
+        errors.push(
+            ConfigError::Invalid {
+                key: source.describe(key),
+                reason: format!(
+                    "component {} would serve gRPC service {service}, which component {} \
+                     already serves ({}); expose only one of them",
+                    descriptor.name(),
+                    first.name(),
+                    source.describe(first_key)
+                ),
+            }
+            .into(),
+        );
+    }
+}
+
+/// The keys of a source that start with a prefix, under the names the
+/// source itself uses (whatever scope it is a view of), so they compare
+/// with the names this crate builds.
+struct Scope<'a> {
+    source: &'a dyn ConfigSource,
+    prefix: &'a str,
+}
+
+impl ConfigSource for Scope<'_> {
+    fn get(&self, key: &str) -> Option<String> {
+        self.source.get(key)
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.source
+            .keys()
+            .into_iter()
+            .filter(|key| key.starts_with(self.prefix))
+            .collect()
+    }
+}
+
+/// Reject every key of `source` under `prefix` that `known` does not list,
+/// sorted, with suggestions.
+///
+/// `known` and the source's keys are compared as `source` names them; the
+/// error shows them as [`ConfigSource::describe`] does, so a
+/// [`Prefixed`](sekvent_config::Prefixed) source is checked and reported by
+/// the names an operator sets.
+pub(crate) fn check_unknown(
+    source: &dyn ConfigSource,
+    prefix: &str,
+    known: &[String],
+) -> Result<(), ConfigError> {
+    sekvent_config::check_reserved(&Scope { source, prefix }, known).map_err(|error| {
+        let ConfigError::UnknownKeys { keys, suggestions } = error else {
+            return error;
+        };
+        ConfigError::UnknownKeys {
+            keys: keys.iter().map(|key| source.describe(key)).collect(),
+            suggestions: suggestions
+                .iter()
+                .map(|(unknown, near)| (source.describe(unknown), source.describe(near)))
+                .collect(),
+        }
     })
 }
 
@@ -461,17 +548,22 @@ fn read_remote(
     let link = source
         .get(&link_key)
         .map(|raw| {
-            if !raw.is_empty()
-                && raw
+            if raw.is_empty()
+                || !raw
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             {
-                Ok(raw.to_ascii_lowercase())
-            } else {
                 Err(ConfigError::Malformed {
                     key: source.describe(&link_key),
                     expected: "a link name of letters, digits and underscores".to_owned(),
                 })
+            } else if raw.eq_ignore_ascii_case(LOCAL_CALLER) {
+                Err(ConfigError::Invalid {
+                    key: source.describe(&link_key),
+                    reason: LOCAL_RESERVED.to_owned(),
+                })
+            } else {
+                Ok(raw.to_ascii_lowercase())
             }
         })
         .transpose();
@@ -593,6 +685,21 @@ fn read_links(
         errors.push(
             ConfigError::Missing {
                 key: format!("{}<CALLER>", sekvent_link::INBOUND_PREFIX),
+            }
+            .into(),
+        );
+    }
+    // A served component could not tell this caller from an in-process one.
+    if inbound
+        && links
+            .inbound()
+            .identities()
+            .any(|identity| identity.name == LOCAL_CALLER)
+    {
+        errors.push(
+            ConfigError::Invalid {
+                key: source.describe(&sekvent_link::inbound_key(LOCAL_CALLER)),
+                reason: LOCAL_RESERVED.to_owned(),
             }
             .into(),
         );
@@ -990,6 +1097,132 @@ mod tests {
             "SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEUOT".to_owned(),
             "SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT".to_owned()
         )));
+    }
+
+    #[test]
+    fn a_prefixed_source_is_checked_and_reported_by_full_names() {
+        for prefix in ["APP_", "SEKVENT_APP_"] {
+            let base: MapSource = [
+                ("SEKVENT_COMPONENT_INVENTORY_TIMEUOT", "1s"),
+                ("SEKVENT_COMPONENT_BINDING", "local-serialized"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (format!("{prefix}{key}"), value))
+            .chain([("SEKVENT_COMPONENT_OUTSIDE".to_owned(), "1")])
+            .collect();
+            let scoped = sekvent_config::Prefixed::new(&base, prefix);
+            let error = resolve(&scoped, &[entry(INVENTORY)]).unwrap_err();
+            let BuildError::Config(ConfigError::UnknownKeys { keys, suggestions }) = error else {
+                panic!("expected unknown keys, got {error}");
+            };
+            let typo = format!("{prefix}SEKVENT_COMPONENT_INVENTORY_TIMEUOT");
+            assert_eq!(keys, std::slice::from_ref(&typo), "{prefix}");
+            assert!(
+                suggestions
+                    .contains(&(typo, format!("{prefix}SEKVENT_COMPONENT_INVENTORY_TIMEOUT")))
+            );
+
+            let valid: MapSource = [
+                (format!("{prefix}SEKVENT_COMPONENT_INVENTORY_TIMEOUT"), "3s"),
+                (
+                    format!("{prefix}SEKVENT_COMPONENT_BINDING"),
+                    "local-serialized",
+                ),
+            ]
+            .into_iter()
+            .collect();
+            let scoped = sekvent_config::Prefixed::new(&valid, prefix);
+            let settings = resolve(&scoped, &[entry(INVENTORY)]).unwrap();
+            assert_eq!(settings.components[0].binding, Binding::LocalSerialized);
+            assert_eq!(
+                settings.components[0].policies[2].timeout,
+                Some(Duration::from_secs(3))
+            );
+        }
+    }
+
+    #[test]
+    fn two_exposed_components_cannot_serve_one_grpc_service() {
+        const STOCK: &ComponentDescriptor = &ComponentDescriptor::new(
+            "stock",
+            "Inventory",
+            &[MethodDescriptor::call("count", "Count")],
+        );
+        const SHOP: &ComponentDescriptor = &ComponentDescriptor::new(
+            "shop_inventory",
+            "Inventory",
+            &[MethodDescriptor::call("count", "Count")],
+        )
+        .with_package("shop.v1");
+        let serve = |component: &str| {
+            [
+                (format!("SEKVENT_COMPONENT_{component}_SERVE"), "grpc"),
+                (format!("SEKVENT_COMPONENT_{component}_SERVE_AUTH"), "none"),
+            ]
+        };
+        let pairs: MapSource = ["INVENTORY", "STOCK", "SHOP_INVENTORY"]
+            .into_iter()
+            .flat_map(serve)
+            .collect();
+        let error = resolve(&pairs, &[entry(INVENTORY), entry(STOCK), entry(SHOP)]).unwrap_err();
+        let BuildError::Config(ConfigError::Invalid { key, reason }) = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(key, "SEKVENT_COMPONENT_STOCK_SERVE");
+        assert_eq!(
+            reason,
+            "component stock would serve gRPC service Inventory, which component inventory \
+             already serves (SEKVENT_COMPONENT_INVENTORY_SERVE); expose only one of them"
+        );
+
+        // The same trait under another package is another service; so is an
+        // unexposed component.
+        let pairs: MapSource = ["INVENTORY", "SHOP_INVENTORY"]
+            .into_iter()
+            .flat_map(serve)
+            .collect();
+        let settings = resolve(&pairs, &[entry(INVENTORY), entry(STOCK), entry(SHOP)]).unwrap();
+        assert!(settings.components[0].serve.is_some());
+        assert!(settings.components[1].serve.is_none());
+        assert!(settings.components[2].serve.is_some());
+    }
+
+    #[test]
+    fn the_local_caller_name_is_not_a_link_name() {
+        for value in ["local", "LOCAL"] {
+            let error = one(&[("SEKVENT_COMPONENT_INVENTORY_LINK", value)], INVENTORY).unwrap_err();
+            assert!(
+                matches!(&error, BuildError::Config(ConfigError::Invalid { key, reason })
+                    if key == "SEKVENT_COMPONENT_INVENTORY_LINK" && reason.contains("reserved")),
+                "{error}"
+            );
+        }
+
+        let error = one(
+            &[
+                ("SEKVENT_COMPONENT_INVENTORY_SERVE", "grpc"),
+                ("SEKVENT_LINK_INBOUND_LOCAL", SHOP_TOKEN),
+            ],
+            INVENTORY,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, BuildError::Config(ConfigError::Invalid { key, reason })
+                if key == "SEKVENT_LINK_INBOUND_LOCAL" && reason.contains("reserved")),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(SHOP_TOKEN), "{error}");
+
+        // Without authenticated serving no caller is named after a link.
+        one(
+            &[
+                ("SEKVENT_COMPONENT_INVENTORY_SERVE", "grpc"),
+                ("SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH", "none"),
+                ("SEKVENT_LINK_INBOUND_LOCAL", SHOP_TOKEN),
+            ],
+            INVENTORY,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::probe::{DependencyProbe, probe_unit};
 use crate::signal::{Trigger, any_trigger, os_signals, signal_arrived};
+use crate::unit::StopWindow;
 use crate::{HealthRegistry, Stage, UnitContext, UnitPolicy};
 
 type UnitFuture = BoxFuture<'static, Result<(), AppError>>;
@@ -617,6 +618,8 @@ struct RunningUnit {
 struct RunningStage {
     stage: Stage,
     token: CancellationToken,
+    /// When the stage's units are aborted; set just before `token` fires.
+    stop_by: Arc<OnceLock<Instant>>,
     units: Vec<RunningUnit>,
 }
 
@@ -699,9 +702,10 @@ impl Supervisor {
 
     async fn start_stage(&mut self, stage: Stage, specs: Vec<UnitSpec>) {
         let token = CancellationToken::new();
+        let stop_by = Arc::new(OnceLock::new());
         let units: Vec<RunningUnit> = specs
             .into_iter()
-            .map(|spec| self.spawn_unit(spec, token.clone()))
+            .map(|spec| self.spawn_unit(spec, token.clone(), Arc::clone(&stop_by)))
             .collect();
         let signals: Vec<(Arc<str>, watch::Receiver<bool>)> = units
             .iter()
@@ -710,6 +714,7 @@ impl Supervisor {
         self.stages.push(RunningStage {
             stage,
             token,
+            stop_by,
             units,
         });
 
@@ -749,7 +754,12 @@ impl Supervisor {
         }
     }
 
-    fn spawn_unit(&self, spec: UnitSpec, token: CancellationToken) -> RunningUnit {
+    fn spawn_unit(
+        &self,
+        spec: UnitSpec,
+        token: CancellationToken,
+        stop_by: Arc<OnceLock<Instant>>,
+    ) -> RunningUnit {
         let (ready_tx, ready) = watch::channel(false);
         let restarts = Arc::new(AtomicU32::new(0));
         let name = Arc::clone(&spec.name);
@@ -757,6 +767,7 @@ impl Supervisor {
         let driver = Driver {
             spec,
             token,
+            stop_by,
             control: Arc::clone(&self.control),
             health: self.health.clone(),
             ready: Arc::new(ready_tx),
@@ -835,6 +846,8 @@ pub(crate) fn panic_detail(panic: &(dyn Any + Send)) -> String {
 /// still running at `grace_end`.
 async fn drain_stage(stage: RunningStage, grace_end: Instant) -> Vec<UnitReport> {
     tracing::debug!(stage = stage.stage.as_str(), "draining stage");
+    // Set before the token fires, so a unit that sees shutdown sees it too.
+    let _ = stage.stop_by.set(grace_end);
     stage.token.cancel();
     join_all(stage.units.into_iter().map(|unit| async move {
         let RunningUnit {
@@ -870,6 +883,7 @@ async fn drain_stage(stage: RunningStage, grace_end: Instant) -> Vec<UnitReport>
 struct Driver {
     spec: UnitSpec,
     token: CancellationToken,
+    stop_by: Arc<OnceLock<Instant>>,
     control: Arc<Control>,
     health: HealthRegistry,
     ready: Arc<watch::Sender<bool>>,
@@ -1000,7 +1014,10 @@ impl Driver {
             self.token.clone(),
             Arc::clone(&self.ready),
             self.health.clone(),
-            self.settings.stage_grace,
+            StopWindow {
+                grace: self.settings.stage_grace,
+                by: Arc::clone(&self.stop_by),
+            },
         );
         let run = match std::panic::catch_unwind(AssertUnwindSafe(|| (self.spec.factory)(ctx))) {
             Ok(run) => run,
@@ -1092,6 +1109,44 @@ mod tests {
         assert_eq!(panic_detail(&*literal), "boom");
         assert_eq!(panic_detail(&*owned), "bang");
         assert_eq!(panic_detail(&*other), "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_draining_unit_learns_when_it_is_aborted() {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let mut seen_tx = Some(seen_tx);
+        let handle = Runtime::builder()
+            .without_signals()
+            .stage_grace(Duration::from_secs(10))
+            .shutdown_deadline(Duration::from_secs(3))
+            .unit(
+                "worker",
+                Stage::Workers,
+                UnitPolicy::Critical,
+                move |ctx: UnitContext| {
+                    let seen_tx = seen_tx.take();
+                    async move {
+                        let before = ctx.stop_deadline();
+                        ctx.ready();
+                        ctx.shutdown().cancelled().await;
+                        if let Some(seen_tx) = seen_tx {
+                            seen_tx.send((before, ctx.stop_deadline())).unwrap();
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .build()
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
+        let requested = Instant::now();
+        handle.shutdown();
+        let (before, during) = seen_rx.await.unwrap();
+        assert_eq!(before, None);
+        assert_eq!(during, Some(requested + Duration::from_secs(3)));
+        handle.wait().await.unwrap();
     }
 
     #[tokio::test]

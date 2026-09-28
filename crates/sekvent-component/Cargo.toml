@@ -46,6 +46,8 @@ tonic-prost = { workspace = true }
 tonic-types = { workspace = true }
 # Health client in the serving tests.
 tonic-health = { workspace = true }
+# A plain HTTP/2 client for raw serving tests.
+hyper-util = { workspace = true }
 
 [lints]
 workspace = true

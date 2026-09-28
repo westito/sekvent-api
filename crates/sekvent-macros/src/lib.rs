@@ -81,9 +81,11 @@ pub fn derive_env_config(input: TokenStream) -> TokenStream {
 ///   `sekvent-proto-build` generated for that package, required unless
 ///   `local_only` (and forbidden with it). The trait is checked at compile
 ///   time against the proto `service` named after it (the constant
-///   `__sekvent_service_<Trait>` in that module): the same full service
-///   name, one unary RPC per method named in `UpperCamelCase`
-///   (`charge` is `Charge`), with the method's request and reply types;
+///   `__sekvent_service_<Trait>` and the aliases `__sekvent_rpc_<Trait>__<Rpc>`
+///   in that module): the same full service name and exactly one unary RPC
+///   per method, named in `UpperCamelCase` (`charge` is `Charge`), with the
+///   method's request and reply types; two methods may not map to one RPC
+///   name (`get_v2` and `get_v_2` both map to `GetV2`);
 /// - `local_only`: requests and replies may be any `Send + 'static` type and
 ///   the component can only be bound `local`;
 /// - `remote_only`: the component never runs in this binary and is declared
@@ -96,8 +98,8 @@ pub fn derive_env_config(input: TokenStream) -> TokenStream {
 /// Result<Reply, Error>` marked `#[call]`, optionally with `idempotent`,
 /// `timeout = "<humantime>"` and `bulkhead = <max concurrent calls>`.
 /// Requests and replies are prost messages that implement `prost::Name`
-/// (sekvent-proto-build enables prost's type names); each error type
-/// implements `ComponentError`.
+/// (sekvent-proto-build enables prost's type names), or `()` for
+/// `google.protobuf.Empty`; each error type implements `ComponentError`.
 ///
 /// The macro keeps the trait (its methods become `fn -> impl Future + Send`,
 /// so implementations still write `async fn`) and generates `<Trait>Handle`

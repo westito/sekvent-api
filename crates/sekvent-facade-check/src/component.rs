@@ -21,6 +21,10 @@ pub mod proto {
             false,
         )],
     );
+    /// Request and reply of `check.echo.v1.Echo.Ping`, checked by `#[component(proto = …)]`.
+    #[doc(hidden)]
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingReply);
 }
 
 /// Text to echo.

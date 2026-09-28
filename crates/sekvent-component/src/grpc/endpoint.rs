@@ -11,9 +11,10 @@ const EXPECTED: &str = "http://host:port";
 const TLS: &str = "TLS endpoints are not supported yet; use http:// on a private network or \
                    behind a TLS-terminating proxy";
 
-/// Read and validate the endpoint URL at `key`: `http://` + host + `:` +
-/// port, optionally followed by one `/`. Returns the URL without that `/`.
-/// `Ok(None)` when unset. Errors name the key, never the value.
+/// Read and validate the endpoint URL at `key`: `http://` (any case), a
+/// host, `:` and a port, optionally followed by one `/`. Returns the URL
+/// with a lowercase scheme and without that `/`; `Ok(None)` when unset.
+/// Errors name the key, never the value.
 pub(crate) fn read(source: &dyn ConfigSource, key: &str) -> Result<Option<String>, ConfigError> {
     source
         .get(key)
@@ -50,7 +51,11 @@ fn parse(raw: &str) -> Result<String, Problem> {
     {
         return Err(Problem::Invalid(TLS));
     }
-    let rest = raw.strip_prefix("http://").ok_or(Problem::Malformed)?;
+    let rest = raw
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .and_then(|_| raw.get(7..))
+        .ok_or(Problem::Malformed)?;
     if rest.contains('@') {
         return Err(Problem::Invalid("must not carry user information"));
     }
@@ -85,8 +90,13 @@ fn valid_host(host: &str) -> bool {
             .strip_suffix(']')
             .is_some_and(|address| address.parse::<Ipv6Addr>().is_ok());
     }
-    if host.parse::<Ipv4Addr>().is_ok() {
-        return true;
+    // A name whose last label is numeric can only be an IPv4 address.
+    if host
+        .rsplit('.')
+        .next()
+        .is_some_and(|last| !last.is_empty() && last.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return host.parse::<Ipv4Addr>().is_ok();
     }
     !host.is_empty()
         && host.len() <= 253
@@ -146,6 +156,10 @@ mod tests {
             ("http://[::1]:8080", "http://[::1]:8080"),
             ("http://[::1]:8080/", "http://[::1]:8080"),
             ("http://a-b.c:80", "http://a-b.c:80"),
+            ("HTTP://inventory:50051", "http://inventory:50051"),
+            ("Http://10.0.0.255:80", "http://10.0.0.255:80"),
+            ("http://v1.inventory9:80", "http://v1.inventory9:80"),
+            ("http://9inventory:80", "http://9inventory:80"),
         ] {
             assert_eq!(read_one(value).unwrap().as_deref(), Some(url), "{value}");
             assert!(endpoint(url).is_ok(), "{url}");
@@ -200,6 +214,14 @@ mod tests {
             "http://[zz]:80",
             "http://[::1:80",
             "http://::1:80",
+            "http://10.0.0.256:80",
+            "http://256.1.1.1:80",
+            "http://1.2.3:80",
+            "http://1.2.3.4.5:80",
+            "http://inventory.42:80",
+            "http://42:80",
+            "HTTPX://inventory:80",
+            "http:/",
         ] {
             let error = read_one(value).unwrap_err();
             assert!(

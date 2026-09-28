@@ -2,12 +2,14 @@ use std::fmt::Write as _;
 
 use prost_build::{Service, ServiceGenerator};
 
-use crate::SERVICE_CONTRACT_PREFIX;
+use crate::{RPC_TYPES_PREFIX, SERVICE_CONTRACT_PREFIX};
 
 /// Appends `__sekvent_service_<Service>` after every service's position in
 /// its package's generated file: the service's full name and, per RPC, its
-/// name, request and reply full names and whether it streams. The
-/// `#[component(proto = …)]` macro checks a component trait against it.
+/// name, request and reply full names and whether it streams. Each RPC also
+/// gets `__sekvent_rpc_<Service>__<Rpc>`, an alias of its Rust
+/// `(Request, Reply)` types. The `#[component(proto = …)]` macro checks a
+/// component trait against both.
 pub(crate) struct ServiceContracts;
 
 impl ServiceGenerator for ServiceContracts {
@@ -16,7 +18,7 @@ impl ServiceGenerator for ServiceContracts {
     }
 }
 
-/// The constant for `service`, as Rust source.
+/// The constant and the per-RPC type aliases for `service`, as Rust source.
 pub(crate) fn render(service: &Service) -> String {
     let full_name = qualified(&service.package, &service.proto_name);
     let mut out = String::new();
@@ -49,7 +51,28 @@ pub(crate) fn render(service: &Service) -> String {
         out.push_str("    ],\n");
     }
     out.push_str(");\n");
+    for method in &service.methods {
+        let _ = writeln!(
+            out,
+            "/// Request and reply of `{full_name}.{}`, checked by `#[component(proto = …)]`.",
+            method.proto_name
+        );
+        out.push_str("#[doc(hidden)]\n");
+        out.push_str("#[allow(non_camel_case_types, dead_code)]\n");
+        let _ = writeln!(
+            out,
+            "pub type {} = ({}, {});",
+            rpc_types_name(&service.proto_name, &method.proto_name),
+            method.input_type,
+            method.output_type,
+        );
+    }
     out
+}
+
+/// `__sekvent_rpc_<Service>__<Rpc>`.
+fn rpc_types_name(service: &str, rpc: &str) -> String {
+    format!("{RPC_TYPES_PREFIX}{service}__{rpc}")
 }
 
 /// `package.name`, or `name` alone in the empty package.
@@ -61,8 +84,9 @@ fn qualified(package: &str, name: &str) -> String {
     }
 }
 
-/// A descriptor's fully qualified type (`.shop.v1.Item`) without the
-/// leading dot, as `prost::Name` spells it.
+/// A descriptor's fully qualified type (`.shop.v1.Order.Item`) without the
+/// leading dot: the full name, with enclosing messages, that
+/// `prost::Name::full_name` returns.
 fn type_name(proto_type: &str) -> &str {
     proto_type.strip_prefix('.').unwrap_or(proto_type)
 }
@@ -73,15 +97,22 @@ mod tests {
 
     use super::*;
 
-    fn method(name: &str, input: &str, output: &str, streaming: (bool, bool)) -> Method {
+    /// An RPC: its name, then (protobuf type, Rust type) of the request
+    /// and of the reply, as prost resolves them from the package module.
+    fn method(
+        name: &str,
+        input: (&str, &str),
+        output: (&str, &str),
+        streaming: (bool, bool),
+    ) -> Method {
         Method {
             name: name.to_lowercase(),
             proto_name: name.to_owned(),
             comments: Comments::default(),
-            input_type: String::new(),
-            output_type: String::new(),
-            input_proto_type: input.to_owned(),
-            output_proto_type: output.to_owned(),
+            input_type: input.1.to_owned(),
+            output_type: output.1.to_owned(),
+            input_proto_type: input.0.to_owned(),
+            output_proto_type: output.0.to_owned(),
             options: prost_types::MethodOptions::default(),
             client_streaming: streaming.0,
             server_streaming: streaming.1,
@@ -107,26 +138,29 @@ mod tests {
             vec![
                 method(
                     "GetInvoice",
-                    ".billing.v1.GetInvoiceRequest",
-                    ".billing.v1.Invoice",
+                    (".billing.v1.GetInvoiceRequest", "GetInvoiceRequest"),
+                    (".billing.v1.Invoice", "Invoice"),
                     (false, false),
                 ),
                 method(
                     "Total",
-                    ".billing.v1.GetInvoiceRequest",
-                    ".common.v1.Money",
+                    (".billing.v1.GetInvoiceRequest", "GetInvoiceRequest"),
+                    (".common.v1.Money", "super::super::common::v1::Money"),
                     (false, false),
                 ),
                 method(
                     "Watch",
-                    ".billing.v1.GetInvoiceRequest",
-                    ".billing.v1.Invoice.Line",
+                    (".billing.v1.GetInvoiceRequest", "GetInvoiceRequest"),
+                    (".billing.v1.Invoice.Line", "invoice::Line"),
                     (false, true),
                 ),
                 method(
                     "Upload",
-                    ".google.protobuf.BytesValue",
-                    ".google.protobuf.Empty",
+                    (
+                        ".google.protobuf.BytesValue",
+                        "::prost::alloc::vec::Vec<u8>",
+                    ),
+                    (".google.protobuf.Empty", "()"),
                     (true, false),
                 ),
             ],
@@ -144,8 +178,58 @@ mod tests {
              \x20       (\"Watch\", \"billing.v1.GetInvoiceRequest\", \"billing.v1.Invoice.Line\", true),\n\
              \x20       (\"Upload\", \"google.protobuf.BytesValue\", \"google.protobuf.Empty\", true),\n\
              \x20   ],\n\
-             );\n"
+             );\n\
+             /// Request and reply of `billing.v1.Invoices.GetInvoice`, checked by `#[component(proto = …)]`.\n\
+             #[doc(hidden)]\n\
+             #[allow(non_camel_case_types, dead_code)]\n\
+             pub type __sekvent_rpc_Invoices__GetInvoice = (GetInvoiceRequest, Invoice);\n\
+             /// Request and reply of `billing.v1.Invoices.Total`, checked by `#[component(proto = …)]`.\n\
+             #[doc(hidden)]\n\
+             #[allow(non_camel_case_types, dead_code)]\n\
+             pub type __sekvent_rpc_Invoices__Total = (GetInvoiceRequest, super::super::common::v1::Money);\n\
+             /// Request and reply of `billing.v1.Invoices.Watch`, checked by `#[component(proto = …)]`.\n\
+             #[doc(hidden)]\n\
+             #[allow(non_camel_case_types, dead_code)]\n\
+             pub type __sekvent_rpc_Invoices__Watch = (GetInvoiceRequest, invoice::Line);\n\
+             /// Request and reply of `billing.v1.Invoices.Upload`, checked by `#[component(proto = …)]`.\n\
+             #[doc(hidden)]\n\
+             #[allow(non_camel_case_types, dead_code)]\n\
+             pub type __sekvent_rpc_Invoices__Upload = (::prost::alloc::vec::Vec<u8>, ());\n"
         );
+    }
+
+    #[test]
+    fn a_nested_message_keeps_its_enclosing_message_in_both_names() {
+        let orders = service(
+            "shop.v1",
+            "Orders",
+            vec![
+                method(
+                    "Nested",
+                    (".shop.v1.Order.Line", "order::Line"),
+                    (".shop.v1.Line", "Line"),
+                    (false, false),
+                ),
+                method(
+                    "Deep",
+                    (".shop.v1.Order.Line.Tax", "order::line::Tax"),
+                    (".other.v1.Line", "super::super::other::v1::Line"),
+                    (false, false),
+                ),
+            ],
+        );
+        let rendered = render(&orders);
+        for needle in [
+            "(\"Nested\", \"shop.v1.Order.Line\", \"shop.v1.Line\", false),",
+            "(\"Deep\", \"shop.v1.Order.Line.Tax\", \"other.v1.Line\", false),",
+            "pub type __sekvent_rpc_Orders__Nested = (order::Line, Line);",
+            "pub type __sekvent_rpc_Orders__Deep = (order::line::Tax, super::super::other::v1::Line);",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "missing `{needle}` in {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -163,13 +247,32 @@ mod tests {
         let loose = service(
             "",
             "Loose",
-            vec![method("Get", ".Req", "Rep", (false, false))],
+            vec![method(
+                "Get",
+                (".Req", "Req"),
+                ("Rep", "Rep"),
+                (false, false),
+            )],
+        );
+        let rendered = render(&loose);
+        assert!(
+            rendered.contains("(\"Get\", \"Req\", \"Rep\", false),"),
+            "{rendered}"
         );
         assert!(
-            render(&loose).contains("(\"Get\", \"Req\", \"Rep\", false),"),
-            "{}",
-            render(&loose)
+            rendered.contains("/// Request and reply of `Loose.Get`"),
+            "{rendered}"
         );
+        assert!(
+            rendered.contains("pub type __sekvent_rpc_Loose__Get = (Req, Rep);"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn rpc_type_aliases_separate_service_and_rpc() {
+        assert_eq!(rpc_types_name("Orders", "Get"), "__sekvent_rpc_Orders__Get");
+        assert_ne!(rpc_types_name("A_B", "C"), rpc_types_name("A", "B_C"));
     }
 
     #[test]

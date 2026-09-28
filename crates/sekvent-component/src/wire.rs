@@ -1,8 +1,11 @@
 //! What crosses the serialization boundary besides requests and replies:
-//! errors as a private protobuf message, and the guard that ties a spawned
-//! call to the caller's future.
+//! errors as a private protobuf message, the guard that ties a spawned call
+//! to the caller's future, and the guard that turns a handler's panic into a
+//! value.
 
 use std::future::Future;
+#[cfg(feature = "grpc")]
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -121,6 +124,37 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+#[cfg(feature = "grpc")]
+/// The marker [`CatchPanic`] yields for a future that panicked; the panic
+/// payload is dropped, never shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Panicked;
+
+#[cfg(feature = "grpc")]
+/// A future whose panic, raised while it is polled, becomes
+/// `Err(Panicked)` instead of unwinding into the caller.
+pub(crate) struct CatchPanic<F>(Pin<Box<F>>);
+
+#[cfg(feature = "grpc")]
+impl<F: Future> CatchPanic<F> {
+    pub(crate) fn new(future: F) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+#[cfg(feature = "grpc")]
+impl<F: Future> Future for CatchPanic<F> {
+    type Output = Result<F::Output, Panicked>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.get_mut().0.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_payload) => Poll::Ready(Err(Panicked)),
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -199,5 +233,27 @@ mod tests {
         started_rx.await.unwrap();
         drop(guard);
         dropped_rx.await.unwrap();
+    }
+
+    #[cfg(feature = "grpc")]
+    #[tokio::test]
+    async fn a_panic_is_caught_and_its_payload_dropped() {
+        let caught = CatchPanic::new(async {
+            tokio::task::yield_now().await;
+            panic!("secret payload");
+        })
+        .await;
+        assert_eq!(caught, Err::<(), _>(Panicked));
+    }
+
+    #[cfg(feature = "grpc")]
+    #[tokio::test]
+    async fn a_normal_outcome_passes_through() {
+        let outcome = CatchPanic::new(async {
+            tokio::task::yield_now().await;
+            7
+        })
+        .await;
+        assert_eq!(outcome, Ok(7));
     }
 }

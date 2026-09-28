@@ -21,7 +21,7 @@ pub(crate) trait __LedgerDyn: ::core::marker::Send + ::core::marker::Sync + 'sta
     ) -> ::sekvent_component::__private::BoxFuture<'a, Result<RecordReply, LedgerError>>;
 }
 #[allow(clippy::all, clippy::pedantic)]
-impl<T: Ledger> __LedgerDyn for T {
+impl<__SekventImpl: Ledger> __LedgerDyn for __SekventImpl {
     fn __record<'a>(
         &'a self,
         cx: &'a CallContext,
@@ -30,7 +30,7 @@ impl<T: Ledger> __LedgerDyn for T {
         'a,
         Result<RecordReply, LedgerError>,
     > {
-        ::std::boxed::Box::pin(<T as Ledger>::record(self, cx, req))
+        ::std::boxed::Box::pin(<__SekventImpl as Ledger>::record(self, cx, req))
     }
 }
 /// Cloneable handle to the [`Ledger`] component (`ledger`).
@@ -135,9 +135,14 @@ const _: () = {
 const _: () = ::sekvent_component::__private::assert_service(
     ::ledger_api::proto::shop::ledger::v1::__sekvent_service_Ledger,
     "shop.ledger.v1.Ledger",
-    1usize,
+    &["Record"],
 );
 const _: () = ::sekvent_component::__private::assert_rpc::<
     RecordRequest,
     RecordReply,
 >(::ledger_api::proto::shop::ledger::v1::__sekvent_service_Ledger, "Record");
+const _: () = ::sekvent_component::__private::assert_rpc_types::<
+    RecordRequest,
+    RecordReply,
+    ::ledger_api::proto::shop::ledger::v1::__sekvent_rpc_Ledger__Record,
+>();

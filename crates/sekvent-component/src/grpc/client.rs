@@ -1,7 +1,7 @@
 //! The caller side of the `grpc` binding: one client per remote component.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::HeaderMap;
@@ -10,26 +10,34 @@ use sekvent_context::{CallContext, headers};
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_link::BearerInjector;
 use sekvent_resilience::{BreakerState, CircuitBreaker, Policy, PolicyError, PolicySpec, Timeout};
+use tokio::time::Instant;
 use tonic::metadata::MetadataMap;
 
 use super::LazyChannel;
 use super::codec::BytesCodec;
+use crate::link::{caller_expired, method_timeout};
 use crate::policy;
-use crate::server::{MethodPolicy, tag};
+use crate::server::{MethodPolicy, shed, tag};
 use crate::{ComponentDescriptor, MethodDescriptor, reasons};
 
 /// Calls one remote component: a lazily connected channel (shared with the
-/// other components on the same endpoint), a gRPC path and a resilience
-/// policy per method, and the link's bearer token.
+/// other components on the same endpoint), a gRPC path, a timeout and a
+/// retry policy per method, the component's circuit breaker, and the
+/// link's bearer token.
 pub(crate) struct RemoteClient {
     descriptor: &'static ComponentDescriptor,
     channel: Arc<LazyChannel>,
     bearer: Option<BearerInjector>,
+    breaker: Option<Arc<CircuitBreaker>>,
     methods: Box<[RemoteMethod]>,
 }
 
 struct RemoteMethod {
     path: PathAndQuery,
+    /// The method's `TIMEOUT`: a bound on the whole call, retries included.
+    timeout: Option<Duration>,
+    /// Retries within the deadline; the breaker is driven by the client,
+    /// which knows whose deadline expired.
     policy: Policy,
 }
 
@@ -76,22 +84,31 @@ impl RemoteClient {
             {
                 policy = policy.with_retry(retry.with_budget(Arc::clone(&budget)));
             }
-            if let Some(breaker) = &breaker {
-                policy = policy.with_breaker(Arc::clone(breaker));
-            }
-            methods.push(RemoteMethod { path, policy });
+            methods.push(RemoteMethod {
+                path,
+                timeout: resolved.timeout,
+                policy,
+            });
         }
         Ok(Self {
             descriptor,
             channel,
             bearer,
+            breaker,
             methods: methods.into_boxed_slice(),
         })
     }
 
-    /// Run method `method` under its policy: breaker, budgeted retries of
-    /// idempotent methods, the context deadline. Errors the pipeline makes
-    /// itself are tagged; the server's errors are returned untouched.
+    /// Run method `method`: the breaker, budgeted retries of idempotent
+    /// methods, all within the method's timeout and the caller's deadline.
+    /// Errors the pipeline makes itself are tagged; the server's errors are
+    /// returned untouched.
+    ///
+    /// The method's timeout expiring while the caller still has time is
+    /// `DEADLINE_EXCEEDED` / [`reasons::METHOD_TIMEOUT`] and counts as a
+    /// failure of the callee. The caller's own deadline passing or the
+    /// caller cancelling says nothing about the callee: the breaker permit
+    /// is given back unrecorded.
     pub(crate) async fn call(
         &self,
         method: usize,
@@ -113,21 +130,68 @@ impl RemoteClient {
             .methods()
             .get(method)
             .is_some_and(MethodDescriptor::is_idempotent);
-        let attempted = AtomicBool::new(false);
-        let outcome = remote
-            .policy
-            .call(&cx, idempotent, || {
-                attempted.store(true, Ordering::Relaxed);
-                self.attempt(method, &remote.path, &cx, body.clone())
-            })
-            .await;
-        match outcome {
-            // Rejected before any attempt: the breaker, or a dead context.
-            Err(error) if !attempted.load(Ordering::Relaxed) => {
-                Err(tag(self.descriptor, error, method))
+        // A dead context takes no breaker permit and sends nothing.
+        shed(&cx).map_err(|error| tag(self.descriptor, error, method))?;
+        let permit = match &self.breaker {
+            Some(breaker) => Some(
+                breaker
+                    .acquire()
+                    .map_err(|error| tag(self.descriptor, error, method))?,
+            ),
+            None => None,
+        };
+        let caller = cx.deadline().map(Instant::from_std);
+        let deadline = remote
+            .timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout))
+            // Only a method deadline before the caller's can fire first.
+            .filter(|deadline| caller.is_none_or(|caller| *deadline < caller));
+        let narrowed = match deadline {
+            Some(deadline) => cx.clone().with_deadline(deadline.into_std()),
+            None => cx.clone(),
+        };
+        let run = remote.policy.call(&narrowed, idempotent, || {
+            self.attempt(method, &remote.path, &narrowed, body.clone())
+        });
+        let timer = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
             }
-            outcome => outcome,
+        };
+        // The policy is polled first: a reply that is ready when the timer
+        // fires is still delivered. Its own view of the same expiry (the
+        // deadline-only timeout, tonic's `grpc-timeout`, the server's
+        // `DEADLINE_EXCEEDED`) is recognised below from the deadlines, not
+        // from which timer won the race.
+        // `None`: the method's timeout fired first.
+        let finished = tokio::select! {
+            biased;
+            result = run => Some(result),
+            () = timer => None,
+        };
+        let timed_out = || {
+            tag(
+                self.descriptor,
+                method_timeout(remote.timeout.unwrap_or_default()),
+                method,
+            )
+        };
+        let result = match finished {
+            None => Err(timed_out()),
+            Some(Err(error)) if is_method_expiry(&cx, deadline, &error) => Err(timed_out()),
+            Some(result) => result,
+        };
+        // The context was live with no await since, so the policy attempted
+        // the call: every outcome the caller did not cause is the callee's.
+        if let Some(permit) = permit {
+            if caused_by_caller(&cx, &result) {
+                permit.release();
+            } else {
+                permit.record(&result);
+            }
         }
+        result
     }
 
     /// One attempt: fresh headers (context, then the bearer), a ready
@@ -185,6 +249,40 @@ impl RemoteClient {
         .with_reason(reasons::UNREACHABLE)
         .with_source(source);
         tag(self.descriptor, error, method)
+    }
+}
+
+/// Whether `error` is the method deadline (`deadline`, set only when it
+/// comes before the caller's) passing: a `DEADLINE_EXCEEDED` naming no other
+/// reason while the caller still has time. Tonic and the server enforce
+/// that deadline too, from a `grpc-timeout` rounded down to its unit, so
+/// their expiry may land a moment before it; the clock is not compared.
+fn is_method_expiry(cx: &CallContext, deadline: Option<Instant>, error: &AppError) -> bool {
+    deadline.is_some()
+        && error.code() == ErrorCode::DeadlineExceeded
+        && error.reason().is_none()
+        && !caller_expired(cx)
+}
+
+/// Whether `result` failed because of the caller — its cancellation or its
+/// own deadline passing — rather than because of the callee.
+///
+/// A [`reasons::METHOD_TIMEOUT`] is never the caller's doing. A
+/// `DEADLINE_EXCEEDED` naming no reason is: the method deadline's expiry
+/// has been turned into a `METHOD_TIMEOUT` by now, so what is left is the
+/// caller's deadline as tonic or the server enforced it from a
+/// `grpc-timeout` rounded down, possibly a moment before it passes here.
+fn caused_by_caller(cx: &CallContext, result: &Result<Bytes, AppError>) -> bool {
+    let Err(error) = result else {
+        return false;
+    };
+    match error.code() {
+        ErrorCode::Cancelled => cx.cancel_token().is_cancelled(),
+        ErrorCode::DeadlineExceeded => match error.reason() {
+            None => true,
+            Some(reason) => reason != reasons::METHOD_TIMEOUT && caller_expired(cx),
+        },
+        _ => false,
     }
 }
 
@@ -281,6 +379,7 @@ mod tests {
             "/shop.v1.Inventory/Release"
         );
         assert_eq!(client.methods[0].policy.name(), "inventory.reserve");
+        assert!(client.breaker.is_none());
         assert!(client.methods[0].policy.breaker().is_none());
         let debug = format!("{client:?}");
         assert!(debug.contains("inventory"), "{debug}");
@@ -334,6 +433,65 @@ mod tests {
         assert_eq!(error.message(), "component inventory is unreachable");
         assert_eq!(error.metadata()["component"], "inventory");
         assert_eq!(error.metadata()["method"], "release");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_method_deadline_passing_is_a_method_timeout() {
+        let now = Instant::now();
+        let live = CallContext::new().with_deadline((now + Duration::from_secs(10)).into_std());
+        let plain = || AppError::deadline_exceeded("late");
+        assert!(is_method_expiry(&live, Some(now), &plain()));
+        assert!(!is_method_expiry(&live, None, &plain()));
+        assert!(
+            is_method_expiry(&live, Some(now + Duration::from_micros(1)), &plain()),
+            "the transport's rounded-down view of the same deadline"
+        );
+        assert!(!is_method_expiry(
+            &live,
+            Some(now),
+            &AppError::unavailable("down")
+        ));
+        assert!(!is_method_expiry(
+            &live,
+            Some(now),
+            &plain().with_reason("SOMETHING_ELSE")
+        ));
+        let expired = CallContext::new().with_deadline(now.into_std());
+        assert!(!is_method_expiry(&expired, Some(now), &plain()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_callers_own_expiry_or_cancellation_is_its_doing() {
+        let now = Instant::now();
+        let live = CallContext::new().with_deadline((now + Duration::from_secs(10)).into_std());
+        assert!(!caused_by_caller(&live, &Ok(Bytes::new())));
+        let other_reason = || AppError::deadline_exceeded("late").with_reason("QUEUE_TIMEOUT");
+        for error in [
+            other_reason(),
+            method_timeout(Duration::from_secs(1)),
+            AppError::cancelled("stopped"),
+            AppError::unavailable("down"),
+        ] {
+            assert!(!caused_by_caller(&live, &Err(error)));
+        }
+        assert!(
+            caused_by_caller(&live, &Err(AppError::deadline_exceeded("late"))),
+            "the caller's deadline enforced a moment early from a rounded grpc-timeout"
+        );
+
+        let expired = CallContext::new().with_deadline(now.into_std());
+        assert!(caused_by_caller(&expired, &Err(other_reason())));
+        assert!(
+            !caused_by_caller(&expired, &Err(method_timeout(Duration::from_secs(1)))),
+            "a method timeout is the callee's"
+        );
+
+        let cancelled = CallContext::new();
+        cancelled.cancel_token().cancel();
+        assert!(caused_by_caller(
+            &cancelled,
+            &Err(AppError::cancelled("stopped"))
+        ));
     }
 
     #[test]

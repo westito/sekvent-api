@@ -42,6 +42,10 @@ mod proto {
             ),
         ],
     );
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingReply);
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Echo__Shout = (super::PingRequest, super::PingReply);
 }
 
 #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]

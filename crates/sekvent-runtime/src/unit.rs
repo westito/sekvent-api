@@ -1,8 +1,9 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{HealthRegistry, Stage};
@@ -19,7 +20,15 @@ pub struct UnitContext {
     shutdown: CancellationToken,
     ready: Arc<watch::Sender<bool>>,
     health: HealthRegistry,
-    grace: Duration,
+    stop: StopWindow,
+}
+
+/// How long a unit may take to stop, and when it must be done once its
+/// stage drains; the instant is shared by every run of the unit.
+#[derive(Clone)]
+pub(crate) struct StopWindow {
+    pub(crate) grace: Duration,
+    pub(crate) by: Arc<OnceLock<Instant>>,
 }
 
 impl UnitContext {
@@ -30,7 +39,7 @@ impl UnitContext {
         shutdown: CancellationToken,
         ready: Arc<watch::Sender<bool>>,
         health: HealthRegistry,
-        grace: Duration,
+        stop: StopWindow,
     ) -> Self {
         Self {
             name,
@@ -39,7 +48,7 @@ impl UnitContext {
             shutdown,
             ready,
             health,
-            grace,
+            stop,
         }
     }
 
@@ -75,7 +84,19 @@ impl UnitContext {
     /// [`stage_grace`](crate::RuntimeBuilder::stage_grace). Also a sensible
     /// bound for cleanup the unit does after failing on its own.
     pub fn stage_grace(&self) -> Duration {
-        self.grace
+        self.stop.grace
+    }
+
+    /// When the unit is aborted if it is still running, on tokio's clock:
+    /// `None` until its stage begins draining, set before
+    /// [`shutdown`](Self::shutdown) fires.
+    ///
+    /// It is the earlier of the end of the stage grace and the runtime's
+    /// overall [`shutdown_deadline`](crate::RuntimeBuilder::shutdown_deadline),
+    /// so it can be sooner than [`stage_grace`](Self::stage_grace) from now.
+    /// A unit that stops in several steps sizes them from this instant.
+    pub fn stop_deadline(&self) -> Option<Instant> {
+        self.stop.by.get().copied()
     }
 
     /// Report that the unit is up. The next stage starts once every unit of
@@ -117,9 +138,21 @@ mod tests {
             shutdown.clone(),
             Arc::new(ready),
             HealthRegistry::new(),
-            Duration::from_secs(7),
+            StopWindow {
+                grace: Duration::from_secs(7),
+                by: Arc::default(),
+            },
         );
         (ctx, shutdown, ready_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_stop_deadline_is_unset_until_the_stage_drains() {
+        let (ctx, _, _) = context(0);
+        assert_eq!(ctx.stop_deadline(), None);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        ctx.stop.by.set(deadline).unwrap();
+        assert_eq!(ctx.clone().stop_deadline(), Some(deadline));
     }
 
     #[test]

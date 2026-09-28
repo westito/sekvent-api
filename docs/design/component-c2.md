@@ -62,13 +62,13 @@
 |---|---|
 | TLS on component endpoints | `https://` endpoints are a build error naming the key; C2 assumes a private network or a TLS-terminating mesh (decision 3) |
 | Per-component caller allow-lists | every configured inbound link may call every exposed component |
-| Compression, message-size keys, keep-alive keys | tonic defaults (4 MiB decode limit), fixed keep-alive |
+| Compression, message-size keys, keep-alive keys | a fixed 4 MiB request-message limit when serving, fixed keep-alive |
 | Per-attempt timeouts, rate limits for components | `TIMEOUT` stays the whole call's deadline; `RATE_LIMIT_*` keys are unknown keys |
 | Shared component-wide bulkhead | component keys remain per-method defaults |
 | Several endpoints per component, client-side balancing | one URL per component; a load balancer or DNS in front |
 | Error reasons in contracts | reasons live in Rust (`ComponentError`); `contract check` sees only protos (decision 6) |
 | Multi-version tooling | `billing.v2` alongside `billing.v1` is two components; nothing new is needed (6.6) |
-| Proto editions, extensions | `contract` rejects editions files and ignores extensions |
+| Proto editions | `contract` rejects editions files (extensions are recorded and checked, 6.3/6.4) |
 | Metrics, streaming, `#[async_call]`, `#[deferred]` | C3 and later |
 
 ## 2. Wire contract
@@ -109,7 +109,7 @@ request. Headers, written by the caller for **every attempt**:
 |---|---|---|
 | `content-type`, `te` | `application/grpc`, `trailers` (tonic) | tonic |
 | `authorization` | `Bearer <token>` of `SEKVENT_LINK_OUTBOUND_<LINK>` (`BearerInjector::apply`); absent with `AUTH=none` | `sekvent_link::authenticate_headers` against the process's inbound `TokenMap` (2.4) |
-| `x-request-id`, `traceparent`, `x-sekvent-subject`, `x-sekvent-tenant`, `idempotency-key` | `sekvent_context::headers::inject(&callee_cx, …)` (C1 semantics: the idempotency key is forwarded, identical on every retry) | `headers::from_headers(&headers, caller)`; subject and tenant survive only for a trusted caller |
+| `x-request-id`, `traceparent`, `x-sekvent-subject`, `x-sekvent-tenant`, `idempotency-key` | `sekvent_context::headers::inject(&callee_cx, …)` (C1 semantics: the key set for this call is forwarded, identical on every retry; a key the caller only received is not) | `headers::from_headers(&headers, caller)`; subject and tenant survive only for a trusted caller |
 | `grpc-timeout` | the callee context's time left at the start of the attempt, truncated (`inject`) | the context deadline, anchored at receipt, then narrowed by the serving side's method timeout |
 | `x-sekvent-hops` (new) | the callee's hop count, 1 for a first-level call | rejected when above the server's `SEKVENT_COMPONENT_MAX_HOPS` |
 
@@ -137,6 +137,21 @@ Caller-side mapping of the `Status` returned by `tonic::client::Grpc::unary`:
 | otherwise has an underlying error (`std::error::Error::source` is `Some`): produced by the client's own transport (connect refused, reset, GOAWAY, h2 error) | `UNAVAILABLE`, reason `COMPONENT_UNREACHABLE`, message `component <c> is unreachable`, the status as internal source, tagged `component`/`method` |
 | anything else (decoded from trailers, or inferred from a non-gRPC HTTP status) | `from_status(&status)`, untouched |
 
+The method's own `TIMEOUT` is tracked apart from the caller's deadline:
+when it expires while the caller still has time, the call is
+`DEADLINE_EXCEEDED` with reason `METHOD_TIMEOUT` and counts as a failure of
+the callee in its circuit breaker, which `RemoteClient` drives itself. The
+caller's own deadline or cancellation says nothing about the callee: the
+breaker permit is returned unrecorded.
+
+A transient failure (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, `METHOD_TIMEOUT`)
+of a call made from inside a handler (hop > 0) is marked with metadata
+`downstream = <callee>`; a marker set further down is kept. The serving
+side (2.4) turns such an error into `INTERNAL` / `DOWNSTREAM_FAILURE`
+(keeping `downstream`, with the original code as `downstream_code` and
+reason as `downstream_reason`), so callers above neither retry the
+healthy component in between nor count the failure against it.
+
 Only errors the caller side creates are tagged (C1 2.5 rule 4); errors from
 the server keep exactly the metadata the server sent, so `local`,
 `local-serialized` and `grpc` return identical values for the same
@@ -146,13 +161,16 @@ server-side outcome. A reply that does not decode as `Rep` is `INTERNAL` /
 ### 2.4 Serving side, in order
 
 The generic service (`src/grpc/service.rs`) receives
-`http::Request<B>` for any body `B: http_body::Body<Data = Bytes>`:
+`http::Request<B>` for any body `B: http_body::Body<Data = Bytes>`.
+Steps 1–3 read only the request headers, so a call is refused before a
+byte of its body is read; request trailers never reach the context.
 
 1. **Route.** The router only reaches the service for an exposed
    component's path prefix; an unknown service path gets tonic's
-   `UNIMPLEMENTED`. The `<Rpc>` segment is looked up among the component's
-   methods by `rpc()`; none → `UNIMPLEMENTED`, reason `UNKNOWN_METHOD`,
-   tagged `component`, before authentication (the path is public anyway).
+   `UNIMPLEMENTED`. The path must be exactly `/<service>/<Rpc>`, with
+   `<Rpc>` one of the component's methods by `rpc()`; anything else →
+   `UNIMPLEMENTED`, reason `UNKNOWN_METHOD`, tagged `component`, before
+   authentication (the path is public anyway).
 2. **Authenticate** (unless `SERVE_AUTH=none`):
    `authenticate_headers(&inbound_map, request.headers())`; `None` →
    `UNAUTHENTICATED` with `sekvent_link::REJECTED_MESSAGE`, no reason, no
@@ -168,11 +186,14 @@ The generic service (`src/grpc/service.rs`) receives
    `UNAVAILABLE` / `COMPONENT_DRAINING`), dead-call shedding, bulkhead,
    deadline — exactly the path `local-serialized` uses. Request bytes that do
    not decode are `INVALID_ARGUMENT` / `MALFORMED_REQUEST` (C1 `serve`).
-5. **Answer** `Ok(bytes)` as the reply, `Err(e)` as `to_status(&e)`.
+5. **Answer** `Ok(bytes)` as the reply, `Err(e)` as `to_status(&e)`. A
+   panicking method is `INTERNAL` / `HANDLER_PANICKED` (payload never
+   shown); an error carrying `downstream` metadata becomes `INTERNAL` /
+   `DOWNSTREAM_FAILURE` (2.3); every other error crosses unchanged.
 
-Steps 1–5 run inside `tonic::server::Grpc::new(BytesCodec).unary(…)`, so
-malformed framing, unsupported compression and oversized messages get
-tonic's standard answers.
+The body is decoded inside `tonic::server::Grpc::new(BytesCodec).unary(…)`
+with a 4 MiB message limit, so malformed framing, unsupported compression
+and oversized messages get tonic's standard answers.
 
 ### 2.5 Interoperability
 
@@ -275,12 +296,19 @@ pub type ProtoService = (&'static str, &'static [ProtoRpc]);
 pub trait ContractMessage: WireMessage + prost::Name {}
 impl<T: WireMessage + prost::Name> ContractMessage for T {}
 
-/// Const-panics unless `proto.0 == service` and `proto.1.len() == methods`.
-pub const fn assert_service(proto: ProtoService, service: &str, methods: usize);
+/// Const-panics unless `proto.0 == service`, the trait's RPC names `rpcs`
+/// are distinct, and the proto declares each of its RPCs once and only RPCs
+/// in `rpcs`.
+pub const fn assert_service(proto: ProtoService, service: &str, rpcs: &[&str]);
 /// Const-panics unless `proto` has a non-streaming RPC `rpc` whose request is
 /// `Req` and whose reply is `Rep` (full names from `prost::Name`; an empty
-/// `PACKAGE` means the bare `NAME`).
+/// `PACKAGE` means the bare `NAME`; `()` is `google.protobuf.Empty`).
 pub const fn assert_rpc<Req: ContractMessage, Rep: ContractMessage>(proto: ProtoService, rpc: &str);
+/// Fails to compile unless `Req` and `Rep` are the very types of `Rpc`
+/// (`__sekvent_rpc_<Service>__<Rpc> = (Req, Rep)`, emitted by
+/// sekvent-proto-build): names alone cannot tell a nested message from a
+/// top-level one of the same leaf name.
+pub const fn assert_rpc_types<Req, Rep, Rpc>();
 ```
 
 Const-panic messages (exact; rustc shows them as
@@ -601,7 +629,7 @@ name, each `assert_rpc` on its method's signature):
 const _: () = ::sekvent_component::__private::assert_service(
     crate::proto::shop::inventory::v1::__sekvent_service_Inventory,
     "shop.inventory.v1.Inventory",
-    2usize,
+    &["Reserve", "Release"],
 );
 const _: () = ::sekvent_component::__private::assert_rpc::<ReserveRequest, ReserveReply>(
     crate::proto::shop::inventory::v1::__sekvent_service_Inventory,
@@ -613,8 +641,11 @@ const _: () = ::sekvent_component::__private::assert_rpc::<ReleaseRequest, Relea
 );
 ```
 
-The path is emitted exactly as parsed, followed by
-`::__sekvent_service_<Trait>`; types are the ones written in the trait.
+plus, per method, `assert_rpc_types::<Req, Rep, <path>::__sekvent_rpc_Inventory__Reserve>()`,
+which compares the types themselves. Two methods mapping to one RPC name
+(`get_v2`, `get_v_2`) are a macro error. The path is emitted exactly as
+parsed, followed by `::__sekvent_service_<Trait>`; types are the ones
+written in the trait.
 `remote_only` gets the same three items; `local_only` gets none (its
 snapshot is unchanged).
 
@@ -691,7 +722,7 @@ so emitting twice yields identical bytes:
 
 ```json
 {
-  "format": 1,
+  "format": 2,
   "service": "shop.inventory.v1.Inventory",
   "file": "shop/inventory/v1/inventory.proto",
   "rpcs": {
@@ -701,11 +732,13 @@ so emitting twice yields identical bytes:
   "messages": {
     "shop.inventory.v1.ReserveRequest": {
       "fields": {
-        "1": { "name": "order_id", "type": "string", "cardinality": "singular", "oneof": null },
-        "3": { "name": "quantity", "type": "uint32", "cardinality": "singular", "oneof": null }
+        "1": { "name": "order_id", "type": "string", "cardinality": "singular", "oneof": null, "default": null },
+        "3": { "name": "quantity", "type": "uint32", "cardinality": "singular", "oneof": null, "default": null }
       },
       "reserved": [[2, 2]],
-      "reserved_names": ["sku_code"]
+      "reserved_names": ["sku_code"],
+      "extension_ranges": [],
+      "extensions": {}
     }
   },
   "enums": {
@@ -726,8 +759,19 @@ so emitting twice yields identical bytes:
 - `reserved`: inclusive `[start, end]` pairs, merged and sorted (message
   ranges converted from the descriptor's exclusive ends); enum `values` list
   every name of a number (aliases); `closed` is true for proto2 enums.
-- Extensions, extension ranges, options, JSON names and comments are not
-  recorded.
+- `default`: a proto2 `[default = …]` as written (an enum default as its
+  number), else `null`.
+- `extension_ranges` (inclusive pairs, merged) and `extensions` (by number:
+  `name`, `type`, `cardinality`, `default`) of every extension of the
+  message declared in the compiled files.
+- Options, JSON names and comments are not recorded. Types from the
+  bundled well-known files are exempt by source file, not by package, so a
+  user file in package `google.protobuf` is still expanded.
+- A baseline of an older format is rejected with "outdated contract
+  format …; re-emit the baselines"; a newer one is unsupported.
+- Roots and includes must resolve to directories inside the project, and a
+  file whose real path leaves it is refused; symlinked directories are not
+  walked. A root that declares no service is an error.
 
 ### 6.4 Compatibility rules
 
@@ -749,11 +793,17 @@ misread or fail on the wire:
 | R10 | an enum value number in `B` is missing in `C` and not reserved |
 | R11 | a number reserved in a `B` enum is no longer reserved |
 | R12 | an enum changed between open and closed |
+| R13 | a `required` field was removed (even with its number reserved) |
+| R14 | a `required` field was added |
+| R15 | a field's or extension's explicit default changed |
+| R16 | an extension of a `B` message is gone, or changed type or cardinality |
+| R17 | a number of a `B` extension range is neither an extension range nor reserved in `C` |
 
-Rules R5–R12 apply to every message and enum of `B`'s closure that `C`
+Rules R5–R17 apply to every message and enum of `B`'s closure that `C`
 still defines under the same name; a type no longer reachable was replaced
 somewhere, which R3 or R6 already reports. **Compatible:** new services,
-RPCs, messages, fields, enum values and reservations; renamed fields, enum
+RPCs, messages, non-required fields, extensions, extension ranges, enum
+values and reservations; renamed fields, enum
 values and oneofs (the binary wire carries numbers only — Rust callers in
 the same workspace are caught by the compiler instead); options and
 comments. A current service without a baseline is an error ("no baseline

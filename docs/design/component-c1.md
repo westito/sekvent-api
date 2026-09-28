@@ -459,8 +459,11 @@ Caller side, identical for both bindings (`Link`):
    `DEADLINE_EXCEEDED`. Nothing is encoded, admitted or spawned.
 2. **Callee context.** `callee = cx.child().with_caller(ServiceIdentity::trusted(LOCAL_CALLER))`,
    then, if the resolved method timeout is `Some(t)`, narrow its deadline to
-   now + `t` (`with_deadline` keeps the earlier of the two). The idempotency
-   key, request id, subject, tenant and traceparent are kept.
+   now + `t` (`with_deadline` keeps the earlier of the two). The request id,
+   subject, tenant and traceparent are kept; the idempotency key is kept
+   only when it was set for this call, never when the caller itself
+   received it (`CallContext::into_inbound`), and the callee sees its
+   context as inbound, so it does not forward the key either.
 3. **Transport**, raced with `cx.cancelled()` (biased toward cancellation,
    which returns `CANCELLED` and drops the transport future) and wrapped in
    `Timeout::deadline_only().call(&callee, …)` (expiry → `DEADLINE_EXCEEDED`):
@@ -580,21 +583,34 @@ Without this, a service's own `sekvent_config::load` rejects component keys.
    every `handle::<H>()`). `debug!` the component, binding and resolved
    policies.
 
-`App::start`: state `Built` → `Starting`. For each component in install
-order: `on_start` (if any); on success its gate becomes `Serving`. On the
-first failure, stop the already-started components in reverse (as below,
-with zero grace), mark the App stopped and return the error with metadata
-`component`. Otherwise the App is `Running`.
+`App::start`: state `Built` → `Starting` (a compare-and-swap; a second
+`start`, or one after `stop`, is `FAILED_PRECONDITION`). For each component
+in install order: `on_start` (if any); on success its gate becomes
+`Serving`. On the first failure, stop the already-started components in
+reverse (as below, with zero grace), mark the App stopped and return the
+error with metadata `component`. Otherwise the App is `Running`. A `stop`
+during the start wins: the running `on_start` future is dropped (that
+component counts as never started, so its `on_stop` never runs) and
+`start` fails with `FAILED_PRECONDITION`; dropping the `start` future does
+the same with zero grace.
 
 `App::stop(grace)`: `deadline = now + grace` (tokio clock). For each
 component in reverse install order: gate → `Draining`; wait until its
 in-flight count is zero or `deadline` passes (`warn!` naming the component
-and the count when it passes); `on_stop` (if any; an error is remembered and
-stopping continues); gate → `Stopped`. Returns the first remembered error.
+and the count when it passes); `on_stop` (if any, only for a component
+whose `on_start` succeeded; an error is remembered and stopping continues);
+gate → `Stopped`. `grace` bounds the drain only; the hooks run to
+completion. The stop runs on its own task, so dropping the future does not
+interrupt it, and each `on_stop` runs exactly once; a later `stop` waits
+for the first and returns `Ok`. Returns the first remembered error.
 
 `App::register` (feature `runtime`) adds one unit named `components` in
 `Stage::Components` with `UnitPolicy::Critical`:
-`start().await?; ctx.ready(); ctx.shutdown().cancelled().await; stop(ctx.stage_grace()).await`.
+`start().await?; ctx.ready(); ctx.shutdown().cancelled().await; stop(drain).await`,
+where a shutdown during `start` abandons the start and `drain` is half the
+time left until the unit's `UnitContext::stop_deadline()` (the end of the
+stage grace or of the overall shutdown deadline, whichever is first), so
+the `on_stop` hooks keep the other half.
 Ingress stops before components and infrastructure after them, so the
 stage order complements the per-component order.
 
@@ -1426,7 +1442,8 @@ looks obvious.
 5. **Identical results across local bindings:** the `local` binding also
    normalizes typed errors through `into_app_error` / `from_app_error`, and
    the callee always sees `caller = trusted("local")` with the idempotency key
-   forwarded (`inject`, not `propagate`). Panics still differ: `local`
+   the caller set for the call (`inject`, not `propagate`); a key the caller
+   only received is not forwarded. Panics still differ: `local`
    propagates, `local-serialized` returns `INTERNAL`.
 6. **Per-method error types** are allowed (each must implement
    `ComponentError`), and `AppError` itself is a `ComponentError`, so

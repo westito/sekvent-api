@@ -1,5 +1,6 @@
 //! The caller side of the `grpc` binding on loopback: an unreachable
-//! service, retries and their limits, the circuit breaker, and the remote
+//! service, retries and their limits, the circuit breaker and what counts
+//! against it, failures further down a chain of calls, and the remote
 //! component's gate through start, drain and stop.
 
 mod support;
@@ -9,12 +10,18 @@ use std::time::Duration;
 
 use sekvent_component::{AppError, CallContext, ComponentState, ErrorCode, reasons};
 use sekvent_config::MapSource;
-use support::fakes::{Behaviour, FakeInventory, FlakyInventory, Probe, build_with};
+use support::fakes::{
+    Behaviour, FakeInventory, FlakyInventory, Probe, RelayInventory, build_with, deadline_in,
+};
 use support::grpc::{
     Service, TOKEN, caller, caller_app, caller_keys, guarded, serve, service_keys,
 };
 use support::inventory::{InventoryError, InventoryHandle, ReleaseRequest, ReserveRequest};
 use tokio::sync::{Semaphore, mpsc};
+use tokio::time::Instant;
+
+/// Nothing listens on port 1 of the loopback interface.
+const UNREACHABLE: &str = "http://127.0.0.1:1";
 
 fn reserve(quantity: u32) -> ReserveRequest {
     ReserveRequest {
@@ -59,10 +66,7 @@ const BREAKER: [(&str, &str); 3] = [
 #[tokio::test]
 async fn nothing_listening_is_unreachable() {
     guarded(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        let (app, inventory) = caller(&endpoint, &[]).await;
+        let (app, inventory) = caller(UNREACHABLE, &[]).await;
         for error in [
             other(
                 inventory
@@ -160,12 +164,19 @@ async fn the_retry_budget_limits_retries() {
         let (app, inventory) = caller(
             &service.endpoint(),
             &[
-                ("SEKVENT_COMPONENT_INVENTORY_RETRY_BUDGET_RATIO", "0"),
-                ("SEKVENT_COMPONENT_INVENTORY_RETRY_BUDGET_MIN_PER_SEC", "1"),
+                ("SEKVENT_COMPONENT_INVENTORY_RETRY_BUDGET_RATIO", "0.5"),
+                ("SEKVENT_COMPONENT_INVENTORY_RETRY_BUDGET_MIN_PER_SEC", "0"),
                 ("SEKVENT_COMPONENT_INVENTORY_BREAKER_ENABLED", "false"),
             ],
         )
         .await;
+        // Two successes earn half a token each: exactly one retry.
+        for _ in 0..2 {
+            inventory
+                .release(&CallContext::new(), release())
+                .await
+                .unwrap();
+        }
         for _ in 0..2 {
             let error = other(
                 inventory
@@ -174,10 +185,12 @@ async fn the_retry_budget_limits_retries() {
                     .unwrap_err(),
             );
             assert_eq!(error.code(), ErrorCode::Unavailable);
+            assert_eq!(error.message(), "busy");
         }
-        // Without the budget, two calls of three attempts make six entries.
-        let entries = probe.calls().len();
-        assert!((2..6).contains(&entries), "{entries}");
+        // Two releases, then the first reserve and its one funded retry,
+        // then the second reserve alone. Unbudgeted, each reserve would
+        // make three attempts.
+        assert_eq!(probe.calls().len(), 5);
         app.stop(Duration::ZERO).await.unwrap();
         service.stop().await;
     })
@@ -213,6 +226,139 @@ async fn the_breaker_opens_and_fails_fast() {
         assert_eq!(probe.calls().len(), 4);
         app.stop(Duration::ZERO).await.unwrap();
         service.stop().await;
+    })
+    .await;
+}
+
+/// A service whose `reserve` never answers, the channels its fake reports
+/// on (kept open so the fake can send), and a caller with a 100 ms
+/// `reserve` timeout and the four-call breaker.
+async fn hanging_service() -> (
+    Service,
+    mpsc::UnboundedReceiver<()>,
+    mpsc::UnboundedReceiver<()>,
+) {
+    let (entered, entered_rx) = mpsc::unbounded_channel();
+    let (dropped, dropped_rx) = mpsc::unbounded_channel();
+    let inventory = FakeInventory::new(Behaviour::Pending { entered, dropped });
+    let service = serve(&service_keys(), move |builder| {
+        InventoryHandle::install(builder, move |_| Ok(inventory))
+    })
+    .await;
+    (service, entered_rx, dropped_rx)
+}
+
+#[tokio::test]
+async fn method_timeouts_open_the_breaker() {
+    guarded(async {
+        let (service, _entered, _dropped) = hanging_service().await;
+        let mut keys = BREAKER.to_vec();
+        keys.push(("SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT", "100ms"));
+        let (app, inventory) = caller(&service.endpoint(), &keys).await;
+        // Each call is one outcome for the breaker, however many attempts
+        // its retries made within the timeout.
+        for _ in 0..4 {
+            let cx = CallContext::new().with_deadline(deadline_in(Duration::from_secs(20)));
+            let started = Instant::now();
+            let error = other(inventory.reserve(&cx, reserve(1)).await.unwrap_err());
+            assert!(started.elapsed() >= Duration::from_millis(100));
+            assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error:?}");
+            assert_eq!(error.reason(), Some(reasons::METHOD_TIMEOUT), "{error:?}");
+            assert_eq!(error.metadata()["component"], "inventory");
+            assert_eq!(error.metadata()["method"], "reserve");
+            assert_eq!(error.metadata()["timeout_ms"], "100");
+            assert!(!error.metadata().contains_key("downstream"));
+        }
+        let error = other(
+            inventory
+                .reserve(&CallContext::new(), reserve(1))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error.code(), ErrorCode::Unavailable, "{error:?}");
+        assert_eq!(error.reason(), Some(reasons::CIRCUIT_OPEN));
+        app.stop(Duration::ZERO).await.unwrap();
+        service.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_callers_own_deadline_never_opens_the_breaker() {
+    guarded(async {
+        let (service, _entered, _dropped) = hanging_service().await;
+        let mut keys = BREAKER.to_vec();
+        keys.push(("SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT", "20s"));
+        let (app, inventory) = caller(&service.endpoint(), &keys).await;
+        for _ in 0..6 {
+            let cx = CallContext::new().with_deadline(deadline_in(Duration::from_millis(100)));
+            let started = Instant::now();
+            let error = other(inventory.reserve(&cx, reserve(1)).await.unwrap_err());
+            assert!(started.elapsed() >= Duration::from_millis(100));
+            assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error:?}");
+            assert_ne!(error.reason(), Some(reasons::METHOD_TIMEOUT), "{error:?}");
+        }
+        let cancelled = CallContext::new();
+        let token = cancelled.cancel_token().clone();
+        let call = {
+            let inventory = inventory.clone();
+            tokio::spawn(async move { inventory.reserve(&cancelled, reserve(1)).await })
+        };
+        tokio::task::yield_now().await;
+        token.cancel();
+        let error = other(call.await.unwrap().unwrap_err());
+        assert_eq!(error.code(), ErrorCode::Cancelled, "{error:?}");
+        // Four recorded failures would have opened it for an hour.
+        inventory
+            .release(&CallContext::new(), release())
+            .await
+            .unwrap();
+        app.stop(Duration::ZERO).await.unwrap();
+        service.stop().await;
+    })
+    .await;
+}
+
+/// A calls B over gRPC; B's implementation relays to C, bound to a port
+/// nobody listens on. B's handle to C retries and gives up; B answers A
+/// `INTERNAL` / `DOWNSTREAM_FAILURE`, which A neither retries nor counts
+/// against B.
+#[tokio::test]
+async fn a_failure_further_down_is_not_blamed_on_the_middle() {
+    guarded(async {
+        let (to_c, c) = caller(UNREACHABLE, &[]).await;
+        let relay = RelayInventory {
+            probe: Probe::default(),
+            next: c,
+        };
+        let relayed = relay.probe.clone();
+        let b = serve(&service_keys(), move |builder| {
+            InventoryHandle::install(builder, move |_| Ok(relay))
+        })
+        .await;
+        let (a, inventory) = caller(&b.endpoint(), &BREAKER).await;
+        for _ in 0..6 {
+            let error = other(
+                inventory
+                    .reserve(&CallContext::new(), reserve(1))
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(error.code(), ErrorCode::Internal, "{error:?}");
+            assert_eq!(
+                error.reason(),
+                Some(reasons::DOWNSTREAM_FAILURE),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            relayed.calls().len(),
+            6,
+            "every call reached B once: no retry, no open breaker"
+        );
+        a.stop(Duration::ZERO).await.unwrap();
+        b.stop().await;
+        to_c.stop(Duration::ZERO).await.unwrap();
     })
     .await;
 }

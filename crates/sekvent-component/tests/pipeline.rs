@@ -209,6 +209,8 @@ async fn the_method_timeout_bounds_a_call() {
         );
         let elapsed = started.elapsed();
         assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{binding}");
+        assert_eq!(error.reason(), Some(reasons::METHOD_TIMEOUT), "{binding}");
+        assert_eq!(error.metadata()["timeout_ms"], "2000", "{binding}");
         assert_tagged(&error, "reserve");
         assert!(elapsed >= Duration::from_secs(2), "{binding}: {elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "{binding}: {elapsed:?}");
@@ -226,6 +228,8 @@ async fn the_caller_deadline_wins_over_a_longer_timeout() {
         let error = other(inventory.reserve(&cx, reserve("o1", 1)).await.unwrap_err());
         let elapsed = started.elapsed();
         assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{binding}");
+        assert_eq!(error.reason(), None, "the caller's own deadline: {binding}");
+        assert_tagged(&error, "reserve");
         assert!(
             elapsed >= Duration::from_millis(100),
             "{binding}: {elapsed:?}"
@@ -253,6 +257,8 @@ async fn a_configured_timeout_overrides_the_attribute() {
         );
         let elapsed = started.elapsed();
         assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{binding}");
+        assert_eq!(error.reason(), Some(reasons::METHOD_TIMEOUT), "{binding}");
+        assert_eq!(error.metadata()["timeout_ms"], "50", "{binding}");
         assert!(
             elapsed >= Duration::from_millis(50),
             "{binding}: {elapsed:?}"
@@ -370,6 +376,26 @@ async fn caller_cancellation_stops_a_call_in_flight() {
         assert_eq!(error.code(), ErrorCode::Cancelled, "{binding}");
         assert_tagged(&error, "reserve");
         dropped.recv().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_handler_sees_the_caller_cancel() {
+    for binding in LOCAL_BINDINGS {
+        let (entered, mut entered_rx) = mpsc::unbounded_channel();
+        let (cancelled, mut cancelled_rx) = mpsc::unbounded_channel();
+        let fake = FakeInventory::new(Behaviour::WatchCancel { entered, cancelled });
+        let (_app, inventory) = started_inventory(binding, &[], fake).await;
+        let cx = CallContext::new();
+        let token = cx.cancel_token().clone();
+        let call = tokio::spawn(async move { inventory.reserve(&cx, reserve("o1", 1)).await });
+        entered_rx.recv().await.unwrap();
+        token.cancel();
+        // The watcher outlives the handler's future: it fires only if the
+        // handler's context shares the caller's cancellation.
+        cancelled_rx.recv().await.unwrap();
+        let error = other(call.await.unwrap().unwrap_err());
+        assert_eq!(error.code(), ErrorCode::Cancelled, "{binding}");
     }
 }
 

@@ -57,6 +57,10 @@ const TIMEOUT_UNITS: [(char, u128); 6] = [
 /// malformed request id is replaced by a fresh one; a malformed
 /// `grpc-timeout` is ignored. The hop count is read from any caller as one
 /// to four ASCII digits; anything else leaves it at 0.
+///
+/// The idempotency key is received, not set for this call (see
+/// [`CallContext::into_inbound`]): handlers read it, but neither
+/// [`inject`] nor [`CallContext::child`] forwards it to another operation.
 pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> CallContext {
     let mut ctx = CallContext::new();
     if let Some(id) = token(headers, REQUEST_ID, MAX_REQUEST_ID_LEN) {
@@ -86,7 +90,7 @@ pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> Cal
     if let Some(caller) = caller {
         ctx = ctx.with_caller(caller);
     }
-    ctx.sanitize_for_caller()
+    ctx.sanitize_for_caller().into_inbound()
 }
 
 /// Write the whole context onto a header map (the remaining deadline as
@@ -97,10 +101,13 @@ pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> Cal
 /// of 0 counts as not carried. An expired deadline is sent as `1n`, the
 /// shortest positive timeout.
 ///
-/// This mirrors the context exactly, idempotency key included, which suits
-/// re-encoding a context. For a request to another service use
-/// [`propagate`], which leaves the caller's own headers alone and does not
-/// forward the idempotency key.
+/// This mirrors the context, which suits re-encoding it for the callee of a
+/// component call. The idempotency key is written only when it was set for
+/// this call ([`CallContext::outbound_idempotency_key`]); a key received
+/// from upstream names the caller's operation and is not forwarded. For a
+/// request to another sekvent service use [`propagate`], which leaves the
+/// caller's own headers alone and never forwards the idempotency key; for a
+/// third-party API use [`propagate_external`].
 pub fn inject(ctx: &CallContext, headers: &mut HeaderMap) {
     set(headers, REQUEST_ID, Some(ctx.request_id()));
     let timeout = ctx.remaining().map(encode_grpc_timeout);
@@ -108,7 +115,7 @@ pub fn inject(ctx: &CallContext, headers: &mut HeaderMap) {
     set(headers, TRACEPARENT, ctx.traceparent());
     set(headers, SUBJECT, ctx.subject());
     set(headers, TENANT, ctx.tenant());
-    set(headers, IDEMPOTENCY_KEY, ctx.idempotency_key());
+    set(headers, IDEMPOTENCY_KEY, ctx.outbound_idempotency_key());
     let hops = encode_hops(ctx.hops());
     set(headers, HOPS, hops.as_deref());
 }
@@ -128,6 +135,22 @@ pub fn inject(ctx: &CallContext, headers: &mut HeaderMap) {
 /// calls would make the upstream treat them as duplicates. Set it on each
 /// outbound request that needs one.
 pub fn propagate(ctx: &CallContext, headers: &mut HeaderMap) {
+    propagate_external(ctx, headers);
+    set_if_absent(headers, SUBJECT, ctx.subject());
+    set_if_absent(headers, TENANT, ctx.tenant());
+    let hops = encode_hops(ctx.hops());
+    set_if_absent(headers, HOPS, hops.as_deref());
+}
+
+/// Add the part of the context a third-party service may see to the
+/// headers of an outbound request: the request id, `traceparent` and the
+/// remaining deadline as `grpc-timeout`, under the same rules as
+/// [`propagate`] (the caller's headers win, `grpc-timeout` only narrows).
+///
+/// Nothing sekvent-internal is written: no subject or tenant, no hop count
+/// and no idempotency key. Those mean something only to a sekvent peer that
+/// authenticates this service as a link.
+pub fn propagate_external(ctx: &CallContext, headers: &mut HeaderMap) {
     set_if_absent(headers, REQUEST_ID, Some(ctx.request_id()));
     if let Some(left) = ctx.remaining() {
         let theirs = header_str(headers, GRPC_TIMEOUT).and_then(parse_grpc_timeout);
@@ -136,10 +159,6 @@ pub fn propagate(ctx: &CallContext, headers: &mut HeaderMap) {
         }
     }
     set_if_absent(headers, TRACEPARENT, ctx.traceparent());
-    set_if_absent(headers, SUBJECT, ctx.subject());
-    set_if_absent(headers, TENANT, ctx.tenant());
-    let hops = encode_hops(ctx.hops());
-    set_if_absent(headers, HOPS, hops.as_deref());
 }
 
 /// Encode a duration as a `grpc-timeout` value (at most 8 digits, choosing
@@ -598,6 +617,55 @@ mod tests {
         let mut zero = HeaderMap::new();
         propagate(&CallContext::new(), &mut zero);
         assert!(zero.get(HOPS).is_none());
+    }
+
+    #[test]
+    fn a_received_idempotency_key_is_not_injected_onward() {
+        let inbound = from_headers(&headers(&[(IDEMPOTENCY_KEY, "upstream-key")]), None);
+        assert_eq!(inbound.idempotency_key(), Some("upstream-key"));
+        let mut onward = headers(&[(IDEMPOTENCY_KEY, "stale")]);
+        inject(&inbound, &mut onward);
+        assert!(onward.get(IDEMPOTENCY_KEY).is_none());
+        inject(&inbound.child(), &mut onward);
+        assert!(onward.get(IDEMPOTENCY_KEY).is_none());
+
+        let own = inbound.child().with_idempotency_key("own-key");
+        inject(&own, &mut onward);
+        assert_eq!(onward[IDEMPOTENCY_KEY], "own-key");
+        let back = from_headers(&onward, None);
+        assert_eq!(back.idempotency_key(), Some("own-key"));
+        assert_eq!(back.outbound_idempotency_key(), None);
+    }
+
+    #[test]
+    fn external_propagation_leaves_sekvent_headers_out() {
+        let ctx = CallContext::new()
+            .with_request_id("req-9")
+            .with_timeout(Duration::from_secs(30))
+            .with_traceparent(TRACE)
+            .with_subject("user-1")
+            .with_tenant("acme")
+            .with_idempotency_key("own-key")
+            .with_hops(3);
+        let mut map = HeaderMap::new();
+        propagate_external(&ctx, &mut map);
+        assert_eq!(map[REQUEST_ID], "req-9");
+        assert_eq!(map[TRACEPARENT], TRACE);
+        let sent = parse_grpc_timeout(map[GRPC_TIMEOUT].to_str().unwrap()).unwrap();
+        assert!(sent <= Duration::from_secs(30));
+        for name in [SUBJECT, TENANT, IDEMPOTENCY_KEY, HOPS] {
+            assert!(map.get(name).is_none(), "{name}");
+        }
+
+        let mut theirs = headers(&[(REQUEST_ID, "caller-id"), (GRPC_TIMEOUT, "5S")]);
+        propagate_external(&ctx, &mut theirs);
+        assert_eq!(theirs[REQUEST_ID], "caller-id");
+        assert_eq!(theirs[GRPC_TIMEOUT], "5S");
+
+        let mut unbounded = HeaderMap::new();
+        propagate_external(&CallContext::new(), &mut unbounded);
+        assert!(unbounded.get(GRPC_TIMEOUT).is_none());
+        assert!(unbounded.get(TRACEPARENT).is_none());
     }
 
     #[test]

@@ -22,7 +22,10 @@ use crate::{
     Lifecycle, reasons,
 };
 
-pub use crate::contract::{ContractMessage, ProtoRpc, ProtoService, assert_rpc, assert_service};
+pub use crate::contract::{
+    ContractMessage, ProtoRpc, ProtoService, RpcTypes, SameReply, SameRequest, assert_rpc,
+    assert_rpc_types, assert_service,
+};
 pub use crate::link::Endpoint;
 
 /// A boxed, sendable future.
@@ -279,6 +282,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(garbage.code(), ErrorCode::InvalidArgument);
         assert_eq!(garbage.reason(), Some(reasons::MALFORMED_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn a_unit_reply_is_encoded_as_an_empty_message() {
+        let reply =
+            serve::<Text, (), AppError, _, _>(CallContext::new(), body("hi"), |_cx, _req| async {
+                Ok::<(), AppError>(())
+            })
+            .await
+            .unwrap();
+        assert!(reply.is_empty());
+        // `google.protobuf.Empty` skips unknown fields, so any message
+        // decodes as `()`, and `()` decodes as a message without fields.
+        <()>::decode(body("hi")).unwrap();
+        assert_eq!(Text::decode(reply).unwrap().text, "");
+
+        let unit =
+            serve::<(), Text, AppError, _, _>(CallContext::new(), Bytes::new(), |_cx, ()| async {
+                Ok::<Text, AppError>(Text { text: "ok".into() })
+            })
+            .await
+            .unwrap();
+        assert_eq!(Text::decode(unit).unwrap().text, "ok");
     }
 
     #[tokio::test]

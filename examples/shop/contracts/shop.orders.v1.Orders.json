@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "service": "shop.orders.v1.Orders",
   "file": "shop/orders/v1/orders.proto",
   "rpcs": {
@@ -23,11 +23,14 @@
           "name": "order_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.orders.v1.Order": {
       "fields": {
@@ -35,35 +38,42 @@
           "name": "order_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "2": {
           "name": "customer_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "3": {
           "name": "sku",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "4": {
           "name": "quantity",
           "type": "uint32",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "5": {
           "name": "status",
           "type": "enum:shop.orders.v1.OrderStatus",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.orders.v1.PlaceOrderReply": {
       "fields": {
@@ -71,17 +81,21 @@
           "name": "order_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "2": {
           "name": "reservation_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.orders.v1.PlaceOrderRequest": {
       "fields": {
@@ -89,23 +103,28 @@
           "name": "customer_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "2": {
           "name": "sku",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "3": {
           "name": "quantity",
           "type": "uint32",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     }
   },
   "enums": {

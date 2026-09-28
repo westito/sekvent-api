@@ -85,7 +85,10 @@
 //! In messages-only and combined mode, every proto `service` also gets a
 //! constant `__sekvent_service_<Service>` in its package's module: the
 //! service's full name and, per RPC, the RPC name, the request and reply
-//! full names and whether it streams. `#[component(proto = "…")]` reads it
+//! full names and whether it streams. Every RPC also gets a type alias
+//! `__sekvent_rpc_<Service>__<Rpc>` of its Rust `(Request, Reply)` types
+//! (`google.protobuf.Empty` is `()`), which tells a nested message from a
+//! top-level one of the same name. `#[component(proto = "…")]` reads both
 //! to check at compile time that a component trait matches its proto
 //! service. The generated code names no sekvent crate.
 //! [`ProtoBuild::service_contracts`] turns it off; services-only mode never
@@ -124,6 +127,9 @@ pub const DEFAULT_WRAPPER_FILE: &str = "sekvent_protos.rs";
 
 /// Prefix of the service contract constants, `__sekvent_service_<Service>`.
 pub const SERVICE_CONTRACT_PREFIX: &str = "__sekvent_service_";
+
+/// Prefix of the per-RPC type aliases, `__sekvent_rpc_<Service>__<Rpc>`.
+pub const RPC_TYPES_PREFIX: &str = "__sekvent_rpc_";
 
 /// The well-known types' package; prost maps it to `prost_types` itself.
 const WELL_KNOWN_PACKAGE: &str = "google.protobuf";
@@ -792,6 +798,7 @@ mod tests {
         assert!(!emits_service_contracts(&services_only, true));
         assert!(!emits_service_contracts(&services_only, false));
         assert_eq!(SERVICE_CONTRACT_PREFIX, "__sekvent_service_");
+        assert_eq!(RPC_TYPES_PREFIX, "__sekvent_rpc_");
     }
 
     #[test]

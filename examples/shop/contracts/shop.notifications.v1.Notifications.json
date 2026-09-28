@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "service": "shop.notifications.v1.Notifications",
   "file": "shop/notifications/v1/notifications.proto",
   "rpcs": {
@@ -23,35 +23,42 @@
           "name": "notification_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "2": {
           "name": "customer_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "3": {
           "name": "order_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "4": {
           "name": "template",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "5": {
           "name": "tenant",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.notifications.v1.NotifyReply": {
       "fields": {
@@ -59,11 +66,14 @@
           "name": "notification_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.notifications.v1.NotifyRequest": {
       "fields": {
@@ -71,23 +81,28 @@
           "name": "customer_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "2": {
           "name": "order_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         },
         "3": {
           "name": "template",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.notifications.v1.SentReply": {
       "fields": {
@@ -95,11 +110,14 @@
           "name": "notifications",
           "type": "message:shop.notifications.v1.Notification",
           "cardinality": "repeated",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.notifications.v1.SentRequest": {
       "fields": {
@@ -107,11 +125,14 @@
           "name": "customer_id",
           "type": "string",
           "cardinality": "singular",
-          "oneof": null
+          "oneof": null,
+          "default": null
         }
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     }
   },
   "enums": {}

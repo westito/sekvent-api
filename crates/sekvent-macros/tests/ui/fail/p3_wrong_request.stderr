@@ -1,7 +1,7 @@
 error[E0080]: evaluation panicked: component contract: this method's request type is not the RPC's input type
-  --> tests/ui/fail/p3_wrong_request.rs:39:1
+  --> tests/ui/fail/p3_wrong_request.rs:53:1
    |
-39 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+53 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
    |
 note: inside `sekvent_component::__private::assert_rpc::<PingRequest, PingReply>`
@@ -17,3 +17,24 @@ note: inside `sekvent_component::__private::assert_rpc::<PingRequest, PingReply>
    | |                 "component contract: this method's request type is not the RPC's input type"
    | |             );
    | |_____________- in this macro invocation
+
+error[E0277]: this method's request type `PingRequest` is not the RPC's input type `ShoutRequest`
+  --> tests/ui/fail/p3_wrong_request.rs:59:14
+   |
+59 |         req: PingRequest,
+   |              ^^^^^^^^^^^ the proto service expects `ShoutRequest` here
+   |
+help: the trait `sekvent_component::__private::SameRequest<ShoutRequest>` is not implemented for `PingRequest`
+  --> tests/ui/fail/p3_wrong_request.rs:6:1
+   |
+ 6 | pub struct PingRequest {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   = note: a nested message or a message of another package is a different type even when its name matches
+note: required by a bound in `sekvent_component::__private::assert_rpc_types`
+  --> $WORKSPACE/crates/sekvent-component/src/contract.rs
+   |
+   | pub const fn assert_rpc_types<Req, Rep, Rpc>()
+   |              ---------------- required by a bound in this function
+...
+   |     Req: SameRequest<Rpc::Request>,
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `assert_rpc_types`

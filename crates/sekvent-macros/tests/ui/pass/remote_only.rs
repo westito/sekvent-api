@@ -40,6 +40,8 @@ pub mod ledger_proto {
             false,
         )],
     );
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Ledger__Record = (super::RecordRequest, super::RecordReply);
 }
 
 /// A ledger served by another process.

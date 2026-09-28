@@ -26,3 +26,13 @@ pub const UNKNOWN_METHOD: &str = "UNKNOWN_METHOD";
 /// A component is exposed over gRPC but its routes were never mounted
 /// (`FAILED_PRECONDITION`).
 pub const GRPC_NOT_MOUNTED: &str = "GRPC_NOT_MOUNTED";
+/// The method's own `TIMEOUT` expired before the callee answered, while the
+/// caller still had time left (`DEADLINE_EXCEEDED`); counted as a failure of
+/// the callee by its circuit breaker.
+pub const METHOD_TIMEOUT: &str = "METHOD_TIMEOUT";
+/// A transient failure of a component further down the call chain, turned
+/// into `INTERNAL` by the component that saw it, so callers above neither
+/// retry it nor count it against the healthy component in between.
+pub const DOWNSTREAM_FAILURE: &str = "DOWNSTREAM_FAILURE";
+/// A component method panicked (`INTERNAL`).
+pub const HANDLER_PANICKED: &str = "HANDLER_PANICKED";

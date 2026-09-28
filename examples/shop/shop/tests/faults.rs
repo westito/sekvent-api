@@ -74,6 +74,7 @@ async fn method_timeout_bounds_a_call(profile: Profile) {
 
     let error = other(result.unwrap_err());
     assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error:?}");
+    assert_eq!(error.reason(), Some(reasons::METHOD_TIMEOUT), "{error:?}");
     assert_elapsed(
         profile,
         elapsed,
@@ -107,6 +108,11 @@ async fn shorter_caller_deadline_wins(profile: Profile) {
 
     let error = other(result.unwrap_err());
     assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error:?}");
+    assert_ne!(
+        error.reason(),
+        Some(reasons::METHOD_TIMEOUT),
+        "the caller's own deadline: {error:?}"
+    );
     assert_elapsed(
         profile,
         elapsed,

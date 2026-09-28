@@ -1,5 +1,0 @@
-error: a #[call] method returns a reply message, not ()
- --> tests/ui/fail/m18_unit_reply.rs:8:17
-  |
-8 |     ) -> Result<(), sekvent_component::AppError>;
-  |                 ^^

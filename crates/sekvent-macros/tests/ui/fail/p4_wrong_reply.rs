@@ -24,6 +24,20 @@ impl prost::Name for PingReply {
     const PACKAGE: &'static str = "check.echo.v1";
 }
 
+/// The RPC's actual output type: same leaf name, another package.
+mod other {
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct PingReply {
+        #[prost(string, tag = "1")]
+        pub text: String,
+    }
+
+    impl prost::Name for PingReply {
+        const NAME: &'static str = "PingReply";
+        const PACKAGE: &'static str = "other.v1";
+    }
+}
+
 mod proto {
     pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
         "check.echo.v1.Echo",
@@ -34,6 +48,8 @@ mod proto {
             false,
         )],
     );
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::other::PingReply);
 }
 
 #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]

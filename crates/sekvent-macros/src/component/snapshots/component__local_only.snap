@@ -34,20 +34,20 @@ pub trait __NotesDyn: ::core::marker::Send + ::core::marker::Sync + 'static {
     ) -> ::sekvent_component::__private::BoxFuture<'a, Result<usize, AppError>>;
 }
 #[allow(clippy::all, clippy::pedantic)]
-impl<T: Notes> __NotesDyn for T {
+impl<__SekventImpl: Notes> __NotesDyn for __SekventImpl {
     fn __add<'a>(
         &'a self,
         cx: &'a CallContext,
         req: String,
     ) -> ::sekvent_component::__private::BoxFuture<'a, Result<usize, AppError>> {
-        ::std::boxed::Box::pin(<T as Notes>::add(self, cx, req))
+        ::std::boxed::Box::pin(<__SekventImpl as Notes>::add(self, cx, req))
     }
     fn __count<'a>(
         &'a self,
         cx: &'a CallContext,
         req: (),
     ) -> ::sekvent_component::__private::BoxFuture<'a, Result<usize, AppError>> {
-        ::std::boxed::Box::pin(<T as Notes>::count(self, cx, req))
+        ::std::boxed::Box::pin(<__SekventImpl as Notes>::count(self, cx, req))
     }
 }
 /// Cloneable handle to the [`Notes`] component (`notes`).
@@ -111,15 +111,15 @@ impl NotesHandle {
     /// Install the implementation `factory` builds. The factory runs during
     /// `AppBuilder::build`, in install order, and only when the component is
     /// bound `local` or `local-serialized`.
-    pub fn install<T, F>(
+    pub fn install<__SekventImpl, __SekventFactory>(
         app: &mut ::sekvent_component::AppBuilder<'_>,
-        factory: F,
+        factory: __SekventFactory,
     ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
     where
-        T: Notes,
-        F: ::core::ops::FnOnce(
+        __SekventImpl: Notes,
+        __SekventFactory: ::core::ops::FnOnce(
                 &mut ::sekvent_component::Deps<'_>,
-            ) -> ::core::result::Result<T, ::sekvent_component::AppError>
+            ) -> ::core::result::Result<__SekventImpl, ::sekvent_component::AppError>
             + ::core::marker::Send + 'static,
     {
         ::sekvent_component::__private::install_local(
@@ -137,15 +137,15 @@ impl NotesHandle {
     }
     /// Like [`NotesHandle::install`], and also run the implementation's
     /// `Lifecycle` hooks when the App starts and stops.
-    pub fn install_with_lifecycle<T, F>(
+    pub fn install_with_lifecycle<__SekventImpl, __SekventFactory>(
         app: &mut ::sekvent_component::AppBuilder<'_>,
-        factory: F,
+        factory: __SekventFactory,
     ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
     where
-        T: Notes + ::sekvent_component::Lifecycle,
-        F: ::core::ops::FnOnce(
+        __SekventImpl: Notes + ::sekvent_component::Lifecycle,
+        __SekventFactory: ::core::ops::FnOnce(
                 &mut ::sekvent_component::Deps<'_>,
-            ) -> ::core::result::Result<T, ::sekvent_component::AppError>
+            ) -> ::core::result::Result<__SekventImpl, ::sekvent_component::AppError>
             + ::core::marker::Send + 'static,
     {
         ::sekvent_component::__private::install_local(
@@ -154,7 +154,7 @@ impl NotesHandle {
             move |deps| {
                 let concrete = ::std::sync::Arc::new(factory(deps)?);
                 let imp: ::std::sync::Arc<dyn __NotesDyn> = ::std::sync::Arc::<
-                    T,
+                    __SekventImpl,
                 >::clone(&concrete);
                 ::core::result::Result::Ok(
                     ::sekvent_component::__private::Local::new(imp)

@@ -1,5 +1,6 @@
 //! Parsing and validation of `#[component]` arguments and the trait.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use proc_macro2::{Span, TokenStream, TokenTree};
@@ -256,6 +257,7 @@ pub(crate) fn component(item: ItemTrait) -> Result<Component> {
             "a component needs at least one method",
         ));
     }
+    check_rpc_names(&methods, &mut errors);
     errors.finish()?;
     Ok(Component {
         attrs: item.attrs,
@@ -264,6 +266,26 @@ pub(crate) fn component(item: ItemTrait) -> Result<Component> {
         supertraits,
         methods,
     })
+}
+
+/// Two methods whose names differ only in underscores before digits
+/// (`get_v2`, `get_v_2`) map to one RPC name; the second is an error.
+fn check_rpc_names(methods: &[Method], errors: &mut Errors) {
+    let mut seen: HashMap<String, &Ident> = HashMap::new();
+    for method in methods {
+        let rpc = rpc_name(&method.ident.to_string());
+        if let Some(first) = seen.get(&rpc) {
+            errors.push(Error::new_spanned(
+                &method.ident,
+                format!(
+                    "methods `{first}` and `{}` both map to the RPC name `{rpc}`; rename one",
+                    method.ident
+                ),
+            ));
+        } else {
+            seen.insert(rpc, &method.ident);
+        }
+    }
 }
 
 /// The supertraits as written plus the missing `Send`, `Sync` and `'static`.
@@ -622,13 +644,7 @@ fn returned(function: &TraitItemFn, errors: &mut Errors) -> Option<(Type, Type, 
         return None;
     };
     let mut valid = true;
-    if matches!(peel(reply), Type::Tuple(tuple) if tuple.elems.is_empty()) {
-        errors.push(Error::new_spanned(
-            reply,
-            "a #[call] method returns a reply message, not ()",
-        ));
-        valid = false;
-    } else if borrows_or_impl(reply.to_token_stream()) {
+    if borrows_or_impl(reply.to_token_stream()) {
         errors.push(Error::new_spanned(reply, BAD_REPLY_OR_ERROR));
         valid = false;
     }

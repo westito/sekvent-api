@@ -1,5 +1,28 @@
 //! The `grpc` binding and gRPC serving: one generic byte-level client and
 //! one generic byte-level service carry every component.
+//!
+//! Serving reads everything that decides whether a call runs from the
+//! request headers, before the body: the link token, the exact
+//! `/<service>/<Rpc>` path, the call context, the hop limit and the
+//! deadline (the caller's, narrowed by the method's timeout). Request
+//! trailers never reach the context. A call still running at its deadline
+//! is answered `DEADLINE_EXCEEDED`, and a client that resets the stream
+//! cancels the call's token.
+//!
+//! What a served method's own failure becomes on the wire:
+//!
+//! - A panic is `INTERNAL` with reason
+//!   [`HANDLER_PANICKED`](crate::reasons::HANDLER_PANICKED); the payload is
+//!   never shown, and the caller does not retry it.
+//! - A transient error that came from the method's own call to another
+//!   component (marked with metadata `downstream`, the callee's name) is
+//!   `INTERNAL` with reason
+//!   [`DOWNSTREAM_FAILURE`](crate::reasons::DOWNSTREAM_FAILURE), keeping
+//!   `downstream`, the original code as `downstream_code` and the original
+//!   reason as `downstream_reason`. The caller neither retries it nor counts
+//!   it against the component in between, which is healthy.
+//! - Any other error crosses unchanged. Errors of the serving side itself
+//!   (not started, draining, bulkhead full, deadline) keep their codes.
 
 pub(crate) mod client;
 pub(crate) mod codec;

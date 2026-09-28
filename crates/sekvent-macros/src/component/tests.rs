@@ -387,6 +387,7 @@ fn an_explicit_crate_path_replaces_the_runtime_path() {
         "::fw::__private::assert_wire::<PingRequest>();",
         "::fw::__private::assert_service(",
         "::fw::__private::assert_rpc::<PingRequest,PingReply>(",
+        "::fw::__private::assert_rpc_types::<PingRequest,PingReply,crate::proto::__sekvent_rpc_Echo__Ping>();",
     ] {
         assert!(out.contains(needle), "missing `{needle}` in {out}");
     }
@@ -478,7 +479,7 @@ fn remote_only_has_no_local_install() {
     assert!(
         out.contains(
             "const_:()=::sekvent_component::__private::assert_service(\
-             crate::proto::__sekvent_service_Echo,\"check.echo.v1.Echo\",1usize,);"
+             crate::proto::__sekvent_service_Echo,\"check.echo.v1.Echo\",&[\"Ping\"],);"
         ),
         "{out}"
     );
@@ -509,7 +510,7 @@ fn the_contract_checks_every_method_against_the_proto_service() {
     for needle in [
         format!(
             "const_:()=::sekvent_component::__private::assert_service({service},\
-             \"shop.orders.v1.Orders\",2usize,);"
+             \"shop.orders.v1.Orders\",&[\"PlaceOrder\",\"Get\"],);"
         ),
         format!(
             "const_:()=::sekvent_component::__private::assert_rpc::<PlaceOrderRequest,\
@@ -519,6 +520,12 @@ fn the_contract_checks_every_method_against_the_proto_service() {
             "const_:()=::sekvent_component::__private::assert_rpc::<common::Id,\
              ::orders_api::Order>({service},\"Get\",);"
         ),
+        "const_:()=::sekvent_component::__private::assert_rpc_types::<PlaceOrderRequest,\
+         PlaceOrderReply,::orders_api::proto::shop::orders::v1::__sekvent_rpc_Orders__PlaceOrder>();"
+            .to_owned(),
+        "const_:()=::sekvent_component::__private::assert_rpc_types::<common::Id,\
+         ::orders_api::Order,::orders_api::proto::shop::orders::v1::__sekvent_rpc_Orders__Get>();"
+            .to_owned(),
     ] {
         assert!(out.contains(&needle), "missing `{needle}` in {out}");
     }
@@ -542,6 +549,12 @@ fn the_contract_follows_the_assertions_and_uses_the_bare_trait_name() {
         .find("assert_service(super::pb::__sekvent_service_Echo,\"check.echo.v1.Echo\"")
         .unwrap_or_else(|| panic!("no contract in {out}"));
     assert!(assertions < service, "{out}");
+    assert!(
+        out.contains(
+            "assert_rpc_types::<PingRequest,PingReply,super::pb::__sekvent_rpc_Echo__Ping>();"
+        ),
+        "{out}"
+    );
 }
 
 #[test]
@@ -558,6 +571,7 @@ fn local_only_has_no_contract() {
     assert!(!out.contains("assert_service"), "{out}");
     assert!(!out.contains("assert_rpc"), "{out}");
     assert!(!out.contains("__sekvent_service_"), "{out}");
+    assert!(!out.contains("__sekvent_rpc_"), "{out}");
 }
 
 #[test]
@@ -1043,7 +1057,6 @@ fn m12_to_m16_argument_errors() {
 #[test]
 fn m17_to_m19_return_errors() {
     let returns = "the return type must be Result<Reply, Error>";
-    let unit = "a #[call] method returns a reply message, not ()";
     let borrowed = "reply and error types cannot contain lifetimes or `impl Trait`";
     let cases = [
         (quote!(), returns),
@@ -1057,7 +1070,6 @@ fn m17_to_m19_return_errors() {
             returns,
         ),
         (quote!(-> io<u8>::Result<PingReply, AppError>), returns),
-        (quote!(-> Result<(), AppError>), unit),
         (quote!(-> Result<&'static str, AppError>), borrowed),
         (quote!(-> Result<PingReply, impl Error>), borrowed),
         (
@@ -1116,6 +1128,10 @@ fn independent_errors_are_combined() {
                     -> Result<PingReply, AppError>;
                 #[call(timeout = "never", bulkhead = 0)]
                 fn not_async(&self, cx: &CallContext, req: &PingRequest) -> Result<(), AppError>;
+                #[call]
+                async fn get_v2(&self, cx: &CallContext, req: PingRequest) -> Result<(), AppError>;
+                #[call]
+                async fn get_v_2(&self, cx: &CallContext, req: PingRequest) -> Result<(), AppError>;
             }
         },
     );
@@ -1130,7 +1146,7 @@ fn independent_errors_are_combined() {
         "bulkhead must be an integer from 1 to 4294967295",
         "component methods must be `async fn`",
         "the request must be an owned type without lifetimes or `impl Trait`",
-        "a #[call] method returns a reply message, not ()",
+        "methods `get_v2` and `get_v_2` both map to the RPC name `GetV2`; rename one",
     ] {
         assert!(
             all.iter().any(|message| message == expected),
@@ -1144,4 +1160,85 @@ fn independent_errors_are_combined() {
 fn an_unparseable_item_is_a_syn_error() {
     let all = messages(standard_args(), quote!(pub trait));
     assert_eq!(all.len(), 1, "{all:?}");
+}
+
+#[test]
+fn methods_mapping_to_one_rpc_name_are_rejected() {
+    let method = |name: &str| {
+        let ident = syn::Ident::new(name, proc_macro2::Span::call_site());
+        quote! {
+            #[call]
+            async fn #ident(&self, cx: &CallContext, req: PingRequest) -> Result<PingReply, AppError>;
+        }
+    };
+    let (v2, v_2, a1b) = (method("get_v2"), method("get_v_2"), method("a1b"));
+    let all = messages(standard_args(), quote!(pub trait Echo { #v2 #v_2 #a1b }));
+    assert_eq!(
+        all,
+        ["methods `get_v2` and `get_v_2` both map to the RPC name `GetV2`; rename one"]
+    );
+    // Every later duplicate is reported against the first method.
+    let all = messages(standard_args(), quote!(pub trait Echo { #v2 #v_2 #v_2 }));
+    assert_eq!(all.len(), 2, "{all:?}");
+    // `a1b` (`A1b`) and `a1_b` (`A1B`) differ.
+    let a1_underscore_b = method("a1_b");
+    expand_ok(
+        standard_args(),
+        quote!(pub trait Echo { #a1b #a1_underscore_b }),
+    );
+    // A local_only component has no RPCs but still maps names the same way.
+    assert_error(
+        quote!(name = "notes", local_only),
+        quote!(pub trait Notes { #v2 #v_2 }),
+        "methods `get_v2` and `get_v_2` both map to the RPC name `GetV2`; rename one",
+    );
+}
+
+#[test]
+fn a_unit_reply_and_request_are_google_protobuf_empty() {
+    let out = expand_ok(
+        standard_args(),
+        quote! {
+            pub trait Echo {
+                #[call]
+                async fn clear(&self, cx: &CallContext, req: PingRequest) -> Result<(), AppError>;
+                #[call]
+                async fn tick(&self, cx: &CallContext, req: ()) -> Result<(), AppError>;
+            }
+        },
+    );
+    for needle in [
+        "assert_wire::<()>();",
+        "assert_rpc::<PingRequest,()>(crate::proto::__sekvent_service_Echo,\"Clear\",);",
+        "assert_rpc_types::<PingRequest,(),crate::proto::__sekvent_rpc_Echo__Clear>();",
+        "assert_rpc::<(),()>(crate::proto::__sekvent_service_Echo,\"Tick\",);",
+        "Output=Result<(),AppError>",
+    ] {
+        assert!(out.contains(needle), "missing `{needle}` in {out}");
+    }
+}
+
+#[test]
+fn generated_generics_do_not_capture_user_types() {
+    let out = expand_ok(
+        standard_args(),
+        quote! {
+            pub trait Echo {
+                #[call]
+                async fn ping(&self, cx: &CallContext, req: T) -> Result<F, AppError>;
+            }
+        },
+    );
+    for needle in [
+        "impl<__SekventImpl:Echo>__EchoDynfor__SekventImpl{",
+        "<__SekventImplasEcho>::ping(self,cx,req)",
+        "pubfninstall<__SekventImpl,__SekventFactory>(",
+        "pubfninstall_with_lifecycle<__SekventImpl,__SekventFactory>(",
+        "::std::sync::Arc::<__SekventImpl>::clone(&concrete)",
+        "fn__ping<'a>(&'aself,cx:&'aCallContext,req:T)",
+    ] {
+        assert!(out.contains(needle), "missing `{needle}` in {out}");
+    }
+    assert!(!out.contains("<T:"), "{out}");
+    assert!(!out.contains("install<T,F>"), "{out}");
 }

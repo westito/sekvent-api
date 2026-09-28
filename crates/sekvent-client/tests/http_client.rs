@@ -346,6 +346,69 @@ async fn context_is_propagated() {
 }
 
 #[tokio::test]
+async fn sekvent_headers_reach_only_sekvent_upstreams() {
+    let router = Router::new().route(
+        "/headers",
+        get(|headers: HeaderMap| async move {
+            Json(json!({
+                "request_id": header_text(&headers, "x-request-id"),
+                "traceparent": header_text(&headers, "traceparent"),
+                "subject": header_text(&headers, "x-sekvent-subject"),
+                "tenant": header_text(&headers, "x-sekvent-tenant"),
+                "hops": header_text(&headers, "x-sekvent-hops"),
+                "idempotency_key": header_text(&headers, "idempotency-key"),
+            }))
+        }),
+    );
+    let base = serve(router).await;
+    let trace = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let ctx = CallContext::new()
+        .with_request_id("req-7")
+        .with_traceparent(trace)
+        .with_subject("user-1")
+        .with_tenant("acme")
+        .with_idempotency_key("own-key")
+        .with_hops(2);
+
+    let seen: Value = plain_client(&base)
+        .get("/headers")
+        .send_json(&ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        seen,
+        json!({
+            "request_id": "req-7",
+            "traceparent": trace,
+            "subject": null,
+            "tenant": null,
+            "hops": null,
+            "idempotency_key": null,
+        }),
+        "a third-party upstream sees no sekvent-internal header"
+    );
+
+    let peer = HttpClient::builder()
+        .base_url(&base)
+        .policy(Policy::new("test"))
+        .sekvent_upstream(true)
+        .build()
+        .unwrap();
+    let seen: Value = peer.get("/headers").send_json(&ctx).await.unwrap();
+    assert_eq!(
+        seen,
+        json!({
+            "request_id": "req-7",
+            "traceparent": trace,
+            "subject": "user-1",
+            "tenant": "acme",
+            "hops": "2",
+            "idempotency_key": null,
+        })
+    );
+}
+
+#[tokio::test]
 async fn request_headers_win_over_the_context() {
     let router = Router::new().route(
         "/headers",
@@ -536,10 +599,8 @@ async fn upstream_bodies_never_reach_the_message() {
 
 #[tokio::test]
 async fn transport_failures_are_transient() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    let refused = plain_client(&format!("http://{address}"))
+    // Nothing listens on port 1 of the loopback interface.
+    let refused = plain_client("http://127.0.0.1:1")
         .get("/")
         .send(&CallContext::new())
         .await

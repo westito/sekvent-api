@@ -1,0 +1,20 @@
+error[E0277]: this method's request type `Inner` is not the RPC's input type `outer::Inner`
+  --> tests/ui/fail/p10_top_level_for_nested.rs:53:14
+   |
+53 |         req: Inner,
+   |              ^^^^^ the proto service expects `outer::Inner` here
+   |
+help: the trait `sekvent_component::__private::SameRequest<outer::Inner>` is not implemented for `Inner`
+  --> tests/ui/fail/p10_top_level_for_nested.rs:9:1
+   |
+ 9 | pub struct Inner {
+   | ^^^^^^^^^^^^^^^^
+   = note: a nested message or a message of another package is a different type even when its name matches
+note: required by a bound in `sekvent_component::__private::assert_rpc_types`
+  --> $WORKSPACE/crates/sekvent-component/src/contract.rs
+   |
+   | pub const fn assert_rpc_types<Req, Rep, Rpc>()
+   |              ---------------- required by a bound in this function
+...
+   |     Req: SameRequest<Rpc::Request>,
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `assert_rpc_types`

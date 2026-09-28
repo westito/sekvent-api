@@ -1,7 +1,7 @@
 error[E0080]: evaluation panicked: component contract: the RPC named after this method is streaming; component methods are unary
-  --> tests/ui/fail/p5_streaming_rpc.rs:39:1
+  --> tests/ui/fail/p5_streaming_rpc.rs:41:1
    |
-39 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+41 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
    |
 note: inside `sekvent_component::__private::assert_rpc::<PingRequest, PingReply>`

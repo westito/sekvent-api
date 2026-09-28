@@ -1,12 +1,15 @@
 //! The canonical contract of one service and its JSON form.
 //!
 //! A contract holds the service, its RPCs and the transitive closure of the
-//! messages and enums the RPCs reach through fields and map values.
-//! `google.protobuf.*` types are referenced by name and never expanded.
-//! Everything is kept in `BTreeMap`s and sorted vectors, so serializing the
-//! same protos twice yields identical bytes.
+//! messages and enums the RPCs reach through fields, map values and the
+//! extensions of those messages. The well-known types protox bundles are
+//! referenced by name and never expanded; a user file that merely declares
+//! `package google.protobuf` is expanded like any other. Everything is kept
+//! in `BTreeMap`s and sorted vectors, so serializing the same protos twice
+//! yields identical bytes; declaration order (of fields, enum values or
+//! anything else) is not recorded because it never reaches the wire.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use anyhow::{Context as _, bail};
@@ -18,10 +21,7 @@ use prost_types::{
 use serde::{Deserialize, Serialize};
 
 /// Version of the baseline file format.
-pub const FORMAT: u32 = 1;
-
-/// Package prefix of the well-known types, which are never expanded.
-const WELL_KNOWN: &str = "google.protobuf.";
+pub const FORMAT: u32 = 2;
 
 /// The canonical contract of one service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +65,10 @@ pub struct Message {
     pub reserved: Vec<[i32; 2]>,
     /// Reserved names, sorted.
     pub reserved_names: Vec<String>,
+    /// Extension ranges as inclusive `[start, end]` pairs, merged and sorted.
+    pub extension_ranges: Vec<[i32; 2]>,
+    /// Extensions of this message declared in the compiled files, by number.
+    pub extensions: BTreeMap<i32, Extension>,
 }
 
 /// A field of a message.
@@ -82,6 +86,24 @@ pub struct Field {
     /// The real oneof holding the field; a proto3 `optional` field's
     /// synthetic oneof is `None`.
     pub oneof: Option<String>,
+    /// The explicit proto2 `[default = …]` as written, an enum default as
+    /// its number; `None` without one.
+    pub default: Option<String>,
+}
+
+/// An extension field of a message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Extension {
+    /// Full name of the extension, e.g. `billing.v1.note`.
+    pub name: String,
+    /// The type, in the grammar of [`Field::ty`].
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// How many values the extension carries.
+    pub cardinality: Cardinality,
+    /// The explicit default, as in [`Field::default`].
+    pub default: Option<String>,
 }
 
 /// How many values a field carries.
@@ -110,6 +132,9 @@ impl fmt::Display for Cardinality {
 }
 
 /// An enum of the closure.
+///
+/// Values are keyed by number: the wire carries numbers only, so the order
+/// in which values are declared is not part of the contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Enum {
@@ -133,15 +158,28 @@ impl Contract {
 
     /// Parse a baseline written by [`Contract::to_json`].
     pub fn from_json(text: &str) -> anyhow::Result<Self> {
-        let contract: Self = serde_json::from_str(text).context("not a contract baseline")?;
-        if contract.format != FORMAT {
+        let probe: FormatProbe = serde_json::from_str(text).context("not a contract baseline")?;
+        if probe.format < FORMAT {
             bail!(
-                "unsupported contract format {} (expected {FORMAT})",
-                contract.format
+                "outdated contract format {} (expected {FORMAT}); re-emit the baselines with \
+                 `cargo sekvent contract emit`",
+                probe.format
             );
         }
-        Ok(contract)
+        if probe.format > FORMAT {
+            bail!(
+                "unsupported contract format {} (expected {FORMAT})",
+                probe.format
+            );
+        }
+        serde_json::from_str(text).context("not a contract baseline")
     }
+}
+
+/// The format field alone, read before the rest of a baseline.
+#[derive(Deserialize)]
+struct FormatProbe {
+    format: u32,
 }
 
 /// A message or enum definition found in the compiled files.
@@ -154,27 +192,56 @@ enum TypeDef<'a> {
     },
 }
 
-/// Every message and enum of a set of compiled files, by full name.
+/// Every message, enum and extension of a set of compiled files.
 #[derive(Debug)]
 pub(crate) struct TypeIndex<'a> {
+    /// Messages and enums of the user's files by full name.
     types: BTreeMap<String, TypeDef<'a>>,
+    /// Full names of the types in the bundled well-known files.
+    bundled: BTreeSet<String>,
+    /// Extensions of the user's files with their full names.
+    extensions: Vec<(String, &'a FieldDescriptorProto)>,
 }
 
 impl<'a> TypeIndex<'a> {
-    /// Index `files`, nested types included.
-    pub(crate) fn new(files: &'a [FileDescriptorProto]) -> Self {
+    /// Index `files`, nested types included; the types of the files named
+    /// in `bundled` are only recorded as well-known.
+    pub(crate) fn new(files: &'a [FileDescriptorProto], bundled: &BTreeSet<String>) -> Self {
         let mut types = BTreeMap::new();
+        let mut well_known = BTreeSet::new();
+        let mut extensions = Vec::new();
         for file in files {
+            if bundled.contains(file.name()) {
+                let mut scratch = BTreeMap::new();
+                add_types(
+                    &mut scratch,
+                    &mut Vec::new(),
+                    file.package(),
+                    &file.message_type,
+                    &file.enum_type,
+                    true,
+                );
+                well_known.extend(scratch.into_keys());
+                continue;
+            }
             let closed = file.syntax() != "proto3";
+            for extension in &file.extension {
+                extensions.push((qualify(file.package(), extension.name()), extension));
+            }
             add_types(
                 &mut types,
+                &mut extensions,
                 file.package(),
                 &file.message_type,
                 &file.enum_type,
                 closed,
             );
         }
-        Self { types }
+        Self {
+            types,
+            bundled: well_known,
+            extensions,
+        }
     }
 
     /// The contract of `service`, declared in `file`.
@@ -204,24 +271,57 @@ impl<'a> TypeIndex<'a> {
             messages: BTreeMap::new(),
             enums: BTreeMap::new(),
         };
-        while let Some(name) = pending.pop() {
-            if name.starts_with(WELL_KNOWN)
-                || contract.messages.contains_key(&name)
-                || contract.enums.contains_key(&name)
-            {
-                continue;
+        loop {
+            while let Some(name) = pending.pop() {
+                if self.bundled.contains(&name)
+                    || contract.messages.contains_key(&name)
+                    || contract.enums.contains_key(&name)
+                {
+                    continue;
+                }
+                match self.get(&name)? {
+                    TypeDef::Message(proto) => {
+                        let message = self.message(proto, &mut pending)?;
+                        contract.messages.insert(name, message);
+                    }
+                    TypeDef::Enum { proto, closed } => {
+                        contract.enums.insert(name, enum_contract(proto, closed));
+                    }
+                }
             }
-            match self.get(&name)? {
-                TypeDef::Message(proto) => {
-                    let message = self.message(proto, &mut pending)?;
-                    contract.messages.insert(name, message);
-                }
-                TypeDef::Enum { proto, closed } => {
-                    contract.enums.insert(name, enum_contract(proto, closed));
-                }
+            self.add_extensions(&mut contract.messages, &mut pending)?;
+            if pending.is_empty() {
+                return Ok(contract);
             }
         }
-        Ok(contract)
+    }
+
+    /// Record every extension of a message in `messages` that is not yet
+    /// recorded; the types they reach join `pending`.
+    fn add_extensions(
+        &self,
+        messages: &mut BTreeMap<String, Message>,
+        pending: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        for (name, proto) in &self.extensions {
+            let Some(message) = messages.get_mut(&type_name(proto.extendee())) else {
+                continue;
+            };
+            if message.extensions.contains_key(&proto.number()) {
+                continue;
+            }
+            let (ty, cardinality) = self.field_type(proto, pending)?;
+            message.extensions.insert(
+                proto.number(),
+                Extension {
+                    name: name.clone(),
+                    ty,
+                    cardinality,
+                    default: self.default_value(proto),
+                },
+            );
+        }
+        Ok(())
     }
 
     fn get(&self, name: &str) -> anyhow::Result<TypeDef<'a>> {
@@ -246,6 +346,7 @@ impl<'a> TypeIndex<'a> {
                     ty,
                     cardinality,
                     oneof: real_oneof(proto, field),
+                    default: self.default_value(field),
                 },
             );
         }
@@ -254,11 +355,31 @@ impl<'a> TypeIndex<'a> {
             .iter()
             .map(|range| [range.start(), range.end() - 1])
             .collect();
+        let extension_ranges = proto
+            .extension_range
+            .iter()
+            .map(|range| [range.start(), range.end() - 1])
+            .collect();
         Ok(Message {
             fields,
             reserved: merge_ranges(reserved),
             reserved_names: sorted(&proto.reserved_name),
+            extension_ranges: merge_ranges(extension_ranges),
+            extensions: BTreeMap::new(),
         })
+    }
+
+    /// A field's explicit default; an enum default becomes its number, so
+    /// renaming the value stays compatible.
+    fn default_value(&self, field: &FieldDescriptorProto) -> Option<String> {
+        let text = field.default_value.as_deref()?;
+        if field.r#type() == Type::Enum
+            && let Some(TypeDef::Enum { proto, .. }) = self.types.get(&type_name(field.type_name()))
+            && let Some(value) = proto.value.iter().find(|value| value.name() == text)
+        {
+            return Some(value.number().to_string());
+        }
+        Some(text.to_owned())
     }
 
     fn field_type(
@@ -300,6 +421,7 @@ impl<'a> TypeIndex<'a> {
 
 fn add_types<'a>(
     types: &mut BTreeMap<String, TypeDef<'a>>,
+    extensions: &mut Vec<(String, &'a FieldDescriptorProto)>,
     prefix: &str,
     messages: &'a [DescriptorProto],
     enums: &'a [EnumDescriptorProto],
@@ -313,7 +435,17 @@ fn add_types<'a>(
     }
     for proto in messages {
         let name = qualify(prefix, proto.name());
-        add_types(types, &name, &proto.nested_type, &proto.enum_type, closed);
+        for extension in &proto.extension {
+            extensions.push((qualify(&name, extension.name()), extension));
+        }
+        add_types(
+            types,
+            extensions,
+            &name,
+            &proto.nested_type,
+            &proto.enum_type,
+            closed,
+        );
         types.insert(name, TypeDef::Message(proto));
     }
 }
@@ -498,7 +630,7 @@ message Unreachable {
 
     /// The expected baseline; `@NAME@` stands for a message's fields.
     const SHOP_JSON: &str = r#"{
-  "format": 1,
+  "format": 2,
   "service": "shop.v1.Shop",
   "file": "shop/v1/shop.proto",
   "rpcs": {
@@ -521,14 +653,18 @@ message Unreachable {
 @MONEY@
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.v1.PlaceReply": {
       "fields": {
 @REPLY@
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.v1.PlaceRequest": {
       "fields": {
@@ -546,14 +682,18 @@ message Unreachable {
       ],
       "reserved_names": [
         "coupon"
-      ]
+      ],
+      "extension_ranges": [],
+      "extensions": {}
     },
     "shop.v1.PlaceRequest.Line": {
       "fields": {
 @LINE@
       },
       "reserved": [],
-      "reserved_names": []
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
     }
   },
   "enums": {
@@ -589,7 +729,8 @@ message Unreachable {
                     format!("          \"name\": \"{name}\","),
                     format!("          \"type\": \"{ty}\","),
                     format!("          \"cardinality\": \"{cardinality}\","),
-                    format!("          \"oneof\": {oneof}"),
+                    format!("          \"oneof\": {oneof},"),
+                    "          \"default\": null".to_owned(),
                     "        }".to_owned(),
                 ]
                 .join("\n")
@@ -661,23 +802,34 @@ message Unreachable {
     }
 
     #[test]
-    fn foreign_or_future_baselines_are_rejected() {
+    fn foreign_outdated_or_future_baselines_are_rejected() {
         let error = Contract::from_json("{}").unwrap_err();
         assert!(
             format!("{error:#}").contains("not a contract baseline"),
             "{error:#}"
         );
-        let future = shop().to_json().replace("\"format\": 1", "\"format\": 2");
+        let future = shop().to_json().replace("\"format\": 2", "\"format\": 3");
         let error = Contract::from_json(&future).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "unsupported contract format 2 (expected 1)"
+            "unsupported contract format 3 (expected 2)"
+        );
+        let outdated = shop().to_json().replace("\"format\": 2", "\"format\": 1");
+        let error = Contract::from_json(&outdated).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "outdated contract format 1 (expected 2); re-emit the baselines with `cargo \
+             sekvent contract emit`"
         );
         let extra =
             shop()
                 .to_json()
-                .replacen("\"format\": 1,", "\"format\": 1,\n  \"extra\": true,", 1);
-        assert!(Contract::from_json(&extra).is_err());
+                .replacen("\"format\": 2,", "\"format\": 2,\n  \"extra\": true,", 1);
+        let error = Contract::from_json(&extra).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a contract baseline"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -721,6 +873,72 @@ enum Level { LOW = 0; HIGH = 1; reserved 7 to max; }
             contract.messages["legacy.v1.GetReply"].fields[&1].ty,
             "bytes"
         );
+    }
+
+    #[test]
+    fn extensions_defaults_and_extension_ranges_are_recorded() {
+        let mut all = contracts(&[(
+            "ext.proto",
+            r#"syntax = "proto2";
+package ext.v1;
+service Svc { rpc Get(Req) returns (Req); }
+message Req {
+  optional int32 limit = 1 [default = -5];
+  optional Mode mode = 2 [default = FAST];
+  optional string plain = 3;
+  extensions 100 to 199, 500 to max;
+}
+enum Mode { SLOW = 0; FAST = 1; }
+message Extra { optional string x = 1; }
+message Holder {
+  extend Req { optional Extra extra = 101; }
+}
+extend Req { repeated bool flags = 100; }
+message Unrelated { extensions 1 to 5; }
+extend Unrelated { optional int32 u = 1 [default = 7]; }
+"#,
+        )]);
+        let contract = all.remove("ext.v1.Svc").unwrap();
+        let request = &contract.messages["ext.v1.Req"];
+        let defaults: Vec<Option<&str>> = request
+            .fields
+            .values()
+            .map(|field| field.default.as_deref())
+            .collect();
+        assert_eq!(defaults, [Some("-5"), Some("1"), None]);
+        assert_eq!(request.extension_ranges, [[100, 199], [500, 536_870_911]]);
+        assert_eq!(
+            request.extensions,
+            BTreeMap::from([
+                (
+                    100,
+                    Extension {
+                        name: "ext.v1.flags".into(),
+                        ty: "bool".into(),
+                        cardinality: Cardinality::Repeated,
+                        default: None,
+                    }
+                ),
+                (
+                    101,
+                    Extension {
+                        name: "ext.v1.Holder.extra".into(),
+                        ty: "message:ext.v1.Extra".into(),
+                        cardinality: Cardinality::Singular,
+                        default: None,
+                    }
+                ),
+            ])
+        );
+        assert_eq!(
+            contract.messages.keys().collect::<Vec<_>>(),
+            ["ext.v1.Extra", "ext.v1.Req"],
+            "an extension's type joins the closure; the declaring and unrelated messages do not"
+        );
+        assert!(contract.messages["ext.v1.Extra"].extensions.is_empty());
+
+        let json = contract.to_json();
+        assert_eq!(Contract::from_json(&json).unwrap(), contract);
     }
 
     #[test]
@@ -818,7 +1036,7 @@ enum Mood { MOOD_UNSPECIFIED = 0; }
             ..FileDescriptorProto::default()
         };
         let files = [file];
-        let index = TypeIndex::new(&files);
+        let index = TypeIndex::new(&files, &BTreeSet::new());
         let error = index
             .service_contract(&files[0], &files[0].service[0])
             .unwrap_err();
@@ -852,7 +1070,7 @@ enum Mood { MOOD_UNSPECIFIED = 0; }
             message_type: vec![holder],
             ..FileDescriptorProto::default()
         }];
-        let index = TypeIndex::new(&files);
+        let index = TypeIndex::new(&files, &BTreeSet::new());
         let error = index
             .message(&files[0].message_type[0], &mut Vec::new())
             .unwrap_err();

@@ -2,12 +2,14 @@
 //!
 //! A change is breaking when an existing binary peer could misread or fail
 //! on the wire. Renamed fields, enum values and oneofs are compatible: the
-//! binary encoding carries numbers only.
+//! binary encoding carries numbers only. For the same reason the order in
+//! which fields or enum values are declared never matters; their numbers
+//! do.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use super::model::{Contract, Enum, Message};
+use super::model::{Cardinality, Contract, Enum, Message, merge_ranges};
 
 /// A breaking change of one service.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,7 +91,12 @@ fn message(name: &str, old: &Message, new: &Message, out: &mut Vec<String>) {
     for (number, field) in &old.fields {
         let label = format!("field {number} ({}) of {name}", field.name);
         let Some(now) = new.fields.get(number) else {
-            if !covers(&new.reserved, *number) {
+            if field.cardinality == Cardinality::Required {
+                out.push(format!(
+                    "{label} was required and was removed; peers still reject messages \
+                     without it"
+                ));
+            } else if !covers(&new.reserved, *number) {
                 out.push(format!("{label} was removed without reserving its number"));
             }
             continue;
@@ -111,9 +118,91 @@ fn message(name: &str, old: &Message, new: &Message, out: &mut Vec<String>) {
             (Some(oneof), None) => out.push(format!("{label} moved out of oneof {oneof}")),
             _ => {}
         }
+        default_change(
+            &label,
+            field.default.as_deref(),
+            now.default.as_deref(),
+            out,
+        );
+    }
+    for (number, field) in &new.fields {
+        if field.cardinality == Cardinality::Required && !old.fields.contains_key(number) {
+            out.push(format!(
+                "field {number} ({}) of {name} was added as required; existing senders do \
+                 not set it",
+                field.name
+            ));
+        }
     }
     oneof_members(name, old, new, out);
     reserved(name, &old.reserved, &new.reserved, out);
+    extensions(name, old, new, out);
+}
+
+/// A changed explicit default changes what a reader sees when the field
+/// is absent on the wire.
+fn default_change(label: &str, before: Option<&str>, now: Option<&str>, out: &mut Vec<String>) {
+    if before == now {
+        return;
+    }
+    let show =
+        |value: Option<&str>| value.map_or_else(|| "none".to_owned(), |value| format!("`{value}`"));
+    out.push(format!(
+        "{label} changed its default from {} to {}",
+        show(before),
+        show(now)
+    ));
+}
+
+/// Extensions keep their number, type and cardinality; extension ranges
+/// stay extension ranges or become reserved.
+fn extensions(name: &str, old: &Message, new: &Message, out: &mut Vec<String>) {
+    for (number, extension) in &old.extensions {
+        let label = format!("extension {number} ({}) of {name}", extension.name);
+        let Some(now) = new.extensions.get(number) else {
+            out.push(format!("{label} was removed"));
+            continue;
+        };
+        if extension.ty != now.ty {
+            out.push(format!(
+                "{label} changed type from {} to {}",
+                extension.ty, now.ty
+            ));
+        }
+        if extension.cardinality != now.cardinality {
+            out.push(format!(
+                "{label} changed cardinality from {} to {}",
+                extension.cardinality, now.cardinality
+            ));
+        }
+        default_change(
+            &label,
+            extension.default.as_deref(),
+            now.default.as_deref(),
+            out,
+        );
+    }
+    let kept = merge_ranges(
+        new.extension_ranges
+            .iter()
+            .chain(&new.reserved)
+            .copied()
+            .collect(),
+    );
+    for range in &old.extension_ranges {
+        for [start, end] in uncovered(*range, &kept) {
+            if start == end {
+                out.push(format!(
+                    "extension number {start} of {name} is no longer an extension range"
+                ));
+            } else {
+                out.push(format!(
+                    "extension numbers {start} to {end} of {name} are no longer an extension \
+                     range"
+                ));
+            }
+        }
+    }
 }
 
 /// Fields that shared a oneof must still share one, and no other field that
@@ -487,6 +576,226 @@ mod tests {
         assert_eq!(
             messages(&closed, &open),
             ["enum t.v1.Kind changed from closed to open"]
+        );
+    }
+
+    fn breaking_proto2(old: &str, new: &str) -> Vec<String> {
+        compare(&svc_with("proto2", old), Some(&svc_with("proto2", new)))
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn r10_renumbered_enum_values_are_breaking_and_reordered_ones_are_not() {
+        let base = with_enum("KIND_A = 1; KIND_B = 2;");
+        assert_eq!(
+            breaking(&base, &with_enum("KIND_A = 1; KIND_B = 3;")),
+            [format!(
+                "{P}value 2 (KIND_B) of t.v1.Kind was removed without reserving its number"
+            )]
+        );
+        assert_compatible(&base, &with_enum("KIND_B = 2; KIND_A = 1;"));
+    }
+
+    #[test]
+    fn r13_a_new_required_field_is_breaking() {
+        let base = with_req("optional string id = 1;");
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_req("optional string id = 1; required int32 count = 2;")
+            ),
+            [format!(
+                "{P}field 2 (count) of t.v1.Req was added as required; existing senders do \
+                 not set it"
+            )]
+        );
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_req("optional string id = 1; optional int32 n = 2;")
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn r13_a_removed_required_field_is_breaking_even_when_reserved() {
+        let base = with_req("optional string id = 1; required int32 count = 2;");
+        let expected = [format!(
+            "{P}field 2 (count) of t.v1.Req was required and was removed; peers still reject \
+             messages without it"
+        )];
+        assert_eq!(
+            breaking_proto2(&base, &with_req("optional string id = 1; reserved 2;")),
+            expected
+        );
+        assert_eq!(
+            breaking_proto2(&base, &with_req("optional string id = 1;")),
+            expected
+        );
+    }
+
+    #[test]
+    fn r13_switching_between_optional_and_required_is_breaking() {
+        let optional = with_req("optional int32 count = 2;");
+        let required = with_req("required int32 count = 2;");
+        assert_eq!(
+            breaking_proto2(&optional, &required),
+            [format!(
+                "{P}field 2 (count) of t.v1.Req changed cardinality from singular to required"
+            )]
+        );
+        assert_eq!(
+            breaking_proto2(&required, &optional),
+            [format!(
+                "{P}field 2 (count) of t.v1.Req changed cardinality from required to singular"
+            )]
+        );
+    }
+
+    #[test]
+    fn r14_a_changed_explicit_default_is_breaking() {
+        let base = with_req("optional int32 limit = 1 [default = 10]; optional string s = 2;");
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_req(
+                    "optional int32 limit = 1 [default = 20]; \
+                     optional string s = 2 [default = \"x\"];"
+                )
+            ),
+            [
+                format!("{P}field 1 (limit) of t.v1.Req changed its default from `10` to `20`"),
+                format!("{P}field 2 (s) of t.v1.Req changed its default from none to `x`"),
+            ]
+        );
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_req("optional int32 limit = 1; optional string s = 2;")
+            ),
+            [format!(
+                "{P}field 1 (limit) of t.v1.Req changed its default from `10` to none"
+            )]
+        );
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_req("optional int32 max = 1 [default = 10]; optional string s = 2;")
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn r14_an_enum_default_is_compared_by_number() {
+        let body = |default: &str, values: &str| {
+            format!(
+                "{SERVICE}message Req {{ optional Kind kind = 1 [default = {default}]; }}\n\
+                 enum Kind {{ KIND_UNSPECIFIED = 0; {values} }}\n"
+            )
+        };
+        let base = body("KIND_A", "KIND_A = 1; KIND_B = 2;");
+        assert_eq!(
+            breaking_proto2(&base, &body("KIND_FIRST", "KIND_FIRST = 1; KIND_B = 2;")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            breaking_proto2(&base, &body("KIND_B", "KIND_A = 1; KIND_B = 2;")),
+            [format!(
+                "{P}field 1 (kind) of t.v1.Req changed its default from `1` to `2`"
+            )]
+        );
+    }
+
+    fn with_extensions(range: &str, extend: &str) -> String {
+        format!(
+            "{SERVICE}message Req {{ optional string id = 1; {range} }}\n\
+             message Extra {{ optional string x = 1; }}\n\
+             extend Req {{ {extend} }}\n"
+        )
+    }
+
+    #[test]
+    fn r15_extensions_keep_their_number_type_cardinality_and_default() {
+        let base = with_extensions(
+            "extensions 100 to 199;",
+            "optional int32 note = 100 [default = 3]; repeated string tags = 101; \
+             optional Extra extra = 102;",
+        );
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_extensions(
+                    "extensions 100 to 199;",
+                    "optional int64 note = 100; optional string tags = 101; \
+                     optional Extra moved = 103;",
+                )
+            ),
+            [
+                format!(
+                    "{P}extension 100 (t.v1.note) of t.v1.Req changed its default from `3` to \
+                     none"
+                ),
+                format!(
+                    "{P}extension 100 (t.v1.note) of t.v1.Req changed type from int32 to \
+                     int64"
+                ),
+                format!(
+                    "{P}extension 101 (t.v1.tags) of t.v1.Req changed cardinality from repeated \
+                     to singular"
+                ),
+                format!("{P}extension 102 (t.v1.extra) of t.v1.Req was removed"),
+            ]
+        );
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_extensions(
+                    "extensions 100 to 199;",
+                    "optional int32 renamed = 100 [default = 3]; repeated string tags = 101; \
+                     optional Extra extra = 102; optional bool added = 104;",
+                )
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn r15_extension_ranges_stay_extension_ranges_or_reserved() {
+        let base = with_extensions("extensions 100 to 199;", "optional int32 note = 100;");
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_extensions(
+                    "extensions 100 to 149; reserved 150 to 159;",
+                    "optional int32 note = 100;"
+                )
+            ),
+            [format!(
+                "{P}extension numbers 160 to 199 of t.v1.Req are no longer an extension range"
+            )]
+        );
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_extensions("extensions 100 to 198;", "optional int32 note = 100;")
+            ),
+            [format!(
+                "{P}extension number 199 of t.v1.Req is no longer an extension range"
+            )]
+        );
+        assert_eq!(
+            breaking_proto2(
+                &base,
+                &with_extensions(
+                    "extensions 100 to 120; reserved 121 to 199;",
+                    "optional int32 note = 100;"
+                )
+            ),
+            Vec::<String>::new()
         );
     }
 

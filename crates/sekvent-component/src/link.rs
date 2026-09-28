@@ -10,16 +10,23 @@ use bytes::Bytes;
 use http::HeaderMap;
 use sekvent_context::{CallContext, ServiceIdentity, headers};
 use sekvent_error::{AppError, ErrorCode};
-use sekvent_resilience::Timeout;
 use tokio::task::JoinError;
+use tokio::time::Instant;
 use tracing::Instrument as _;
 
 use crate::__private::{Dispatch, LocalMessage, WireMessage};
 #[cfg(feature = "grpc")]
 use crate::grpc::client::RemoteClient;
-use crate::server::{Server, shed};
+use crate::server::Server;
 use crate::wire::{self, AbortOnDrop};
 use crate::{Binding, ComponentError, LOCAL_CALLER, reasons};
+
+/// Metadata key naming the component whose transient failure a call made
+/// from inside a handler returned. The gRPC serving side turns an error
+/// carrying it into `INTERNAL` / [`reasons::DOWNSTREAM_FAILURE`], so the
+/// callers above neither retry the healthy component in between nor count
+/// the failure against it.
+pub(crate) const DOWNSTREAM: &str = "downstream";
 
 /// The caller's view of one installed component: its binding, the gate
 /// its calls pass, the hop limit and, under `grpc`, the remote client.
@@ -150,14 +157,14 @@ impl<D: ?Sized + Send + Sync + 'static> Endpoint<D> {
             let outcome = match &self.route {
                 Route::Local(imp) => {
                     let imp = Arc::clone(imp);
-                    invoke(link, method, cx, move |callee| {
+                    invoke(link, method, cx, MethodTimeout::Here, move |callee| {
                         run_local(server, method, callee, imp, req, local)
                     })
                     .await
                 }
                 Route::Serialized(dispatch) => {
                     let dispatch = Arc::clone(dispatch);
-                    invoke(link, method, cx, move |callee| {
+                    invoke(link, method, cx, MethodTimeout::Here, move |callee| {
                         run_serialized::<Req, Rep>(server, dispatch, method, callee, req)
                     })
                     .await
@@ -165,7 +172,7 @@ impl<D: ?Sized + Send + Sync + 'static> Endpoint<D> {
                 #[cfg(feature = "grpc")]
                 Route::Remote(client) => {
                     let client = Arc::clone(client);
-                    invoke(link, method, cx, move |callee| {
+                    invoke(link, method, cx, MethodTimeout::Transport, move |callee| {
                         run_remote::<Req, Rep>(server, client, method, callee, req)
                     })
                     .await
@@ -199,7 +206,7 @@ impl<D: ?Sized + Send + Sync + 'static> Endpoint<D> {
             let outcome = match &self.route {
                 Route::Local(imp) => {
                     let imp = Arc::clone(imp);
-                    invoke(link, method, cx, move |callee| {
+                    invoke(link, method, cx, MethodTimeout::Here, move |callee| {
                         run_local(server, method, callee, imp, req, local)
                     })
                     .await
@@ -213,13 +220,32 @@ impl<D: ?Sized + Send + Sync + 'static> Endpoint<D> {
     }
 }
 
-/// The caller side shared by every binding: shed a dead call, enforce the
-/// hop limit, derive the callee's context, and run `transport` within the
-/// callee's deadline and until the caller cancels, in one `debug` span.
+/// Who enforces the method's `TIMEOUT` for one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodTimeout {
+    /// [`invoke`] narrows the callee's deadline and reports its expiry.
+    Here,
+    /// The transport does (the remote client, which must tell its circuit
+    /// breaker a slow callee from a caller that gave up); [`invoke`] only
+    /// enforces the caller's deadline.
+    #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+    Transport,
+}
+
+/// The caller side shared by every binding: enforce the hop limit, derive
+/// the callee's context, and run `transport` within the call's deadline and
+/// until the caller cancels, in one `debug` span.
+///
+/// The method's `TIMEOUT` bounds the whole call. Its expiry while the
+/// caller still has time is `DEADLINE_EXCEEDED` / [`reasons::METHOD_TIMEOUT`];
+/// the caller's own deadline passing is a plain `DEADLINE_EXCEEDED`. A call
+/// whose caller already cancelled or ran out of time fails before
+/// `transport` is polled, so nothing is encoded or sent.
 async fn invoke<Rep, T, Fut>(
     link: &Link,
     method: usize,
     cx: &CallContext,
+    enforce: MethodTimeout,
     transport: T,
 ) -> Result<Rep, AppError>
 where
@@ -238,26 +264,139 @@ where
         binding = link.binding.as_str(),
     );
     async move {
-        shed(cx).map_err(|error| server.tag(error, method))?;
+        let timeout = match enforce {
+            MethodTimeout::Here => server.timeout(method),
+            MethodTimeout::Transport => None,
+        };
+        let bounds = Bounds::new(cx, timeout);
+        let expired = || server.tag(bounds.expired(cx, timeout), method);
+        let cancelled = || server.tag(AppError::cancelled("the call was cancelled"), method);
+        if cx.cancel_token().is_cancelled() {
+            return Err(cancelled());
+        }
+        if bounds.passed() {
+            return Err(expired());
+        }
         let hops = cx.hops().saturating_add(1);
         if hops > link.max_hops {
             return Err(server.tag(depth_exceeded(link.max_hops), method));
         }
-        let callee = callee_context(cx, server.timeout(method)).with_hops(hops);
-        let sent = callee.clone();
-        let limit = Timeout::deadline_only();
-        let run = limit.call(&callee, async move { Ok(transport(sent).await) });
-        tokio::select! {
+        let callee = callee_context(cx, bounds.method).with_hops(hops);
+        let outcome = tokio::select! {
             biased;
-            () = cx.cancelled() => Err(server.tag(AppError::cancelled("the call was cancelled"), method)),
-            outcome = run => match outcome {
-                Ok(result) => result,
-                Err(expired) => Err(server.tag(expired, method)),
-            },
-        }
+            () = cx.cancelled() => Err(cancelled()),
+            result = transport(callee) => result.map_err(|error| {
+                if bounds.method_fired(cx) && is_plain_deadline(&error) {
+                    expired()
+                } else {
+                    error
+                }
+            }),
+            () = bounds.sleep() => Err(expired()),
+        };
+        outcome.map_err(|error| mark_downstream(cx, descriptor.name(), error))
     }
     .instrument(span)
     .await
+}
+
+/// The two deadlines of one call, on tokio's clock: the caller's and, when
+/// [`invoke`] enforces it, the method's own.
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    caller: Option<Instant>,
+    method: Option<Instant>,
+}
+
+impl Bounds {
+    fn new(cx: &CallContext, timeout: Option<Duration>) -> Self {
+        Self {
+            caller: cx.deadline().map(Instant::from_std),
+            method: timeout.and_then(|timeout| Instant::now().checked_add(timeout)),
+        }
+    }
+
+    /// The earlier of the two deadlines.
+    fn effective(self) -> Option<Instant> {
+        match (self.caller, self.method) {
+            (Some(caller), Some(method)) => Some(caller.min(method)),
+            (caller, method) => caller.or(method),
+        }
+    }
+
+    fn passed(self) -> bool {
+        self.effective()
+            .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    async fn sleep(self) {
+        match self.effective() {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Whether the method's deadline — not the caller's — has passed, with
+    /// the caller still having time left.
+    fn method_fired(self, cx: &CallContext) -> bool {
+        let now = Instant::now();
+        self.method.is_some_and(|method| {
+            method <= now && self.caller.is_none_or(|caller| method < caller) && !caller_expired(cx)
+        })
+    }
+
+    /// The error for the call's deadline passing.
+    fn expired(self, cx: &CallContext, timeout: Option<Duration>) -> AppError {
+        match timeout {
+            Some(timeout) if self.method_fired(cx) => method_timeout(timeout),
+            _ => AppError::deadline_exceeded("the call deadline was exceeded"),
+        }
+    }
+}
+
+/// Whether `cx`'s own deadline has passed (on tokio's clock).
+pub(crate) fn caller_expired(cx: &CallContext) -> bool {
+    sekvent_resilience::remaining(cx) == Some(Duration::ZERO)
+}
+
+/// `DEADLINE_EXCEEDED` / [`reasons::METHOD_TIMEOUT`]: the method's own
+/// `timeout` expired while the caller still had time.
+pub(crate) fn method_timeout(timeout: Duration) -> AppError {
+    AppError::deadline_exceeded(format!(
+        "the call did not complete within the method timeout of {} ms",
+        timeout.as_millis()
+    ))
+    .with_reason(reasons::METHOD_TIMEOUT)
+    .with_metadata("timeout_ms", timeout.as_millis().to_string())
+}
+
+/// A `DEADLINE_EXCEEDED` that does not say whose deadline passed: the
+/// serving gate's or a transport's view of the same expiry.
+fn is_plain_deadline(error: &AppError) -> bool {
+    error.code() == ErrorCode::DeadlineExceeded && error.reason().is_none()
+}
+
+/// Whether `error` is a transient failure of the callee itself, as opposed
+/// to the caller's own deadline or cancellation, or a definitive answer.
+fn is_downstream_failure(error: &AppError) -> bool {
+    match error.code() {
+        ErrorCode::Unavailable | ErrorCode::ResourceExhausted => true,
+        ErrorCode::DeadlineExceeded => error.reason() == Some(reasons::METHOD_TIMEOUT),
+        _ => false,
+    }
+}
+
+/// Name `component` as the [`DOWNSTREAM`] failure when a call made from
+/// inside a handler (`hops > 0`) failed transiently. A marker set further
+/// down the chain is kept, so it names where the failure started; a call
+/// made at the edge (`hops == 0`) is left alone, its caller is the one to
+/// retry.
+fn mark_downstream(cx: &CallContext, component: &str, error: AppError) -> AppError {
+    if cx.hops() == 0 || error.metadata().contains_key(DOWNSTREAM) || !is_downstream_failure(&error)
+    {
+        return error;
+    }
+    error.with_metadata(DOWNSTREAM, component)
 }
 
 /// `INTERNAL` for a `local_only` component reached through a route that
@@ -285,14 +424,15 @@ pub(crate) fn depth_exceeded(max_hops: u32) -> AppError {
     .with_reason(reasons::CALL_DEPTH_EXCEEDED)
 }
 
-/// The context the callee sees: the caller's identity and trace, a child
+/// The context sent to the callee: the caller's identity and trace, a child
 /// cancellation token, the in-process caller identity, and the deadline
-/// narrowed by the method's timeout (measured on tokio's clock).
-fn callee_context(cx: &CallContext, timeout: Option<Duration>) -> CallContext {
+/// narrowed to `method_deadline` (on tokio's clock). An idempotency key the
+/// caller received is not carried over (see [`CallContext::child`]).
+fn callee_context(cx: &CallContext, method_deadline: Option<Instant>) -> CallContext {
     let callee = cx
         .child()
         .with_caller(ServiceIdentity::trusted(LOCAL_CALLER));
-    match timeout.and_then(|timeout| tokio::time::Instant::now().checked_add(timeout)) {
+    match method_deadline {
         Some(deadline) => callee.with_deadline(deadline.into_std()),
         None => callee,
     }
@@ -316,7 +456,7 @@ where
     Fut: Future<Output = Result<Rep, E>>,
 {
     match server
-        .run(method, callee, move |cx| local(imp, cx, req))
+        .run(method, callee.into_inbound(), move |cx| local(imp, cx, req))
         .await
     {
         Ok(Ok(reply)) => Ok(reply),
@@ -345,11 +485,16 @@ where
     // The header codec re-anchors the deadline on the std clock when the
     // task reads it, which can land it a little after the caller's.
     let deadline = callee.deadline();
+    // Headers carry no cancellation: the served context shares the caller's
+    // child token, so work the handler hands off (spawned tasks, detached
+    // calls it chose to bind to the call) sees the caller cancel.
+    let cancel = callee.cancel_token().clone();
     let serving = Arc::clone(server);
     let task = tokio::spawn(
         async move {
             let mut cx =
-                headers::from_headers(&wire_headers, Some(ServiceIdentity::trusted(LOCAL_CALLER)));
+                headers::from_headers(&wire_headers, Some(ServiceIdentity::trusted(LOCAL_CALLER)))
+                    .with_cancel(cancel);
             if let Some(deadline) = deadline {
                 cx = cx.with_deadline(deadline);
             }
@@ -373,8 +518,9 @@ where
 }
 
 /// `grpc`: encode the request, pass the component's gate (admission,
-/// shedding, deadline), call the remote client, decode the reply. Dropping
-/// the returned future resets the HTTP/2 stream.
+/// shedding, deadline), call the remote client — which enforces the
+/// method's timeout — and decode the reply. Dropping the returned future
+/// resets the HTTP/2 stream.
 #[cfg(feature = "grpc")]
 async fn run_remote<Req, Rep>(
     server: &Server,
@@ -432,12 +578,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_callee_context_is_narrowed_and_trusted() {
-        let deadline = (tokio::time::Instant::now() + Duration::from_secs(5)).into_std();
+        let deadline = (Instant::now() + Duration::from_secs(5)).into_std();
         let cx = CallContext::new()
             .with_request_id("req-1")
             .with_deadline(deadline);
 
-        let narrowed = callee_context(&cx, Some(Duration::from_secs(1)));
+        let narrowed = callee_context(&cx, Some(Instant::now() + Duration::from_secs(1)));
         assert_eq!(narrowed.request_id(), "req-1");
         assert_eq!(
             sekvent_resilience::remaining(&narrowed),
@@ -448,16 +594,115 @@ mod tests {
             Some(&ServiceIdentity::trusted(LOCAL_CALLER))
         );
 
-        let kept = callee_context(&cx, Some(Duration::from_secs(9)));
+        let kept = callee_context(&cx, Some(Instant::now() + Duration::from_secs(9)));
         assert_eq!(kept.deadline(), Some(deadline));
 
         let unbounded = callee_context(&CallContext::new(), None);
         assert_eq!(unbounded.deadline(), None);
-        let huge = callee_context(&CallContext::new(), Some(Duration::MAX));
-        assert_eq!(huge.deadline(), None);
 
         cx.cancel_token().cancel();
         assert!(narrowed.cancel_token().is_cancelled());
+    }
+
+    #[test]
+    fn the_callee_context_forwards_only_a_key_set_for_the_call() {
+        let own = CallContext::new().with_idempotency_key("order-7");
+        let callee = callee_context(&own, None);
+        assert_eq!(callee.outbound_idempotency_key(), Some("order-7"));
+        assert_eq!(
+            callee.into_inbound().outbound_idempotency_key(),
+            None,
+            "the callee reads the key but does not pass it on"
+        );
+
+        let received = CallContext::new()
+            .with_idempotency_key("upstream")
+            .into_inbound();
+        assert_eq!(callee_context(&received, None).idempotency_key(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounds_tell_the_method_timeout_from_the_callers_deadline() {
+        let far =
+            CallContext::new().with_deadline((Instant::now() + Duration::from_secs(10)).into_std());
+        let bounds = Bounds::new(&far, Some(Duration::from_secs(1)));
+        assert!(!bounds.passed());
+        assert!(!bounds.method_fired(&far));
+        assert_eq!(bounds.effective(), bounds.method);
+        let started = Instant::now();
+        bounds.sleep().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert!(bounds.passed());
+        assert!(bounds.method_fired(&far));
+        let error = bounds.expired(&far, Some(Duration::from_secs(1)));
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(error.reason(), Some(reasons::METHOD_TIMEOUT));
+        assert_eq!(error.metadata()["timeout_ms"], "1000");
+
+        let near =
+            CallContext::new().with_deadline((Instant::now() + Duration::from_secs(1)).into_std());
+        let bounds = Bounds::new(&near, Some(Duration::from_secs(5)));
+        assert_eq!(bounds.effective(), bounds.caller);
+        bounds.sleep().await;
+        assert!(caller_expired(&near));
+        assert!(!bounds.method_fired(&near));
+        let error = bounds.expired(&near, Some(Duration::from_secs(5)));
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(error.reason(), None, "the caller's own deadline passed");
+
+        let unbounded = Bounds::new(&CallContext::new(), None);
+        assert_eq!(unbounded.effective(), None);
+        assert!(!unbounded.passed());
+        assert!(!unbounded.method_fired(&CallContext::new()));
+        let never = tokio::time::timeout(Duration::from_secs(60), unbounded.sleep()).await;
+        assert!(never.is_err(), "no deadline never expires");
+        assert_eq!(unbounded.expired(&CallContext::new(), None).reason(), None);
+        let huge = Bounds::new(&CallContext::new(), Some(Duration::MAX));
+        assert_eq!(huge.method, None);
+    }
+
+    #[test]
+    fn only_plain_deadlines_are_reinterpreted() {
+        assert!(is_plain_deadline(&AppError::deadline_exceeded("late")));
+        assert!(!is_plain_deadline(&method_timeout(Duration::from_secs(1))));
+        assert!(!is_plain_deadline(&AppError::unavailable("down")));
+    }
+
+    #[test]
+    fn transient_failures_of_a_nested_call_name_the_callee() {
+        let nested = CallContext::new().with_hops(1);
+        for error in [
+            AppError::unavailable("down").with_reason(reasons::UNREACHABLE),
+            AppError::unavailable("open").with_reason(reasons::CIRCUIT_OPEN),
+            AppError::resource_exhausted("full"),
+            method_timeout(Duration::from_millis(250)),
+        ] {
+            let marked = mark_downstream(&nested, "inventory", error);
+            assert_eq!(marked.metadata()[DOWNSTREAM], "inventory", "{marked}");
+        }
+        for error in [
+            AppError::deadline_exceeded("the call deadline was exceeded"),
+            AppError::cancelled("the call was cancelled"),
+            AppError::not_found("no such item"),
+            AppError::new(ErrorCode::Internal, "bug"),
+        ] {
+            let kept = mark_downstream(&nested, "inventory", error);
+            assert!(!kept.metadata().contains_key(DOWNSTREAM), "{kept}");
+        }
+
+        let deeper = AppError::unavailable("down").with_metadata(DOWNSTREAM, "stock");
+        let kept = mark_downstream(&nested, "inventory", deeper);
+        assert_eq!(kept.metadata()[DOWNSTREAM], "stock", "the origin is kept");
+
+        let edge = mark_downstream(
+            &CallContext::new(),
+            "inventory",
+            AppError::unavailable("down"),
+        );
+        assert!(
+            !edge.metadata().contains_key(DOWNSTREAM),
+            "a call from the edge is retried by its own caller"
+        );
     }
 
     #[test]

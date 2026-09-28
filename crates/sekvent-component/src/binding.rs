@@ -11,8 +11,12 @@ pub enum Binding {
     /// call context and the outcome are encoded and decoded, and the call runs
     /// on its own task, as it would behind a network transport.
     LocalSerialized,
-    /// A gRPC channel to another process. Parsed, but not available in this
-    /// build.
+    /// A gRPC call to another process that serves the component (feature
+    /// `grpc`): plaintext HTTP/2 to `SEKVENT_COMPONENT_<C>_ENDPOINT`,
+    /// authenticated with a service-link token from `sekvent-link` (TLS is
+    /// not supported yet). The call carries the context and runs under the
+    /// method's retry, circuit-breaker and retry-budget policy. Without the
+    /// feature the value parses but the app fails to build.
     Grpc,
 }
 

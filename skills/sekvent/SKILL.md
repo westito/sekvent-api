@@ -374,8 +374,10 @@ pub trait Inventory: Send + Sync + 'static {
 - `proto` is required for standard and `remote_only` components. The macro
   fails to compile (`component contract: …`) when the proto service is not
   `<package>.<Trait>`, when the RPC set differs from the methods, or when a
-  method's request or reply is not its RPC's input or output type. Change
-  trait and proto together.
+  method's request or reply is not its RPC's input or output type (compared
+  by type, so a nested message never passes for a top-level one of the
+  same name), or when two methods map to one RPC name. `()` is
+  `google.protobuf.Empty`. Change trait and proto together.
 - The derive gives `From<E> for AppError` and `From<AppError> for E`; do not
   add another `From<AppError>`.
 
@@ -405,13 +407,19 @@ let orders = app.handle::<OrdersHandle>()?;            // for ingress code and t
   never a shared one.
 - Components start in install order and stop in reverse. Stopping drains:
   new calls get `UNAVAILABLE`/`COMPONENT_DRAINING`, in-flight calls finish
-  within the grace.
+  within the grace, then `on_stop` runs exactly once (only if `on_start`
+  succeeded). A stop during start cancels the pending `on_start`. Under the
+  runtime the drain gets half the time left before the unit's stop
+  deadline, the hooks the rest. Two components with the same gRPC service
+  name, or a link named `local`, fail the build.
 - Per call: a cancelled or expired context is rejected before any work;
   the method timeout is capped by the caller's deadline (`DEADLINE_EXCEEDED`);
   a full bulkhead sheds at once (`RESOURCE_EXHAUSTED`/`BULKHEAD_FULL`, no
   queue). Reason constants: `sekvent::component::reasons`.
 - Locally, the callee sees `cx.caller() == trusted("local")` with request
-  id, subject, tenant and idempotency key kept. Over gRPC the caller is the
+  id, subject and tenant kept. An idempotency key is forwarded only when
+  set for this call (`cx.with_idempotency_key(k)`); a key a handler
+  received is readable but never forwarded to its own callees. Over gRPC the caller is the
   authenticated link; subject and tenant survive only for a link listed in
   `SEKVENT_LINK_TRUSTED`.
 - Every call counts a hop; a chain deeper than `SEKVENT_COMPONENT_MAX_HOPS`
@@ -485,16 +493,26 @@ hop unchanged; errors made on the caller side carry `component`/`method`
 metadata: `UNAVAILABLE`/`COMPONENT_UNREACHABLE` (connect refused, reset),
 `UNAVAILABLE`/`CIRCUIT_OPEN` (with `retry_after`), `UNAUTHENTICATED`
 ("service authentication required", same answer for a missing or wrong
-token). The breaker trips only on `UNAVAILABLE`, `DEADLINE_EXCEEDED`,
-`RESOURCE_EXHAUSTED`; business errors never open it.
+token), `DEADLINE_EXCEEDED`/`METHOD_TIMEOUT` (the method's `TIMEOUT` ran
+out while the caller still had time). The breaker trips only on
+`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, and never on the
+caller's own deadline or cancellation; business errors never open it. A handler
+whose own component call failed transiently answers `INTERNAL`/
+`DOWNSTREAM_FAILURE` (metadata `downstream`, `downstream_code`), so callers
+above neither retry nor trip on it; a panicking handler answers
+`INTERNAL`/`HANDLER_PANICKED`. The server authenticates, routes (exact
+`/<service>/<Rpc>` path) and checks hops from headers before reading the
+body, never trusts request trailers, and caps requests at 4 MiB.
 
 Contracts: `[contract]` in `sekvent.toml` lists the proto roots
 (`roots = ["crates/billing-api/proto"]`, `baseline = "contracts"`,
 `gate = true`). `cargo sekvent contract emit [service…]` writes one
 canonical JSON baseline per service — commit them; `cargo sekvent contract
 check [service…]` fails on wire-breaking changes (a removed RPC or
-unreserved field number, a changed type, cardinality or oneof, a dropped
-reservation) and runs in the gate. Both compile the protos in-process
+unreserved field number, a changed type, cardinality, oneof or default, a
+dropped reservation or extension range, an added or removed `required`
+field, a removed or changed extension) and runs in the gate. Roots must lie
+inside the project and declare at least one service. Both compile the protos in-process
 (protox: no `protoc`, no Rust build). Renames and additions are compatible.
 A breaking change goes into a new package (`billing.v2`) served alongside
 v1 as a second component; delete v1 and its baseline once no caller uses it.

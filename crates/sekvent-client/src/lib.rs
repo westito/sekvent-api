@@ -8,7 +8,8 @@
 //! - [`CallContext`](sekvent_context::CallContext) propagation: request id,
 //!   remaining deadline as `grpc-timeout`, trace context — never
 //!   overriding headers set on the request, and never forwarding the
-//!   inbound idempotency key;
+//!   inbound idempotency key. Subject, tenant and call depth go only to
+//!   upstreams declared with [`HttpClientBuilder::sekvent_upstream`];
 //! - error mapping to [`AppError`](sekvent_error::AppError): transient HTTP
 //!   statuses and transport failures become retryable codes, `Retry-After`
 //!   is honoured up to the retry policy's cap, and upstream bodies never

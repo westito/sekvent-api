@@ -60,6 +60,12 @@ pub mod proto {
                         ("Tag", "Loose", "check.billing.v1.TotalRequest", false),
                     ],
                 );
+                #[allow(non_camel_case_types, dead_code)]
+                pub type __sekvent_rpc_Billing__Total = (TotalRequest, super::super::super::common::v1::Money);
+                #[allow(non_camel_case_types, dead_code)]
+                pub type __sekvent_rpc_Billing__Describe = (::prost::alloc::string::String, ::prost::alloc::string::String);
+                #[allow(non_camel_case_types, dead_code)]
+                pub type __sekvent_rpc_Billing__Tag = (super::super::super::super::Loose, TotalRequest);
             }
         }
     }

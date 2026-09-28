@@ -215,8 +215,9 @@ fn compact(text: &str) -> String {
     dense.replace(",]", "]").replace(",)", ")")
 }
 
-/// A package with two services, a streaming RPC and a type from another
-/// package, importing the fixtures' `common.v1`.
+/// A package with two services, a streaming RPC, a type from another
+/// package and a nested message next to a top-level one of the same name,
+/// importing the fixtures' `common.v1`.
 fn contract_fixture(dir: &Path) {
     fs::create_dir_all(dir.join("ledger/v1")).unwrap();
     fs::write(
@@ -224,13 +225,19 @@ fn contract_fixture(dir: &Path) {
         "syntax = \"proto3\";\n\
          package ledger.v1;\n\
          import \"common/v1/money.proto\";\n\
-         message Entry { string id = 1; common.v1.Money amount = 2; }\n\
+         message Entry {\n\
+           string id = 1;\n\
+           common.v1.Money amount = 2;\n\
+           message Line { string text = 1; }\n\
+         }\n\
+         message Line { string text = 1; }\n\
          message GetEntryRequest { string id = 1; }\n\
          message Ack {}\n\
          service Entries {\n\
            rpc GetEntry(GetEntryRequest) returns (Entry);\n\
            rpc Balance(GetEntryRequest) returns (common.v1.Money);\n\
            rpc Follow(GetEntryRequest) returns (stream Entry);\n\
+           rpc Relabel(Entry.Line) returns (Line);\n\
          }\n\
          service Audit { rpc Record(Entry) returns (Ack); }\n",
     )
@@ -247,15 +254,29 @@ const ENTRIES_CONTRACT: &str = r#"
             ("GetEntry", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", false),
             ("Balance", "ledger.v1.GetEntryRequest", "common.v1.Money", false),
             ("Follow", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", true),
+            ("Relabel", "ledger.v1.Entry.Line", "ledger.v1.Line", false),
         ],
     );
 "#;
+
+/// The per-RPC type aliases of `ledger.v1.Entries`, with the Rust paths
+/// prost resolves from the package module.
+const ENTRIES_TYPES: [&str; 4] = [
+    "pub type __sekvent_rpc_Entries__GetEntry = (GetEntryRequest, Entry);",
+    "pub type __sekvent_rpc_Entries__Balance = (GetEntryRequest, super::super::common::v1::Money);",
+    "pub type __sekvent_rpc_Entries__Follow = (GetEntryRequest, Entry);",
+    "pub type __sekvent_rpc_Entries__Relabel = (entry::Line, Line);",
+];
 
 const AUDIT_CONTRACT: &str = r#"
     pub const __sekvent_service_Audit: (&str, &[(&str, &str, &str, bool)]) = (
         "ledger.v1.Audit",
         &[("Record", "ledger.v1.Entry", "ledger.v1.Ack", false)],
     );
+    /// Request and reply of `ledger.v1.Audit.Record`, checked by `#[component(proto = …)]`.
+    #[doc(hidden)]
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Audit__Record = (Entry, Ack);
 "#;
 
 #[test]
@@ -276,7 +297,20 @@ fn messages_only_emits_a_contract_per_service() {
 
     let ledger = compact(&read(&out.path().join("ledger.v1.rs")));
     assert!(ledger.contains(&compact(ENTRIES_CONTRACT)), "{ledger}");
+    for alias in ENTRIES_TYPES {
+        assert!(
+            ledger.contains(&compact(alias)),
+            "missing `{alias}` in {ledger}"
+        );
+    }
     assert!(ledger.contains(&compact(AUDIT_CONTRACT)), "{ledger}");
+    // prost names a nested message by its leaf and its file's package; only
+    // the full name (and the Rust path in the aliases) keeps the nesting.
+    assert!(
+        ledger.contains(&compact(r#"const NAME: &'static str = "Line";"#)),
+        "{ledger}"
+    );
+    assert!(ledger.contains("ledger.v1.Entry.Line"), "{ledger}");
     assert!(!ledger.contains("sekvent_component"), "{ledger}");
     assert!(!ledger.contains("entries_server"), "{ledger}");
     let common = read(&out.path().join("common.v1.rs"));
@@ -307,6 +341,50 @@ fn both_emits_contracts_next_to_the_stubs() {
         )),
         "{billing}"
     );
+    assert!(
+        compact(&billing).contains(&compact(
+            "pub type __sekvent_rpc_Invoices__GetInvoice = (GetInvoiceRequest, Invoice);"
+        )),
+        "{billing}"
+    );
+}
+
+#[test]
+fn empty_is_the_unit_type_in_the_rpc_types() {
+    if !protoc_available() {
+        return;
+    }
+    let src = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("chores/v1")).unwrap();
+    fs::write(
+        src.path().join("chores/v1/chores.proto"),
+        "syntax = \"proto3\";\n\
+         package chores.v1;\n\
+         import \"google/protobuf/empty.proto\";\n\
+         message Chore { string name = 1; }\n\
+         service Chores {\n\
+           rpc Clear(Chore) returns (google.protobuf.Empty);\n\
+           rpc Tick(google.protobuf.Empty) returns (Chore);\n\
+         }\n",
+    )
+    .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    ProtoBuild::new(src.path())
+        .messages_only()
+        .out_dir(out.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+
+    let chores = compact(&read(&out.path().join("chores.v1.rs")));
+    for needle in [
+        r#"("Clear","chores.v1.Chore","google.protobuf.Empty",false)"#,
+        r#"("Tick","google.protobuf.Empty","chores.v1.Chore",false)"#,
+        "pubtype__sekvent_rpc_Chores__Clear=(Chore,());",
+        "pubtype__sekvent_rpc_Chores__Tick=((),Chore);",
+    ] {
+        assert!(chores.contains(needle), "missing `{needle}` in {chores}");
+    }
 }
 
 #[test]

@@ -1,4 +1,5 @@
-//! The RPC named after the method streams; component methods are unary.
+//! A method returns `()` (`google.protobuf.Empty`) where the RPC returns a
+//! message.
 
 #![allow(dead_code, non_upper_case_globals)]
 
@@ -13,29 +14,18 @@ impl prost::Name for PingRequest {
     const PACKAGE: &'static str = "check.echo.v1";
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct PingReply {
-    #[prost(string, tag = "1")]
-    pub text: String,
-}
-
-impl prost::Name for PingReply {
-    const NAME: &'static str = "PingReply";
-    const PACKAGE: &'static str = "check.echo.v1";
-}
-
 mod proto {
     pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
         "check.echo.v1.Echo",
         &[(
             "Ping",
             "check.echo.v1.PingRequest",
-            "check.echo.v1.PingReply",
-            true,
+            "check.echo.v1.PingRequest",
+            false,
         )],
     );
     #[allow(non_camel_case_types, dead_code)]
-    pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingReply);
+    pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingRequest);
 }
 
 #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
@@ -45,7 +35,7 @@ pub trait Echo {
         &self,
         cx: &sekvent_component::CallContext,
         req: PingRequest,
-    ) -> Result<PingReply, sekvent_component::AppError>;
+    ) -> Result<(), sekvent_component::AppError>;
 }
 
 fn main() {}

@@ -217,8 +217,14 @@ async fn the_callers_deadline_crosses_the_hop() {
         let (fake_inventory, mut pending) = PendingInventory::new();
         let shop = start(Profile::SplitGrpc, &[], fake(fake_inventory)).await;
         let inventory = inventory(&shop.app);
+        // Connect the lazy channel first, so the budget is not spent on
+        // the connection; the fake answers `stock` with an error at once.
+        inventory
+            .stock(&CallContext::new(), stock())
+            .await
+            .expect_err("the pending fake does not serve stock");
 
-        let budget = Duration::from_millis(300);
+        let budget = Duration::from_secs(1);
         let started = Instant::now();
         let cx = CallContext::new().with_deadline((started + budget).into_std());
         let error = other(
@@ -229,6 +235,11 @@ async fn the_callers_deadline_crosses_the_hop() {
         );
         let elapsed = started.elapsed();
         assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{error:?}");
+        assert_ne!(
+            error.reason(),
+            Some(reasons::METHOD_TIMEOUT),
+            "the caller's deadline, shorter than the 2 s timeout, expired"
+        );
         assert!(elapsed >= budget, "{elapsed:?}");
 
         let remaining = pending

@@ -56,6 +56,10 @@ pub struct CallContext {
     subject: Option<String>,
     tenant: Option<String>,
     idempotency_key: Option<String>,
+    /// Whether the idempotency key came in with this call rather than being
+    /// set for it: such a key names the caller's operation and is never
+    /// forwarded to another one.
+    key_received: bool,
     traceparent: Option<String>,
     hops: u32,
 }
@@ -78,6 +82,7 @@ impl CallContext {
             subject: None,
             tenant: None,
             idempotency_key: None,
+            key_received: false,
             traceparent: None,
             hops: 0,
         }
@@ -132,10 +137,25 @@ impl CallContext {
         self.tenant = Some(tenant.into());
         self
     }
-    /// Set the idempotency key.
+    /// Set the idempotency key of this call: it is forwarded to the callee
+    /// of the next outbound call made with this context (or a
+    /// [`child`](Self::child) of it).
     #[must_use]
     pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
         self.idempotency_key = Some(key.into());
+        self.key_received = false;
+        self
+    }
+    /// The context as the callee of a call sees it: an idempotency key it
+    /// carries was received with the call, so it stays readable through
+    /// [`idempotency_key`](Self::idempotency_key) but is no longer forwarded
+    /// by [`child`](Self::child) or [`headers::inject`]. A key identifies one
+    /// operation; handing it to a different one would make that callee treat
+    /// distinct requests as duplicates.
+    /// [`headers::from_headers`] returns contexts in this state.
+    #[must_use]
+    pub fn into_inbound(mut self) -> Self {
+        self.key_received = self.idempotency_key.is_some();
         self
     }
     /// Set the W3C `traceparent`.
@@ -189,9 +209,19 @@ impl CallContext {
     pub fn tenant(&self) -> Option<&str> {
         self.tenant.as_deref()
     }
-    /// Idempotency key, if any.
+    /// Idempotency key, if any: set for this call or received with it.
     pub fn idempotency_key(&self) -> Option<&str> {
         self.idempotency_key.as_deref()
+    }
+    /// The idempotency key an outbound call made with this context carries:
+    /// one set for this call, never one received with it (see
+    /// [`into_inbound`](Self::into_inbound)).
+    pub fn outbound_idempotency_key(&self) -> Option<&str> {
+        if self.key_received {
+            None
+        } else {
+            self.idempotency_key()
+        }
     }
     /// W3C `traceparent`, if any.
     pub fn traceparent(&self) -> Option<&str> {
@@ -204,7 +234,8 @@ impl CallContext {
 
     /// A child for an outbound call: same identity, deadline and hop count, a
     /// child cancellation token, and the caller cleared (the callee learns its
-    /// caller from authentication, not from us).
+    /// caller from authentication, not from us). The idempotency key is kept
+    /// only when it was set for this call, not received with it.
     #[must_use]
     pub fn child(&self) -> Self {
         Self {
@@ -214,7 +245,8 @@ impl CallContext {
             caller: None,
             subject: self.subject.clone(),
             tenant: self.tenant.clone(),
-            idempotency_key: self.idempotency_key.clone(),
+            idempotency_key: self.outbound_idempotency_key().map(str::to_owned),
+            key_received: false,
             traceparent: self.traceparent.clone(),
             hops: self.hops,
         }
@@ -232,6 +264,7 @@ impl CallContext {
             subject: self.subject.clone(),
             tenant: self.tenant.clone(),
             idempotency_key: self.idempotency_key.clone(),
+            key_received: self.key_received,
             traceparent: self.traceparent.clone(),
             hops: self.hops,
         }
@@ -383,6 +416,34 @@ mod tests {
         assert_eq!(child.idempotency_key(), parent.idempotency_key());
         assert_eq!(child.traceparent(), parent.traceparent());
         assert_eq!(child.hops(), 3);
+    }
+
+    #[test]
+    fn a_received_idempotency_key_is_readable_but_not_forwarded() {
+        let inbound = populated().into_inbound();
+        assert_eq!(inbound.idempotency_key(), Some("order-42"));
+        assert_eq!(inbound.outbound_idempotency_key(), None);
+        let child = inbound.child();
+        assert_eq!(child.idempotency_key(), None);
+        assert_eq!(child.outbound_idempotency_key(), None);
+        assert_eq!(inbound.detached().idempotency_key(), Some("order-42"));
+        assert_eq!(inbound.detached().outbound_idempotency_key(), None);
+
+        let own = inbound.with_idempotency_key("order-43");
+        assert_eq!(own.outbound_idempotency_key(), Some("order-43"));
+        assert_eq!(own.child().idempotency_key(), Some("order-43"));
+
+        let set = populated();
+        assert_eq!(set.outbound_idempotency_key(), Some("order-42"));
+        assert_eq!(set.child().outbound_idempotency_key(), Some("order-42"));
+
+        let keyless = CallContext::new().into_inbound();
+        assert_eq!(keyless.outbound_idempotency_key(), None);
+        assert_eq!(
+            keyless.with_idempotency_key("k").outbound_idempotency_key(),
+            Some("k"),
+            "a key set after the call came in is this call's own"
+        );
     }
 
     #[tokio::test]

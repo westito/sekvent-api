@@ -5,3 +5,11 @@ error[E0425]: cannot find value `__sekvent_service_Echo` in module `crate::proto
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::proto`
    |
    = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0425]: cannot find type `__sekvent_rpc_Echo__Ping` in module `crate::proto`
+  --> tests/ui/fail/p8_missing_constant.rs:29:1
+   |
+29 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::proto`
+   |
+   = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)

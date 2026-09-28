@@ -998,7 +998,10 @@ mod tests {
             token.clone(),
             Arc::new(ready_tx),
             HealthRegistry::new(),
-            GRACE,
+            crate::unit::StopWindow {
+                grace: GRACE,
+                by: Arc::default(),
+            },
         );
         (ctx, ready)
     }

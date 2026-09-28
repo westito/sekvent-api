@@ -34,6 +34,8 @@ mod proto {
             false,
         )],
     );
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingReply);
 }
 
 #[sekvent_component::component(name = "echo", package = "check.echo.v2", proto = "crate::proto")]

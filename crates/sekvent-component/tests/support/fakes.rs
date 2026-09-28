@@ -85,6 +85,13 @@ pub enum Behaviour {
         entered: mpsc::UnboundedSender<()>,
         dropped: mpsc::UnboundedSender<()>,
     },
+    /// Hand the call's cancellation token to a task of its own, which
+    /// reports on `cancelled` once the token fires; then report entry and
+    /// never complete.
+    WatchCancel {
+        entered: mpsc::UnboundedSender<()>,
+        cancelled: mpsc::UnboundedSender<()>,
+    },
     /// Panic.
     Panic,
     /// Fail with this error.
@@ -142,6 +149,16 @@ impl Inventory for FakeInventory {
             }
             Behaviour::Pending { entered, dropped } => {
                 let _signal = DropSignal(dropped.clone());
+                entered.send(()).unwrap();
+                std::future::pending::<Result<ReserveReply, InventoryError>>().await
+            }
+            Behaviour::WatchCancel { entered, cancelled } => {
+                let token = cx.cancel_token().clone();
+                let cancelled = cancelled.clone();
+                tokio::spawn(async move {
+                    token.cancelled().await;
+                    let _ = cancelled.send(());
+                });
                 entered.send(()).unwrap();
                 std::future::pending::<Result<ReserveReply, InventoryError>>().await
             }
@@ -219,6 +236,33 @@ impl Inventory for FlakyInventory {
     ) -> Result<ReleaseReply, InventoryError> {
         self.fail(cx, "release")?;
         self.stock.release(cx, req).await
+    }
+}
+
+/// Serves the inventory by calling another inventory through `next` (a
+/// handle of a different App), recording every call that reaches it.
+pub struct RelayInventory {
+    pub probe: Probe,
+    pub next: InventoryHandle,
+}
+
+impl Inventory for RelayInventory {
+    async fn reserve(
+        &self,
+        cx: &CallContext,
+        req: ReserveRequest,
+    ) -> Result<ReserveReply, InventoryError> {
+        self.probe.record(cx);
+        self.next.reserve(cx, req).await
+    }
+
+    async fn release(
+        &self,
+        cx: &CallContext,
+        req: ReleaseRequest,
+    ) -> Result<ReleaseReply, InventoryError> {
+        self.probe.record(cx);
+        self.next.release(cx, req).await
     }
 }
 

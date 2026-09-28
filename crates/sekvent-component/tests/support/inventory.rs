@@ -87,6 +87,14 @@ pub mod proto {
             ),
         ],
     );
+    /// Request and reply of `shop.inventory.v1.Inventory.Reserve`, checked by `#[component(proto = …)]`.
+    #[doc(hidden)]
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Inventory__Reserve = (super::ReserveRequest, super::ReserveReply);
+    /// Request and reply of `shop.inventory.v1.Inventory.Release`, checked by `#[component(proto = …)]`.
+    #[doc(hidden)]
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Inventory__Release = (super::ReleaseRequest, super::ReleaseReply);
 }
 
 // ---------------------------------------------------------------------------
@@ -260,20 +268,20 @@ pub trait __InventoryDyn: ::core::marker::Send + ::core::marker::Sync + 'static 
 }
 
 #[allow(clippy::all, clippy::pedantic)]
-impl<T: Inventory> __InventoryDyn for T {
+impl<__SekventImpl: Inventory> __InventoryDyn for __SekventImpl {
     fn __reserve<'a>(
         &'a self,
         cx: &'a CallContext,
         req: ReserveRequest,
     ) -> ::sekvent_component::__private::BoxFuture<'a, Result<ReserveReply, InventoryError>> {
-        ::std::boxed::Box::pin(<T as Inventory>::reserve(self, cx, req))
+        ::std::boxed::Box::pin(<__SekventImpl as Inventory>::reserve(self, cx, req))
     }
     fn __release<'a>(
         &'a self,
         cx: &'a CallContext,
         req: ReleaseRequest,
     ) -> ::sekvent_component::__private::BoxFuture<'a, Result<ReleaseReply, InventoryError>> {
-        ::std::boxed::Box::pin(<T as Inventory>::release(self, cx, req))
+        ::std::boxed::Box::pin(<__SekventImpl as Inventory>::release(self, cx, req))
     }
 }
 
@@ -345,17 +353,18 @@ impl InventoryHandle {
     /// Install the implementation `factory` builds. The factory runs during
     /// `AppBuilder::build`, in install order, and only when the component is
     /// bound `local` or `local-serialized`.
-    pub fn install<T, F>(
+    pub fn install<__SekventImpl, __SekventFactory>(
         app: &mut ::sekvent_component::AppBuilder<'_>,
-        factory: F,
+        factory: __SekventFactory,
     ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
     where
-        T: Inventory,
-        F: ::core::ops::FnOnce(
+        __SekventImpl: Inventory,
+        __SekventFactory: ::core::ops::FnOnce(
                 &mut ::sekvent_component::Deps<'_>,
-            )
-                -> ::core::result::Result<T, ::sekvent_component::AppError>
-            + ::core::marker::Send
+            ) -> ::core::result::Result<
+                __SekventImpl,
+                ::sekvent_component::AppError,
+            > + ::core::marker::Send
             + 'static,
     {
         ::sekvent_component::__private::install_local(app, InventoryHandle, move |deps| {
@@ -370,22 +379,24 @@ impl InventoryHandle {
 
     /// Like [`InventoryHandle::install`], and also run the implementation's
     /// `Lifecycle` hooks when the App starts and stops.
-    pub fn install_with_lifecycle<T, F>(
+    pub fn install_with_lifecycle<__SekventImpl, __SekventFactory>(
         app: &mut ::sekvent_component::AppBuilder<'_>,
-        factory: F,
+        factory: __SekventFactory,
     ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
     where
-        T: Inventory + ::sekvent_component::Lifecycle,
-        F: ::core::ops::FnOnce(
+        __SekventImpl: Inventory + ::sekvent_component::Lifecycle,
+        __SekventFactory: ::core::ops::FnOnce(
                 &mut ::sekvent_component::Deps<'_>,
-            )
-                -> ::core::result::Result<T, ::sekvent_component::AppError>
-            + ::core::marker::Send
+            ) -> ::core::result::Result<
+                __SekventImpl,
+                ::sekvent_component::AppError,
+            > + ::core::marker::Send
             + 'static,
     {
         ::sekvent_component::__private::install_local(app, InventoryHandle, move |deps| {
             let concrete = ::std::sync::Arc::new(factory(deps)?);
-            let imp: ::std::sync::Arc<dyn __InventoryDyn> = ::std::sync::Arc::<T>::clone(&concrete);
+            let imp: ::std::sync::Arc<dyn __InventoryDyn> =
+                ::std::sync::Arc::<__SekventImpl>::clone(&concrete);
             let dispatch =
                 ::std::sync::Arc::new(__InventoryDispatcher(::std::sync::Arc::clone(&imp)));
             ::core::result::Result::Ok(
@@ -461,16 +472,26 @@ const _: () = {
 const _: () = ::sekvent_component::__private::assert_service(
     crate::support::inventory::proto::__sekvent_service_Inventory,
     "shop.inventory.v1.Inventory",
-    2usize,
+    &["Reserve", "Release"],
 );
 const _: () = ::sekvent_component::__private::assert_rpc::<ReserveRequest, ReserveReply>(
     crate::support::inventory::proto::__sekvent_service_Inventory,
     "Reserve",
 );
+const _: () = ::sekvent_component::__private::assert_rpc_types::<
+    ReserveRequest,
+    ReserveReply,
+    crate::support::inventory::proto::__sekvent_rpc_Inventory__Reserve,
+>();
 const _: () = ::sekvent_component::__private::assert_rpc::<ReleaseRequest, ReleaseReply>(
     crate::support::inventory::proto::__sekvent_service_Inventory,
     "Release",
 );
+const _: () = ::sekvent_component::__private::assert_rpc_types::<
+    ReleaseRequest,
+    ReleaseReply,
+    crate::support::inventory::proto::__sekvent_rpc_Inventory__Release,
+>();
 
 // ---------------------------------------------------------------------------
 // Not part of the expansion: lets tests pair the handle with another

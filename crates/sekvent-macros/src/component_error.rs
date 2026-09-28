@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote, quote_spanned};
 use syn::ext::IdentExt;
 use syn::parse::ParseStream;
@@ -420,6 +420,7 @@ fn generate(
     let decode = reasons
         .iter()
         .map(|reason| decode_branch(reason, domain, krate));
+    let error = local("error");
     quote! {
         #assertions
 
@@ -429,30 +430,37 @@ fn generate(
             fn into_app_error(self) -> #krate::AppError {
                 match self {
                     #(#encode)*
-                    Self::#other(error) => error,
+                    Self::#other(#error) => #error,
                 }
             }
 
-            fn from_app_error(error: #krate::AppError) -> Self {
+            fn from_app_error(#error: #krate::AppError) -> Self {
                 #(#decode)*
-                Self::#other(error)
+                Self::#other(#error)
             }
         }
 
         #[automatically_derived]
         impl ::core::convert::From<#krate::AppError> for #name {
-            fn from(error: #krate::AppError) -> Self {
-                <Self as #krate::ComponentError>::from_app_error(error)
+            fn from(#error: #krate::AppError) -> Self {
+                <Self as #krate::ComponentError>::from_app_error(#error)
             }
         }
 
         #[automatically_derived]
         impl ::core::convert::From<#name> for #krate::AppError {
-            fn from(error: #name) -> Self {
-                <#name as #krate::ComponentError>::into_app_error(error)
+            fn from(#error: #name) -> Self {
+                <#name as #krate::ComponentError>::into_app_error(#error)
             }
         }
     }
+}
+
+/// A local variable or parameter of the expansion. The mixed-site span
+/// keeps it apart from a field of the same name (`error`, `value`), as in
+/// a `macro_rules!` macro, without changing how it reads.
+fn local(name: &str) -> Ident {
+    Ident::new(name, Span::mixed_site())
 }
 
 /// `Self::X`, `Self::X {}` or `Self::X { a, b }`.
@@ -495,25 +503,26 @@ fn encode_arm(reason: &Reason, domain: Option<&LitStr>, krate: &TokenStream) -> 
     let Some((&last, rest)) = optional.split_last() else {
         return quote!(#pattern => #base,);
     };
+    let (error, value) = (local("error"), local("value"));
     let attach = |field: &MetadataField| {
         let ident = &field.ident;
         let key = field.key();
         quote! {
             match #ident {
-                ::core::option::Option::Some(value) =>
-                    error.with_metadata(#key, ::std::string::ToString::to_string(&value)),
-                ::core::option::Option::None => error,
+                ::core::option::Option::Some(#value) =>
+                    #error.with_metadata(#key, ::std::string::ToString::to_string(&#value)),
+                ::core::option::Option::None => #error,
             }
         }
     };
     let rest = rest.iter().map(|&field| {
         let attach = attach(field);
-        quote!(let error = #attach;)
+        quote!(let #error = #attach;)
     });
     let last = attach(last);
     quote! {
         #pattern => {
-            let error = #base;
+            let #error = #base;
             #(#rest)*
             #last
         }
@@ -531,6 +540,7 @@ fn decode_branch(reason: &Reason, domain: Option<&LitStr>, krate: &TokenStream) 
     };
     let construct = construct(reason);
     let fields = reason.fields.as_deref().unwrap_or_default();
+    let error = local("error");
     let body = if fields.is_empty() {
         quote!(return #construct;)
     } else {
@@ -538,9 +548,9 @@ fn decode_branch(reason: &Reason, domain: Option<&LitStr>, krate: &TokenStream) 
             let ty = &field.ty;
             let key = field.key();
             if field.optional {
-                quote!(#krate::__private::optional_field::<#ty>(&error, #key))
+                quote!(#krate::__private::optional_field::<#ty>(&#error, #key))
             } else {
-                quote!(#krate::__private::field::<#ty>(&error, #key))
+                quote!(#krate::__private::field::<#ty>(&#error, #key))
             }
         });
         let idents = fields.iter().map(|field| &field.ident);
@@ -552,7 +562,7 @@ fn decode_branch(reason: &Reason, domain: Option<&LitStr>, krate: &TokenStream) 
         }
     };
     quote! {
-        if #krate::__private::matches(&error, #text, #domain) {
+        if #krate::__private::matches(&#error, #text, #domain) {
             #body
         }
     }

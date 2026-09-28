@@ -1,7 +1,7 @@
 error[E0080]: evaluation panicked: component contract: the proto service is not <package>.<Trait>; check package and proto
-  --> tests/ui/fail/p6_package_mismatch.rs:39:1
+  --> tests/ui/fail/p6_package_mismatch.rs:41:1
    |
-39 | #[sekvent_component::component(name = "echo", package = "check.echo.v2", proto = "crate::proto")]
+41 | #[sekvent_component::component(name = "echo", package = "check.echo.v2", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
    |
 note: inside `sekvent_component::__private::assert_service`

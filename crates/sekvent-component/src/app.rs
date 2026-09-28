@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use sekvent_config::ConfigSource;
 use sekvent_error::AppError;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
+use tokio::time::Instant;
 
 use crate::__private::Dispatch;
 use crate::config::{self, Entry, Resolved, Settings};
@@ -236,6 +237,7 @@ impl AppBuilder<'_> {
                 exposed,
                 mounted: AtomicBool::new(false),
                 phase: watch::Sender::new(Phase::Built),
+                serial: Mutex::new(()),
             }),
         })
     }
@@ -539,6 +541,10 @@ struct Inner {
     /// Whether [`App::grpc_routes`] was called.
     mounted: AtomicBool,
     phase: watch::Sender<Phase>,
+    /// Held while components start and while they stop, so a teardown never
+    /// runs alongside the start sequence and every started component is
+    /// stopped exactly once.
+    serial: Mutex<()>,
 }
 
 /// A built set of components. Cheap to clone; clones share everything.
@@ -618,14 +624,26 @@ impl App {
     /// component for calls once its hook succeeded.
     ///
     /// On the first failure the components already started are stopped in
-    /// reverse order, the App is stopped, and the error is returned with
-    /// `component` metadata. Starting an App twice, or after
-    /// [`stop`](Self::stop), is `FAILED_PRECONDITION`; so is starting one
-    /// whose exposed components' gRPC routes were never taken (reason
-    /// `GRPC_NOT_MOUNTED`), before any component starts.
+    /// reverse order (without a grace period), the App is stopped, and the
+    /// error is returned with `component` metadata once they all stopped.
+    ///
+    /// A [`stop`](Self::stop) while the App starts wins: the `on_start` hook
+    /// still running is cancelled (its future dropped, and that component
+    /// counts as never started), and `start` fails with
+    /// `FAILED_PRECONDITION` naming it while `stop` stops the components that
+    /// did start. Dropping this future before it finishes does the same,
+    /// with no grace period, on a task of its own.
+    ///
+    /// Starting an App twice, or after [`stop`](Self::stop), is
+    /// `FAILED_PRECONDITION`; so is starting one whose exposed components'
+    /// gRPC routes were never taken (reason `GRPC_NOT_MOUNTED`), before any
+    /// component starts.
     pub async fn start(&self) -> Result<(), AppError> {
         self.check_mounted()?;
-        match self.transition(|phase| (phase == Phase::Built).then_some(Phase::Starting)) {
+        match self
+            .inner
+            .transition(|phase| (phase == Phase::Built).then_some(Phase::Starting))
+        {
             Phase::Built => {}
             Phase::Stopping | Phase::Stopped => {
                 return Err(AppError::failed_precondition(
@@ -636,109 +654,67 @@ impl App {
                 return Err(AppError::failed_precondition("the app was already started"));
             }
         }
-        let components = &self.inner.components;
-        for (index, component) in components.iter().enumerate() {
-            let name = component.descriptor.name();
-            if let Some(lifecycle) = &component.lifecycle
-                && let Err(error) = lifecycle.start().await
-            {
-                self.roll_back(index).await;
-                return Err(error.with_metadata("component", name));
-            }
-            if !component.server.open() {
-                if let Some(lifecycle) = &component.lifecycle
-                    && let Err(error) = lifecycle.stop().await
-                {
-                    tracing::warn!(component = name, error = %error, "stop hook failed");
+        let _abandon = AbandonStart(&self.inner);
+        match self.inner.start_components().await {
+            Started::All => {
+                let previous = self
+                    .inner
+                    .transition(|phase| (phase == Phase::Starting).then_some(Phase::Running));
+                if previous == Phase::Starting {
+                    Ok(())
+                } else {
+                    Err(stopped_while_starting())
                 }
-                return Err(stopped_while_starting().with_metadata("component", name));
             }
-        }
-        let previous =
-            self.transition(|phase| (phase == Phase::Starting).then_some(Phase::Running));
-        if previous == Phase::Starting {
-            Ok(())
-        } else {
-            Err(stopped_while_starting())
+            Started::Interrupted(error) => Err(error),
+            Started::Failed(error) => {
+                if self.inner.stop_from(Phase::Starting) {
+                    let rollback = Arc::clone(&self.inner).teardown(Some(Instant::now()));
+                    if let Err(stop_error) = joined(tokio::spawn(rollback).await) {
+                        tracing::warn!(
+                            error = %stop_error,
+                            "stop hook failed while rolling back a failed start"
+                        );
+                    }
+                }
+                Err(error)
+            }
         }
     }
 
     /// Stop every component in reverse install order: reject new calls, wait
     /// for in-flight calls until `grace` has passed (in total, not per
-    /// component), then run its `on_stop` hook.
+    /// component), then run its `on_stop` hook. `grace` bounds the drain
+    /// only; the hooks run to completion after it.
     ///
-    /// Every component is stopped even when a hook fails; the first hook
-    /// error is returned with `component` metadata. Idempotent: a second call
-    /// waits for the first to finish and returns `Ok`. On an App that never
-    /// started, only marks the components stopped.
+    /// Every started component is stopped exactly once, even when a hook
+    /// fails; the first hook error is returned with `component` metadata.
+    /// The stop runs on a task of its own, so dropping this future does not
+    /// interrupt it. Idempotent: a later call waits until every component
+    /// has stopped and returns `Ok`. On an App that never started, only
+    /// marks the components stopped; on one that is starting, first waits
+    /// for the start to give up (see [`start`](Self::start)).
     pub async fn stop(&self, grace: Duration) -> Result<(), AppError> {
-        let previous = self.transition(|phase| match phase {
-            Phase::Built => Some(Phase::Stopped),
-            Phase::Starting | Phase::Running => Some(Phase::Stopping),
+        let deadline = Instant::now().checked_add(grace);
+        let previous = self.inner.transition(|phase| match phase {
+            Phase::Built | Phase::Starting | Phase::Running => Some(Phase::Stopping),
             Phase::Stopping | Phase::Stopped => None,
         });
         match previous {
             Phase::Built => {
-                for component in &self.inner.components {
-                    component.server.set_state(ComponentState::Stopped);
-                }
-                return Ok(());
+                self.inner.mark_stopped();
+                Ok(())
+            }
+            Phase::Starting | Phase::Running => {
+                joined(tokio::spawn(Arc::clone(&self.inner).teardown(deadline)).await)
             }
             Phase::Stopping | Phase::Stopped => {
                 let mut phases = self.inner.phase.subscribe();
                 // The sender lives as long as `self`, so the wait cannot fail.
                 drop(phases.wait_for(|phase| *phase == Phase::Stopped).await);
-                return Ok(());
-            }
-            Phase::Starting | Phase::Running => {}
-        }
-        let deadline = tokio::time::Instant::now().checked_add(grace);
-        let mut first_error = None;
-        for component in self.inner.components.iter().rev() {
-            if let Err(error) = stop_component(component, deadline).await
-                && first_error.is_none()
-            {
-                first_error = Some(error.with_metadata("component", component.descriptor.name()));
+                Ok(())
             }
         }
-        self.inner.phase.send_replace(Phase::Stopped);
-        first_error.map_or(Ok(()), Err)
-    }
-
-    /// After component `failed` did not start: stop the ones before it at
-    /// once, mark the rest stopped, and stop the App.
-    async fn roll_back(&self, failed: usize) {
-        let now = Some(tokio::time::Instant::now());
-        let components = &self.inner.components;
-        for component in components[..failed].iter().rev() {
-            if let Err(error) = stop_component(component, now).await {
-                tracing::warn!(
-                    component = component.descriptor.name(),
-                    error = %error,
-                    "stop hook failed while rolling back a failed start"
-                );
-            }
-        }
-        for component in &components[failed..] {
-            component.server.set_state(ComponentState::Stopped);
-        }
-        self.inner.phase.send_replace(Phase::Stopped);
-    }
-
-    /// Apply `next` to the phase atomically; returns the phase before.
-    fn transition(&self, next: impl FnOnce(Phase) -> Option<Phase>) -> Phase {
-        let mut previous = Phase::Built;
-        self.inner.phase.send_if_modified(|phase| {
-            previous = *phase;
-            match next(*phase) {
-                Some(new) => {
-                    *phase = new;
-                    true
-                }
-                None => false,
-            }
-        });
-        previous
     }
 
     /// `GRPC_NOT_MOUNTED` for the first exposed component when
@@ -766,22 +742,161 @@ impl App {
     }
 }
 
+/// How the start sequence ended.
+enum Started {
+    /// Every component started.
+    All,
+    /// A stop was requested; the stop owns the teardown.
+    Interrupted(AppError),
+    /// A hook failed; the start rolls back.
+    Failed(AppError),
+}
+
+impl Inner {
+    /// Run the `on_start` hooks in install order, each raced with a stop
+    /// request, and open each component whose hook succeeded.
+    async fn start_components(&self) -> Started {
+        let _serial = self.serial.lock().await;
+        let mut phases = self.phase.subscribe();
+        for component in &self.components {
+            let name = component.descriptor.name();
+            let hook = async {
+                match &component.lifecycle {
+                    Some(lifecycle) => lifecycle.start().await,
+                    None => Ok(()),
+                }
+            };
+            let outcome = tokio::select! {
+                biased;
+                _ = phases.wait_for(|phase| *phase != Phase::Starting) => None,
+                outcome = hook => Some(outcome),
+            };
+            match outcome {
+                None => {
+                    return Started::Interrupted(
+                        stopped_while_starting().with_metadata("component", name),
+                    );
+                }
+                Some(Err(error)) => return Started::Failed(error.with_metadata("component", name)),
+                Some(Ok(())) => {}
+            }
+            // Only a teardown abandoned while waiting for this sequence to
+            // end marks a component meanwhile.
+            if !component.server.open() {
+                return Started::Interrupted(
+                    stopped_while_starting().with_metadata("component", name),
+                );
+            }
+        }
+        Started::All
+    }
+
+    /// Drain and stop every component in reverse install order, draining
+    /// until `deadline` (`None`: no limit); returns the first hook error.
+    ///
+    /// The App is stopped once the returned future ends, whether it
+    /// finishes, unwinds or is dropped, even before its first poll.
+    fn teardown(
+        self: Arc<Self>,
+        deadline: Option<Instant>,
+    ) -> impl Future<Output = Result<(), AppError>> + Send + 'static {
+        let stopped = MarkStopped(self);
+        async move {
+            let inner = &stopped.0;
+            let _serial = inner.serial.lock().await;
+            let mut first_error = None;
+            for component in inner.components.iter().rev() {
+                if let Err(error) = stop_component(component, deadline).await
+                    && first_error.is_none()
+                {
+                    first_error =
+                        Some(error.with_metadata("component", component.descriptor.name()));
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        }
+    }
+
+    /// Mark every component and the App stopped.
+    fn mark_stopped(&self) {
+        for component in &self.components {
+            component.server.set_state(ComponentState::Stopped);
+        }
+        self.phase.send_replace(Phase::Stopped);
+    }
+
+    /// Move the App from `from` to stopping; whether it was in `from`.
+    fn stop_from(&self, from: Phase) -> bool {
+        self.transition(|phase| (phase == from).then_some(Phase::Stopping)) == from
+    }
+
+    /// Apply `next` to the phase atomically; returns the phase before.
+    fn transition(&self, next: impl FnOnce(Phase) -> Option<Phase>) -> Phase {
+        let mut previous = Phase::Built;
+        self.phase.send_if_modified(|phase| {
+            previous = *phase;
+            match next(*phase) {
+                Some(new) => {
+                    *phase = new;
+                    true
+                }
+                None => false,
+            }
+        });
+        previous
+    }
+}
+
+/// Marks the App stopped when dropped, even while a stop hook unwinds.
+struct MarkStopped(Arc<Inner>);
+
+impl Drop for MarkStopped {
+    fn drop(&mut self) {
+        self.0.mark_stopped();
+    }
+}
+
+/// Stops the components of a start whose future was dropped before it
+/// finished; a no-op once the start left [`Phase::Starting`].
+struct AbandonStart<'a>(&'a Arc<Inner>);
+
+impl Drop for AbandonStart<'_> {
+    fn drop(&mut self) {
+        if !self.0.stop_from(Phase::Starting) {
+            return;
+        }
+        let rollback = Arc::clone(self.0).teardown(Some(Instant::now()));
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(rollback));
+        } else {
+            // Dropping the rollback marks everything stopped.
+            tracing::warn!(
+                "an unfinished start was dropped outside a tokio runtime; \
+                 the components are marked stopped without their stop hooks"
+            );
+        }
+    }
+}
+
+/// The result of a spawned stop; a panic (or a task the runtime cancelled)
+/// is `INTERNAL`.
+fn joined(result: Result<Result<(), AppError>, tokio::task::JoinError>) -> Result<(), AppError> {
+    result.unwrap_or_else(|panic| Err(AppError::internal(panic)))
+}
+
 fn stopped_while_starting() -> AppError {
     AppError::failed_precondition("the app was stopped while it was starting")
 }
 
-/// Drain one component until `deadline` (`None`: no limit), run its stop
-/// hook if it had started, and mark it stopped.
-async fn stop_component(
-    component: &Component,
-    deadline: Option<tokio::time::Instant>,
-) -> Result<(), AppError> {
+/// Drain one started component until `deadline` (`None`: no limit), run its
+/// stop hook, and mark it stopped; a component that never started is only
+/// marked stopped.
+async fn stop_component(component: &Component, deadline: Option<Instant>) -> Result<(), AppError> {
     let server = &component.server;
-    let started = match server.state() {
-        ComponentState::Stopped => return Ok(()),
-        ComponentState::NotStarted => false,
-        ComponentState::Serving | ComponentState::Draining => true,
-    };
+    if server.state() != ComponentState::Serving {
+        server.set_state(ComponentState::Stopped);
+        return Ok(());
+    }
     server.set_state(ComponentState::Draining);
     if !server.wait_idle(deadline).await {
         tracing::warn!(
@@ -791,8 +906,12 @@ async fn stop_component(
         );
     }
     let outcome = match &component.lifecycle {
-        Some(lifecycle) if started => lifecycle.stop().await,
-        _ => Ok(()),
+        // On a task of its own, so a panicking hook fails only its component.
+        Some(lifecycle) => {
+            let lifecycle = Arc::clone(lifecycle);
+            joined(tokio::spawn(async move { lifecycle.stop().await }).await)
+        }
+        None => Ok(()),
     };
     server.set_state(ComponentState::Stopped);
     outcome

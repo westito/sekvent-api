@@ -1,13 +1,18 @@
 //! The inventory served over gRPC on loopback and called through the `grpc`
 //! binding or a plain tonic client: results, typed errors, authentication,
-//! the forwarded context, hop limits, malformed requests and health.
+//! the forwarded context, hop limits, malformed requests and health, and
+//! the header-only decisions made before a request body is read.
 
 mod support;
 
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use http::uri::PathAndQuery;
+use http_body::{Body as _, Frame};
 use sekvent_component::{AppError, Binding, CallContext, ErrorCode, reasons};
 use sekvent_config::{ConfigError, MapSource};
 use sekvent_error::grpc::from_status;
@@ -320,24 +325,23 @@ async fn deadlines_cross_the_hop_and_the_server_applies_its_own_timeout() {
         let (service, probe) = inventory_service(&service_keys(), FakeInventory::stock(5)).await;
         let (app, inventory) = caller(&service.endpoint(), &[]).await;
 
-        // The caller's 300 ms deadline shortens the server's 2 s timeout.
-        let start = Instant::now();
-        let cx = CallContext::new().with_deadline(start + Duration::from_millis(300));
-        inventory.reserve(&cx, reserve(1)).await.unwrap();
-        let deadline = probe.calls()[0].deadline.unwrap();
-        assert!(deadline > start);
-        assert!(
-            deadline < start + Duration::from_millis(1500),
-            "{deadline:?}"
-        );
-
-        // Without a caller deadline, the method's 2 s timeout applies.
+        // Without a caller deadline, the method's 2 s timeout applies. This
+        // call also connects the lazy channel, so the next one has its whole
+        // budget for the hop.
         inventory
             .reserve(&CallContext::new(), reserve(1))
             .await
             .unwrap();
-        let deadline = probe.calls()[1].deadline.unwrap();
+        let deadline = probe.calls()[0].deadline.unwrap();
         assert!(deadline <= Instant::now() + Duration::from_secs(2));
+
+        // The caller's 1 s deadline shortens the server's 2 s timeout.
+        let start = Instant::now();
+        let cx = CallContext::new().with_deadline(start + Duration::from_secs(1));
+        inventory.reserve(&cx, reserve(1)).await.unwrap();
+        let deadline = probe.calls()[1].deadline.unwrap();
+        assert!(deadline > start);
+        assert!(deadline < start + Duration::from_secs(2), "{deadline:?}");
 
         // A plain client sending no grpc-timeout still gets the server's.
         let reply: ReserveReply = raw_call(service.addr, RESERVE, reserve(1), Some(TOKEN), None)
@@ -354,27 +358,64 @@ async fn deadlines_cross_the_hop_and_the_server_applies_its_own_timeout() {
 }
 
 #[tokio::test]
-async fn calls_deeper_than_the_hop_limit_are_rejected() {
+async fn the_server_enforces_its_own_hop_limit() {
     guarded(async {
         let keys = with(service_keys(), &[("SEKVENT_COMPONENT_MAX_HOPS", "1")]);
         let (service, probe) = inventory_service(&keys, FakeInventory::stock(5)).await;
-        let endpoint = service.endpoint();
-        for caller_limit in ["16", "1"] {
-            let (app, inventory) =
-                caller(&endpoint, &[("SEKVENT_COMPONENT_MAX_HOPS", caller_limit)]).await;
-            let error = other(
-                inventory
-                    .reserve(&CallContext::new().with_hops(1), reserve(1))
-                    .await
-                    .unwrap_err(),
-            );
-            assert_eq!(error.code(), ErrorCode::FailedPrecondition);
-            assert_eq!(error.reason(), Some(reasons::CALL_DEPTH_EXCEEDED));
-            assert_eq!(error.metadata()["component"], "inventory");
-            assert_eq!(error.metadata()["method"], "reserve");
-            app.stop(Duration::ZERO).await.unwrap();
-        }
+        // The caller allows 16 hops, so only the server can refuse hop 2.
+        let (app, inventory) =
+            caller(&service.endpoint(), &[("SEKVENT_COMPONENT_MAX_HOPS", "16")]).await;
+        let error = other(
+            inventory
+                .reserve(&CallContext::new().with_hops(1), reserve(1))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(error.reason(), Some(reasons::CALL_DEPTH_EXCEEDED));
+        assert_eq!(error.metadata()["component"], "inventory");
+        assert_eq!(error.metadata()["method"], "reserve");
+
+        // The same refusal for a plain client that sends the hop count.
+        let response = raw_http(
+            service.addr,
+            RESERVE,
+            &[("authorization", BEARER), ("x-sekvent-hops", "2")],
+            Frames::message(&reserve(1)),
+        )
+        .await;
+        let (status, _) = outcome(response).await;
+        assert_eq!(status, tonic::Code::FailedPrecondition);
         assert!(probe.calls().is_empty());
+
+        inventory
+            .reserve(&CallContext::new(), reserve(1))
+            .await
+            .unwrap();
+        assert_eq!(probe.calls().len(), 1);
+        app.stop(Duration::ZERO).await.unwrap();
+        service.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_caller_enforces_its_own_hop_limit() {
+    guarded(async {
+        // The server allows the default 16 hops and would serve hop 2.
+        let (service, probe) = inventory_service(&service_keys(), FakeInventory::stock(5)).await;
+        let (app, inventory) =
+            caller(&service.endpoint(), &[("SEKVENT_COMPONENT_MAX_HOPS", "1")]).await;
+        let error = other(
+            inventory
+                .reserve(&CallContext::new().with_hops(1), reserve(1))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(error.reason(), Some(reasons::CALL_DEPTH_EXCEEDED));
+        assert!(probe.calls().is_empty());
+        app.stop(Duration::ZERO).await.unwrap();
         service.stop().await;
     })
     .await;
@@ -413,13 +454,23 @@ async fn a_plain_tonic_client_interoperates() {
             .unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
-        // The method lookup comes before authentication.
+        // Authentication comes before the method lookup.
+        let status = raw_call::<_, ReserveReply>(
+            addr,
+            "/shop.inventory.v1.Inventory/Stock",
+            reserve(1),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
         let error = from_status(
             &raw_call::<_, ReserveReply>(
                 addr,
                 "/shop.inventory.v1.Inventory/Stock",
                 reserve(1),
-                None,
+                Some(TOKEN),
                 None,
             )
             .await
@@ -541,6 +592,325 @@ async fn health_follows_the_app() {
             app.state("inventory"),
             Some(sekvent_component::ComponentState::Stopped)
         );
+    })
+    .await;
+}
+
+const BEARER: &str = "Bearer shop-link-token-0123456789abcdefghijklmn";
+
+/// A request body: gRPC-framed data, then optional trailers or a stall that
+/// never ends.
+struct Frames {
+    data: Option<Bytes>,
+    trailers: Option<http::HeaderMap>,
+    stall: bool,
+}
+
+impl Frames {
+    /// One complete gRPC message.
+    fn message(message: &impl prost::Message) -> Self {
+        let encoded = message.encode_to_vec();
+        let mut data = vec![0];
+        data.extend_from_slice(&u32::try_from(encoded.len()).unwrap().to_be_bytes());
+        data.extend_from_slice(&encoded);
+        Self {
+            data: Some(Bytes::from(data)),
+            trailers: None,
+            stall: false,
+        }
+    }
+
+    /// The message, then these request trailers.
+    fn with_trailers(mut self, trailers: &[(&'static str, &str)]) -> Self {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in trailers {
+            map.insert(*name, value.parse().unwrap());
+        }
+        self.trailers = Some(map);
+        self
+    }
+
+    /// The prefix of a 1 MiB message and some of its bytes, then nothing,
+    /// ever: a server that waits for the body never answers.
+    fn stalled() -> Self {
+        let mut data = vec![0];
+        data.extend_from_slice(&(1_u32 << 20).to_be_bytes());
+        data.extend_from_slice(&[0; 1024]);
+        Self {
+            data: Some(Bytes::from(data)),
+            trailers: None,
+            stall: true,
+        }
+    }
+}
+
+impl http_body::Body for Frames {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        if let Some(data) = self.data.take() {
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        if self.stall {
+            return Poll::Pending;
+        }
+        Poll::Ready(
+            self.trailers
+                .take()
+                .map(|trailers| Ok(Frame::trailers(trailers))),
+        )
+    }
+}
+
+/// One raw HTTP/2 gRPC request with exactly these headers and body, over a
+/// plain HTTP/2 client: a tonic channel would enforce `grpc-timeout` itself
+/// and race the server's answer.
+async fn raw_http(
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&'static str, &str)],
+    body: Frames,
+) -> http::Response<tonic::body::Body> {
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .http2_only(true)
+        .build_http::<tonic::body::Body>();
+    let mut request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("http://{addr}{path}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let request = request.body(tonic::body::Body::new(body)).unwrap();
+    client
+        .request(request)
+        .await
+        .unwrap()
+        .map(tonic::body::Body::new)
+}
+
+/// The gRPC status of a response (from its headers when trailers-only, else
+/// from its trailers) and the number of data bytes it carried.
+async fn outcome(response: http::Response<tonic::body::Body>) -> (tonic::Code, usize) {
+    let status = |map: &http::HeaderMap| {
+        map.get("grpc-status")
+            .map(|value| tonic::Code::from_bytes(value.as_bytes()))
+    };
+    if let Some(code) = status(response.headers()) {
+        return (code, 0);
+    }
+    let mut body = response.into_body();
+    let mut bytes = 0;
+    let mut code = None;
+    while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+        let frame = frame.unwrap();
+        if let Some(data) = frame.data_ref() {
+            bytes += data.len();
+        } else if let Some(trailers) = frame.trailers_ref() {
+            code = status(trailers);
+        }
+    }
+    (code.expect("a grpc-status"), bytes)
+}
+
+#[tokio::test]
+async fn request_trailers_never_reach_the_context() {
+    guarded(async {
+        let keys = with(
+            service_keys(),
+            &[
+                ("SEKVENT_LINK_TRUSTED", "shop"),
+                ("SEKVENT_COMPONENT_MAX_HOPS", "1"),
+            ],
+        );
+        let (service, probe) = inventory_service(&keys, FakeInventory::stock(5)).await;
+        let spoofed = [
+            ("x-sekvent-subject", "u-spoofed"),
+            ("x-sekvent-tenant", "t-spoofed"),
+            ("x-sekvent-hops", "9"),
+            ("grpc-timeout", "1n"),
+            ("x-request-id", "req-spoofed"),
+        ];
+
+        // Identity, hops and timeout sent only as trailers are ignored: the
+        // call is served, as hop 0, without the spoofed identity.
+        let response = raw_http(
+            service.addr,
+            RESERVE,
+            &[("authorization", BEARER), ("x-request-id", "req-1")],
+            Frames::message(&reserve(1)).with_trailers(&spoofed),
+        )
+        .await;
+        let (status, bytes) = outcome(response).await;
+        assert_eq!(status, tonic::Code::Ok);
+        assert!(bytes > 0);
+        let seen = probe.calls();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].request_id, "req-1");
+        assert_eq!(seen[0].subject, None);
+        assert_eq!(seen[0].tenant, None);
+        assert_eq!(seen[0].hops, 0);
+        assert!(seen[0].deadline.unwrap() > Instant::now());
+
+        // A token sent only as a trailer authenticates nothing.
+        let response = raw_http(
+            service.addr,
+            RESERVE,
+            &[],
+            Frames::message(&reserve(1)).with_trailers(&[("authorization", BEARER)]),
+        )
+        .await;
+        assert_eq!(outcome(response).await.0, tonic::Code::Unauthenticated);
+        assert_eq!(probe.calls().len(), 1);
+        service.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn requests_are_refused_before_their_body_is_read() {
+    guarded(async {
+        let (service, probe) = inventory_service(&service_keys(), FakeInventory::stock(5)).await;
+        // The body never ends, so only an answer from the headers arrives.
+        for (headers, path, code) in [
+            (vec![], RESERVE, tonic::Code::Unauthenticated),
+            (
+                vec![(
+                    "authorization",
+                    "Bearer other-link-token-0123456789abcdefghijklm",
+                )],
+                RESERVE,
+                tonic::Code::Unauthenticated,
+            ),
+            (
+                vec![("authorization", BEARER)],
+                "/shop.inventory.v1.Inventory/Stock",
+                tonic::Code::Unimplemented,
+            ),
+            (
+                vec![("authorization", BEARER), ("x-sekvent-hops", "99")],
+                RESERVE,
+                tonic::Code::FailedPrecondition,
+            ),
+        ] {
+            let response = raw_http(service.addr, path, &headers, Frames::stalled()).await;
+            assert_eq!(outcome(response).await.0, code, "{path} {headers:?}");
+        }
+
+        // An authenticated call whose body stalls ends at its deadline.
+        let start = Instant::now();
+        let response = raw_http(
+            service.addr,
+            RESERVE,
+            &[("authorization", BEARER), ("grpc-timeout", "100m")],
+            Frames::stalled(),
+        )
+        .await;
+        let (status, _) = outcome(response).await;
+        assert_eq!(status, tonic::Code::DeadlineExceeded);
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        assert!(probe.calls().is_empty());
+        service.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn only_the_exact_method_path_is_served() {
+    guarded(async {
+        let (service, probe) = inventory_service(&service_keys(), FakeInventory::stock(5)).await;
+        for path in [
+            "/shop.inventory.v1.Inventory/a/Reserve",
+            "/shop.inventory.v1.Inventory/Reserve/",
+            "/shop.inventory.v1.Inventory/x/y/Reserve",
+        ] {
+            let error = from_status(
+                &raw_call::<_, ReserveReply>(service.addr, path, reserve(1), Some(TOKEN), None)
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(error.code(), ErrorCode::Unimplemented, "{path}");
+            assert_eq!(error.reason(), Some(reasons::UNKNOWN_METHOD), "{path}");
+        }
+        assert!(probe.calls().is_empty());
+        service.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_panicking_method_is_internal_and_not_retried() {
+    guarded(async {
+        let (service, probe) =
+            inventory_service(&service_keys(), FakeInventory::new(Behaviour::Panic)).await;
+        let (app, inventory) = caller(&service.endpoint(), &[]).await;
+        let error = other(
+            inventory
+                .reserve(&CallContext::new(), reserve(1))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.reason(), Some(reasons::HANDLER_PANICKED));
+        assert_eq!(
+            error.message(),
+            "component inventory method reserve panicked"
+        );
+        assert_eq!(error.metadata()["component"], "inventory");
+        assert_eq!(error.metadata()["method"], "reserve");
+        assert_eq!(probe.calls().len(), 1);
+
+        // The server keeps serving.
+        let released = inventory
+            .release(
+                &CallContext::new(),
+                ReleaseRequest {
+                    reservation_id: "res-o1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(released.released);
+        app.stop(Duration::ZERO).await.unwrap();
+        service.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_downstream_failure_is_internal_to_the_caller() {
+    guarded(async {
+        let inventory = FakeInventory::new(Behaviour::Fail(|| {
+            InventoryError::Other(
+                AppError::unavailable("pricing is down")
+                    .with_reason(reasons::CIRCUIT_OPEN)
+                    .with_metadata("downstream", "pricing"),
+            )
+        }));
+        let (service, probe) = inventory_service(&service_keys(), inventory).await;
+        let (app, inventory) = caller(&service.endpoint(), &[]).await;
+        let error = other(
+            inventory
+                .reserve(&CallContext::new(), reserve(1))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.reason(), Some(reasons::DOWNSTREAM_FAILURE));
+        assert_eq!(error.metadata()["downstream"], "pricing");
+        assert_eq!(error.metadata()["downstream_code"], "UNAVAILABLE");
+        assert_eq!(error.metadata()["downstream_reason"], reasons::CIRCUIT_OPEN);
+        assert_eq!(error.metadata()["component"], "inventory");
+        assert_eq!(error.metadata()["method"], "reserve");
+        // Not retried: the inventory saw one call.
+        assert_eq!(probe.calls().len(), 1);
+        app.stop(Duration::ZERO).await.unwrap();
+        service.stop().await;
     })
     .await;
 }

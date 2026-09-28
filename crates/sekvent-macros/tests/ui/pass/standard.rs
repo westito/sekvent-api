@@ -49,6 +49,10 @@ mod proto {
             ),
         ],
     );
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingReply);
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Echo__Twice = (super::PingRequest, super::PingReply);
 }
 
 #[derive(Debug, ComponentError)]
