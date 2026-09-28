@@ -220,7 +220,9 @@ pub struct Boundary {
 pub struct CoverageConfig {
     /// Line coverage floor for every measured package, in percent.
     pub fail_under_lines: f64,
-    /// Filename regexes left out of the report, on top of the built-ins.
+    /// Filename regexes left out of the report, on top of the built-ins
+    /// (see [`crate::coverage::builtin_ignore`]). Matched as written
+    /// against absolute paths.
     pub ignore: Vec<String>,
     /// Packages built but not measured.
     pub exclude: Vec<String>,
@@ -260,7 +262,9 @@ pub struct HarnessConfig {
     pub stale_after: String,
     /// Run the container-backed tests in `gate`, `test` and `coverage`:
     /// `SEKVENT_DOCKER_TESTS=1` is exported (unless the environment already
-    /// sets it) and the test binaries get `--include-ignored`.
+    /// sets it) and the test binaries get `--include-ignored`, doctests
+    /// running separately without it. An environment value other than `1`
+    /// or `true` switches both off.
     pub docker_tests: bool,
 }
 

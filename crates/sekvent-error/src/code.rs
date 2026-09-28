@@ -138,6 +138,10 @@ impl ErrorCode {
 
     /// Whether this code should count as a failure for a circuit breaker:
     /// the callee (not the request) is unhealthy.
+    ///
+    /// The code alone cannot tell a slow dependency from a caller whose own
+    /// deadline ran out; whoever reports outcomes to a breaker must not
+    /// report the caller's expired deadline or cancellation at all.
     pub fn trips_breaker(self) -> bool {
         matches!(
             self,

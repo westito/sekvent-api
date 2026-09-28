@@ -1,10 +1,12 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use sekvent_context::CallContext;
-use sekvent_error::AppError;
+use sekvent_error::{AppError, ErrorCode};
 
-use crate::{Bulkhead, CircuitBreaker, RateGate, RetryPolicy, Timeout};
+use crate::{Bulkhead, CircuitBreaker, RateGate, RetryPolicy, Timeout, ensure_live, remaining};
 
 /// A composed per-call resilience policy.
 ///
@@ -21,6 +23,14 @@ use crate::{Bulkhead, CircuitBreaker, RateGate, RetryPolicy, Timeout};
 /// Every part is optional except the timeout, which without a configured
 /// limit still enforces the context deadline. Cloning is cheap and shares
 /// all state (budget, gate, slots, breaker).
+///
+/// A call whose context is already cancelled or past its deadline fails
+/// before any part runs, so it spends no rate permit, slot or breaker
+/// permit. The breaker only learns about outcomes the dependency caused:
+/// when the operation never ran, or the call ended because the caller
+/// cancelled or its own deadline ran out, the breaker permit is released
+/// unrecorded. A per-attempt timeout firing while the caller still had
+/// time left does count as a failure — the dependency was too slow.
 #[derive(Debug, Clone)]
 pub struct Policy {
     name: String,
@@ -121,6 +131,7 @@ impl Policy {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, AppError>>,
     {
+        ensure_live(ctx)?;
         if let Some(gate) = &self.rate_gate {
             gate.acquire_within(ctx).await?;
         }
@@ -129,28 +140,55 @@ impl Policy {
             None => None,
         };
         let permit = match &self.breaker {
-            Some(breaker) => Some(breaker.acquire()?),
+            Some(breaker) => {
+                ensure_live(ctx)?;
+                Some(breaker.acquire()?)
+            }
             None => None,
         };
+        let invoked = AtomicBool::new(false);
         let timeout = &self.timeout;
         let result = self
             .retry
-            .retry(ctx, idempotent, || timeout.call(ctx, op()))
+            .retry(ctx, idempotent, || {
+                let attempt = op();
+                let invoked = &invoked;
+                timeout.call(ctx, async move {
+                    invoked.store(true, Ordering::Relaxed);
+                    attempt.await
+                })
+            })
             .await;
         if let Some(permit) = permit {
-            permit.record(&result);
+            if invoked.load(Ordering::Relaxed) && !caused_by_caller(ctx, &result) {
+                permit.record(&result);
+            } else {
+                permit.release();
+            }
         }
         result
+    }
+}
+
+/// Whether `result` failed because of the caller — its own cancellation or
+/// its own deadline running out — rather than because of the dependency.
+fn caused_by_caller<T>(ctx: &CallContext, result: &Result<T, AppError>) -> bool {
+    let Err(error) = result else {
+        return false;
+    };
+    match error.code() {
+        ErrorCode::Cancelled => ctx.cancel_token().is_cancelled(),
+        ErrorCode::DeadlineExceeded => remaining(ctx) == Some(Duration::ZERO),
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::time::Duration;
 
-    use sekvent_error::ErrorCode;
     use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::{Backoff, BreakerState, BreakerWindow, CircuitBreakerConfig};
@@ -288,6 +326,179 @@ mod tests {
             "gate closed until the window rolls"
         );
         assert_eq!(error.retry_after(), Some(secs(60)));
+    }
+
+    fn probing_breaker() -> Arc<CircuitBreaker> {
+        Arc::new(
+            CircuitBreaker::new(
+                "orders",
+                CircuitBreakerConfig {
+                    window: BreakerWindow::Count { size: 4 },
+                    failure_rate: 0.5,
+                    min_calls: 1,
+                    wait_in_open: secs(30),
+                    permitted_in_half_open: 1,
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn trip(policy: &Policy) {
+        policy
+            .call(&CallContext::new(), false, || async {
+                Err::<(), _>(AppError::unavailable("down"))
+            })
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_contexts_spend_nothing() {
+        let gate = Arc::new(RateGate::new(1, secs(60)).unwrap());
+        let breaker = probing_breaker();
+        let policy = Policy::new("orders")
+            .with_rate_gate(Arc::clone(&gate))
+            .with_breaker(Arc::clone(&breaker));
+        let calls = Cell::new(0_u32);
+
+        let expired = CallContext::new().with_deadline(Instant::now().into_std());
+        let error = policy
+            .call(&expired, true, || {
+                calls.set(calls.get() + 1);
+                async { Ok(()) }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let cancelled = CallContext::new().with_cancel(token);
+        let error = policy
+            .call(&cancelled, true, || {
+                calls.set(calls.get() + 1);
+                async { Ok(()) }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(breaker.metrics().calls, 0);
+        assert!(gate.try_acquire(), "no rate permit was spent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_callers_own_deadline_does_not_count_against_the_dependency() {
+        let breaker = probing_breaker();
+        let policy = Policy::new("orders").with_breaker(Arc::clone(&breaker));
+        trip(&policy).await;
+        assert_eq!(breaker.state(), BreakerState::Open);
+        tokio::time::advance(secs(30)).await;
+
+        let ctx = CallContext::new().with_deadline(Instant::now().into_std() + secs(1));
+        let error = policy
+            .call(&ctx, true, futures::future::pending::<Result<(), AppError>>)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(
+            breaker.state(),
+            BreakerState::HalfOpen,
+            "the probe was released, not failed"
+        );
+
+        policy
+            .call(&CallContext::new(), true, || async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(
+            breaker.state(),
+            BreakerState::Closed,
+            "the freed slot let a real probe through"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_callers_cancellation_does_not_count_against_the_dependency() {
+        let breaker = probing_breaker();
+        let policy = Policy::new("orders").with_breaker(Arc::clone(&breaker));
+        let token = CancellationToken::new();
+        let ctx = CallContext::new().with_cancel(token.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(secs(1)).await;
+            token.cancel();
+        });
+        let error = policy
+            .call(&ctx, true, futures::future::pending::<Result<(), AppError>>)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert_eq!(
+            breaker.metrics().calls,
+            0,
+            "the call reached the dependency, but the caller walked away"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_dependency_counts_as_a_failure() {
+        let breaker = probing_breaker();
+        let policy = Policy::new("orders")
+            .with_timeout(Timeout::new(secs(1)))
+            .with_breaker(Arc::clone(&breaker));
+        let ctx = CallContext::new().with_deadline(Instant::now().into_std() + secs(10));
+        let error = policy
+            .call(&ctx, true, futures::future::pending::<Result<(), AppError>>)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(
+            breaker.state(),
+            BreakerState::Open,
+            "one timed-out attempt is one failure, enough to open"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_operation_that_never_ran_is_not_recorded() {
+        let breaker = probing_breaker();
+        let policy = Policy::new("orders")
+            .with_timeout(Timeout::new(Duration::ZERO))
+            .with_breaker(Arc::clone(&breaker));
+        let polled = Cell::new(false);
+        let error = policy
+            .call(&CallContext::new(), true, || {
+                let polled = &polled;
+                async move {
+                    polled.set(true);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert!(!polled.get());
+        assert_eq!(breaker.metrics().calls, 0);
+    }
+
+    #[test]
+    fn only_caller_side_failures_are_attributed_to_the_caller() {
+        let ctx = CallContext::new();
+        assert!(!caused_by_caller(&ctx, &Ok::<(), AppError>(())));
+        assert!(!caused_by_caller::<()>(
+            &ctx,
+            &Err(AppError::cancelled("upstream cancelled"))
+        ));
+        assert!(!caused_by_caller::<()>(
+            &ctx,
+            &Err(AppError::deadline_exceeded("upstream 504"))
+        ));
+        assert!(!caused_by_caller::<()>(
+            &ctx,
+            &Err(AppError::unavailable("down"))
+        ));
     }
 
     #[tokio::test(start_paused = true)]

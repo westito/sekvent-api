@@ -16,7 +16,8 @@ definitions:
     docker:
       memory: 3072
   caches:
-    # Registry, git checkouts and the installed cargo-sekvent with its stamp.
+    # Registry, git checkouts and the pinned cargo-sekvent builds under
+    # sekvent-cli/<rev> (see .sekvent/run.sh).
     cargo-home: /usr/local/cargo
     cargo-target: target
 

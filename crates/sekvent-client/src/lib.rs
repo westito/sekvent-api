@@ -6,12 +6,20 @@
 //!   default a timeout plus retries, which only ever apply to idempotent
 //!   requests;
 //! - [`CallContext`](sekvent_context::CallContext) propagation: request id,
-//!   remaining deadline as `grpc-timeout`, trace context;
+//!   remaining deadline as `grpc-timeout`, trace context — never
+//!   overriding headers set on the request, and never forwarding the
+//!   inbound idempotency key;
 //! - error mapping to [`AppError`](sekvent_error::AppError): transient HTTP
 //!   statuses and transport failures become retryable codes, `Retry-After`
-//!   is honoured, sekvent JSON error bodies are decoded losslessly, and any
-//!   other upstream body is kept only in the internal source chain,
-//!   truncated;
+//!   is honoured up to the retry policy's cap, and upstream bodies never
+//!   reach the error (only status, content type and length go to the
+//!   internal source chain). Sekvent JSON error bodies are adopted only from
+//!   upstreams declared with
+//!   [`HttpClientBuilder::sekvent_upstream`]; otherwise a `401`/`403`
+//!   means this service's credentials were refused and maps to `INTERNAL`;
+//! - redirects followed only within the original origin
+//!   ([`RedirectPolicy`]), so credentials and identity headers never reach
+//!   another host;
 //! - static Basic/bearer credentials or a [`BearerSource`] such as
 //!   [`oauth2::ClientCredentials`], with one retry after a `401`.
 //!
@@ -42,7 +50,7 @@ mod request;
 mod response;
 
 pub use auth::BearerSource;
-pub use client::{BuildError, HttpClient, HttpClientBuilder};
+pub use client::{BuildError, HttpClient, HttpClientBuilder, RedirectPolicy};
 pub use mapping::{code_for_status, parse_retry_after};
 pub use request::RequestBuilder;
 pub use response::HttpResponse;

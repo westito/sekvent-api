@@ -8,7 +8,10 @@ use rand::rngs::SmallRng;
 use sekvent_context::CallContext;
 use sekvent_error::AppError;
 
-use crate::{Backoff, RetryBudget, cancelled_error, deadline_error, remaining};
+use crate::{Backoff, RetryBudget, cancelled_error, ensure_live, remaining};
+
+/// Default for [`RetryPolicy::max_retry_after`].
+const DEFAULT_MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Bounded, budgeted retries of transient failures.
 ///
@@ -16,6 +19,9 @@ use crate::{Backoff, RetryBudget, cancelled_error, deadline_error, remaining};
 /// - the operation was declared idempotent by the caller;
 /// - the error is transient ([`AppError::is_transient`]);
 /// - fewer than `max_attempts` attempts were made;
+/// - the error's `retry_after` hint, if any, is at most `max_retry_after`
+///   (default 30 s) — an upstream asking for a longer pause gets it: the
+///   error is returned at once instead of parking the caller;
 /// - the delay (the larger of the backoff and the error's `retry_after`)
 ///   ends before the call deadline — the policy never sleeps past
 ///   [`CallContext::deadline`], it returns the last error instead;
@@ -28,6 +34,7 @@ pub struct RetryPolicy {
     max_attempts: u32,
     backoff: Backoff,
     budget: Option<Arc<RetryBudget>>,
+    max_retry_after: Duration,
     rng: Arc<Mutex<SmallRng>>,
 }
 
@@ -37,6 +44,7 @@ impl fmt::Debug for RetryPolicy {
             .field("max_attempts", &self.max_attempts)
             .field("backoff", &self.backoff)
             .field("budget", &self.budget)
+            .field("max_retry_after", &self.max_retry_after)
             .finish_non_exhaustive()
     }
 }
@@ -56,6 +64,7 @@ impl RetryPolicy {
             max_attempts: max_attempts.max(1),
             backoff,
             budget: None,
+            max_retry_after: DEFAULT_MAX_RETRY_AFTER,
             rng: Arc::new(Mutex::new(SmallRng::from_rng(&mut rand::rng()))),
         }
     }
@@ -80,6 +89,14 @@ impl RetryPolicy {
         self
     }
 
+    /// The longest `retry_after` hint worth waiting for (default 30 s). A
+    /// failure whose hint is longer is returned without retrying.
+    #[must_use]
+    pub fn with_max_retry_after(mut self, max: Duration) -> Self {
+        self.max_retry_after = max;
+        self
+    }
+
     /// Seed the jitter source, for reproducible delays.
     #[must_use]
     pub fn with_seed(mut self, seed: u64) -> Self {
@@ -99,6 +116,10 @@ impl RetryPolicy {
     pub fn budget(&self) -> Option<&Arc<RetryBudget>> {
         self.budget.as_ref()
     }
+    /// The longest `retry_after` hint the policy waits for.
+    pub fn max_retry_after(&self) -> Duration {
+        self.max_retry_after
+    }
 
     /// Run `op`, retrying as described on [`RetryPolicy`].
     ///
@@ -115,12 +136,7 @@ impl RetryPolicy {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, AppError>>,
     {
-        if ctx.cancel_token().is_cancelled() {
-            return Err(cancelled_error());
-        }
-        if remaining(ctx) == Some(Duration::ZERO) {
-            return Err(deadline_error());
-        }
+        ensure_live(ctx)?;
         let mut attempt: u32 = 0;
         loop {
             attempt = attempt.saturating_add(1);
@@ -171,6 +187,13 @@ impl RetryPolicy {
             self.backoff.delay(attempt - 1, &mut *rng)
         };
         if let Some(hint) = error.retry_after() {
+            if hint > self.max_retry_after {
+                tracing::debug!(
+                    attempt,
+                    "not retrying: the upstream asked to wait longer than max_retry_after"
+                );
+                return None;
+            }
             delay = delay.max(hint);
         }
         if remaining(ctx).is_some_and(|left| delay >= left) {
@@ -336,6 +359,50 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_retry_after_above_the_cap_is_not_waited_for() {
+        let calls = Cell::new(0_u32);
+        let failing = || {
+            calls.set(calls.get() + 1);
+            async {
+                Err::<(), _>(
+                    AppError::unavailable("come back tomorrow")
+                        .with_retry_after(Duration::from_secs(u64::MAX)),
+                )
+            }
+        };
+        let started = Instant::now();
+        let error = RetryPolicy::new(5, constant(10))
+            .retry(&CallContext::new(), true, failing)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(calls.get(), 1, "a hint above the cap is not retried");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        calls.set(0);
+        let hinted = || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n == 1 {
+                    Err(AppError::unavailable("busy").with_retry_after(Duration::from_secs(60)))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let raised =
+            RetryPolicy::new(2, constant(10)).with_max_retry_after(Duration::from_secs(60));
+        assert_eq!(raised.max_retry_after(), Duration::from_secs(60));
+        raised
+            .retry(&CallContext::new(), true, hinted)
+            .await
+            .unwrap();
+        assert_eq!(calls.get(), 2, "a hint at the cap is honoured");
+        assert_eq!(started.elapsed(), Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn retry_after_beyond_the_deadline_returns_the_error_without_sleeping() {
         let policy = RetryPolicy::new(5, constant(10));
         let ctx = ctx_with_deadline(Duration::from_secs(2));
@@ -436,6 +503,7 @@ mod tests {
     fn accessors_and_defaults() {
         let policy = RetryPolicy::default().with_seed(1);
         assert_eq!(policy.max_attempts(), 3);
+        assert_eq!(policy.max_retry_after(), Duration::from_secs(30));
         assert_eq!(policy.backoff(), &Backoff::default());
         assert!(policy.budget().is_some());
         assert!(policy.clone().without_budget().budget().is_none());

@@ -82,6 +82,18 @@ pub(crate) fn deadline_error() -> sekvent_error::AppError {
     sekvent_error::AppError::deadline_exceeded("the call deadline was exceeded")
 }
 
+/// `Err` when `ctx` is already cancelled or past its deadline, so no work
+/// (and no shared quota) is spent on a call nobody waits for.
+pub(crate) fn ensure_live(ctx: &CallContext) -> Result<(), sekvent_error::AppError> {
+    if ctx.cancel_token().is_cancelled() {
+        return Err(cancelled_error());
+    }
+    if remaining(ctx) == Some(Duration::ZERO) {
+        return Err(deadline_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +109,23 @@ mod tests {
         assert_eq!(remaining(&ctx), Some(Duration::ZERO));
         assert_eq!(remaining(&CallContext::new()), None);
         assert!(deadline_of(&CallContext::new()).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_live_rejects_dead_contexts() {
+        assert!(ensure_live(&CallContext::new()).is_ok());
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let cancelled = CallContext::new().with_cancel(token);
+        assert_eq!(
+            ensure_live(&cancelled).unwrap_err().code(),
+            sekvent_error::ErrorCode::Cancelled
+        );
+        let expired = CallContext::new().with_deadline(tokio::time::Instant::now().into_std());
+        assert_eq!(
+            ensure_live(&expired).unwrap_err().code(),
+            sekvent_error::ErrorCode::DeadlineExceeded
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,7 @@ pub struct UnitContext {
     shutdown: CancellationToken,
     ready: Arc<watch::Sender<bool>>,
     health: HealthRegistry,
+    grace: Duration,
 }
 
 impl UnitContext {
@@ -28,6 +30,7 @@ impl UnitContext {
         shutdown: CancellationToken,
         ready: Arc<watch::Sender<bool>>,
         health: HealthRegistry,
+        grace: Duration,
     ) -> Self {
         Self {
             name,
@@ -36,6 +39,7 @@ impl UnitContext {
             shutdown,
             ready,
             health,
+            grace,
         }
     }
 
@@ -66,8 +70,18 @@ impl UnitContext {
         self.shutdown.is_cancelled()
     }
 
+    /// How long the unit may take to stop once its stage drains, before it
+    /// is aborted: the runtime's
+    /// [`stage_grace`](crate::RuntimeBuilder::stage_grace). Also a sensible
+    /// bound for cleanup the unit does after failing on its own.
+    pub fn stage_grace(&self) -> Duration {
+        self.grace
+    }
+
     /// Report that the unit is up. The next stage starts once every unit of
-    /// this stage has reported ready (or exited). Calling it again is harmless.
+    /// this stage has reported ready. A critical or best-effort unit that
+    /// exits no longer holds its stage up; a restarting unit must report
+    /// ready from one of its runs. Calling it again is harmless.
     pub fn ready(&self) {
         self.ready.send_replace(true);
     }
@@ -103,6 +117,7 @@ mod tests {
             shutdown.clone(),
             Arc::new(ready),
             HealthRegistry::new(),
+            Duration::from_secs(7),
         );
         (ctx, shutdown, ready_rx)
     }
@@ -113,6 +128,7 @@ mod tests {
         assert_eq!(ctx.name(), "orders-consumer");
         assert_eq!(ctx.stage(), Stage::Workers);
         assert_eq!(ctx.attempt(), 3);
+        assert_eq!(ctx.stage_grace(), Duration::from_secs(7));
         assert!(ctx.health().is_live());
         assert!(!ctx.health().is_ready());
     }

@@ -56,7 +56,10 @@ fn every_code_survives_grpc() {
 
 #[tokio::test]
 async fn every_code_survives_http() {
-    for code in ErrorCode::ALL {
+    for code in ErrorCode::ALL
+        .into_iter()
+        .filter(|code| *code != ErrorCode::Ok)
+    {
         let (status, _, back) = http_round_trip(AppError::new(code, "m")).await;
         assert_eq!(status, code.http_status(), "{code}");
         assert_eq!(back.code(), code);
@@ -169,6 +172,18 @@ fn malformed_or_absent_grpc_details_leave_code_and_message() {
         grpc::from_status(&plain).to_wire(),
         AppError::new(ErrorCode::Internal, "boom").to_wire()
     );
+}
+
+#[tokio::test]
+async fn an_ok_code_is_never_read_back_as_an_error() {
+    let response = AppError::new(ErrorCode::Ok, "m").into_response();
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    assert!(http::from_json_body(status, &body).is_none());
+    assert!(http::from_json_body(500, &body).is_none());
 }
 
 #[test]

@@ -67,6 +67,10 @@ pub enum Source {
 }
 
 /// Decode a `Cargo.lock` source string.
+///
+/// A `git+` source whose repository is not an `https://`, `ssh://` or
+/// `user@host:path` URL (see [`is_safe_git_url`]) comes back as
+/// [`Source::Other`], so it never reaches a `git` command line.
 pub fn parse_source(source: Option<&str>) -> Source {
     let Some(source) = source else {
         return Source::Path;
@@ -76,6 +80,9 @@ pub fn parse_source(source: Option<&str>) -> Source {
     };
     let (base, rev) = git.split_once('#').unwrap_or((git, ""));
     let (url, query) = base.split_once('?').unwrap_or((base, ""));
+    if !is_safe_git_url(url) {
+        return Source::Other(source.to_owned());
+    }
     let branch = query
         .split('&')
         .find_map(|pair| pair.strip_prefix("branch="))
@@ -87,6 +94,49 @@ pub fn parse_source(source: Option<&str>) -> Source {
     }
 }
 
+/// `url` is a repository URL git can be handed without reading it as an
+/// option: `https://host/…`, `ssh://[user@]host[:port]/…` or the scp-like
+/// `user@host:path`, with a host that does not start with `-` and no
+/// whitespace or control characters anywhere.
+pub fn is_safe_git_url(url: &str) -> bool {
+    if url.starts_with('-') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("ssh://"))
+    {
+        let authority = rest.split('/').next().unwrap_or_default();
+        let host_port = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let host = host_port
+            .split_once(':')
+            .map_or(host_port, |(host, _)| host);
+        return is_safe_host(host);
+    }
+    let Some((user, rest)) = url.split_once('@') else {
+        return false;
+    };
+    let Some((host, path)) = rest.split_once(':') else {
+        return false;
+    };
+    !user.is_empty()
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && is_safe_host(host)
+        && !path.is_empty()
+}
+
+fn is_safe_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('-')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
 /// The locked `sekvent` package and its source.
 pub fn locked_sdk(packages: &[LockedPackage]) -> Option<(&LockedPackage, Source)> {
     packages
@@ -95,10 +145,12 @@ pub fn locked_sdk(packages: &[LockedPackage]) -> Option<(&LockedPackage, Source)
         .map(|package| (package, parse_source(package.source.as_deref())))
 }
 
-/// `git ls-remote <url> refs/heads/<branch>`, never prompting.
+/// `git ls-remote -- <url> refs/heads/<branch>`, never prompting. The `--`
+/// keeps a repository argument that starts with `-` from being read as an
+/// option.
 pub fn ls_remote_command(url: &str, branch: &str) -> Cmd {
     Cmd::new("git")
-        .args(["ls-remote", url])
+        .args(["ls-remote", "--", url])
         .arg(format!("refs/heads/{branch}"))
         .env("GIT_TERMINAL_PROMPT", "0")
 }
@@ -278,6 +330,65 @@ checksum = "00"
     }
 
     #[test]
+    fn only_plain_repository_urls_are_git_sources() {
+        for good in [
+            "https://github.com/westito/sekvent",
+            "https://user@git.example.com:8443/team/repo.git",
+            "ssh://git@git.example.com/team/repo.git",
+            "ssh://git.example.com:2222/repo",
+            "git@github.com:westito/sekvent.git",
+        ] {
+            assert!(is_safe_git_url(good), "{good}");
+        }
+        for bad in [
+            "--upload-pack=touch /tmp/x",
+            "-oProxyCommand=x",
+            "https://-oProxyCommand=x/repo",
+            "ssh://-oProxyCommand=x/repo",
+            "ssh://git@-host/repo",
+            "https:///repo",
+            "https://host name/repo",
+            "file:///etc",
+            "/local/checkout",
+            "git@host",
+            "git@host:",
+            "@host:repo",
+            "-u@host:repo",
+            "git@-host:repo",
+            "git@ho$t:repo",
+            "https://host/re\tpo",
+        ] {
+            assert!(!is_safe_git_url(bad), "{bad}");
+        }
+        assert!(!is_safe_git_url("https://host/a\u{7f}b"));
+    }
+
+    #[test]
+    fn a_malicious_lock_source_never_reaches_git() {
+        let malicious = "git+--upload-pack=touch /tmp/x#abc";
+        assert_eq!(
+            parse_source(Some(malicious)),
+            Source::Other(malicious.to_owned())
+        );
+        let text = lock().replace(
+            "source = \"git+https://github.com/westito/sekvent?branch=master#",
+            "source = \"git+--upload-pack=touch /tmp/x?branch=master#",
+        );
+        let runner = FakeRunner::default();
+        let report = status(&runner, &text, true).unwrap();
+        assert!(report.contains("from git+--upload-pack="), "{report}");
+        assert!(runner.calls().is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), &text).unwrap();
+        assert_eq!(update_hint(&runner, dir.path(), &EnvMap::new()), None);
+        assert!(runner.calls().is_empty());
+
+        let cmd = ls_remote_command("-x", "master");
+        assert_eq!(cmd.args, ["ls-remote", "--", "-x", "refs/heads/master"]);
+    }
+
+    #[test]
     fn ls_remote_output_is_parsed() {
         assert_eq!(
             parse_ls_remote(&format!("{REV}\trefs/heads/master\n")).as_deref(),
@@ -304,7 +415,7 @@ checksum = "00"
         );
         assert_eq!(
             runner.lines()[0],
-            "git ls-remote https://github.com/westito/sekvent refs/heads/master"
+            "git ls-remote -- https://github.com/westito/sekvent refs/heads/master"
         );
         let offline = status(&runner, &lock(), false).unwrap();
         assert_eq!(

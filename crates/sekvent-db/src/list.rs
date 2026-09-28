@@ -1,14 +1,30 @@
 //! Generic list filtering, search and pagination for sea-orm entities.
 //!
-//! Clients send [`ListParams`]; the server turns the filters into a sea-orm
-//! [`Condition`] with [`apply_column_filters`], which looks each field up
-//! among the entity's columns and builds a comparison suited to the column's
-//! type. Unknown fields, unsupported operators and unparseable values are
-//! ignored rather than rejected, so an old client never breaks a list view.
+//! Clients send [`ListParams`]; the server declares, per entity, which
+//! columns a client may sort and filter by in a [`ListSpec`], then turns the
+//! parameters into a sort order and a sea-orm [`Condition`]. The allow-lists
+//! are fail-closed: a column is usable only when the spec names it, and a
+//! sort or filter on any other field (including one that is not a column at
+//! all) is an `INVALID_ARGUMENT` error naming the field. Sorting or filtering
+//! on a secret column (a password hash, an internal flag) would leak its
+//! contents one comparison at a time, so such columns are never listed.
 //!
-//! Use [`allow_fields`] when some columns must not be filterable (password
-//! hashes, internal flags): filtering on a column leaks its contents one
-//! comparison at a time.
+//! ```ignore
+//! let spec = ListSpec::<invoice::Entity>::new()
+//!     .sortable([invoice::Column::CreatedAt, invoice::Column::Total])
+//!     .filterable([invoice::Column::Status, invoice::Column::CreatedAt]);
+//! let condition = spec.apply_filters(Condition::all(), &params.filters)?;
+//! let mut query = invoice::Entity::find().filter(condition);
+//! if let Some((column, order)) = spec.sort(&params)? {
+//!     query = query.order_by(column, order);
+//! }
+//! let page = paginate(params.page, params.page_size, 100)?;
+//! let rows = query.offset(page.offset).limit(page.limit).all(&db).await?;
+//! ```
+//!
+//! Within an allowed column, unsupported operators and unparseable values
+//! are ignored rather than rejected, so an old client never breaks a list
+//! view.
 //!
 //! | column type | operators | value |
 //! |---|---|---|
@@ -28,14 +44,25 @@
 //! `eq d` is `[d, d+1)`, `range a..b` is `[a, b+1)`, `gte d` is `>= d`,
 //! `gt d` is `>= d+1`, `lte d` is `< d+1` and `lt d` is `< d`.
 
+use std::fmt;
+
 use sea_orm::prelude::{ChronoDate, ChronoDateTime, Decimal, Uuid};
-use sea_orm::sea_query::{ColumnType, LikeExpr};
+use sea_orm::sea_query::{ColumnType, LikeExpr, Order};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, IdenStatic, Iterable, Value};
+use sekvent_error::AppError;
 
 /// The escape character used in generated `LIKE` patterns. It is neither a
 /// backslash (whose meaning differs between backends and SQL modes) nor
 /// a pattern metacharacter.
 const LIKE_ESCAPE: char = '!';
+
+/// The largest offset or limit a query may bind: drivers bind them as
+/// signed 64-bit integers.
+const MAX_BIND: u64 = i64::MAX.unsigned_abs();
+
+/// Client-supplied field names are echoed in errors up to this many
+/// characters.
+const MAX_ECHOED_FIELD: usize = 64;
 
 /// List query parameters as a client sends them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -44,7 +71,7 @@ const LIKE_ESCAPE: char = '!';
 pub struct ListParams {
     /// Free-text search term, for [`prefix_search`].
     pub search: Option<String>,
-    /// Field to sort by (`camelCase` or `snake_case`), for [`resolve_column`].
+    /// Field to sort by (`camelCase` or `snake_case`), for [`ListSpec::sort`].
     pub sort_by: Option<String>,
     /// Sort descending.
     pub sort_desc: bool,
@@ -52,7 +79,7 @@ pub struct ListParams {
     pub page: u64,
     /// Page size; clamped by [`paginate`].
     pub page_size: u64,
-    /// Per-column filters.
+    /// Per-column filters, for [`ListSpec::apply_filters`].
     pub filters: Vec<ColumnFilter>,
 }
 
@@ -184,45 +211,140 @@ pub fn to_snake_case(field: &str) -> String {
 }
 
 /// The column of `E` named `field` (`camelCase` or `snake_case`).
-pub fn resolve_column<E: EntityTrait>(field: &str) -> Option<E::Column> {
+fn resolve_column<E: EntityTrait>(field: &str) -> Option<E::Column> {
     let wanted = to_snake_case(field);
     E::Column::iter().find(|column| column.as_str() == wanted)
 }
 
-/// Keep only the filters on `allowed` fields (compared in `snake_case`).
+/// The columns of one entity a client may sort and filter by.
 ///
-/// ```ignore
-/// let safe = allow_fields(&params.filters, &["status", "createdAt"]);
-/// let condition = apply_column_filters::<invoice::Entity>(Condition::all(), &safe);
-/// ```
-pub fn allow_fields(filters: &[ColumnFilter], allowed: &[&str]) -> Vec<ColumnFilter> {
-    let allowed: Vec<String> = allowed.iter().map(|field| to_snake_case(field)).collect();
-    filters
-        .iter()
-        .filter(|filter| allowed.contains(&to_snake_case(&filter.field)))
-        .cloned()
-        .collect()
+/// Both lists start empty: a new spec rejects every sort and every filter
+/// until columns are allowed explicitly. See the [module documentation](self)
+/// for an example.
+pub struct ListSpec<E: EntityTrait> {
+    sortable: Vec<E::Column>,
+    filterable: Vec<E::Column>,
 }
 
-/// Add one condition per usable filter to `condition`.
-///
-/// See the [module documentation](self) for the operators per column type.
-/// Filters on unknown fields, with unknown operators, blank values or values
-/// that do not parse for the column's type are skipped.
-pub fn apply_column_filters<E: EntityTrait>(
-    condition: Condition,
-    filters: &[ColumnFilter],
-) -> Condition {
-    filters.iter().fold(condition, |condition, filter| {
-        match filter_condition::<E>(filter) {
-            Some(extra) => condition.add(extra),
-            None => condition,
+impl<E: EntityTrait> ListSpec<E> {
+    /// A spec that allows no sorting and no filtering.
+    pub fn new() -> Self {
+        Self {
+            sortable: Vec::new(),
+            filterable: Vec::new(),
         }
-    })
+    }
+
+    /// Allow sorting by `columns` (added to any already allowed).
+    #[must_use]
+    pub fn sortable(mut self, columns: impl IntoIterator<Item = E::Column>) -> Self {
+        self.sortable.extend(columns);
+        self
+    }
+
+    /// Allow filtering by `columns` (added to any already allowed).
+    #[must_use]
+    pub fn filterable(mut self, columns: impl IntoIterator<Item = E::Column>) -> Self {
+        self.filterable.extend(columns);
+        self
+    }
+
+    /// The sortable column named `field` (`camelCase` or `snake_case`).
+    ///
+    /// Fails with `INVALID_ARGUMENT` naming the field when it is not a
+    /// sortable column of `E`.
+    pub fn sort_column(&self, field: &str) -> Result<E::Column, AppError> {
+        allowed_column::<E>(&self.sortable, field)
+            .ok_or_else(|| disallowed("sortBy", field, "is not a sortable field"))
+    }
+
+    /// The column and direction `params` asks to sort by, or `None` when it
+    /// names no field.
+    ///
+    /// Fails with `INVALID_ARGUMENT` when the field is not sortable.
+    pub fn sort(&self, params: &ListParams) -> Result<Option<(E::Column, Order)>, AppError> {
+        let Some(field) = params.sort_by.as_deref().and_then(non_blank) else {
+            return Ok(None);
+        };
+        let order = if params.sort_desc {
+            Order::Desc
+        } else {
+            Order::Asc
+        };
+        Ok(Some((self.sort_column(field)?, order)))
+    }
+
+    /// Add one condition per usable filter to `condition`.
+    ///
+    /// Fails with `INVALID_ARGUMENT` naming the field when any filter is on
+    /// a field that is not a filterable column of `E`. Within allowed
+    /// columns, filters with unknown operators, blank values or values that
+    /// do not parse for the column's type are skipped; see the
+    /// [module documentation](self) for the operators per column type.
+    pub fn apply_filters(
+        &self,
+        condition: Condition,
+        filters: &[ColumnFilter],
+    ) -> Result<Condition, AppError> {
+        filters.iter().try_fold(condition, |condition, filter| {
+            let column = allowed_column::<E>(&self.filterable, &filter.field)
+                .ok_or_else(|| disallowed("filters", &filter.field, "is not a filterable field"))?;
+            Ok(match filter_condition(column, filter) {
+                Some(extra) => condition.add(extra),
+                None => condition,
+            })
+        })
+    }
 }
 
-fn filter_condition<E: EntityTrait>(filter: &ColumnFilter) -> Option<Condition> {
-    let column = resolve_column::<E>(&filter.field)?;
+impl<E: EntityTrait> Default for ListSpec<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<E: EntityTrait> Clone for ListSpec<E> {
+    fn clone(&self) -> Self {
+        Self {
+            sortable: self.sortable.clone(),
+            filterable: self.filterable.clone(),
+        }
+    }
+}
+
+impl<E: EntityTrait> fmt::Debug for ListSpec<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = |columns: &[E::Column]| -> Vec<&'static str> {
+            columns.iter().map(IdenStatic::as_str).collect()
+        };
+        f.debug_struct("ListSpec")
+            .field("sortable", &names(&self.sortable))
+            .field("filterable", &names(&self.filterable))
+            .finish()
+    }
+}
+
+/// The column named `field` if it is one of `allowed`.
+fn allowed_column<E: EntityTrait>(allowed: &[E::Column], field: &str) -> Option<E::Column> {
+    let column = resolve_column::<E>(field)?;
+    allowed
+        .iter()
+        .any(|candidate| candidate.as_str() == column.as_str())
+        .then_some(column)
+}
+
+/// `INVALID_ARGUMENT` naming a rejected client field, echoed only up to
+/// [`MAX_ECHOED_FIELD`] characters.
+fn disallowed(parameter: &str, field: &str, problem: &str) -> AppError {
+    let mut shown: String = field.trim().chars().take(MAX_ECHOED_FIELD).collect();
+    if field.trim().chars().nth(MAX_ECHOED_FIELD).is_some() {
+        shown.push('…');
+    }
+    AppError::invalid_argument(format!("field `{shown}` {problem}"))
+        .with_field_violation(parameter, format!("`{shown}` {problem}"))
+}
+
+fn filter_condition<C: ColumnTrait>(column: C, filter: &ColumnFilter) -> Option<Condition> {
     let op = Op::parse(&filter.op)?;
     let kind = kind_of(column.def().get_column_type())?;
     let from = non_blank(&filter.value);
@@ -383,6 +505,9 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// Match `term` as a prefix of any of `columns` (`col LIKE 'term%'`,
 /// metacharacters escaped). A blank term yields an empty condition that
 /// filters nothing.
+///
+/// The columns come from the server, never from the client; pass only
+/// columns whose contents the caller may see.
 pub fn prefix_search<E: EntityTrait>(columns: &[E::Column], term: &str) -> Condition {
     let Some(term) = non_blank(term) else {
         return Condition::all();
@@ -404,16 +529,26 @@ pub struct Page {
 /// Turn a 1-based `page` and a requested `page_size` into offset and limit.
 ///
 /// Page 0 is page 1. The size is clamped to `1..=max_page_size`, and a size
-/// of 0 means the maximum. The offset saturates instead of overflowing.
-pub fn paginate(page: u64, page_size: u64, max_page_size: u64) -> Page {
-    let max = max_page_size.max(1);
+/// of 0 means the maximum; the limit never exceeds `i64::MAX`. A page whose
+/// offset would not fit in an `i64` (what drivers bind) is an
+/// `INVALID_ARGUMENT` error naming `page`.
+pub fn paginate(page: u64, page_size: u64, max_page_size: u64) -> Result<Page, AppError> {
+    let max = max_page_size.clamp(1, MAX_BIND);
     let limit = if page_size == 0 {
         max
     } else {
         page_size.min(max)
     };
-    let offset = page.max(1).saturating_sub(1).saturating_mul(limit);
-    Page { offset, limit }
+    let offset = page
+        .max(1)
+        .saturating_sub(1)
+        .checked_mul(limit)
+        .filter(|offset| *offset <= MAX_BIND)
+        .ok_or_else(|| {
+            AppError::invalid_argument("page is out of range")
+                .with_field_violation("page", "the page is beyond the last possible row")
+        })?;
+    Ok(Page { offset, limit })
 }
 
 /// A `NaiveDateTime` at midnight, for callers building their own day ranges.
@@ -423,7 +558,8 @@ pub fn start_of_day(day: ChronoDate) -> Option<ChronoDateTime> {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{DbBackend, QueryFilter, QueryTrait};
+    use sea_orm::{DbBackend, QueryFilter, QueryOrder, QueryTrait};
+    use sekvent_error::ErrorCode;
 
     use super::*;
 
@@ -455,12 +591,17 @@ mod tests {
         impl ActiveModelBehavior for ActiveModel {}
     }
 
+    /// Every column filterable, for the per-type operator tests.
+    fn every_column() -> ListSpec<item::Entity> {
+        ListSpec::new().filterable(item::Column::iter())
+    }
+
     fn where_clause(backend: DbBackend, filters: &[ColumnFilter]) -> String {
+        let condition = every_column()
+            .apply_filters(Condition::all(), filters)
+            .unwrap();
         let sql = item::Entity::find()
-            .filter(apply_column_filters::<item::Entity>(
-                Condition::all(),
-                filters,
-            ))
+            .filter(condition)
             .build(backend)
             .to_string();
         sql.split_once(" WHERE ")
@@ -680,8 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_ops_and_types_are_ignored() {
-        assert_eq!(pg(&[f("nope", "", "x")]), NO_FILTER);
+    fn unknown_ops_and_types_are_ignored() {
         assert_eq!(pg(&[f("name", "contains", "x")]), NO_FILTER);
         assert_eq!(pg(&[f("payload", "eq", "{}")]), NO_FILTER);
     }
@@ -692,23 +832,133 @@ mod tests {
             pg(&[
                 f("name", "", "a"),
                 f("quantity", "gt", "1"),
-                f("nope", "", "x")
+                f("quantity", "between", "x")
             ]),
             r#""item"."name" LIKE 'a%' ESCAPE '!' AND "item"."quantity" > 1"#
         );
     }
 
+    fn safe_spec() -> ListSpec<item::Entity> {
+        ListSpec::new()
+            .sortable([item::Column::Name])
+            .sortable([item::Column::CreatedAt])
+            .filterable([item::Column::Name, item::Column::CreatedAt])
+    }
+
     #[test]
-    fn the_allow_list_drops_sensitive_fields() {
-        let filters = [
-            f("passwordHash", "prefix", "$argon2"),
-            f("name", "", "a"),
-            f("createdAt", "gte", "2024-01-01"),
-        ];
-        let allowed = allow_fields(&filters, &["name", "created_at"]);
-        assert_eq!(allowed.len(), 2);
-        assert!(allowed.iter().all(|filter| filter.field != "passwordHash"));
-        assert!(!pg(&allowed).contains("password_hash"));
+    fn a_new_spec_allows_nothing() {
+        let spec = ListSpec::<item::Entity>::default();
+        assert!(spec.sort_column("name").is_err());
+        assert!(
+            spec.apply_filters(Condition::all(), &[f("name", "", "a")])
+                .is_err()
+        );
+        assert!(spec.apply_filters(Condition::all(), &[]).is_ok());
+    }
+
+    #[test]
+    fn filters_outside_the_allow_list_are_rejected_naming_the_field() {
+        let spec = safe_spec();
+        for field in ["passwordHash", "password_hash", "quantity", "nope"] {
+            let error = spec
+                .apply_filters(
+                    Condition::all(),
+                    &[f("name", "", "a"), f(field, "prefix", "$argon2")],
+                )
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                error.message(),
+                format!("field `{field}` is not a filterable field")
+            );
+            assert_eq!(error.field_violations()[0].field, "filters");
+        }
+        let condition = spec
+            .apply_filters(
+                Condition::all(),
+                &[f("name", "", "a"), f("createdAt", "gte", "2024-01-01")],
+            )
+            .unwrap();
+        let sql = item::Entity::find()
+            .filter(condition)
+            .build(DbBackend::Postgres)
+            .to_string();
+        assert!(sql.contains(r#""item"."name" LIKE 'a%'"#), "{sql}");
+        assert!(sql.contains(r#""item"."created_at" >="#), "{sql}");
+    }
+
+    #[test]
+    fn sorting_is_limited_to_the_allow_list() {
+        let spec = safe_spec();
+        assert!(matches!(
+            spec.sort_column("createdAt"),
+            Ok(item::Column::CreatedAt)
+        ));
+        for field in ["passwordHash", "quantity", "nope"] {
+            let error = spec.sort_column(field).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                error.message(),
+                format!("field `{field}` is not a sortable field")
+            );
+            assert_eq!(error.field_violations()[0].field, "sortBy");
+        }
+    }
+
+    #[test]
+    fn sort_reads_the_params() {
+        let spec = safe_spec();
+        let mut params = ListParams::default();
+        assert!(spec.sort(&params).unwrap().is_none());
+        params.sort_by = Some("  ".to_owned());
+        assert!(spec.sort(&params).unwrap().is_none());
+
+        params.sort_by = Some("name".to_owned());
+        let (column, order) = spec.sort(&params).unwrap().unwrap();
+        assert!(matches!(column, item::Column::Name));
+        assert_eq!(order, Order::Asc);
+
+        params.sort_by = Some("created_at".to_owned());
+        params.sort_desc = true;
+        let (column, order) = spec.sort(&params).unwrap().unwrap();
+        let sql = item::Entity::find()
+            .order_by(column, order)
+            .build(DbBackend::Postgres)
+            .to_string();
+        assert!(
+            sql.ends_with(r#"ORDER BY "item"."created_at" DESC"#),
+            "{sql}"
+        );
+
+        params.sort_by = Some("passwordHash".to_owned());
+        assert_eq!(
+            spec.sort(&params).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn long_rejected_fields_are_truncated_in_errors() {
+        let field = "x".repeat(500);
+        let error = safe_spec().sort_column(&field).unwrap_err();
+        let expected = format!("field `{}…` is not a sortable field", "x".repeat(64));
+        assert_eq!(error.message(), expected);
+        let exact = "y".repeat(64);
+        let error = safe_spec().sort_column(&exact).unwrap_err();
+        assert_eq!(
+            error.message(),
+            format!("field `{exact}` is not a sortable field")
+        );
+    }
+
+    #[test]
+    fn specs_debug_and_clone_by_column_name() {
+        let spec = safe_spec();
+        let copy = spec.clone();
+        assert_eq!(
+            format!("{copy:?}"),
+            r#"ListSpec { sortable: ["name", "created_at"], filterable: ["name", "created_at"] }"#
+        );
     }
 
     #[test]
@@ -731,50 +981,70 @@ mod tests {
     }
 
     #[test]
-    fn pagination_clamps_and_saturates() {
+    fn pagination_clamps_the_size() {
+        let page = |page, size, max| paginate(page, size, max).unwrap();
         assert_eq!(
-            paginate(1, 20, 100),
+            page(1, 20, 100),
             Page {
                 offset: 0,
                 limit: 20
             }
         );
         assert_eq!(
-            paginate(0, 20, 100),
+            page(0, 20, 100),
             Page {
                 offset: 0,
                 limit: 20
             }
         );
         assert_eq!(
-            paginate(3, 20, 100),
+            page(3, 20, 100),
             Page {
                 offset: 40,
                 limit: 20
             }
         );
         assert_eq!(
-            paginate(2, 500, 100),
+            page(2, 500, 100),
             Page {
                 offset: 100,
                 limit: 100
             }
         );
         assert_eq!(
-            paginate(2, 0, 50),
+            page(2, 0, 50),
             Page {
                 offset: 50,
                 limit: 50
             }
         );
         assert_eq!(
-            paginate(2, 10, 0),
+            page(2, 10, 0),
             Page {
                 offset: 1,
                 limit: 1
             }
         );
-        assert_eq!(paginate(u64::MAX, 100, 100).offset, u64::MAX);
+        assert_eq!(page(1, 0, u64::MAX).limit, MAX_BIND);
+    }
+
+    #[test]
+    fn offsets_beyond_i64_are_rejected() {
+        let max = i64::MAX.unsigned_abs();
+        // The largest offset that still binds.
+        assert_eq!(paginate(max / 7 + 1, 7, 7).unwrap().offset, max / 7 * 7);
+        assert_eq!(paginate(max + 1, 1, 1).unwrap().offset, max);
+        for (page, size, limit) in [
+            (u64::MAX, 100, 100),
+            (max + 2, 1, 1),
+            (3, 0, u64::MAX),
+            (3, max, max),
+        ] {
+            let error = paginate(page, size, limit).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert_eq!(error.message(), "page is out of range");
+            assert_eq!(error.field_violations()[0].field, "page");
+        }
     }
 
     #[test]

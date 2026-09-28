@@ -23,6 +23,9 @@ pub trait PolicyRequest: Sized + Send + 'static {
 /// `http::Request` with a cloneable body.
 ///
 /// The context is read from the request extensions (a fresh one if absent).
+/// A fresh context has no deadline, so only the retry policy's own limits
+/// (attempts, backoff cap, [`RetryPolicy::max_retry_after`](crate::RetryPolicy::max_retry_after))
+/// bound how long retries may wait.
 /// `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS` and `TRACE` are idempotent, as is
 /// any request carrying an `idempotency-key` header.
 impl<B> PolicyRequest for http::Request<B>

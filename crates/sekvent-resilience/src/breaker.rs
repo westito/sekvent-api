@@ -405,6 +405,14 @@ impl BreakerPermit<'_> {
         self.finish(true);
     }
 
+    /// Give the permit back without reporting anything, for a call that
+    /// never reached the dependency or that the caller itself abandoned
+    /// (its own cancellation or deadline). Nothing is recorded and a
+    /// half-open probe slot is freed; the same as dropping the permit.
+    pub fn release(self) {
+        drop(self);
+    }
+
     fn finish(mut self, failed: bool) {
         self.reported = true;
         self.breaker.on_outcome(self.generation, failed);
@@ -430,6 +438,12 @@ impl CircuitBreaker {
                     "must hold at least one call",
                 ));
             }
+            BreakerWindow::Count { size } if size < config.min_calls => {
+                return Err(PolicyError::new(
+                    "breaker.min_calls",
+                    "must not exceed the call count of breaker.window, or the circuit never opens",
+                ));
+            }
             BreakerWindow::Time { duration } if duration.is_zero() => {
                 return Err(PolicyError::new(
                     "breaker.window",
@@ -440,6 +454,12 @@ impl CircuitBreaker {
         }
         if config.min_calls == 0 {
             return Err(PolicyError::new("breaker.min_calls", "must be at least 1"));
+        }
+        if config.wait_in_open.is_zero() {
+            return Err(PolicyError::new(
+                "breaker.wait_in_open",
+                "must be longer than zero",
+            ));
         }
         if config.permitted_in_half_open == 0 {
             return Err(PolicyError::new(
@@ -914,7 +934,7 @@ mod tests {
         h.clock.advance(secs(30));
         let probe = h.breaker.acquire().unwrap();
         assert!(h.breaker.acquire().is_err());
-        drop(probe);
+        probe.release();
         let probe = h.breaker.acquire().unwrap();
         assert!(format!("{probe:?}").contains("orders"));
         probe.record_success();
@@ -996,6 +1016,43 @@ mod tests {
                 ..config()
             }),
             "breaker.permitted_in_half_open"
+        );
+        assert_eq!(
+            bad(CircuitBreakerConfig {
+                window: BreakerWindow::Count { size: 5 },
+                min_calls: 6,
+                ..config()
+            }),
+            "breaker.min_calls"
+        );
+        let reason = CircuitBreaker::new(
+            "x",
+            CircuitBreakerConfig {
+                window: BreakerWindow::Count { size: 5 },
+                min_calls: 6,
+                ..config()
+            },
+        )
+        .unwrap_err()
+        .reason();
+        assert!(reason.contains("breaker.window"), "names both settings");
+        assert!(
+            CircuitBreaker::new(
+                "x",
+                CircuitBreakerConfig {
+                    window: BreakerWindow::Count { size: 5 },
+                    min_calls: 5,
+                    ..config()
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            bad(CircuitBreakerConfig {
+                wait_in_open: Duration::ZERO,
+                ..config()
+            }),
+            "breaker.wait_in_open"
         );
         assert_eq!(rate_to_permille(0.0001).unwrap(), 1);
         assert!(CircuitBreaker::new("x", CircuitBreakerConfig::default()).is_ok());

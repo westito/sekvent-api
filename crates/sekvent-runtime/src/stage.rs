@@ -57,6 +57,10 @@ pub enum UnitPolicy {
     Critical,
     /// Run the unit again after a backoff. Once the restarts are exhausted
     /// the next exit is treated as a critical failure.
+    ///
+    /// An exit before the unit reported ready counts as a restart too, and
+    /// the unit keeps holding up its stage's start until one of its runs
+    /// reports ready.
     Restart(RestartPolicy),
     /// Log the exit and carry on without the unit.
     BestEffort,
@@ -71,7 +75,10 @@ pub struct RestartPolicy {
     pub max: Duration,
     /// Factor applied to the delay after each restart; at least `1.0`.
     pub multiplier: f64,
-    /// Restarts allowed before escalating; `None` restarts forever.
+    /// Consecutive restarts allowed before escalating; `None` restarts
+    /// forever. A run that lasts
+    /// [`restart_reset_after`](crate::RuntimeBuilder::restart_reset_after)
+    /// resets the count and the backoff.
     pub max_restarts: Option<u32>,
 }
 

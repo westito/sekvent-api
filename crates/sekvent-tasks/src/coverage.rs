@@ -14,24 +14,52 @@ use crate::config::CoverageConfig;
 use crate::metadata::Metadata;
 use crate::plan::Selection;
 
-/// Filename regexes always left out of the report: tests, benches, examples,
-/// the target dir and build-script output (`OUT_DIR`). llvm-cov uses POSIX
-/// extended syntax, so these avoid non-capturing groups.
-pub const BUILTIN_IGNORE: &[&str] = &[
-    r"(^|/)(tests|benches|examples)/",
-    r"(^|/)target/",
-    r"(^|/)build/[^/]+/out/",
-];
+/// Filename regexes always left out of the report, anchored to the
+/// workspace root or the target directory so a checkout that happens to sit
+/// under a directory named `tests/` or `build/` keeps its files: tests,
+/// benches and examples inside the workspace, the target dir and
+/// build-script output (`OUT_DIR`). llvm-cov uses POSIX extended syntax, so
+/// these avoid non-capturing groups.
+pub fn builtin_ignore(workspace_root: &Path, target_dir: &Path) -> Vec<String> {
+    let root = escape_ere(&display_dir(workspace_root));
+    let target = escape_ere(&display_dir(target_dir));
+    vec![
+        format!("^{root}/(.*/)?(tests|benches|examples)/"),
+        format!("^{target}/"),
+        format!("^({root}|{target})/(.*/)?build/[^/]+/out/"),
+    ]
+}
 
-/// The `--ignore-filename-regex` value: built-ins plus `[coverage].ignore`.
-pub fn ignore_regex(config: &CoverageConfig) -> String {
-    BUILTIN_IGNORE
+/// The `--ignore-filename-regex` value: [`builtin_ignore`] plus
+/// `[coverage].ignore`, which is used as written.
+pub fn ignore_regex(workspace_root: &Path, target_dir: &Path, config: &CoverageConfig) -> String {
+    builtin_ignore(workspace_root, target_dir)
         .iter()
-        .copied()
+        .map(String::as_str)
         .chain(config.ignore.iter().map(String::as_str))
         .map(|pattern| format!("({pattern})"))
         .collect::<Vec<_>>()
         .join("|")
+}
+
+fn display_dir(dir: &Path) -> String {
+    dir.display().to_string().trim_end_matches('/').to_owned()
+}
+
+/// Escape the POSIX extended regex metacharacters of `text` with a
+/// backslash; everything else is copied as is.
+pub fn escape_ere(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '.' | '[' | ']' | '{' | '}' | '(' | ')' | '\\' | '*' | '+' | '?' | '^' | '$' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A `llvm.coverage.json.export` document.
@@ -106,7 +134,8 @@ impl PackageCoverage {
         (self.lines.count > 0).then(|| self.lines.covered as f64 * 100.0 / self.lines.count as f64)
     }
 
-    /// At or above the floor; a package without data passes.
+    /// At or above the floor; a package without data passes (see
+    /// [`no_data_error`] for the case where no package has any).
     pub fn passes(&self) -> bool {
         self.percent()
             .is_none_or(|percent| percent + 1e-9 >= self.threshold)
@@ -145,6 +174,23 @@ pub fn aggregate(
         .collect()
 }
 
+/// An explanation when the export has no instrumented line for any of the
+/// `rows` (usually every file was filtered out, or nothing was attributed to
+/// a workspace member); `None` when at least one package has data or there
+/// are no rows at all.
+pub fn no_data_error(rows: &[PackageCoverage], ignore_regex: &str) -> Option<String> {
+    if rows.is_empty() || rows.iter().any(|row| row.lines.count > 0) {
+        return None;
+    }
+    let names: Vec<&str> = rows.iter().map(|row| row.package.as_str()).collect();
+    Some(format!(
+        "the coverage report has no instrumented lines for any selected package ({}); \
+         check that the tests ran and that `[coverage].ignore` does not match every \
+         source file (the filename filter was `{ignore_regex}`)",
+        names.join(", ")
+    ))
+}
+
 /// Render the per-package table.
 pub fn render_table(rows: &[PackageCoverage]) -> String {
     let width = rows
@@ -160,7 +206,7 @@ pub fn render_table(rows: &[PackageCoverage]) -> String {
     for row in rows {
         let cover = row
             .percent()
-            .map_or_else(|| "-".to_owned(), |percent| format!("{percent:.2}%"));
+            .map_or_else(|| "no data".to_owned(), |percent| format!("{percent:.2}%"));
         let verdict = if row.passes() { "" } else { "  FAIL" };
         let _ = writeln!(
             out,
@@ -348,16 +394,69 @@ mod tests {
             ignore: vec![r"(^|/)src/main\.rs$".into()],
             ..CoverageConfig::default()
         };
-        let combined = ignore_regex(&config);
+        let combined = ignore_regex(Path::new("/work"), Path::new("/work/target"), &config);
         assert_eq!(
             combined,
-            r"((^|/)(tests|benches|examples)/)|((^|/)target/)|((^|/)build/[^/]+/out/)|((^|/)src/main\.rs$)"
+            concat!(
+                r"(^/work/(.*/)?(tests|benches|examples)/)|(^/work/target/)|",
+                r"(^(/work|/work/target)/(.*/)?build/[^/]+/out/)|((^|/)src/main\.rs$)"
+            )
         );
         let regex = regex::Regex::new(&combined).unwrap();
         assert!(regex.is_match("/work/crates/a/tests/it.rs"));
-        assert!(regex.is_match("/cache/target/debug/build/a-0123/out/gen.rs"));
+        assert!(regex.is_match("/work/tests/it.rs"));
+        assert!(regex.is_match("/work/target/debug/build/a-0123/out/gen.rs"));
         assert!(regex.is_match("/work/crates/a/src/main.rs"));
         assert!(!regex.is_match("/work/crates/a/src/lib.rs"));
+    }
+
+    #[test]
+    fn builtins_ignore_ancestors_of_the_workspace() {
+        let root = Path::new("/home/u/tests/build/x/out/my.proj");
+        let target = Path::new("/cache/target/");
+        let combined = ignore_regex(root, target, &CoverageConfig::default());
+        let regex = regex::Regex::new(&combined).unwrap();
+        assert!(!regex.is_match("/home/u/tests/build/x/out/my.proj/crates/a/src/lib.rs"));
+        assert!(regex.is_match("/home/u/tests/build/x/out/my.proj/crates/a/tests/it.rs"));
+        assert!(regex.is_match("/home/u/tests/build/x/out/my.proj/examples/demo.rs"));
+        assert!(regex.is_match("/cache/target/llvm-cov-target/debug/build/a-1/out/gen.rs"));
+        assert!(!regex.is_match("/home/u/tests/build/x/out/myxproj/crates/a/src/lib.rs"));
+        assert!(
+            combined.starts_with(r"(^/home/u/tests/build/x/out/my\.proj/"),
+            "{combined}"
+        );
+        assert!(combined.contains("(^/cache/target/)"), "{combined}");
+    }
+
+    #[test]
+    fn regex_metacharacters_in_paths_are_escaped() {
+        assert_eq!(
+            escape_ere("/a.b[c]{d}(e)\\f*g+h?i^j$k|l-m"),
+            r"/a\.b\[c\]\{d\}\(e\)\\f\*g\+h\?i\^j\$k\|l-m"
+        );
+        let raw = "/w (1)/a+b";
+        let regex = regex::Regex::new(&format!("^{}$", escape_ere(raw))).unwrap();
+        assert!(regex.is_match(raw));
+        assert_eq!(display_dir(Path::new("/")), "");
+        assert_eq!(
+            builtin_ignore(Path::new("/"), Path::new("/t"))[0],
+            "^/(.*/)?(tests|benches|examples)/"
+        );
+    }
+
+    #[test]
+    fn a_report_without_any_data_is_an_error() {
+        let row = |package: &str, count: u64| PackageCoverage {
+            package: package.to_owned(),
+            lines: Counts { count, covered: 0 },
+            threshold: 95.0,
+        };
+        assert_eq!(no_data_error(&[], "x"), None);
+        assert_eq!(no_data_error(&[row("a", 0), row("b", 3)], "x"), None);
+        let error = no_data_error(&[row("a", 0), row("b", 0)], "RE").unwrap();
+        assert!(error.contains("(a, b)"), "{error}");
+        assert!(error.contains("`RE`"), "{error}");
+        assert!(render_table(&[row("a", 0)]).contains("no data"));
     }
 
     #[test]

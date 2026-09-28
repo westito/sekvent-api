@@ -45,5 +45,5 @@ pub mod tonic;
 pub use adapter::BearerAuth;
 pub use jwt::{Claims, DEVELOPMENT_SECRET, JwtKeys, NoClaims, TokenRejected, Validation};
 pub use login::{Authenticated, LoginOutcome, LoginRejected, authenticate};
-pub use password::{PasswordHasher, PasswordParams, Verification};
+pub use password::{MAX_BCRYPT_COST, PasswordHasher, PasswordParams, Verification};
 pub use roles::{HasRoles, require_any_role};

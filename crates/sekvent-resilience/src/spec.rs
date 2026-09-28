@@ -172,6 +172,10 @@ pub struct PolicySpec {
     /// Retries always allowed per second.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_budget_min_per_sec: Option<u32>,
+    /// Longest `retry_after` hint worth waiting for; a failure asking for a
+    /// longer pause is returned without retrying (default 30 s).
+    #[serde(with = "humantime_opt", skip_serializing_if = "Option::is_none")]
+    pub retry_max_retry_after: Option<Duration>,
     /// Maximum concurrent calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bulkhead_max_concurrent: Option<u32>,
@@ -224,6 +228,7 @@ impl PolicySpec {
         "RETRY_JITTER",
         "RETRY_BUDGET_RATIO",
         "RETRY_BUDGET_MIN_PER_SEC",
+        "RETRY_MAX_RETRY_AFTER",
         "BULKHEAD_MAX_CONCURRENT",
         "BULKHEAD_MAX_QUEUE",
         "BULKHEAD_QUEUE_TIMEOUT",
@@ -253,6 +258,7 @@ impl PolicySpec {
                 retry_jitter,
                 retry_budget_ratio,
                 retry_budget_min_per_sec,
+                retry_max_retry_after,
                 bulkhead_max_concurrent,
                 bulkhead_max_queue,
                 bulkhead_queue_timeout,
@@ -280,6 +286,11 @@ impl PolicySpec {
     /// Read a spec from `source`, keys prefixed with `prefix` (for example
     /// `ORDERS_TIMEOUT` for prefix `ORDERS_`). Unset keys stay unset. Every
     /// malformed or invalid key is reported; messages name keys, never values.
+    ///
+    /// Degenerate values are rejected here rather than at build time: a zero
+    /// `TIMEOUT`, `BREAKER_WAIT_IN_OPEN` or `RATE_LIMIT_WINDOW`, and a
+    /// `BREAKER_MIN_CALLS` above a call-count `BREAKER_WINDOW` (the circuit
+    /// could never open).
     pub fn from_config(source: &dyn ConfigSource, prefix: &str) -> Result<PolicySpec, ConfigError> {
         let mut reader = Reader {
             source,
@@ -287,7 +298,7 @@ impl PolicySpec {
             errors: Vec::new(),
         };
         let spec = PolicySpec {
-            timeout: reader.duration("TIMEOUT"),
+            timeout: reader.positive_duration("TIMEOUT"),
             retry_max_attempts: reader.count("RETRY_MAX_ATTEMPTS", 1),
             retry_initial_backoff: reader.duration("RETRY_INITIAL_BACKOFF"),
             retry_max_backoff: reader.duration("RETRY_MAX_BACKOFF"),
@@ -303,6 +314,7 @@ impl PolicySpec {
                     .ok_or("must be between 0 and 1000")
             }),
             retry_budget_min_per_sec: reader.count("RETRY_BUDGET_MIN_PER_SEC", 0),
+            retry_max_retry_after: reader.duration("RETRY_MAX_RETRY_AFTER"),
             bulkhead_max_concurrent: reader.count("BULKHEAD_MAX_CONCURRENT", 1),
             bulkhead_max_queue: reader.count("BULKHEAD_MAX_QUEUE", 0),
             bulkhead_queue_timeout: reader.duration("BULKHEAD_QUEUE_TIMEOUT"),
@@ -310,11 +322,17 @@ impl PolicySpec {
             breaker_failure_rate: reader.rate("BREAKER_FAILURE_RATE"),
             breaker_window: reader.window("BREAKER_WINDOW"),
             breaker_min_calls: reader.count("BREAKER_MIN_CALLS", 1),
-            breaker_wait_in_open: reader.duration("BREAKER_WAIT_IN_OPEN"),
+            breaker_wait_in_open: reader.positive_duration("BREAKER_WAIT_IN_OPEN"),
             breaker_permitted_in_half_open: reader.count("BREAKER_PERMITTED_IN_HALF_OPEN", 1),
             rate_limit_permits: reader.count("RATE_LIMIT_PERMITS", 1),
-            rate_limit_window: reader.duration("RATE_LIMIT_WINDOW"),
+            rate_limit_window: reader.positive_duration("RATE_LIMIT_WINDOW"),
         };
+        if let (Some(BreakerWindowSpec::Calls(size)), Some(min_calls)) =
+            (spec.breaker_window, spec.breaker_min_calls)
+            && min_calls > size
+        {
+            reader.min_calls_above_window("BREAKER_MIN_CALLS", "BREAKER_WINDOW");
+        }
         let mut errors = reader.errors;
         match errors.len() {
             0 => Ok(spec),
@@ -326,8 +344,14 @@ impl PolicySpec {
     /// Build a live [`Policy`] named `name`. Stateful parts (budget, rate
     /// gate, bulkhead, breaker) are created fresh, so build once per
     /// dependency and share the result.
+    ///
+    /// Without an explicit `breaker_min_calls`, a call-count window smaller
+    /// than the default minimum lowers the minimum to the window size.
     pub fn build(&self, name: impl Into<String>) -> Result<Policy, PolicyError> {
         let name = name.into();
+        if self.timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(PolicyError::new("timeout", "must be longer than zero"));
+        }
         let mut policy = Policy::new(name.clone()).with_timeout(
             self.timeout
                 .map_or_else(Timeout::deadline_only, Timeout::new),
@@ -349,12 +373,25 @@ impl PolicySpec {
                 self.retry_budget_ratio.unwrap_or(0.2),
                 self.retry_budget_min_per_sec.unwrap_or(10),
             )?;
-            policy = policy
-                .with_retry(RetryPolicy::new(attempts, backoff).with_budget(Arc::new(budget)));
+            let mut retry = RetryPolicy::new(attempts, backoff).with_budget(Arc::new(budget));
+            if let Some(max) = self.retry_max_retry_after {
+                retry = retry.with_max_retry_after(max);
+            }
+            policy = policy.with_retry(retry);
         }
 
         if let Some(max_concurrent) = self.bulkhead_max_concurrent {
             let queue = self.bulkhead_max_queue.unwrap_or(0);
+            if queue > 0
+                && self
+                    .bulkhead_queue_timeout
+                    .is_some_and(|wait| wait.is_zero())
+            {
+                return Err(PolicyError::new(
+                    "bulkhead.queue_timeout",
+                    "must be longer than zero when bulkhead.max_queue is above zero",
+                ));
+            }
             let wait = self.bulkhead_queue_timeout.unwrap_or(if queue > 0 {
                 Duration::from_secs(1)
             } else {
@@ -370,12 +407,17 @@ impl PolicySpec {
             .unwrap_or(self.breaker_failure_rate.is_some())
         {
             let defaults = CircuitBreakerConfig::default();
+            let window = self
+                .breaker_window
+                .map_or(defaults.window, BreakerWindowSpec::to_window);
+            let default_min_calls = match window {
+                BreakerWindow::Count { size } => defaults.min_calls.min(size),
+                BreakerWindow::Time { .. } => defaults.min_calls,
+            };
             let config = CircuitBreakerConfig {
-                window: self
-                    .breaker_window
-                    .map_or(defaults.window, BreakerWindowSpec::to_window),
+                window,
                 failure_rate: self.breaker_failure_rate.unwrap_or(defaults.failure_rate),
-                min_calls: self.breaker_min_calls.unwrap_or(defaults.min_calls),
+                min_calls: self.breaker_min_calls.unwrap_or(default_min_calls),
                 wait_in_open: self.breaker_wait_in_open.unwrap_or(defaults.wait_in_open),
                 permitted_in_half_open: self
                     .breaker_permitted_in_half_open
@@ -429,6 +471,25 @@ impl Reader<'_> {
             self.malformed(key, "a duration like 500ms, 5s or 2m");
         }
         parsed
+    }
+
+    fn positive_duration(&mut self, suffix: &str) -> Option<Duration> {
+        let duration = self.duration(suffix)?;
+        if duration.is_zero() {
+            let (_, key) = self.raw(suffix)?;
+            self.invalid(key, "must be longer than zero");
+            return None;
+        }
+        Some(duration)
+    }
+
+    fn min_calls_above_window(&mut self, suffix: &str, window: &str) {
+        let key = self.source.describe(&format!("{}{suffix}", self.prefix));
+        let window = self.source.describe(&format!("{}{window}", self.prefix));
+        self.errors.push(ConfigError::Invalid {
+            key,
+            reason: format!("must not exceed the call count of {window}"),
+        });
     }
 
     fn count(&mut self, suffix: &str, min: u32) -> Option<u32> {
@@ -588,6 +649,7 @@ mod tests {
             .with("ORDERS_RETRY_JITTER", "equal")
             .with("ORDERS_RETRY_BUDGET_RATIO", "0.1")
             .with("ORDERS_RETRY_BUDGET_MIN_PER_SEC", "0")
+            .with("ORDERS_RETRY_MAX_RETRY_AFTER", "45s")
             .with("ORDERS_BULKHEAD_MAX_CONCURRENT", "8")
             .with("ORDERS_BULKHEAD_MAX_QUEUE", "16")
             .with("ORDERS_BULKHEAD_QUEUE_TIMEOUT", "250ms")
@@ -609,6 +671,7 @@ mod tests {
         assert_eq!(spec.retry_jitter, Some(Jitter::Equal));
         assert_eq!(spec.retry_budget_ratio, Some(0.1));
         assert_eq!(spec.retry_budget_min_per_sec, Some(0));
+        assert_eq!(spec.retry_max_retry_after, Some(secs(45)));
         assert_eq!(spec.bulkhead_max_concurrent, Some(8));
         assert_eq!(spec.bulkhead_max_queue, Some(16));
         assert_eq!(
@@ -626,12 +689,13 @@ mod tests {
         assert_eq!(spec.breaker_permitted_in_half_open, Some(2));
         assert_eq!(spec.rate_limit_permits, Some(50));
         assert_eq!(spec.rate_limit_window, Some(secs(60)));
-        assert_eq!(PolicySpec::CONFIG_KEYS.len(), 19);
+        assert_eq!(PolicySpec::CONFIG_KEYS.len(), 20);
 
         let policy = spec.build("orders").unwrap();
         assert_eq!(policy.name(), "orders");
         assert_eq!(policy.timeout().limit(), Some(Duration::from_millis(750)));
         assert_eq!(policy.retry().max_attempts(), 4);
+        assert_eq!(policy.retry().max_retry_after(), secs(45));
         assert_eq!(policy.bulkhead().unwrap().max_queue(), 16);
         assert_eq!(policy.breaker().unwrap().name(), "orders");
         assert_eq!(policy.rate_gate().unwrap().permits(), 50);
@@ -753,6 +817,46 @@ mod tests {
     }
 
     #[test]
+    fn degenerate_values_are_rejected_by_key() {
+        let invalid = |source: &MapSource| match PolicySpec::from_config(source, "X_").unwrap_err()
+        {
+            ConfigError::Invalid { key, reason } => (key, reason),
+            other => panic!("unexpected {other:?}"),
+        };
+        for key in ["X_TIMEOUT", "X_BREAKER_WAIT_IN_OPEN", "X_RATE_LIMIT_WINDOW"] {
+            for zero in ["0", "0s"] {
+                let (named, reason) = invalid(&MapSource::new().with(key, zero));
+                assert_eq!(named, key);
+                assert_eq!(reason, "must be longer than zero");
+            }
+        }
+        assert!(matches!(
+            PolicySpec::from_config(&MapSource::new().with("X_TIMEOUT", "never"), "X_")
+                .unwrap_err(),
+            ConfigError::Malformed { .. }
+        ));
+
+        let (key, reason) = invalid(
+            &MapSource::new()
+                .with("X_BREAKER_WINDOW", "5")
+                .with("X_BREAKER_MIN_CALLS", "6"),
+        );
+        assert_eq!(key, "X_BREAKER_MIN_CALLS");
+        assert_eq!(reason, "must not exceed the call count of X_BREAKER_WINDOW");
+
+        for (window, min_calls) in [("5", "5"), ("30s", "100")] {
+            let spec = PolicySpec::from_config(
+                &MapSource::new()
+                    .with("X_BREAKER_WINDOW", window)
+                    .with("X_BREAKER_MIN_CALLS", min_calls),
+                "X_",
+            )
+            .unwrap();
+            assert!(spec.breaker_min_calls.is_some());
+        }
+    }
+
+    #[test]
     fn serde_uses_humantime() {
         let spec = PolicySpec {
             timeout: Some(Duration::from_millis(1500)),
@@ -804,6 +908,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn build_validates_combinations() {
         let bad = |spec: PolicySpec| spec.build("x").unwrap_err().parameter();
         assert_eq!(
@@ -844,6 +949,68 @@ mod tests {
             }),
             "breaker.min_calls"
         );
+        assert_eq!(
+            bad(PolicySpec {
+                timeout: Some(Duration::ZERO),
+                ..PolicySpec::default()
+            }),
+            "timeout"
+        );
+        assert_eq!(
+            bad(PolicySpec {
+                bulkhead_max_concurrent: Some(1),
+                bulkhead_max_queue: Some(2),
+                bulkhead_queue_timeout: Some(Duration::ZERO),
+                ..PolicySpec::default()
+            }),
+            "bulkhead.queue_timeout"
+        );
+        assert_eq!(
+            bad(PolicySpec {
+                breaker_enabled: Some(true),
+                breaker_window: Some(BreakerWindowSpec::Calls(5)),
+                breaker_min_calls: Some(6),
+                ..PolicySpec::default()
+            }),
+            "breaker.min_calls"
+        );
+        assert_eq!(
+            bad(PolicySpec {
+                retry_max_attempts: Some(3),
+                retry_budget_ratio: Some(0.0),
+                retry_budget_min_per_sec: Some(0),
+                ..PolicySpec::default()
+            }),
+            "retry_budget.ratio"
+        );
+        assert_eq!(
+            bad(PolicySpec {
+                rate_limit_permits: Some(1),
+                rate_limit_window: Some(Duration::MAX),
+                ..PolicySpec::default()
+            }),
+            "rate_gate.window"
+        );
+
+        let small_window = PolicySpec {
+            breaker_enabled: Some(true),
+            breaker_window: Some(BreakerWindowSpec::Calls(5)),
+            ..PolicySpec::default()
+        }
+        .build("x")
+        .unwrap();
+        assert!(
+            format!("{:?}", small_window.breaker().unwrap()).contains("min_calls: 5"),
+            "the default minimum shrinks to fit the window"
+        );
+        let unqueued = PolicySpec {
+            bulkhead_max_concurrent: Some(1),
+            bulkhead_queue_timeout: Some(Duration::ZERO),
+            ..PolicySpec::default()
+        }
+        .build("x")
+        .unwrap();
+        assert_eq!(unqueued.bulkhead().unwrap().max_queue(), 0);
 
         let queued = PolicySpec {
             bulkhead_max_concurrent: Some(1),

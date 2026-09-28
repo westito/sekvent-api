@@ -81,20 +81,25 @@ pub fn render_new(
     if let Some(ci) = ci {
         merge(&mut files, template::render_kind(ci.template_kind(), vars)?)?;
     }
-    upsert_agents(&mut files, &agents::section_body(vars)?);
+    upsert_agents(&mut files, &agents::section_body(vars)?)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
-fn upsert_agents(files: &mut Vec<RenderedFile>, body: &str) {
+fn upsert_agents(files: &mut Vec<RenderedFile>, body: &str) -> anyhow::Result<()> {
     match files.iter_mut().find(|file| file.path == AGENTS_FILE) {
-        Some(file) => file.contents = agents::upsert(Some(&file.text()), body).into_bytes(),
+        Some(file) => {
+            file.contents = agents::upsert(Some(&file.text()), body)
+                .with_context(|| format!("the rendered {AGENTS_FILE}"))?
+                .into_bytes();
+        }
         None => files.push(RenderedFile {
             path: AGENTS_FILE.to_owned(),
-            contents: agents::upsert(None, body).into_bytes(),
+            contents: agents::upsert(None, body)?.into_bytes(),
             executable: false,
         }),
     }
+    Ok(())
 }
 
 fn sekvent_source(cwd: &Path, path: Option<&Path>) -> anyhow::Result<SekventSource> {
@@ -199,11 +204,17 @@ pub fn init(cwd: &Path, kind: ServiceKind, force: bool) -> anyhow::Result<PathBu
 
     for path in [CONFIG_FILE, BOOTSTRAP] {
         let file = rendered(&files, path)?;
-        let outcome =
-            template::write_file(&root.join(path), &file.contents, file.executable, force)?;
+        let outcome = template::write_file(
+            &root,
+            Path::new(path),
+            &file.contents,
+            file.executable,
+            force,
+        )?;
         print_line(outcome, path);
     }
 
+    template::refuse_symlinks(&root, Path::new(REMOTE_BUILD_FILE))?;
     let remote_path = root.join(REMOTE_BUILD_FILE);
     match std::fs::read_to_string(&remote_path) {
         Ok(existing) => match remote_build::ensure_command(&existing, force)? {
@@ -416,12 +427,34 @@ mod tests {
         assert_eq!(config.project.name, "orders");
         let bootstrap = rendered(&files, BOOTSTRAP).unwrap();
         assert!(bootstrap.executable);
+        let script = bootstrap.text();
+        for needle in [
+            "cli_home=\"$CARGO_HOME/sekvent-cli\"",
+            "root=\"$cli_home/$rev\"",
+            "cargo install --locked --root \"$tmp\"",
+            "--rev \"$rev\" cargo-sekvent",
+            "exec \"$root/bin/cargo-sekvent\" sekvent \"$@\"",
+        ] {
+            assert!(script.contains(needle), "run.sh lacks `{needle}`");
+        }
+        assert!(!script.contains(".sekvent-cli-rev"));
+        assert!(!script.contains("exec cargo sekvent"));
         let remote = rendered(&files, REMOTE_BUILD_FILE).unwrap().text();
         assert_eq!(
             remote_build::ensure_command(&remote, false).unwrap(),
             Edit::Unchanged
         );
         agents::section_body(&vars()).unwrap();
+    }
+
+    #[test]
+    fn ci_templates_cache_the_pinned_cli_roots() {
+        let github = template::render_kind("ci-github", &vars()).unwrap();
+        let workflow = github[0].text();
+        assert_eq!(workflow.matches("path: ~/.cargo/sekvent-cli\n").count(), 2);
+        assert!(!workflow.contains("sekvent-cli-rev"), "{workflow}");
+        let bitbucket = template::render_kind("ci-bitbucket", &vars()).unwrap();
+        assert!(bitbucket[0].text().contains("sekvent-cli/<rev>"));
     }
 
     #[test]
@@ -578,10 +611,18 @@ mod tests {
     #[test]
     fn the_agents_section_is_added_when_no_template_renders_one() {
         let mut files = vec![file("README.md")];
-        upsert_agents(&mut files, "body");
+        upsert_agents(&mut files, "body").unwrap();
         let agents = rendered(&files, AGENTS_FILE).unwrap().text();
         assert_eq!(agents.matches(agents::BEGIN).count(), 1, "{agents}");
         assert!(agents.contains("body"), "{agents}");
+
+        let mut broken = vec![RenderedFile {
+            path: AGENTS_FILE.to_owned(),
+            contents: format!("# x\n{}\n", agents::BEGIN).into_bytes(),
+            executable: false,
+        }];
+        let error = upsert_agents(&mut broken, "body").unwrap_err();
+        assert!(format!("{error:#}").contains("line 2"), "{error:#}");
     }
 
     #[test]
@@ -696,6 +737,28 @@ mod tests {
         std::fs::create_dir_all(root.join(REMOTE_BUILD_FILE)).unwrap();
         let error = init(&root, ServiceKind::Http, false).unwrap_err();
         assert!(error.to_string().starts_with("cannot read"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_to_write_through_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = workspace(dir.path());
+        symlink(outside.path(), root.join(".sekvent")).unwrap();
+        let error = init(&root, ServiceKind::Http, true).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error:#}");
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+
+        std::fs::remove_file(root.join(".sekvent")).unwrap();
+        let victim = outside.path().join("remote.toml");
+        std::fs::write(&victim, "keep").unwrap();
+        symlink(&victim, root.join(REMOTE_BUILD_FILE)).unwrap();
+        let error = init(&root, ServiceKind::Http, true).unwrap_err();
+        assert!(error.to_string().contains(REMOTE_BUILD_FILE), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
     }
 
     #[test]

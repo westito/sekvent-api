@@ -91,6 +91,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 syn = { version = "3.0.6", features = ["full", "extra-traits"] }
 quote = "1.0.47"
 proc-macro2 = "1.0.107"
+proc-macro-crate = "3.5.0"
 
 # --- tests / tooling ---
 # NOT testcontainers-modules: 0.15 requires testcontainers ^0.27, and the

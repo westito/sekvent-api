@@ -134,6 +134,40 @@ async fn postgres_databases_are_separate_and_reachable() {
     assert!(pg.url().starts_with("postgres://"));
     assert!(pg.port() > 0);
     assert!(!pg.host().is_empty());
+    assert_eq!(
+        format!("{first:?}"),
+        format!("TestDatabase {{ name: {:?}, .. }}", first.name)
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn the_postgres_admin_password_is_random_per_server() {
+    use sekvent_testing::PostgresHarness;
+    use sqlx::{Connection, PgConnection};
+
+    if skip() {
+        return;
+    }
+    let pg = PostgresHarness::shared().await;
+    let guessed = format!(
+        "postgres://sekvent:sekvent@{}:{}/postgres",
+        pg.host(),
+        pg.port()
+    );
+    assert!(PgConnection::connect(&guessed).await.is_err());
+    let admin = pg.admin_url();
+    assert!(!admin.contains(":sekvent@"));
+    let shown = format!("{pg:?}");
+    let password = admin
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('@'))
+        .and_then(|(user_info, _)| user_info.split_once(':'))
+        .map(|(_, password)| password.to_owned())
+        .unwrap();
+    assert_eq!(password.len(), 32);
+    assert!(!shown.contains(&password));
 }
 
 #[cfg(feature = "postgres")]
@@ -200,4 +234,9 @@ async fn mysql_databases_are_separate_and_reachable() {
     b.close().await.unwrap();
     assert!(my.url().starts_with("mysql://"));
     assert!(my.admin_url().ends_with("/mysql"));
+
+    let guessed = format!("mysql://root:sekvent@{}:{}/mysql", my.host(), my.port());
+    assert!(MySqlConnection::connect(&guessed).await.is_err());
+    assert!(!my.admin_url().contains(":sekvent@"));
+    assert!(!format!("{my:?}").contains("mysql://"));
 }

@@ -1,5 +1,6 @@
 //! Dependency probes feeding readiness, on tokio's paused clock.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -104,4 +105,54 @@ async fn readiness_follows_the_required_probe() {
     let probes = report.unit(PROBE_UNIT).expect("the probe unit is reported");
     assert_eq!(probes.stage, Stage::Infrastructure);
     assert_eq!(probes.exit, UnitExit::Completed);
+}
+
+const HEALTHY: u8 = 0;
+const PANIC_WHEN_CALLED: u8 = 1;
+const PANIC_WHEN_POLLED: u8 = 2;
+
+/// A required probe with a bug the test can switch on.
+struct Fragile(Arc<AtomicU8>);
+
+impl DependencyProbe for Fragile {
+    fn name(&self) -> &'static str {
+        "cache"
+    }
+    fn probe(&self) -> BoxFuture<'_, ProbeStatus> {
+        let mode = self.0.load(Ordering::SeqCst);
+        assert_ne!(mode, PANIC_WHEN_CALLED, "probe bug while building");
+        Box::pin(async move {
+            assert_ne!(mode, PANIC_WHEN_POLLED, "probe bug while polling");
+            ProbeStatus::Up
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_probe_is_down_and_asked_again() {
+    let panicked = Some(ProbeStatus::Down(ProbeFailure::Unreachable(
+        "probe panicked",
+    )));
+    let mode = Arc::new(AtomicU8::new(PANIC_WHEN_CALLED));
+    let builder = Runtime::builder()
+        .without_signals()
+        .probe(Fragile(Arc::clone(&mode)))
+        .probe_interval(Duration::from_secs(10))
+        .unit("api", Stage::Ingress, UnitPolicy::Critical, until_shutdown);
+    let health = builder.health();
+    let handle = builder.build().unwrap().start().await.unwrap();
+    assert_eq!(health.readiness().probes[0].status, panicked);
+    assert!(!health.is_ready());
+
+    let mut ready = health.watch_ready();
+    mode.store(HEALTHY, Ordering::SeqCst);
+    ready.wait_for(|ready| *ready).await.unwrap();
+
+    mode.store(PANIC_WHEN_POLLED, Ordering::SeqCst);
+    ready.wait_for(|ready| !*ready).await.unwrap();
+    assert_eq!(health.readiness().probes[0].status, panicked);
+
+    handle.shutdown();
+    let report = handle.wait().await.unwrap();
+    assert_eq!(report.unit(PROBE_UNIT).unwrap().exit, UnitExit::Completed);
 }

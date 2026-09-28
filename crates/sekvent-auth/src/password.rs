@@ -12,9 +12,21 @@
 //! | `$2a$…`, `$2b$…`, `$2y$…` (bcrypt) | [`Verification::ValidNeedsRehash`] |
 //! | `{bcrypt}$2a$…` (delegating-encoder prefix) | [`Verification::ValidNeedsRehash`] |
 //!
-//! Anything else — unknown prefixes, malformed strings, `$2x$` — is
-//! [`Verification::Invalid`] and logged at `warn` without the value.
-//! Nothing in this module panics on a bad stored value.
+//! Anything else — unknown prefixes, malformed strings, `$2x$`, an empty
+//! value — is [`Verification::Invalid`] and logged at `warn` without the
+//! value. So is a hash whose cost exceeds the verification limits
+//! ([`PasswordParams::VERIFY_LIMIT`] for argon2, [`MAX_BCRYPT_COST`] for
+//! bcrypt): a stored value must not be able to make one login consume
+//! unbounded memory or time. Nothing in this module panics on a bad stored
+//! value.
+//!
+//! # Uniform work
+//!
+//! Every [`PasswordHasher::verify`] call performs one expensive
+//! verification. When the stored value cannot be checked (unusable, over
+//! the limits, an account with no password such as a single-sign-on-only
+//! user) it runs [`PasswordHasher::dummy_verify`] instead, so such an
+//! account takes as long to reject as a wrong password.
 
 use std::fmt;
 use std::hint::black_box;
@@ -29,9 +41,10 @@ use sekvent_error::AppError;
 const OUTPUT_LEN: usize = 32;
 /// Length of a generated salt in bytes.
 const SALT_LEN: usize = 16;
-/// Stored argon2 hashes asking for more memory than this are refused rather
-/// than allowed to exhaust the process.
-const MAX_VERIFY_MEMORY_KIB: u32 = 1024 * 1024;
+/// Highest bcrypt cost [`PasswordHasher::verify`] accepts: 2^14 rounds,
+/// around a second on current hardware and four times the common default
+/// of 12. Stored hashes above it are refused.
+pub const MAX_BCRYPT_COST: u32 = 14;
 
 const ARGON2_PREFIX: &str = "{argon2}";
 const BCRYPT_PREFIX: &str = "{bcrypt}";
@@ -54,6 +67,23 @@ pub struct PasswordParams {
 }
 
 impl PasswordParams {
+    /// The largest argon2 cost a stored hash may ask for, and a hasher may
+    /// be configured with: 1 GiB of memory, 16 iterations, 16 lanes. Stored
+    /// hashes above any of these are refused rather than allowed to exhaust
+    /// the process.
+    pub const VERIFY_LIMIT: Self = Self {
+        memory_kib: 1024 * 1024,
+        iterations: 16,
+        parallelism: 16,
+    };
+
+    /// Whether every parameter is within [`VERIFY_LIMIT`](Self::VERIFY_LIMIT).
+    pub fn within_verify_limit(self) -> bool {
+        self.memory_kib <= Self::VERIFY_LIMIT.memory_kib
+            && self.iterations <= Self::VERIFY_LIMIT.iterations
+            && self.parallelism <= Self::VERIFY_LIMIT.parallelism
+    }
+
     /// The OWASP password-storage recommendation for argon2id:
     /// 19 MiB of memory, 2 iterations, parallelism 1.
     pub const OWASP: Self = Self {
@@ -108,8 +138,15 @@ impl PasswordHasher {
     /// A hasher producing argon2id hashes with `params`.
     ///
     /// Fails when argon2 rejects the parameters (for example less than
-    /// 8 KiB of memory per lane, or zero iterations).
+    /// 8 KiB of memory per lane, or zero iterations), or when they exceed
+    /// [`PasswordParams::VERIFY_LIMIT`] (the hasher could not verify its own
+    /// hashes).
     pub fn new(params: PasswordParams) -> Result<Self, AppError> {
+        if !params.within_verify_limit() {
+            return Err(AppError::invalid_argument(
+                "argon2id parameters exceed the verification limit",
+            ));
+        }
         let argon_params = Params::new(
             params.memory_kib,
             params.iterations,
@@ -151,20 +188,27 @@ impl PasswordHasher {
 
     /// Check `password` against a stored hash. See the [module docs](self)
     /// for the accepted formats.
+    ///
+    /// Exactly one expensive verification runs per call: a stored value that
+    /// cannot be checked costs a [`dummy_verify`](Self::dummy_verify) before
+    /// it is reported [`Verification::Invalid`].
     pub fn verify(&self, password: &str, stored: &str) -> Verification {
-        if let Some(rest) = stored.strip_prefix(ARGON2_PREFIX) {
-            return self.verify_argon2(password, rest, true);
-        }
-        if let Some(rest) = stored.strip_prefix(BCRYPT_PREFIX) {
-            return verify_bcrypt(password, rest);
-        }
-        if stored.starts_with("$argon2") {
-            return self.verify_argon2(password, stored, false);
-        }
-        if is_bcrypt(stored) {
-            return verify_bcrypt(password, stored);
-        }
-        rejected("unrecognised format")
+        let checked = if let Some(rest) = stored.strip_prefix(ARGON2_PREFIX) {
+            self.verify_argon2(password, rest, true)
+        } else if let Some(rest) = stored.strip_prefix(BCRYPT_PREFIX) {
+            verify_bcrypt(password, rest)
+        } else if stored.starts_with("$argon2") {
+            self.verify_argon2(password, stored, false)
+        } else if is_bcrypt(stored) {
+            verify_bcrypt(password, stored)
+        } else {
+            Err("unrecognised format")
+        };
+        checked.unwrap_or_else(|reason| {
+            self.dummy_verify(password);
+            tracing::warn!(reason, "stored password hash rejected");
+            Verification::Invalid
+        })
     }
 
     /// Spend the same work as [`verify`](Self::verify) of a current argon2id
@@ -175,32 +219,46 @@ impl PasswordHasher {
     /// hash with a legacy scheme or different cost still takes a different
     /// time; rehashing on login closes that gap over time.
     pub fn dummy_verify(&self, password: &str) {
+        #[cfg(test)]
+        DUMMY_RUNS.with(|runs| runs.set(runs.get() + 1));
         let outcome = self
             .argon2
             .verify_password(black_box(password.as_bytes()), &self.dummy);
         black_box(outcome.is_ok());
     }
 
-    fn verify_argon2(&self, password: &str, stored: &str, prefixed: bool) -> Verification {
-        let Ok(hash) = PasswordHash::new(stored) else {
-            return rejected("malformed argon2 hash");
+    /// `Err` means no real verification ran; the caller spends the dummy
+    /// work instead.
+    fn verify_argon2(
+        &self,
+        password: &str,
+        stored: &str,
+        prefixed: bool,
+    ) -> Result<Verification, &'static str> {
+        let hash = PasswordHash::new(stored).map_err(|_| "malformed argon2 hash")?;
+        // Without both, argon2 reports a mismatch without hashing anything.
+        if hash.salt.is_none() || hash.hash.is_none() {
+            return Err("argon2 hash without salt or output");
+        }
+        let algorithm =
+            Algorithm::new(hash.algorithm.as_str()).map_err(|_| "unknown argon2 variant")?;
+        let params = Params::try_from(&hash).map_err(|_| "invalid argon2 parameters")?;
+        let cost = PasswordParams {
+            memory_kib: params.m_cost(),
+            iterations: params.t_cost(),
+            parallelism: params.p_cost(),
         };
-        let Ok(algorithm) = Algorithm::new(hash.algorithm.as_str()) else {
-            return rejected("unknown argon2 variant");
-        };
-        let Ok(params) = Params::try_from(&hash) else {
-            return rejected("invalid argon2 parameters");
-        };
-        if params.m_cost() > MAX_VERIFY_MEMORY_KIB {
-            return rejected("argon2 memory cost above the verification limit");
+        if !cost.within_verify_limit() {
+            return Err("argon2 cost above the verification limit");
         }
         match self.argon2.verify_password(password.as_bytes(), &hash) {
             Ok(()) if prefixed || self.is_weaker(algorithm, hash.version, &params) => {
-                Verification::ValidNeedsRehash
+                Ok(Verification::ValidNeedsRehash)
             }
-            Ok(()) => Verification::Valid,
-            Err(HashError::PasswordInvalid) => Verification::Invalid,
-            Err(_) => rejected("argon2 verification failed"),
+            Ok(()) => Ok(Verification::Valid),
+            Err(HashError::PasswordInvalid) => Ok(Verification::Invalid),
+            // Argon2 validates before it hashes, so other errors did no work.
+            Err(_) => Err("argon2 verification failed"),
         }
     }
 
@@ -235,21 +293,44 @@ fn is_bcrypt(stored: &str) -> bool {
         .any(|version| stored.starts_with(version))
 }
 
-fn verify_bcrypt(password: &str, stored: &str) -> Verification {
+/// `Err` means no real verification ran; the caller spends the dummy work
+/// instead.
+fn verify_bcrypt(password: &str, stored: &str) -> Result<Verification, &'static str> {
     if !is_bcrypt(stored) {
-        return rejected("unsupported bcrypt version");
+        return Err("unsupported bcrypt version");
+    }
+    let cost = bcrypt_cost(stored).ok_or("malformed bcrypt hash")?;
+    if cost > MAX_BCRYPT_COST {
+        return Err("bcrypt cost above the verification limit");
     }
     match bcrypt::verify(password, stored) {
-        Ok(true) => Verification::ValidNeedsRehash,
-        Ok(false) => Verification::Invalid,
+        Ok(true) => Ok(Verification::ValidNeedsRehash),
+        Ok(false) => Ok(Verification::Invalid),
         // The bcrypt error can quote parts of the hash; it is not logged.
-        Err(_) => rejected("malformed bcrypt hash"),
+        // bcrypt parses and validates before it hashes, so no work was done.
+        Err(_) => Err("malformed bcrypt hash"),
     }
 }
 
-fn rejected(reason: &'static str) -> Verification {
-    tracing::warn!(reason, "stored password hash rejected");
-    Verification::Invalid
+/// The cost field of `$2b$12$…`.
+fn bcrypt_cost(stored: &str) -> Option<u32> {
+    let cost = stored.get(4..)?.split('$').next()?;
+    if cost.is_empty() || !cost.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    cost.parse().ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`PasswordHasher::dummy_verify`] ran on this thread.
+    static DUMMY_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Dummy verifications run so far on this thread.
+#[cfg(test)]
+pub(crate) fn dummy_runs() -> u32 {
+    DUMMY_RUNS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -417,14 +498,114 @@ mod tests {
             "$argon2id$v=19$m=1,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "$argon2id$v=19$m=4294967295,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "$argon2id$v=7$m=8,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "$argon2id$v=19$m=8,t=1,p=1",
+            "$argon2id$v=19$m=8,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA",
             "$2b$04$tooshort",
             "$2b$99$abcdefghijklmnopqrstuuabcdefghijklmnopqrstuvwxyz01234",
         ] {
+            let before = dummy_runs();
             assert_eq!(
                 hasher.verify("pw", stored),
                 Verification::Invalid,
                 "{stored}"
             );
+            assert_eq!(dummy_runs(), before + 1, "no dummy work for {stored}");
+        }
+    }
+
+    #[test]
+    fn checkable_hashes_do_no_dummy_work() {
+        let hasher = low();
+        let argon = hasher.hash("pw").unwrap();
+        let legacy = bcrypt_hash("pw", bcrypt::Version::TwoB);
+        let before = dummy_runs();
+        for (password, stored) in [
+            ("pw", argon.as_str()),
+            ("nope", argon.as_str()),
+            ("pw", legacy.as_str()),
+            ("nope", legacy.as_str()),
+        ] {
+            let _ = hasher.verify(password, stored);
+        }
+        assert_eq!(dummy_runs(), before);
+    }
+
+    #[test]
+    fn an_account_without_a_password_pays_the_dummy_work() {
+        let hasher = low();
+        let before = dummy_runs();
+        assert_eq!(hasher.verify("pw", ""), Verification::Invalid);
+        assert_eq!(dummy_runs(), before + 1);
+    }
+
+    #[test]
+    fn argon2_costs_above_the_limit_are_refused() {
+        let hasher = low();
+        let hash =
+            |cost: &str| format!("$argon2id$v=19${cost}${DUMMY_SALT_B64}${DUMMY_OUTPUT_B64}");
+        for cost in ["m=1048577,t=1,p=1", "m=8,t=17,p=1", "m=136,t=1,p=17"] {
+            let stored = hash(cost);
+            assert!(PasswordHash::new(&stored).is_ok(), "{stored}");
+            let before = dummy_runs();
+            assert_eq!(hasher.verify("pw", &stored), Verification::Invalid);
+            assert_eq!(dummy_runs(), before + 1, "{cost}");
+        }
+        // At the limit is still checked for real (and does not match).
+        let before = dummy_runs();
+        assert_eq!(
+            hasher.verify("pw", &hash("m=128,t=16,p=16")),
+            Verification::Invalid
+        );
+        assert_eq!(dummy_runs(), before);
+    }
+
+    #[test]
+    fn bcrypt_costs_above_the_limit_are_refused() {
+        let hasher = low();
+        let real = bcrypt_hash("pw", bcrypt::Version::TwoB);
+        assert!(real.starts_with("$2b$04$"));
+        let too_costly = real.replacen("$04$", &format!("${}$", MAX_BCRYPT_COST + 1), 1);
+        let before = dummy_runs();
+        assert_eq!(hasher.verify("pw", &too_costly), Verification::Invalid);
+        assert_eq!(dummy_runs(), before + 1);
+        let prefixed = format!("{{bcrypt}}{too_costly}");
+        assert_eq!(hasher.verify("pw", &prefixed), Verification::Invalid);
+        assert_eq!(dummy_runs(), before + 2);
+    }
+
+    #[test]
+    fn bcrypt_cost_parsing() {
+        assert_eq!(bcrypt_cost("$2b$12$rest"), Some(12));
+        assert_eq!(bcrypt_cost("$2b$04"), Some(4));
+        assert_eq!(bcrypt_cost("$2b$"), None);
+        assert_eq!(bcrypt_cost("$2b$+1$rest"), None);
+        assert_eq!(bcrypt_cost("$2b$ab$rest"), None);
+        assert_eq!(bcrypt_cost("$2b"), None);
+        assert_eq!(bcrypt_cost("$2b$99999999999$rest"), None);
+    }
+
+    #[test]
+    fn verify_limits() {
+        assert!(PasswordParams::OWASP.within_verify_limit());
+        assert!(PasswordParams::VERIFY_LIMIT.within_verify_limit());
+        for over in [
+            PasswordParams {
+                memory_kib: PasswordParams::VERIFY_LIMIT.memory_kib + 1,
+                ..LOW
+            },
+            PasswordParams {
+                iterations: PasswordParams::VERIFY_LIMIT.iterations + 1,
+                ..LOW
+            },
+            PasswordParams {
+                memory_kib: 8 * 17,
+                parallelism: PasswordParams::VERIFY_LIMIT.parallelism + 1,
+                ..LOW
+            },
+        ] {
+            assert!(!over.within_verify_limit(), "{over:?}");
+            let error = PasswordHasher::new(over).unwrap_err();
+            assert_eq!(error.code(), sekvent_error::ErrorCode::InvalidArgument);
         }
     }
 

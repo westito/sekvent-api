@@ -5,6 +5,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -14,14 +15,16 @@ use futures::future::BoxFuture;
 use http::header::CONTENT_TYPE;
 use http::request::Parts;
 use http::{HeaderMap, Request, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use hyper_util::service::TowerToHyperService;
 use sekvent_context::{CallContext, ServiceIdentity, headers};
 use sekvent_error::AppError;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tonic::server::NamedService;
 use tonic::service::Routes;
 use tower::ServiceExt;
@@ -35,6 +38,11 @@ pub type Authenticator = Arc<dyn Fn(&Parts) -> Option<ServiceIdentity> + Send + 
 
 /// The health endpoints, which always live at the root.
 const HEALTH_PATHS: [&str; 3] = ["/livez", "/readyz", "/healthz"];
+
+/// Pause after the first accept failure that is not about one connection.
+const ACCEPT_BACKOFF_FIRST: Duration = Duration::from_millis(100);
+/// Longest pause between accept attempts while they keep failing.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Axum extractor for the [`CallContext`] the server attached to the request.
 ///
@@ -79,6 +87,8 @@ pub struct ServerBuilder {
     grpc_health: bool,
     visibility: HealthVisibility,
     authenticator: Option<Authenticator>,
+    header_read_timeout: Option<Duration>,
+    max_connections: Option<usize>,
     problems: Vec<String>,
 }
 
@@ -91,6 +101,8 @@ impl fmt::Debug for ServerBuilder {
             .field("health_routes", &self.health_routes)
             .field("grpc_health", &self.grpc_health)
             .field("visibility", &self.visibility)
+            .field("header_read_timeout", &self.header_read_timeout)
+            .field("max_connections", &self.max_connections)
             .finish_non_exhaustive()
     }
 }
@@ -195,6 +207,25 @@ impl ServerBuilder {
         self
     }
 
+    /// Longest a new connection may stay silent, and an HTTP/1 client may
+    /// take to send a request's headers, before the connection is closed
+    /// (default 30 s). `None` waits forever, which lets idle clients hold
+    /// connections open.
+    #[must_use]
+    pub fn header_read_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.header_read_timeout = timeout;
+        self
+    }
+
+    /// Most connections served at once (default 10 000). Beyond it, new
+    /// connections wait in the operating system's accept queue until one
+    /// closes. `None` removes the limit.
+    #[must_use]
+    pub fn max_connections(mut self, limit: Option<usize>) -> Self {
+        self.max_connections = limit;
+        self
+    }
+
     /// Validate and bind `addr` (port 0 picks a free port).
     pub async fn bind(self, addr: SocketAddr) -> Result<Server, AppError> {
         self.validate()?;
@@ -224,6 +255,8 @@ impl ServerBuilder {
                     grpc_health: self.grpc_health,
                     visibility: self.visibility,
                     authenticator: self.authenticator,
+                    header_read_timeout: self.header_read_timeout,
+                    max_connections: self.max_connections,
                 },
             }),
         })
@@ -232,6 +265,23 @@ impl ServerBuilder {
     fn validate(&self) -> Result<(), AppError> {
         if let Some(problem) = self.problems.first() {
             return Err(AppError::invalid_argument(problem.clone()));
+        }
+        if self
+            .header_read_timeout
+            .is_some_and(|timeout| timeout.is_zero())
+        {
+            return Err(AppError::invalid_argument(
+                "the header read timeout must be positive",
+            ));
+        }
+        if self
+            .max_connections
+            .is_some_and(|limit| limit == 0 || limit > Semaphore::MAX_PERMITS)
+        {
+            return Err(AppError::invalid_argument(format!(
+                "the connection limit must be between 1 and {}",
+                Semaphore::MAX_PERMITS
+            )));
         }
         if let Some(prefix) = &self.prefix {
             if !is_valid_prefix(prefix) {
@@ -279,6 +329,8 @@ struct ServerConfig {
     grpc_health: bool,
     visibility: HealthVisibility,
     authenticator: Option<Authenticator>,
+    header_read_timeout: Option<Duration>,
+    max_connections: Option<usize>,
 }
 
 struct ServerInner {
@@ -321,6 +373,8 @@ impl Server {
             grpc_health: true,
             visibility: HealthVisibility::default(),
             authenticator: None,
+            header_read_timeout: Some(Duration::from_secs(30)),
+            max_connections: Some(10_000),
             problems: Vec::new(),
         }
     }
@@ -369,6 +423,13 @@ impl Server {
     /// The unit that serves this listener: ready once listening, stops
     /// accepting when its stage drains, then lets in-flight requests finish.
     /// A restarted unit binds the same address again.
+    ///
+    /// Accept failures that concern one connection are skipped; running out
+    /// of file descriptors or memory pauses accepting (100 ms, doubling up
+    /// to 1 s) and is logged once per burst. Only a listener that can no
+    /// longer accept at all fails the unit: it returns the error at once and
+    /// its open connections drain in the background for at most the stage
+    /// grace period.
     pub fn into_unit(
         self,
     ) -> impl FnMut(UnitContext) -> BoxFuture<'static, Result<(), AppError>> + Send + 'static {
@@ -397,49 +458,100 @@ impl Server {
 
     async fn serve(self, ctx: UnitContext) -> Result<(), AppError> {
         let listener = self.take_listener().await?;
+        self.serve_on(listener, ctx).await
+    }
+
+    async fn serve_on<L: Incoming>(
+        self,
+        mut listener: L,
+        ctx: UnitContext,
+    ) -> Result<(), AppError> {
+        let config = &self.inner.config;
         let app = self.router(ctx.health());
         ctx.health().publish().await;
         let shutdown = ctx.shutdown();
-        let builder = auto::Builder::new(TokioExecutor::new());
+        // Releases connections still waiting for their first byte.
+        let silent = shutdown.child_token();
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(config.header_read_timeout);
+        let builder = Arc::new(builder);
+        let limit = config
+            .max_connections
+            .map(|limit| Arc::new(Semaphore::new(limit)));
         let graceful = GracefulShutdown::new();
         let mut connections = JoinSet::new();
+        let mut accept_errors = AcceptErrors::default();
         let addr = self.inner.local_addr;
         tracing::info!(%addr, unit = ctx.name(), "listening");
         ctx.ready();
 
         let outcome = loop {
             while connections.try_join_next().is_some() {}
-            tokio::select! {
+            let permit = match &limit {
+                None => None,
+                Some(limit) => tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break Ok(()),
+                    permit = Arc::clone(limit).acquire_owned() => permit.ok(),
+                },
+            };
+            let accepted = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break Ok(()),
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, _peer)) => {
-                        let service = TowerToHyperService::new(app.clone());
-                        let connection = builder
-                            .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                            .into_owned();
-                        let connection = graceful.watch(connection);
-                        connections.spawn(async move {
-                            if let Err(error) = connection.await {
-                                tracing::debug!(%error, "connection closed with an error");
-                            }
-                        });
+                accepted = listener.next_connection() => accepted,
+            };
+            let error = match accepted {
+                Ok(stream) => {
+                    accept_errors.recovered(addr);
+                    connections.spawn(serve_connection(
+                        stream,
+                        Accepted {
+                            builder: Arc::clone(&builder),
+                            service: TowerToHyperService::new(app.clone()),
+                            watcher: graceful.watcher(),
+                            first_byte: config.header_read_timeout,
+                            silent: silent.clone(),
+                            permit,
+                        },
+                    ));
+                    continue;
+                }
+                Err(error) => error,
+            };
+            match AcceptFailure::of(&error) {
+                AcceptFailure::Connection => {
+                    tracing::debug!(%error, "accept failed for one connection");
+                }
+                AcceptFailure::Listener => {
+                    break Err(
+                        AppError::unavailable(format!("the listener on {addr} failed"))
+                            .with_source(error),
+                    );
+                }
+                AcceptFailure::Resources => {
+                    let pause = accept_errors.failed(addr, &error);
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break Ok(()),
+                        () = tokio::time::sleep(pause) => {}
                     }
-                    Err(error) if is_per_connection(&error) => {
-                        tracing::debug!(%error, "accept failed for one connection");
-                    }
-                    Err(error) => {
-                        break Err(AppError::unavailable(format!("the listener on {addr} failed"))
-                            .with_source(error));
-                    }
-                },
+                }
             }
         };
 
         drop(listener);
-        tracing::info!(%addr, "stopped accepting; draining connections");
-        graceful.shutdown().await;
-        while connections.join_next().await.is_some() {}
+        if outcome.is_ok() {
+            tracing::info!(%addr, "stopped accepting; draining connections");
+            graceful.shutdown().await;
+            while connections.join_next().await.is_some() {}
+            return outcome;
+        }
+        tracing::warn!(%addr, "the listener failed; draining its connections in the background");
+        silent.cancel();
+        drain_in_background(graceful, connections, ctx.stage_grace(), addr);
         outcome
     }
 
@@ -460,15 +572,139 @@ impl Server {
     }
 }
 
-/// Accept errors that concern one connection, not the listener.
-fn is_per_connection(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::ConnectionAborted
+/// Let a failed listener's connections finish in the background, cutting
+/// whatever is left after `grace`: the failure is reported at once, and an
+/// open gRPC health watch, for one, never ends on its own.
+fn drain_in_background(
+    graceful: GracefulShutdown,
+    mut connections: JoinSet<()>,
+    grace: Duration,
+    addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        let drained = tokio::time::timeout(grace, async {
+            graceful.shutdown().await;
+            while connections.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(%addr, "connections outlived the grace period and were closed");
+        }
+    });
+}
+
+/// Where the serve loop takes its connections from; a seam so tests can
+/// inject accept failures.
+trait Incoming: Send + 'static {
+    fn next_connection(&mut self) -> impl Future<Output = io::Result<TcpStream>> + Send;
+}
+
+impl Incoming for TcpListener {
+    #[allow(clippy::manual_async_fn)]
+    fn next_connection(&mut self) -> impl Future<Output = io::Result<TcpStream>> + Send {
+        async move { self.accept().await.map(|(stream, _peer)| stream) }
+    }
+}
+
+/// What a failed `accept` means for the listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptFailure {
+    /// One connection went away before it was accepted; carry on.
+    Connection,
+    /// The socket cannot accept at all (not listening, wrong type).
+    Listener,
+    /// The process is out of something (file descriptors, memory, buffers);
+    /// pause, then try again.
+    Resources,
+}
+
+impl AcceptFailure {
+    fn of(error: &io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::ConnectionAborted
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionRefused
             | io::ErrorKind::Interrupted
-    )
+            | io::ErrorKind::WouldBlock => Self::Connection,
+            io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported => Self::Listener,
+            _ => Self::Resources,
+        }
+    }
+}
+
+/// Backoff and log throttling for a burst of resource-related accept
+/// failures.
+#[derive(Debug, Default)]
+struct AcceptErrors {
+    burst: u32,
+}
+
+impl AcceptErrors {
+    /// Record a failure and return how long to pause before accepting again.
+    fn failed(&mut self, addr: SocketAddr, error: &io::Error) -> Duration {
+        if self.burst == 0 {
+            tracing::warn!(%addr, %error, "accepting connections failed; backing off");
+        } else {
+            let failures = self.burst.saturating_add(1);
+            tracing::debug!(%addr, %error, failures, "accepting connections still fails");
+        }
+        let pause = ACCEPT_BACKOFF_FIRST
+            .saturating_mul(1 << self.burst.min(4))
+            .min(ACCEPT_BACKOFF_MAX);
+        self.burst = self.burst.saturating_add(1);
+        pause
+    }
+
+    /// A connection was accepted: end the burst.
+    fn recovered(&mut self, addr: SocketAddr) {
+        if self.burst > 0 {
+            tracing::info!(%addr, failures = self.burst, "accepting connections again");
+            self.burst = 0;
+        }
+    }
+}
+
+/// Everything one accepted connection needs to be served.
+struct Accepted {
+    builder: Arc<auto::Builder<TokioExecutor>>,
+    service: TowerToHyperService<Router>,
+    watcher: Watcher,
+    first_byte: Option<Duration>,
+    silent: CancellationToken,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+async fn serve_connection(stream: TcpStream, accepted: Accepted) {
+    let Accepted {
+        builder,
+        service,
+        watcher,
+        first_byte,
+        silent,
+        // Held until the connection is done, so it counts against the limit.
+        permit: _permit,
+    } = accepted;
+    if let Some(timeout) = first_byte {
+        // The protocol sniffing below has no timeout of its own.
+        let mut first = [0_u8; 1];
+        let spoke = tokio::select! {
+            biased;
+            () = silent.cancelled() => false,
+            peeked = tokio::time::timeout(timeout, stream.peek(&mut first)) => {
+                matches!(peeked, Ok(Ok(read)) if read > 0)
+            }
+        };
+        if !spoke {
+            tracing::debug!("connection closed before it sent anything");
+            return;
+        }
+    }
+    let connection = builder
+        .serve_connection_with_upgrades(TokioIo::new(stream), service)
+        .into_owned();
+    if let Err(error) = watcher.watch(connection).await {
+        tracing::debug!(%error, "connection closed with an error");
+    }
 }
 
 fn attach_context(request: Request<Body>, authenticator: Option<&Authenticator>) -> Request<Body> {
@@ -520,13 +756,20 @@ impl tower::Service<Request<Body>> for Dispatch {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use axum::routing::get;
     use http_body_util::BodyExt;
-    use tokio::sync::watch;
-    use tokio_util::sync::CancellationToken;
+    use sekvent_error::ErrorCode;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{oneshot, watch};
+    use tokio::time::Instant;
 
     use super::*;
     use crate::Stage;
+
+    const GRACE: Duration = Duration::from_secs(5);
 
     fn localhost() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 0))
@@ -696,7 +939,16 @@ mod tests {
         );
         let reused = Server::builder().from_listener(taken).unwrap();
         assert_eq!(reused.local_addr(), addr);
-        assert!(format!("{:?}", Server::builder()).contains("ServerBuilder"));
+        assert!(format!("{:?}", Server::builder()).contains("max_connections: Some(10000)"));
+
+        for limits in [
+            Server::builder().header_read_timeout(Some(Duration::ZERO)),
+            Server::builder().max_connections(Some(0)),
+            Server::builder().max_connections(Some(usize::MAX)),
+        ] {
+            let error = limits.bind(localhost()).await.unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        }
     }
 
     #[tokio::test]
@@ -707,11 +959,34 @@ mod tests {
     }
 
     #[test]
-    fn only_connection_level_accept_errors_are_tolerated() {
-        assert!(is_per_connection(&io::Error::from(
-            io::ErrorKind::ConnectionAborted
-        )));
-        assert!(!is_per_connection(&io::Error::other("fd limit")));
+    fn accept_failures_are_told_apart() {
+        let of = |kind: io::ErrorKind| AcceptFailure::of(&io::Error::from(kind));
+        assert_eq!(
+            of(io::ErrorKind::ConnectionAborted),
+            AcceptFailure::Connection
+        );
+        assert_eq!(of(io::ErrorKind::Interrupted), AcceptFailure::Connection);
+        assert_eq!(of(io::ErrorKind::InvalidInput), AcceptFailure::Listener);
+        assert_eq!(of(io::ErrorKind::OutOfMemory), AcceptFailure::Resources);
+        assert_eq!(
+            AcceptFailure::of(&io::Error::other("too many open files")),
+            AcceptFailure::Resources
+        );
+    }
+
+    #[test]
+    fn accept_backoff_doubles_to_a_cap_and_resets() {
+        let addr = localhost();
+        let error = io::Error::other("too many open files");
+        let mut errors = AcceptErrors::default();
+        let pauses: Vec<u128> = (0..6)
+            .map(|_| errors.failed(addr, &error).as_millis())
+            .collect();
+        assert_eq!(pauses, [100, 200, 400, 800, 1000, 1000]);
+        errors.recovered(addr);
+        assert_eq!(errors.burst, 0);
+        errors.recovered(addr);
+        assert_eq!(errors.failed(addr, &error), ACCEPT_BACKOFF_FIRST);
     }
 
     fn context(token: &CancellationToken) -> (UnitContext, watch::Receiver<bool>) {
@@ -723,8 +998,277 @@ mod tests {
             token.clone(),
             Arc::new(ready_tx),
             HealthRegistry::new(),
+            GRACE,
         );
         (ctx, ready)
+    }
+
+    /// One step of a scripted listener.
+    enum Step {
+        /// Accept a real connection.
+        Accept,
+        /// Fail this accept with the error.
+        Fail(io::Error),
+        /// Hold the next accept until the sender fires.
+        Wait(oneshot::Receiver<()>),
+        /// Fire the sender, then go on with the next step.
+        Tell(oneshot::Sender<()>),
+    }
+
+    /// A real listener that plays a script of accept outcomes first.
+    struct Scripted {
+        listener: TcpListener,
+        steps: VecDeque<Step>,
+    }
+
+    impl Incoming for Scripted {
+        #[allow(clippy::manual_async_fn)]
+        fn next_connection(&mut self) -> impl Future<Output = io::Result<TcpStream>> + Send {
+            async move {
+                loop {
+                    match self.steps.pop_front() {
+                        Some(Step::Fail(error)) => return Err(error),
+                        Some(Step::Wait(go)) => {
+                            let _ = go.await;
+                        }
+                        Some(Step::Tell(told)) => {
+                            let _ = told.send(());
+                        }
+                        Some(Step::Accept) | None => return self.listener.next_connection().await,
+                    }
+                }
+            }
+        }
+    }
+
+    async fn scripted(server: &Server, steps: impl IntoIterator<Item = Step>) -> Scripted {
+        Scripted {
+            listener: server.take_listener().await.unwrap(),
+            steps: steps.into_iter().collect(),
+        }
+    }
+
+    /// One `connection: close` request over a fresh connection; the raw
+    /// response.
+    async fn exchange(addr: SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nhost: test\r\nconnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn out_of_files() -> Step {
+        Step::Fail(io::Error::other("too many open files"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resource_failures_pause_accepting_without_ending_it() {
+        let server = Server::builder().bind(localhost()).await.unwrap();
+        let addr = server.local_addr();
+        let reset = Step::Fail(io::ErrorKind::ConnectionReset.into());
+        let listener = scripted(
+            &server,
+            [out_of_files(), out_of_files(), out_of_files(), reset],
+        )
+        .await;
+        let token = CancellationToken::new();
+        let (ctx, mut ready) = context(&token);
+        let started = Instant::now();
+        let running = tokio::spawn(server.serve_on(listener, ctx));
+        ready.wait_for(|ready| *ready).await.unwrap();
+
+        let response = exchange(addr, "/livez").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(Instant::now() - started >= Duration::from_millis(700));
+
+        token.cancel();
+        running.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cuts_an_accept_pause_short() {
+        let server = Server::builder().bind(localhost()).await.unwrap();
+        let (told_tx, told_rx) = oneshot::channel::<()>();
+        let listener = scripted(&server, [Step::Tell(told_tx), out_of_files()]).await;
+        let token = CancellationToken::new();
+        let (ctx, _ready) = context(&token);
+        let running = tokio::spawn(server.serve_on(listener, ctx));
+        // The unit reaches its pause without yielding after telling.
+        told_rx.await.unwrap();
+        let paused_at = Instant::now();
+        token.cancel();
+        running.await.unwrap().unwrap();
+        assert_eq!(Instant::now(), paused_at);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_listener_fails_the_unit_at_once_and_bounds_the_drain() {
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (guard_tx, guard_rx) = oneshot::channel::<()>();
+        let slot = Arc::new(Mutex::new(Some((entered_tx, guard_tx))));
+        let hold = Router::new().route(
+            "/hold",
+            get(move || {
+                let taken = slot.lock().unwrap().take();
+                async move {
+                    if let Some((entered, guard)) = taken {
+                        let _guard = guard;
+                        let _ = entered.send(());
+                        std::future::pending::<()>().await;
+                    }
+                    "released"
+                }
+            }),
+        );
+        let server = Server::builder()
+            .rest(hold)
+            .bind(localhost())
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let broken = Step::Fail(io::ErrorKind::InvalidInput.into());
+        let listener = scripted(&server, [Step::Accept, Step::Wait(go_rx), broken]).await;
+        let token = CancellationToken::new();
+        let (ctx, mut ready) = context(&token);
+        let running = tokio::spawn(server.serve_on(listener, ctx));
+        ready.wait_for(|ready| *ready).await.unwrap();
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /hold HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await
+            .unwrap();
+        entered_rx.await.unwrap();
+
+        let failed = Instant::now();
+        go_tx.send(()).unwrap();
+        let error = running.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert!(error.message().contains("listener"), "{}", error.message());
+        assert_eq!(Instant::now(), failed, "reported before any draining");
+        TcpListener::bind(addr)
+            .await
+            .expect("the port was released at once");
+
+        assert!(guard_rx.await.is_err(), "the held request was cut");
+        assert_eq!(Instant::now() - failed, GRACE);
+        let mut rest = Vec::new();
+        let _ = client.read_to_end(&mut rest).await;
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_and_slow_clients_are_cut_off() {
+        let timeout = Duration::from_secs(3);
+        let server = Server::builder()
+            .header_read_timeout(Some(timeout))
+            .bind(localhost())
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let token = CancellationToken::new();
+        let (ctx, mut ready) = context(&token);
+        let mut unit = server.into_unit();
+        let running = tokio::spawn(unit(ctx));
+        ready.wait_for(|ready| *ready).await.unwrap();
+
+        for opening in [&b""[..], &b"GET /livez HTTP/1.1\r\n"[..]] {
+            let started = Instant::now();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(opening).await.unwrap();
+            let mut rest = Vec::new();
+            let _ = client.read_to_end(&mut rest).await;
+            assert!(Instant::now() - started >= timeout);
+        }
+        token.cancel();
+        running.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_connection_limit_queues_new_connections() {
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let slot = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+        let first_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&first_done);
+        let routes = Router::new()
+            .route(
+                "/hold",
+                get(move || {
+                    let taken = slot.lock().unwrap().take();
+                    let done = Arc::clone(&done);
+                    async move {
+                        if let Some((entered, release)) = taken {
+                            let _ = entered.send(());
+                            let _ = release.await;
+                        }
+                        done.store(true, Ordering::SeqCst);
+                        "held"
+                    }
+                }),
+            )
+            .route(
+                "/first-done",
+                get(move || {
+                    let seen = first_done.load(Ordering::SeqCst);
+                    async move { seen.to_string() }
+                }),
+            );
+        let server = Server::builder()
+            .rest(routes)
+            .max_connections(Some(1))
+            .bind(localhost())
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let token = CancellationToken::new();
+        let (ctx, mut ready) = context(&token);
+        let mut unit = server.into_unit();
+        let running = tokio::spawn(unit(ctx));
+        ready.wait_for(|ready| *ready).await.unwrap();
+
+        let first = tokio::spawn(exchange(addr, "/hold"));
+        entered_rx.await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(b"GET /first-done HTTP/1.1\r\nhost: test\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert!(first.await.unwrap().ends_with("held"));
+        let mut response = Vec::new();
+        second.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.ends_with("true"),
+            "served only once the first connection closed: {response}"
+        );
+
+        token.cancel();
+        running.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn limits_can_be_lifted() {
+        let server = Server::builder()
+            .header_read_timeout(None)
+            .max_connections(None)
+            .bind(localhost())
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let token = CancellationToken::new();
+        let (ctx, mut ready) = context(&token);
+        let mut unit = server.into_unit();
+        let running = tokio::spawn(unit(ctx));
+        ready.wait_for(|ready| *ready).await.unwrap();
+        let response = exchange(addr, "/livez").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        token.cancel();
+        running.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -22,6 +22,9 @@ pub struct Metadata {
     pub resolve: Option<Resolve>,
     /// The workspace root directory.
     pub workspace_root: PathBuf,
+    /// The target directory cargo builds into.
+    #[serde(default)]
+    pub target_directory: Option<PathBuf>,
 }
 
 /// One package.
@@ -35,9 +38,36 @@ pub struct Package {
     pub version: String,
     /// Path of its `Cargo.toml`.
     pub manifest_path: PathBuf,
+    /// Its build targets.
+    #[serde(default)]
+    pub targets: Vec<Target>,
 }
 
+/// One build target of a package.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Target {
+    /// Target kinds: `lib`, `rlib`, `proc-macro`, `bin`, `test`, …
+    #[serde(default)]
+    pub kind: Vec<String>,
+}
+
+/// Target kinds `cargo test --lib` and `--doc` select.
+pub const LIBRARY_KINDS: [&str; 6] = ["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+
 impl Package {
+    /// The package has a library target. A package listed without any
+    /// targets counts as having one, so a trimmed metadata document never
+    /// drops `--lib` or the doctests.
+    pub fn has_library(&self) -> bool {
+        self.targets.is_empty()
+            || self.targets.iter().any(|target| {
+                target
+                    .kind
+                    .iter()
+                    .any(|kind| LIBRARY_KINDS.contains(&kind.as_str()))
+            })
+    }
+
     /// The directory holding the manifest.
     pub fn dir(&self) -> &Path {
         self.manifest_path.parent().unwrap_or(Path::new(""))
@@ -114,6 +144,13 @@ impl Metadata {
             bail!("`{cmd}` failed:\n{}", output.stderr.trim());
         }
         Self::parse(&output.stdout).context("cannot parse `cargo metadata` output")
+    }
+
+    /// The target directory: cargo's `target_directory`, else `<root>/target`.
+    pub fn target_dir(&self) -> PathBuf {
+        self.target_directory
+            .clone()
+            .unwrap_or_else(|| self.workspace_root.join("target"))
     }
 
     /// The workspace members, sorted by name.
@@ -224,6 +261,12 @@ mod tests {
         runner.push_output(FIXTURE);
         let meta = Metadata::load(&runner, Path::new("/work"), false).unwrap();
         assert_eq!(meta.workspace_root, PathBuf::from("/work"));
+        assert_eq!(meta.target_dir(), PathBuf::from("/work/target"));
+        assert!(meta.members().iter().all(|package| package.has_library()));
+        let without = FIXTURE.replace("\"target_directory\": \"/work/target\",", "");
+        let without = Metadata::parse(&without).unwrap();
+        assert_eq!(without.target_directory, None);
+        assert_eq!(without.target_dir(), PathBuf::from("/work/target"));
         assert_eq!(
             runner.lines(),
             ["cargo metadata --format-version 1 --no-deps"]
@@ -242,5 +285,25 @@ mod tests {
         let error = Metadata::load(&failing, Path::new("/work"), true).unwrap_err();
         assert!(error.to_string().contains("no manifest"), "{error}");
         assert_eq!(failing.lines(), ["cargo metadata --format-version 1"]);
+    }
+
+    #[test]
+    fn library_targets_are_detected() {
+        let package = |kinds: &[&[&str]]| Package {
+            name: "a".into(),
+            id: "a".into(),
+            version: "0.1.0".into(),
+            manifest_path: PathBuf::from("/w/a/Cargo.toml"),
+            targets: kinds
+                .iter()
+                .map(|kind| Target {
+                    kind: kind.iter().map(|k| (*k).to_owned()).collect(),
+                })
+                .collect(),
+        };
+        assert!(package(&[]).has_library());
+        assert!(package(&[&["bin"], &["lib"]]).has_library());
+        assert!(package(&[&["proc-macro"]]).has_library());
+        assert!(!package(&[&["bin"], &["test"], &["example"]]).has_library());
     }
 }

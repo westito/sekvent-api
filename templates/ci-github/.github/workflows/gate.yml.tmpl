@@ -48,9 +48,8 @@ jobs:
       - name: Cache cargo-sekvent
         uses: actions/cache@v5
         with:
-          path: |
-            ~/.cargo/bin/cargo-sekvent
-            ~/.cargo/.sekvent-cli-rev
+          # One immutable root per sekvent revision; see .sekvent/run.sh.
+          path: ~/.cargo/sekvent-cli
           key: cargo-sekvent-${{{{ runner.os }}-${{{{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-sekvent-${{{{ runner.os }}-
 
@@ -78,9 +77,8 @@ jobs:
       - name: Cache cargo-sekvent
         uses: actions/cache@v5
         with:
-          path: |
-            ~/.cargo/bin/cargo-sekvent
-            ~/.cargo/.sekvent-cli-rev
+          # One immutable root per sekvent revision; see .sekvent/run.sh.
+          path: ~/.cargo/sekvent-cli
           key: cargo-sekvent-${{{{ runner.os }}-${{{{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-sekvent-${{{{ runner.os }}-
 

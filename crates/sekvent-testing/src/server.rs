@@ -62,12 +62,23 @@ impl ServerImage {
 }
 
 /// A database created for one test.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` output shows the name only: the URL carries the server's
+/// admin password.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TestDatabase {
     /// The database name, unique per call.
     pub name: String,
     /// A URL connecting to it with the server's admin credentials.
     pub url: String,
+}
+
+impl std::fmt::Debug for TestDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestDatabase")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Everything needed to start one database server container.
@@ -121,6 +132,12 @@ pub(crate) async fn start_server(
         host,
         port,
     })
+}
+
+/// A fresh admin password for one server container: 32 random hex digits,
+/// safe in a URL and in an environment variable.
+pub(crate) fn random_password() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// A unique database name: `t_` plus 32 hex digits, valid unquoted in both
@@ -218,6 +235,26 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         );
+    }
+
+    #[test]
+    fn passwords_are_random_hex() {
+        let first = random_password();
+        assert_ne!(first, random_password());
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_databases_debug_without_the_url() {
+        let database = TestDatabase {
+            name: "t_1".to_owned(),
+            url: "postgres://sekvent:hunter2@db:5432/t_1".to_owned(),
+        };
+        let shown = format!("{database:?}");
+        assert_eq!(shown, r#"TestDatabase { name: "t_1", .. }"#);
+        assert!(!shown.contains("hunter2"));
+        assert_eq!(database.clone(), database);
     }
 
     #[tokio::test(start_paused = true)]

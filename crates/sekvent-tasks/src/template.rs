@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use include_dir::Dir;
@@ -466,15 +466,66 @@ impl WriteOutcome {
     }
 }
 
-/// Write `contents` to `path`, never replacing different contents unless
-/// `force`.
+/// Refuse to write `relative` under `root` through a symbolic link.
+///
+/// Walks every component of `relative` that already exists and fails on the
+/// first symlink, naming it, so a checked-in or planted link (say
+/// `.sekvent -> ~/.ssh`) cannot redirect a scaffolded file outside the
+/// project. `root` itself is trusted. Components that do not exist yet end
+/// the walk; `relative` must be a plain relative path.
+pub fn refuse_symlinks(root: &Path, relative: &Path) -> io::Result<()> {
+    let mut current = root.to_path_buf();
+    let components = relative
+        .components()
+        .filter(|component| *component != Component::CurDir);
+    for component in components {
+        match component {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("`{}` is not a plain relative path", relative.display()),
+                ));
+            }
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to write through the symbolic link {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Write `contents` to `relative` under `root`, never replacing different
+/// contents unless `force` and never writing through a symbolic link.
+///
+/// A new file is created exclusively (`O_EXCL`), so a file or link that
+/// appears between the check and the write is left alone and reported as
+/// [`WriteOutcome::Skipped`]. With `force` an existing file is removed (a
+/// link is removed, not followed) and created afresh.
 pub fn write_file(
-    path: &Path,
+    root: &Path,
+    relative: &Path,
     contents: &[u8],
     executable: bool,
     force: bool,
 ) -> io::Result<WriteOutcome> {
-    let outcome = match std::fs::read(path) {
+    refuse_symlinks(root, relative)?;
+    let path = root.join(relative);
+    let outcome = match std::fs::read(&path) {
         Ok(existing) if existing == contents => return Ok(WriteOutcome::Unchanged),
         Ok(_) if !force => return Ok(WriteOutcome::Skipped),
         Ok(_) => WriteOutcome::Overwritten,
@@ -484,11 +535,40 @@ pub fn write_file(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents)?;
-    if executable {
-        set_executable(path)?;
+    refuse_symlinks(root, relative)?;
+    if outcome == WriteOutcome::Overwritten {
+        std::fs::remove_file(&path)?;
     }
-    Ok(outcome)
+    if create_new(&path, contents, executable)? {
+        Ok(outcome)
+    } else {
+        Ok(WriteOutcome::Skipped)
+    }
+}
+
+/// Create `path` exclusively with `contents`; `false` when something already
+/// exists there (it is not touched).
+pub fn create_new(path: &Path, contents: &[u8], executable: bool) -> io::Result<bool> {
+    use std::io::Write as _;
+
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    file.write_all(contents)?;
+    if executable {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(true)
 }
 
 /// Make `path` mode 0755 (a no-op off Unix).
@@ -503,7 +583,7 @@ pub fn set_executable(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write rendered files under `root`.
+/// Write rendered files under `root` (see [`write_file`]).
 pub fn write_all(
     root: &Path,
     files: &[RenderedFile],
@@ -513,7 +593,8 @@ pub fn write_all(
         .iter()
         .map(|file| {
             let outcome = write_file(
-                &root.join(&file.path),
+                root,
+                Path::new(&file.path),
                 &file.contents,
                 file.executable,
                 force,
@@ -752,5 +833,64 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a/b.txt")).unwrap(),
             "one"
         );
+    }
+
+    #[test]
+    fn a_file_that_appears_before_the_write_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        assert!(create_new(&path, b"first", false).unwrap());
+        assert!(!create_new(&path, b"second", true).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        assert!(create_new(&dir.path().join("missing/x"), b"", false).is_err());
+    }
+
+    #[test]
+    fn only_plain_relative_paths_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["../x", "/abs"] {
+            let error = write_file(dir.path(), Path::new(bad), b"", false, false).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{bad}");
+            assert!(error.to_string().contains("plain relative path"), "{error}");
+        }
+        refuse_symlinks(dir.path(), Path::new("./a/b")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scaffolding_never_writes_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), project.path().join(".sekvent")).unwrap();
+        let files = vec![RenderedFile {
+            path: ".sekvent/run.sh".into(),
+            contents: b"#!/bin/sh\n".to_vec(),
+            executable: true,
+        }];
+        for force in [false, true] {
+            let error = write_all(project.path(), &files, force).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let message = error.to_string();
+            assert!(message.contains("symbolic link"), "{message}");
+            assert!(message.ends_with(".sekvent"), "{message}");
+        }
+        assert!(!outside.path().join("run.sh").exists());
+
+        let target = outside.path().join("victim");
+        std::fs::write(&target, "keep").unwrap();
+        symlink(&target, project.path().join("file.txt")).unwrap();
+        for force in [false, true] {
+            let error =
+                write_file(project.path(), Path::new("file.txt"), b"x", false, force).unwrap_err();
+            assert!(error.to_string().contains("file.txt"), "{error}");
+        }
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+
+        let directory = project.path().join("a-dir");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("f"), "x").unwrap();
+        assert!(write_file(project.path(), Path::new("a-dir"), b"x", false, true).is_err());
     }
 }

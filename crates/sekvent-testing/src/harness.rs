@@ -5,6 +5,11 @@ use crate::HarnessError;
 /// The label namespace used unless a project picks its own.
 pub const DEFAULT_NAMESPACE: &str = "io.sekvent.harness";
 
+/// Environment variable naming the label namespace, so a test runner that
+/// sweeps by its own namespace finds the containers its tests start. Unset
+/// or blank means [`DEFAULT_NAMESPACE`].
+pub const HARNESS_NAMESPACE_ENV: &str = "SEKVENT_HARNESS_NAMESPACE";
+
 /// Environment variable that pins the run id, so a test runner can clean up
 /// exactly the containers of the run it started.
 pub const RUN_ID_ENV: &str = "SEKVENT_TEST_RUN_ID";
@@ -30,10 +35,25 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// The default namespace and a run id from [`RUN_ID_ENV`], or a freshly
+    /// The namespace from [`HARNESS_NAMESPACE_ENV`] (or [`DEFAULT_NAMESPACE`]
+    /// when unset or blank) and a run id from [`RUN_ID_ENV`], or a freshly
     /// generated one when that variable is unset or blank.
+    ///
+    /// Fails when either variable is set to an unusable label part.
     pub fn from_env() -> Result<Self, HarnessError> {
-        Self::with_run_id(DEFAULT_NAMESPACE, std::env::var(RUN_ID_ENV).ok().as_deref())
+        Self::from_vars(
+            std::env::var(HARNESS_NAMESPACE_ENV).ok().as_deref(),
+            std::env::var(RUN_ID_ENV).ok().as_deref(),
+        )
+    }
+
+    /// [`from_env`](Self::from_env) over already-read variable values.
+    fn from_vars(namespace: Option<&str>, run_id: Option<&str>) -> Result<Self, HarnessError> {
+        let namespace = match namespace.map(str::trim) {
+            Some(namespace) if !namespace.is_empty() => namespace,
+            _ => DEFAULT_NAMESPACE,
+        };
+        Self::with_run_id(namespace, run_id)
     }
 
     /// A harness under `namespace`, with a run id from [`RUN_ID_ENV`] or a
@@ -222,8 +242,38 @@ mod tests {
     }
 
     #[test]
-    fn from_env_and_with_namespace_use_the_given_namespace() {
-        assert_eq!(Harness::from_env().unwrap().namespace(), DEFAULT_NAMESPACE);
+    fn the_namespace_variable_picks_the_namespace() {
+        for unset in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                Harness::from_vars(unset, None).unwrap().namespace(),
+                DEFAULT_NAMESPACE
+            );
+        }
+        let harness = Harness::from_vars(Some(" org.example.ci "), Some("r7")).unwrap();
+        assert_eq!(harness.namespace(), "org.example.ci");
+        assert_eq!(harness.run_id(), "r7");
+        let error = Harness::from_vars(Some("bad namespace"), None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid label namespace: may only contain ASCII letters, digits, '.', '-' and '_'"
+        );
+        assert!(Harness::from_vars(None, Some("bad id")).is_err());
+    }
+
+    #[test]
+    fn from_env_reads_the_namespace_variable() {
+        let expected = std::env::var(HARNESS_NAMESPACE_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map_or_else(
+                || DEFAULT_NAMESPACE.to_owned(),
+                |value| value.trim().to_owned(),
+            );
+        assert_eq!(Harness::from_env().unwrap().namespace(), expected);
+    }
+
+    #[test]
+    fn with_namespace_uses_the_given_namespace() {
         assert_eq!(
             Harness::with_namespace("org.example").unwrap().namespace(),
             "org.example"

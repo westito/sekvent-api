@@ -1,5 +1,6 @@
 //! Configuration sources.
 use std::collections::BTreeMap;
+use std::fmt;
 
 /// Where configuration values come from.
 pub trait ConfigSource: Send + Sync {
@@ -30,7 +31,10 @@ impl ConfigSource for EnvSource {
 }
 
 /// An in-memory source, for tests and for layering defaults.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` lists the key names (sorted) and their count, never the values,
+/// which may be secrets.
+#[derive(Clone, Default)]
 pub struct MapSource(BTreeMap<String, String>);
 
 impl MapSource {
@@ -57,6 +61,15 @@ impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for MapSource {
                 .map(|(k, v)| (k.into(), v.into()))
                 .collect(),
         )
+    }
+}
+
+impl fmt::Debug for MapSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MapSource")
+            .field("keys", &self.0.keys().collect::<Vec<_>>())
+            .field("len", &self.0.len())
+            .finish()
     }
 }
 
@@ -123,6 +136,27 @@ mod tests {
 
         let collected: MapSource = [("X", "1")].into_iter().collect();
         assert_eq!(collected.keys(), ["X"]);
+    }
+
+    #[test]
+    fn map_source_debug_shows_keys_but_never_values() {
+        let map = MapSource::new()
+            .with("SEKVENT_B_TOKEN", "hunter2")
+            .with("A_URL", "postgres://user:pw@db/app");
+        let debug = format!("{map:?}");
+        assert_eq!(
+            debug,
+            r#"MapSource { keys: ["A_URL", "SEKVENT_B_TOKEN"], len: 2 }"#
+        );
+        let pretty = format!("{map:#?}");
+        for value in ["hunter2", "postgres", "pw@db"] {
+            assert!(!debug.contains(value), "{debug}");
+            assert!(!pretty.contains(value), "{pretty}");
+        }
+        assert_eq!(
+            format!("{:?}", MapSource::new()),
+            "MapSource { keys: [], len: 0 }"
+        );
     }
 
     #[test]

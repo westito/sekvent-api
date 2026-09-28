@@ -46,6 +46,10 @@ managed by `cargo sekvent agents`; edit outside it.
 - There is no local fallback. If the builder is unreachable, stop and report;
   do not "just run cargo test here". CI runs the same commands locally
   (`CI=true`).
+- A project or machine without a remote builder opts out explicitly with
+  `[remote].mode = "local"` in `sekvent.toml` (or `SEKVENT_LOCAL=1` for one
+  shell); compiling commands then run on this machine. That is a
+  configuration choice, not a fallback for an unreachable builder.
 
 ### Commands
 

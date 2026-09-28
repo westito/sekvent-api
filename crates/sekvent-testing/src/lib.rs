@@ -31,6 +31,19 @@
 //!
 //! With a remote daemon, export `DOCKER_HOST` and set
 //! `TESTCONTAINERS_HOST_OVERRIDE` to the host that publishes the ports.
+//! `SEKVENT_HARNESS_NAMESPACE` ([`HARNESS_NAMESPACE_ENV`]) picks the label
+//! namespace of the shared containers, and `SEKVENT_TEST_RUN_ID`
+//! ([`RUN_ID_ENV`]) their run id.
+//!
+//! # Credentials and exposure
+//!
+//! Every server container gets a fresh random admin password, so a
+//! container's published port cannot be logged into with a well-known
+//! password. The port is published on all of the daemon host's interfaces:
+//! a test process running in a sibling container reaches it through the
+//! Docker bridge gateway, which a loopback-only binding would not serve.
+//! The URLs carry that password; [`TestDatabase`]'s `Debug` and the
+//! harnesses' `Debug` print no URL.
 //!
 //! # Safety note
 //!
@@ -58,7 +71,7 @@ mod postgres;
 pub use addr::{HOST_OVERRIDE_ENV, container_addr, mapped_addr, resolve_host};
 pub use await_until::{DEFAULT_AWAIT_INTERVAL, DEFAULT_AWAIT_TIMEOUT};
 pub use error::HarnessError;
-pub use harness::{DEFAULT_NAMESPACE, Harness, RUN_ID_ENV, generate_run_id};
+pub use harness::{DEFAULT_NAMESPACE, HARNESS_NAMESPACE_ENV, Harness, RUN_ID_ENV, generate_run_id};
 pub use reaper::Reaper;
 pub use server::{DOCKER_TESTS_ENV, ServerImage, TestDatabase, docker_tests_enabled};
 pub use sweep::SweepReport;

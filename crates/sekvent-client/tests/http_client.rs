@@ -12,8 +12,9 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::Redirect;
 use axum::routing::{any, get, post};
-use sekvent_client::{BuildError, HttpClient};
+use sekvent_client::{BuildError, HttpClient, RedirectPolicy};
 use sekvent_config::Secret;
 use sekvent_context::{CallContext, ManualClock};
 use sekvent_error::{AppError, ErrorCode};
@@ -106,11 +107,11 @@ async fn statuses_map_to_codes() {
     let client = plain_client(&base);
     let table = [
         (400, ErrorCode::InvalidArgument),
-        (401, ErrorCode::Unauthenticated),
-        (403, ErrorCode::PermissionDenied),
+        (401, ErrorCode::Internal),
+        (403, ErrorCode::Internal),
         (404, ErrorCode::NotFound),
         (408, ErrorCode::DeadlineExceeded),
-        (409, ErrorCode::Aborted),
+        (409, ErrorCode::AlreadyExists),
         (412, ErrorCode::FailedPrecondition),
         (422, ErrorCode::InvalidArgument),
         (429, ErrorCode::ResourceExhausted),
@@ -132,6 +133,50 @@ async fn statuses_map_to_codes() {
             format!("upstream responded with HTTP {status}")
         );
     }
+
+    let sekvent = HttpClient::builder()
+        .base_url(&base)
+        .policy(Policy::new("test"))
+        .sekvent_upstream(true)
+        .build()
+        .unwrap();
+    for (status, code) in [
+        (401, ErrorCode::Unauthenticated),
+        (403, ErrorCode::PermissionDenied),
+    ] {
+        let error = sekvent
+            .get(&format!("/status/{status}"))
+            .send(&CallContext::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), code, "HTTP {status} from a sekvent upstream");
+    }
+}
+
+#[tokio::test]
+async fn a_conflict_is_not_retried() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let router = Router::new().route(
+        "/conflict",
+        any(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { StatusCode::CONFLICT }
+        }),
+    );
+    let base = serve(router).await;
+    let client = HttpClient::builder()
+        .base_url(&base)
+        .policy(fast_retries())
+        .build()
+        .unwrap();
+    let error = client
+        .put("/conflict")
+        .send(&CallContext::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::AlreadyExists);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -264,12 +309,14 @@ async fn context_is_propagated() {
             Json(json!({
                 "request_id": header_text(&headers, "x-request-id"),
                 "grpc_timeout": header_text(&headers, "grpc-timeout"),
+                "idempotency_key": header_text(&headers, "idempotency-key"),
             }))
         }),
     );
     let base = serve(router).await;
     let ctx = CallContext::new()
         .with_request_id("req-42")
+        .with_idempotency_key("inbound-key")
         .with_timeout(Duration::from_secs(5));
 
     let seen: Value = plain_client(&base)
@@ -278,6 +325,7 @@ async fn context_is_propagated() {
         .await
         .unwrap();
     assert_eq!(seen["request_id"], "req-42");
+    assert_eq!(seen["idempotency_key"], Value::Null);
     let timeout = sekvent_context::headers::parse_grpc_timeout(
         seen["grpc_timeout"].as_str().expect("grpc-timeout is sent"),
     )
@@ -291,7 +339,120 @@ async fn context_is_propagated() {
         .build()
         .unwrap();
     let seen: Value = quiet.get("/headers").send_json(&ctx).await.unwrap();
-    assert_eq!(seen, json!({ "request_id": null, "grpc_timeout": null }));
+    assert_eq!(
+        seen,
+        json!({ "request_id": null, "grpc_timeout": null, "idempotency_key": null })
+    );
+}
+
+#[tokio::test]
+async fn request_headers_win_over_the_context() {
+    let router = Router::new().route(
+        "/headers",
+        post(|headers: HeaderMap| async move {
+            Json(json!({
+                "request_id": header_text(&headers, "x-request-id"),
+                "idempotency_key": header_text(&headers, "idempotency-key"),
+            }))
+        }),
+    );
+    let base = serve(router).await;
+    let ctx = CallContext::new()
+        .with_request_id("req-42")
+        .with_idempotency_key("inbound-key");
+    let client = plain_client(&base);
+
+    let seen: Value = client.post("/headers").send_json(&ctx).await.unwrap();
+    assert_eq!(seen["request_id"], "req-42");
+    assert_eq!(
+        seen["idempotency_key"],
+        Value::Null,
+        "the inbound key is not reused upstream"
+    );
+
+    let seen: Value = client
+        .post("/headers")
+        .header("x-request-id", "caller-chosen")
+        .header("idempotency-key", "outbound-key")
+        .send_json(&ctx)
+        .await
+        .unwrap();
+    assert_eq!(seen["request_id"], "caller-chosen");
+    assert_eq!(seen["idempotency_key"], "outbound-key");
+}
+
+#[tokio::test]
+async fn redirects_never_leave_the_origin() {
+    let stolen = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&stolen);
+    let elsewhere = serve(Router::new().route(
+        "/steal",
+        get(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { "gotcha" }
+        }),
+    ))
+    .await;
+    let hops = Arc::new(AtomicUsize::new(0));
+    let hop_counter = Arc::clone(&hops);
+    let router = Router::new()
+        .route("/hop", get(|| async { Redirect::to("/landing") }))
+        .route(
+            "/landing",
+            get(|headers: HeaderMap| async move {
+                header_text(&headers, "x-api-key").unwrap_or_default()
+            }),
+        )
+        .route(
+            "/away",
+            get(move || {
+                let target = format!("{elsewhere}/steal");
+                async move { Redirect::to(&target) }
+            }),
+        )
+        .route(
+            "/loop/{n}",
+            get(move |Path(n): Path<u32>| {
+                hop_counter.fetch_add(1, Ordering::SeqCst);
+                async move { Redirect::to(&format!("/loop/{}", n + 1)) }
+            }),
+        );
+    let base = serve(router).await;
+    let client = HttpClient::builder()
+        .base_url(&base)
+        .policy(Policy::new("test"))
+        .default_header("x-api-key", "k-123")
+        .build()
+        .unwrap();
+    let ctx = CallContext::new();
+
+    let landed = client.get("/hop").send(&ctx).await.unwrap();
+    assert_eq!(landed.status(), StatusCode::OK);
+    assert_eq!(landed.text().unwrap(), "k-123");
+
+    let stopped = client.get("/away").send(&ctx).await.unwrap();
+    assert_eq!(stopped.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        stolen.load(Ordering::SeqCst),
+        0,
+        "the other origin never saw the key"
+    );
+
+    let looping = client.get("/loop/0").send(&ctx).await.unwrap();
+    assert_eq!(looping.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        hops.load(Ordering::SeqCst),
+        6,
+        "the first request and five redirects"
+    );
+
+    let manual = HttpClient::builder()
+        .base_url(&base)
+        .redirects(RedirectPolicy::None)
+        .build()
+        .unwrap();
+    let not_followed = manual.get("/hop").send(&ctx).await.unwrap();
+    assert_eq!(not_followed.status(), StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
@@ -309,7 +470,25 @@ async fn sekvent_json_errors_decode_losslessly() {
         }),
     );
     let base = serve(router).await;
-    let error = plain_client(&base)
+    let foreign = plain_client(&base)
+        .get("/orders/7")
+        .send(&CallContext::new())
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), ErrorCode::NotFound);
+    assert_eq!(
+        foreign.message(),
+        "upstream responded with HTTP 404",
+        "an upstream not declared as sekvent is not trusted"
+    );
+    assert_eq!(foreign.reason(), Some("UPSTREAM_HTTP_ERROR"));
+
+    let error = HttpClient::builder()
+        .base_url(&base)
+        .policy(Policy::new("test"))
+        .sekvent_upstream(true)
+        .build()
+        .unwrap()
         .get("/orders/7")
         .send(&CallContext::new())
         .await
@@ -345,13 +524,14 @@ async fn upstream_bodies_never_reach_the_message() {
     assert_eq!(error.code(), ErrorCode::Internal);
     assert!(!error.message().contains("SECRET"));
     assert!(!error.to_string().contains("SECRET"));
+    assert!(!format!("{error:?}").contains("SECRET"));
     assert!(!format!("{:?}", error.to_wire()).contains("SECRET"));
     let source = error
         .source()
-        .expect("the body is kept internally")
+        .expect("the response shape is kept internally")
         .to_string();
-    assert!(source.contains("SECRET"));
-    assert!(!source.contains(&body), "the internal copy is truncated");
+    assert!(!source.contains("SECRET"));
+    assert!(source.contains(&format!("{}-byte body", body.len())));
 }
 
 #[tokio::test]

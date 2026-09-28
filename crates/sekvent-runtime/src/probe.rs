@@ -1,17 +1,21 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
 use futures::future::{BoxFuture, join_all};
 use sekvent_error::AppError;
 
 use crate::UnitContext;
+use crate::runtime::panic_detail;
 
 /// A check of one external dependency (database, broker, upstream service)
 /// that feeds readiness.
 ///
 /// The runtime polls every probe on an interval with a per-probe timeout; a
-/// probe that does not answer in time counts as
-/// [`ProbeFailure::Unreachable`].
+/// probe that does not answer in time, or panics, counts as
+/// [`ProbeFailure::Unreachable`] for that round and is asked again on the
+/// next one.
 pub trait DependencyProbe: Send + Sync + 'static {
     /// Stable name shown in full health output, e.g. `postgres`.
     fn name(&self) -> &str;
@@ -83,6 +87,9 @@ impl ProbeFailure {
 /// Detail recorded for a probe that exceeded its timeout.
 pub(crate) const TIMED_OUT: &str = "probe timed out";
 
+/// Detail recorded for a probe that panicked.
+pub(crate) const PANICKED: &str = "probe panicked";
+
 /// The unit that polls every probe and records the results.
 ///
 /// It reports ready after the first round, so the infrastructure stage (and
@@ -105,12 +112,11 @@ async fn run_probes(
 ) -> Result<(), AppError> {
     let shutdown = ctx.shutdown();
     loop {
-        let round = join_all(probes.iter().map(|probe| async move {
-            let status = tokio::time::timeout(timeout, probe.probe())
-                .await
-                .unwrap_or(ProbeStatus::Down(ProbeFailure::Unreachable(TIMED_OUT)));
-            (probe.name(), status)
-        }))
+        let round = join_all(
+            probes
+                .iter()
+                .map(|probe| async move { (probe.name(), check(&**probe, timeout).await) }),
+        )
         .await;
         for (name, status) in round {
             if ctx.health().record_probe(name, status) {
@@ -125,6 +131,26 @@ async fn run_probes(
             () = tokio::time::sleep(interval) => {}
         }
     }
+}
+
+/// Run one probe once. A probe that panics, whether building its future or
+/// polling it, is down for this round; the others and later rounds go on.
+async fn check(probe: &dyn DependencyProbe, timeout: Duration) -> ProbeStatus {
+    let answer = match std::panic::catch_unwind(AssertUnwindSafe(|| probe.probe())) {
+        Ok(pending) => AssertUnwindSafe(pending).catch_unwind(),
+        Err(panic) => return panicked(probe, &*panic),
+    };
+    match tokio::time::timeout(timeout, answer).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(panic)) => panicked(probe, &*panic),
+        Err(_elapsed) => ProbeStatus::Down(ProbeFailure::Unreachable(TIMED_OUT)),
+    }
+}
+
+fn panicked(probe: &dyn DependencyProbe, panic: &(dyn std::any::Any + Send)) -> ProbeStatus {
+    let detail = panic_detail(panic);
+    tracing::error!(probe = probe.name(), panic = %detail, "dependency probe panicked");
+    ProbeStatus::Down(ProbeFailure::Unreachable(PANICKED))
 }
 
 fn log_transition(name: &str, status: ProbeStatus) {

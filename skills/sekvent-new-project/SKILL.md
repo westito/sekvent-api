@@ -13,8 +13,9 @@ cargo sekvent --version || curl -fsSL https://raw.githubusercontent.com/westito/
 
 The installer puts a prebuilt `cargo-sekvent` into `${CARGO_HOME:-~/.cargo}/bin`
 after checking its SHA-256. Inside the remote builder and in CI the project's
-`.sekvent/run.sh` installs the CLI at the exact revision `Cargo.lock` pins, so
-the laptop copy only needs to be recent enough to generate.
+`.sekvent/run.sh` installs the CLI at the exact revision `Cargo.lock` pins
+into `$CARGO_HOME/sekvent-cli/<rev>` and runs that binary directly, so the
+laptop copy only needs to be recent enough to generate.
 
 ## 1. Pick the kind
 
@@ -66,7 +67,10 @@ cargo sekvent coverage           # remote: per-package line floors
 
 Commit `Cargo.lock`: the CLI in containers and CI reads the sekvent revision
 from it. If the remote builder is unreachable, stop and report; do not fall
-back to local builds.
+back to local builds. A project or machine that has no remote builder at all
+opts out explicitly with `[remote].mode = "local"` in `sekvent.toml` (or
+`SEKVENT_LOCAL=1` for one shell); the CLI's error for a missing `rrb` says
+the same.
 
 Then make it yours: rewrite the `Ping` RPC / `/api/ping` route or the
 `Heartbeat` job, fill in the "what this is" parts of `AGENTS.md` and

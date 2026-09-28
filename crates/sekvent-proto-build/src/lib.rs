@@ -37,10 +37,20 @@
 //!     .unwrap_or_else(|error| panic!("{error}"));
 //! ```
 //!
-//! Every package found in the sources is mapped with prost's `extern_path`,
-//! `.billing.v1` to `::billing_proto::billing::v1`, so the generated stubs
-//! use the messages crate's types. The server crate needs `tonic` and
-//! `tonic-prost` as dependencies; the stubs name `tonic_prost::ProstCodec`.
+//! Every package the compiled files declare or (transitively) import is
+//! mapped with prost's `extern_path`, `.billing.v1` to
+//! `::billing_proto::billing::v1`, so the generated stubs use the messages
+//! crate's types. `google.protobuf` is left to prost, which maps it to
+//! `prost_types`. The server crate needs `tonic` and `tonic-prost` as
+//! dependencies; the stubs name `tonic_prost::ProstCodec`.
+//!
+//! # Rebuilds
+//!
+//! Unless [`ProtoBuild::emit_rerun_if_changed`] turns it off, the build
+//! script is rerun when a compiled file, a file it imports from the proto
+//! root or an [`include`](ProtoBuild::include) directory, a discovered
+//! directory or `PROTOC` changes. Files served by protoc's own include
+//! directory (the `google/protobuf` well-known types) are not watched.
 //!
 //! # Including generated code
 //!
@@ -98,6 +108,9 @@ pub const RESERVED_PACKAGE: &str = "sekvent.v1";
 
 /// Default file name of the generated wrapper module.
 pub const DEFAULT_WRAPPER_FILE: &str = "sekvent_protos.rs";
+
+/// The well-known types' package; prost maps it to `prost_types` itself.
+const WELL_KNOWN_PACKAGE: &str = "google.protobuf";
 
 /// Why code generation failed.
 #[derive(Debug, thiserror::Error)]
@@ -168,8 +181,9 @@ pub struct Compiled {
     pub out_dir: PathBuf,
     /// The `.proto` files compiled.
     pub files: Vec<PathBuf>,
-    /// The distinct packages declared by those files, sorted. A file without
-    /// a package contributes the empty string.
+    /// The distinct packages declared by those files and by every file they
+    /// import, sorted, without `google.protobuf`. A file without a package
+    /// contributes the empty string.
     pub packages: Vec<String>,
     /// The generated `.rs` files, one per package.
     pub generated: Vec<PathBuf>,
@@ -375,12 +389,6 @@ impl ProtoBuild {
                 reason: "services-only generation needs a package declaration to map messages",
             });
         }
-        let packages: Vec<String> = file_packages
-            .iter()
-            .map(|(_, package)| package.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
 
         let protoc = self
             .protoc
@@ -388,7 +396,8 @@ impl ProtoBuild {
             .unwrap_or_else(prost_build::protoc_from_env);
         check_protoc(&protoc)?;
 
-        if self.emit_rerun {
+        let emit_rerun = self.emit_rerun;
+        if emit_rerun {
             for line in rerun_lines(&files, &watched_dirs) {
                 println!("{line}");
             }
@@ -398,9 +407,30 @@ impl ProtoBuild {
         let wrapper = out_dir.join(&self.wrapper_file);
         let mut includes = vec![self.root.clone()];
         includes.extend(self.includes.iter().cloned());
-        let mut config = self.prost_config(&protoc, &out_dir, &packages, descriptor_set.as_deref());
+        let mode = self.mode.clone();
+        let mut config = self.prost_config(&protoc, &out_dir, descriptor_set.as_deref());
+        let descriptors = config
+            .load_fds(&files, &includes)
+            .map_err(ProtoBuildError::Compile)?;
+        let described: Vec<(String, String)> = descriptors
+            .file
+            .iter()
+            .map(|file| (file.name().to_owned(), file.package().to_owned()))
+            .collect();
+        if matches!(mode, Mode::ServicesOnly { .. }) {
+            check_imported_packages(&described)?;
+        }
+        if emit_rerun {
+            for line in changed_lines(&imported_files(&described, &includes, &files)) {
+                println!("{line}");
+            }
+        }
+        let packages = descriptor_packages(&described);
+        for (proto_path, rust_path) in extern_paths(&mode, &packages) {
+            config.extern_path(proto_path, rust_path);
+        }
         config
-            .compile_protos(&files, &includes)
+            .compile_fds(descriptors)
             .map_err(ProtoBuildError::Compile)?;
 
         let generated: Vec<(String, PathBuf)> = packages
@@ -429,15 +459,11 @@ impl ProtoBuild {
         self,
         protoc: &Path,
         out_dir: &Path,
-        packages: &[String],
         descriptor_set: Option<&Path>,
     ) -> prost_build::Config {
         let mut config = prost_build::Config::new();
         config.protoc_executable(protoc);
         config.out_dir(out_dir);
-        for (proto_path, rust_path) in extern_paths(&self.mode, packages) {
-            config.extern_path(proto_path, rust_path);
-        }
         if !matches!(self.mode, Mode::ServicesOnly { .. }) {
             config.enable_type_names();
         }
@@ -471,12 +497,13 @@ impl ProtoBuild {
 }
 
 /// The `extern_path` pairs for `mode`: one per package in services-only
-/// mode, none otherwise.
+/// mode, none otherwise. The empty package and `google.protobuf` (which
+/// prost already maps to `prost_types`) are skipped.
 pub fn extern_paths(mode: &Mode, packages: &[String]) -> Vec<(String, String)> {
     match mode {
         Mode::ServicesOnly { messages_crate } => packages
             .iter()
-            .filter(|package| !package.is_empty())
+            .filter(|package| !package.is_empty() && *package != WELL_KNOWN_PACKAGE)
             .map(|package| {
                 (
                     format!(".{package}"),
@@ -533,12 +560,66 @@ fn generated_file_name(package: &str) -> String {
     }
 }
 
-fn rerun_lines(files: &[PathBuf], dirs: &[PathBuf]) -> Vec<String> {
-    let mut lines: Vec<String> = files
+/// The distinct packages of `(file name, package)` descriptor pairs, sorted,
+/// without the well-known types' package.
+fn descriptor_packages(described: &[(String, String)]) -> Vec<String> {
+    described
         .iter()
-        .chain(dirs)
+        .map(|(_, package)| package)
+        .filter(|package| *package != WELL_KNOWN_PACKAGE)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Services-only generation maps messages by package, so an imported file
+/// without one would have its messages generated again.
+fn check_imported_packages(described: &[(String, String)]) -> Result<(), ProtoBuildError> {
+    match described.iter().find(|(_, package)| package.is_empty()) {
+        Some((name, _)) => Err(ProtoBuildError::Package {
+            file: PathBuf::from(name),
+            reason: "services-only generation needs a package declaration in every imported file",
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The files behind descriptor names (relative to an import path) that
+/// exist under one of `includes`, searched in order like protoc does,
+/// excluding those in `known`. Names that resolve nowhere come from protoc's
+/// own include directory (the well-known types) and are skipped.
+fn imported_files(
+    described: &[(String, String)],
+    includes: &[PathBuf],
+    known: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for (name, _) in described {
+        let Some(path) = includes
+            .iter()
+            .map(|include| include.join(name))
+            .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        if !known.contains(&path) && !found.contains(&path) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+fn changed_lines(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
         .map(|path| format!("cargo:rerun-if-changed={}", path.display()))
-        .collect();
+        .collect()
+}
+
+fn rerun_lines(files: &[PathBuf], dirs: &[PathBuf]) -> Vec<String> {
+    let mut lines = changed_lines(files);
+    lines.extend(changed_lines(dirs));
     lines.push("cargo:rerun-if-env-changed=PROTOC".to_owned());
     lines
 }
@@ -568,6 +649,87 @@ mod tests {
                     "::billing_proto::common::v1".to_owned()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn services_only_leaves_the_well_known_types_to_prost() {
+        let mode = Mode::ServicesOnly {
+            messages_crate: "::m".to_owned(),
+        };
+        assert_eq!(
+            extern_paths(&mode, &packages(&["google.protobuf", "orders.v1"])),
+            [(".orders.v1".to_owned(), "::m::orders::v1".to_owned())]
+        );
+    }
+
+    fn described(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, package)| ((*name).to_owned(), (*package).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn descriptor_packages_cover_imports_without_the_well_known_types() {
+        let set = described(&[
+            ("google/protobuf/timestamp.proto", "google.protobuf"),
+            ("common/v1/money.proto", "common.v1"),
+            ("billing/v1/billing.proto", "billing.v1"),
+            ("billing/v1/extra.proto", "billing.v1"),
+            ("loose.proto", ""),
+        ]);
+        assert_eq!(
+            descriptor_packages(&set),
+            packages(&["", "billing.v1", "common.v1"])
+        );
+    }
+
+    #[test]
+    fn services_only_rejects_package_less_imports() {
+        let fine = described(&[("a.proto", "a.v1"), ("b.proto", "b.v1")]);
+        assert!(check_imported_packages(&fine).is_ok());
+        let error =
+            check_imported_packages(&described(&[("a.proto", "a.v1"), ("dep/loose.proto", "")]))
+                .unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("dep/loose.proto: "), "{message}");
+        assert!(message.contains("every imported file"), "{message}");
+    }
+
+    #[test]
+    fn imported_files_resolve_under_the_includes_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("proto");
+        let vendor = temp.path().join("vendor");
+        std::fs::create_dir_all(root.join("billing/v1")).unwrap();
+        std::fs::create_dir_all(root.join("common/v1")).unwrap();
+        std::fs::create_dir_all(vendor.join("common/v1")).unwrap();
+        std::fs::create_dir_all(vendor.join("google/api")).unwrap();
+        std::fs::write(root.join("billing/v1/billing.proto"), "").unwrap();
+        std::fs::write(root.join("common/v1/money.proto"), "").unwrap();
+        std::fs::write(vendor.join("common/v1/money.proto"), "").unwrap();
+        std::fs::write(vendor.join("google/api/http.proto"), "").unwrap();
+
+        let set = described(&[
+            ("google/protobuf/descriptor.proto", "google.protobuf"),
+            ("google/api/http.proto", "google.api"),
+            ("common/v1/money.proto", "common.v1"),
+            ("common/v1/money.proto", "common.v1"),
+            ("billing/v1/billing.proto", "billing.v1"),
+        ]);
+        let includes = [root.clone(), vendor.clone()];
+        let listed = [root.join("billing/v1/billing.proto")];
+        assert_eq!(
+            imported_files(&set, &includes, &listed),
+            [
+                vendor.join("google/api/http.proto"),
+                root.join("common/v1/money.proto"),
+            ]
+        );
+        assert_eq!(
+            changed_lines(&[PathBuf::from("v/x.proto")]),
+            ["cargo:rerun-if-changed=v/x.proto"]
         );
     }
 

@@ -385,3 +385,55 @@ fn from_env_uses_the_derive() {
         missing("SEKVENT_DERIVE_TEST_UNSET_VALUE")
     );
 }
+
+#[derive(Debug, EnvConfig)]
+#[config(prefix = "SEKVENT_APP_")]
+struct Reserved {
+    #[config(default = "1")]
+    workers: u8,
+    #[config(nested)]
+    db: Database,
+}
+
+#[test]
+fn load_checks_reserved_keys_by_their_full_names() {
+    let mut map = source(&[("SEKVENT_APP_DB_URL", "postgres://example")]);
+    map.set("SEKVENT_LOG", "debug");
+    map.set("SEKVENT_APP_DB_MAX_CONNECTIONS", "3");
+    let config = sekvent_config::load::<Reserved>(&map).expect("every key is known");
+    assert_eq!((config.workers, config.db.max_connections), (1, 3));
+
+    map.set("SEKVENT_APP_DB_MAX_CONECTIONS", "5");
+    map.set("SEKVENT_APP_WORKRES", "2");
+    assert_eq!(
+        sekvent_config::load::<Reserved>(&map).expect_err("two typos"),
+        ConfigError::UnknownKeys {
+            keys: vec![
+                "SEKVENT_APP_DB_MAX_CONECTIONS".into(),
+                "SEKVENT_APP_WORKRES".into(),
+            ],
+            suggestions: vec![
+                (
+                    "SEKVENT_APP_DB_MAX_CONECTIONS".into(),
+                    "SEKVENT_APP_DB_MAX_CONNECTIONS".into(),
+                ),
+                ("SEKVENT_APP_WORKRES".into(), "SEKVENT_APP_WORKERS".into()),
+            ],
+        }
+    );
+}
+
+#[test]
+fn load_leaves_keys_outside_the_reserved_namespace_alone() {
+    let mut map = minimal();
+    map.set("BILLING_UNUSED", "x");
+    assert!(sekvent_config::load::<Billing>(&map).is_ok());
+    map.set("SEKVENT_LOG_FORMT", "json");
+    let error = sekvent_config::load::<Billing>(&map).expect_err("reserved typo");
+    assert!(
+        error
+            .to_string()
+            .ends_with("SEKVENT_LOG_FORMT (did you mean SEKVENT_LOG_FORMAT?)"),
+        "{error}"
+    );
+}

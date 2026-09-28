@@ -8,6 +8,10 @@ use tokio::time::Instant;
 
 use crate::{PolicyError, cancelled_error, deadline_of};
 
+/// Longest accepted window: a year and a day, well inside what an instant
+/// can represent.
+const MAX_WINDOW: Duration = Duration::from_hours(366 * 24);
+
 /// At most `permits` acquisitions in any rolling `window`, shared by every
 /// task holding the gate (wrap it in an `Arc`).
 ///
@@ -24,7 +28,8 @@ pub struct RateGate {
 }
 
 impl RateGate {
-    /// A gate allowing `permits` acquisitions per rolling `window`.
+    /// A gate allowing `permits` acquisitions per rolling `window` (longer
+    /// than zero, at most 366 days).
     pub fn new(permits: u32, window: Duration) -> Result<Self, PolicyError> {
         if permits == 0 {
             return Err(PolicyError::new("rate_gate.permits", "must be at least 1"));
@@ -33,6 +38,12 @@ impl RateGate {
             return Err(PolicyError::new(
                 "rate_gate.window",
                 "must be longer than zero",
+            ));
+        }
+        if window > MAX_WINDOW {
+            return Err(PolicyError::new(
+                "rate_gate.window",
+                "must be at most 366 days",
             ));
         }
         let permits = usize::try_from(permits).unwrap_or(usize::MAX);
@@ -74,7 +85,8 @@ impl RateGate {
     /// Fails fast with `RESOURCE_EXHAUSTED` (and a `retry_after` hint) when
     /// the gate cannot open before the deadline, with `DEADLINE_EXCEEDED`
     /// when the deadline passes while queued, and with `CANCELLED` on
-    /// cancellation.
+    /// cancellation. Cancellation and expiry are checked before a permit is
+    /// taken, so a call nobody waits for never spends quota.
     pub async fn acquire_within(&self, ctx: &CallContext) -> Result<(), AppError> {
         let deadline = deadline_of(ctx);
         let wait = async {
@@ -107,10 +119,10 @@ impl RateGate {
         tokio::select! {
             biased;
             () = ctx.cancelled() => Err(cancelled_error()),
-            outcome = wait => outcome,
             () = expiry => Err(AppError::deadline_exceeded(
                 "the call deadline passed while waiting for a rate permit",
             )),
+            outcome = wait => outcome,
         }
     }
 
@@ -140,7 +152,14 @@ impl RateGate {
         if grants.len() < self.permits {
             None
         } else {
-            grants.front().map(|oldest| *oldest + self.window)
+            // The window is bounded at construction, so the fallbacks only
+            // guard against an instant at the edge of the platform's range.
+            grants.front().map(|oldest| {
+                oldest
+                    .checked_add(self.window)
+                    .or_else(|| now.checked_add(self.window))
+                    .unwrap_or(now)
+            })
         }
     }
 }
@@ -173,6 +192,17 @@ mod tests {
             RateGate::new(1, Duration::ZERO).unwrap_err().parameter(),
             "rate_gate.window"
         );
+        assert_eq!(
+            RateGate::new(1, Duration::from_hours(367 * 24))
+                .unwrap_err()
+                .parameter(),
+            "rate_gate.window"
+        );
+        assert_eq!(
+            RateGate::new(1, Duration::MAX).unwrap_err().parameter(),
+            "rate_gate.window"
+        );
+        assert!(RateGate::new(1, MAX_WINDOW).is_ok());
         let gate = RateGate::new(3, SECOND).unwrap();
         assert_eq!(gate.permits(), 3);
         assert_eq!(gate.window(), SECOND);
@@ -286,6 +316,22 @@ mod tests {
         let error = gate.acquire_within(&ctx).await.unwrap_err();
         assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
         holder.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_calls_never_consume_quota() {
+        let gate = RateGate::new(1, Duration::from_secs(10)).unwrap();
+        let expired = CallContext::new().with_deadline(Instant::now().into_std());
+        let error = gate.acquire_within(&expired).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let cancelled = CallContext::new().with_cancel(token);
+        let error = gate.acquire_within(&cancelled).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+
+        assert!(gate.try_acquire(), "the permit is still free");
     }
 
     #[tokio::test(start_paused = true)]

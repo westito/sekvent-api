@@ -43,14 +43,17 @@ impl IntoResponse for AppError {
 /// Parse an HTTP error response body produced by this module back into an
 /// `AppError`; `None` if the body is not in that shape.
 ///
-/// When the body names a code this version does not know, the code is
-/// derived from the HTTP `status` instead.
+/// Only a body this module could have produced is accepted: the code must
+/// name a known error (never `OK`) whose conventional status
+/// ([`ErrorCode::http_status`]) is `status`. Anything else — an unknown code,
+/// `OK`, or a code that disagrees with the status — is treated as a foreign
+/// body and yields `None`, so the caller maps the response by its status
+/// instead of adopting a message it cannot vouch for.
 pub fn from_json_body(status: u16, body: &[u8]) -> Option<AppError> {
-    let Envelope { mut error } = serde_json::from_slice(body).ok()?;
-    if ErrorCode::parse(&error.code).is_none() {
-        code_for_http_status(status)
-            .as_str()
-            .clone_into(&mut error.code);
+    let Envelope { error } = serde_json::from_slice(body).ok()?;
+    let code = ErrorCode::parse(&error.code)?;
+    if code == ErrorCode::Ok || code.http_status() != status {
+        return None;
     }
     Some(AppError::from_wire(error))
 }
@@ -60,25 +63,6 @@ fn retry_after_seconds(after: Duration) -> u64 {
     after
         .as_secs()
         .saturating_add(u64::from(after.subsec_nanos() > 0))
-}
-
-/// The inverse of [`ErrorCode::http_status`] where it is unambiguous.
-fn code_for_http_status(status: u16) -> ErrorCode {
-    match status {
-        200..=299 => ErrorCode::Ok,
-        400 => ErrorCode::InvalidArgument,
-        401 => ErrorCode::Unauthenticated,
-        403 => ErrorCode::PermissionDenied,
-        404 => ErrorCode::NotFound,
-        409 => ErrorCode::Aborted,
-        429 => ErrorCode::ResourceExhausted,
-        499 => ErrorCode::Cancelled,
-        500 => ErrorCode::Internal,
-        501 => ErrorCode::Unimplemented,
-        503 => ErrorCode::Unavailable,
-        504 => ErrorCode::DeadlineExceeded,
-        _ => ErrorCode::Unknown,
-    }
 }
 
 #[cfg(test)]
@@ -95,23 +79,38 @@ mod tests {
     }
 
     #[test]
-    fn every_mapped_status_inverts_its_code() {
-        for code in ErrorCode::ALL {
-            let derived = code_for_http_status(code.http_status());
-            assert_eq!(
-                derived.http_status(),
-                code.http_status(),
-                "{code} and {derived} must share a status"
-            );
-        }
-        assert_eq!(code_for_http_status(418), ErrorCode::Unknown);
-    }
-
-    #[test]
-    fn an_unknown_code_name_falls_back_to_the_status() {
-        let body = br#"{"error":{"code":"NOT_A_CODE","message":"gone"}}"#;
+    fn a_known_code_matching_the_status_is_adopted() {
+        let body = br#"{"error":{"code":"NOT_FOUND","message":"gone"}}"#;
         let error = from_json_body(404, body).expect("well-formed envelope");
         assert_eq!(error.code(), ErrorCode::NotFound);
         assert_eq!(error.message(), "gone");
+        let conflict = br#"{"error":{"code":"ALREADY_EXISTS","message":"dup"}}"#;
+        assert_eq!(
+            from_json_body(409, conflict).as_ref().map(AppError::code),
+            Some(ErrorCode::AlreadyExists)
+        );
+    }
+
+    #[test]
+    fn foreign_or_inconsistent_envelopes_are_rejected() {
+        for (status, body) in [
+            (
+                404,
+                &br#"{"error":{"code":"NOT_A_CODE","message":"gone"}}"#[..],
+            ),
+            (500, br#"{"error":{"code":"OK","message":"fine"}}"#),
+            (200, br#"{"error":{"code":"OK","message":"fine"}}"#),
+            (500, br#"{"error":{"code":"NOT_FOUND","message":"gone"}}"#),
+            (
+                401,
+                br#"{"error":{"code":"PERMISSION_DENIED","message":"no"}}"#,
+            ),
+        ] {
+            assert!(
+                from_json_body(status, body).is_none(),
+                "{status} {}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 }

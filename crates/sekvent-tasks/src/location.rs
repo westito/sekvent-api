@@ -16,7 +16,8 @@ pub const RRB_CONTAINER_ENV: &str = "RRB_CONTAINER";
 /// Set by CI systems.
 pub const CI_ENV: &str = "CI";
 
-/// `SEKVENT_LOCAL=1` forces local execution.
+/// `SEKVENT_LOCAL=1` (any value [`is_enabled`] accepts) forces local
+/// execution.
 pub const LOCAL_ENV: &str = "SEKVENT_LOCAL";
 
 /// Any non-empty value disables the "sekvent is behind" check.
@@ -32,6 +33,16 @@ pub fn process_env() -> EnvMap {
 /// `key` is present with a non-empty value.
 pub fn is_set(env: &EnvMap, key: &str) -> bool {
     env.get(key).is_some_and(|value| !value.is_empty())
+}
+
+/// `key` is set to a value that switches a flag on: anything except empty,
+/// `0`, `false`, `no` or `off` (case-insensitive, surrounding whitespace
+/// ignored). So `CI=false` or `SEKVENT_LOCAL=0` count as unset.
+pub fn is_enabled(env: &EnvMap, key: &str) -> bool {
+    env.get(key).is_some_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "" | "0" | "false" | "no" | "off")
+    })
 }
 
 /// Where compiling commands run.
@@ -50,7 +61,7 @@ pub enum LocalReason {
     InsideBuilder,
     /// Running in CI (`CI`).
     Ci,
-    /// `SEKVENT_LOCAL=1`.
+    /// `SEKVENT_LOCAL=1` (or another enabling value).
     ForcedByEnv,
     /// `[remote].mode = "local"`.
     ForcedByConfig,
@@ -59,13 +70,14 @@ pub enum LocalReason {
 /// Decide where compiling commands run.
 ///
 /// Local when inside the builder, in CI, with `SEKVENT_LOCAL=1` or with
-/// `[remote].mode = "local"`; remote otherwise.
+/// `[remote].mode = "local"`; remote otherwise. The three variables are read
+/// with [`is_enabled`], so `CI=false` does not count as CI.
 pub fn decide_location(env: &EnvMap, remote: &RemoteConfig) -> Location {
-    if is_set(env, RRB_CONTAINER_ENV) {
+    if is_enabled(env, RRB_CONTAINER_ENV) {
         Location::Local(LocalReason::InsideBuilder)
-    } else if is_set(env, CI_ENV) {
+    } else if is_enabled(env, CI_ENV) {
         Location::Local(LocalReason::Ci)
-    } else if env.get(LOCAL_ENV).is_some_and(|value| value == "1") {
+    } else if is_enabled(env, LOCAL_ENV) {
         Location::Local(LocalReason::ForcedByEnv)
     } else if remote.mode == RemoteMode::Local {
         Location::Local(LocalReason::ForcedByConfig)
@@ -119,13 +131,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_other_values_do_not_count() {
+    fn disabling_values_do_not_count() {
         let rrb = RemoteConfig::default();
+        for key in ["RRB_CONTAINER", "CI", "SEKVENT_LOCAL"] {
+            for value in ["", "  ", "0", "false", "FALSE", "No", "off", " false "] {
+                assert_eq!(
+                    decide_location(&env(&[(key, value)]), &rrb),
+                    Location::Remote,
+                    "{key}={value:?}"
+                );
+            }
+        }
+        for value in ["yes", "true"] {
+            assert_eq!(
+                decide_location(&env(&[("SEKVENT_LOCAL", value)]), &rrb),
+                Location::Local(LocalReason::ForcedByEnv)
+            );
+        }
         for pairs in [
-            &[("RRB_CONTAINER", "")][..],
-            &[("CI", "")][..],
-            &[("SEKVENT_LOCAL", "0")][..],
-            &[("SEKVENT_LOCAL", "yes")][..],
+            &[("CI", "false"), ("SEKVENT_LOCAL", "0")][..],
+            &[("RRB_CONTAINER", "0"), ("CI", "no")][..],
         ] {
             assert_eq!(
                 decide_location(&env(pairs), &rrb),

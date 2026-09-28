@@ -7,8 +7,9 @@
 # platform, checks its SHA-256 and installs it into
 # ${SEKVENT_INSTALL_DIR:-${CARGO_HOME:-$HOME/.cargo}/bin}. When there is no
 # prebuilt binary for the platform, or the download fails, it builds the CLI
-# from source with `cargo install` instead. A checksum mismatch is always an
-# error, never a reason to fall back.
+# from source with `cargo install` instead, pinned to the same `cli-latest`
+# tag the release was built from (never the moving branch head). A checksum
+# mismatch is always an error, never a reason to fall back.
 #
 # Environment:
 #   SEKVENT_INSTALL_DIR  directory to install into
@@ -136,11 +137,11 @@ install_prebuilt() {
 
 install_from_source() {
   have cargo || die "no prebuilt $binary for this platform and cargo is not installed; install Rust from https://rustup.rs and run this script again"
-  say "building $binary from source with cargo install (this takes a few minutes)"
-  cargo install --locked --root "$work/cargo-root" --git "$repo_url" "$binary" ||
-    die "cargo install failed"
+  say "building $binary from source at tag $release_tag with cargo install (this takes a few minutes)"
+  cargo install --locked --root "$work/cargo-root" --git "$repo_url" --tag "$release_tag" "$binary" ||
+    die "cargo install of $repo_url at tag $release_tag failed"
   place_binary "$work/cargo-root/bin/$binary"
-  say "installed a source build of $repo_url"
+  say "installed a source build of $repo_url at tag $release_tag"
 }
 
 have curl || die "curl is required"

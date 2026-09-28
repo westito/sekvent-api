@@ -2,6 +2,7 @@
 //! single-flight refresh.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -15,6 +16,10 @@ use serde::{Deserialize, Deserializer};
 
 use crate::mapping::{JsonShape, UpstreamBody, code_for_status, map_transport_error};
 use crate::{BearerSource, BuildError};
+
+/// Longest token lifetime honoured; a longer `expires_in` is clamped so an
+/// absurd value can neither overflow the clock nor pin a token for years.
+const MAX_TOKEN_LIFETIME: Duration = Duration::from_hours(24);
 
 /// How the client authenticates to the token endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -34,10 +39,16 @@ struct CachedToken {
 
 /// Client-credentials token source.
 ///
-/// A token is cached until `expires_in` minus the refresh skew. Concurrent
-/// callers needing a new token wait on a single request to the endpoint.
+/// A token is cached until `expires_in` minus the refresh skew, but at
+/// least half its lifetime, so a short-lived token is still reused; lifetimes
+/// above one day are treated as one day. Concurrent callers needing a new
+/// token wait on a single request to the endpoint.
 /// [`ClientCredentials::invalidate`] drops the cached token (the HTTP client
 /// calls it after a `401`). Time comes from the injected [`Clock`].
+///
+/// The token endpoint is never redirected to, and a rejection there is
+/// `INTERNAL` (this service's credentials or configuration are wrong), not
+/// the end user's `UNAUTHENTICATED`.
 pub struct ClientCredentials {
     http: reqwest::Client,
     token_url: Url,
@@ -96,11 +107,15 @@ impl ClientCredentials {
             return Ok(token);
         }
         let (token, ttl) = self.fetch(ctx).await?;
-        let refresh_at = self.clock.now() + ttl.saturating_sub(self.refresh_skew);
-        *self.lock_cache() = Some(CachedToken {
-            token: token.clone(),
-            refresh_at,
-        });
+        let usable = usable_lifetime(ttl, self.refresh_skew);
+        *self.lock_cache() = self
+            .clock
+            .now()
+            .checked_add(usable)
+            .map(|refresh_at| CachedToken {
+                token: token.clone(),
+                refresh_at,
+            });
         Ok(token)
     }
 
@@ -155,21 +170,22 @@ impl ClientCredentials {
             .await
             .map_err(map_transport_error)?;
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = response.bytes().await.map_err(map_transport_error)?;
         if !status.is_success() {
             let code = match code_for_status(status) {
                 code if code.is_transient() => code,
-                _ => ErrorCode::Unauthenticated,
+                _ => ErrorCode::Internal,
             };
             return Err(AppError::new(
                 code,
                 format!("the token endpoint responded with HTTP {}", status.as_u16()),
             )
             .with_reason("TOKEN_REQUEST_FAILED")
-            .with_source(UpstreamBody::new(status, &bytes)));
+            .with_source(UpstreamBody::new(status, &headers, &bytes)));
         }
         let parsed: TokenResponse = serde_json::from_slice(&bytes).map_err(|error| {
-            AppError::unauthenticated("the token endpoint returned an unreadable response")
+            token_error("the token endpoint returned an unreadable response")
                 .with_source(JsonShape::new(&error))
         })?;
         if parsed
@@ -177,21 +193,45 @@ impl ClientCredentials {
             .as_deref()
             .is_some_and(|kind| !kind.eq_ignore_ascii_case("bearer"))
         {
-            return Err(AppError::unauthenticated(
+            return Err(token_error(
                 "the token endpoint returned a token that is not a bearer token",
             ));
         }
         if parsed.access_token.is_blank() {
-            return Err(AppError::unauthenticated(
-                "the token endpoint returned an empty token",
-            ));
+            return Err(token_error("the token endpoint returned an empty token"));
         }
         let ttl = parsed
             .expires_in
-            .map_or(self.default_ttl, Duration::from_secs);
+            .map_or(self.default_ttl, Duration::from_secs)
+            .min(MAX_TOKEN_LIFETIME);
         tracing::debug!(ttl_secs = ttl.as_secs(), "fetched an OAuth2 access token");
         Ok((parsed.access_token, ttl))
     }
+}
+
+/// A misbehaving token endpoint: this service cannot authenticate upstream.
+fn token_error(message: &str) -> AppError {
+    AppError::new(ErrorCode::Internal, message).with_reason("TOKEN_REQUEST_FAILED")
+}
+
+/// How long a token with lifetime `ttl` is served from the cache: `ttl`
+/// minus `skew`, but never less than half of `ttl` (a skew as long as the
+/// lifetime would otherwise refetch on every call), and at most one day.
+fn usable_lifetime(ttl: Duration, skew: Duration) -> Duration {
+    let ttl = ttl.min(MAX_TOKEN_LIFETIME);
+    ttl.saturating_sub(skew).max(ttl / 2)
+}
+
+/// Whether `url` names a loopback host (`localhost`, `127.0.0.0/8`, `::1`).
+fn is_loopback(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
 }
 
 impl BearerSource for ClientCredentials {
@@ -333,14 +373,26 @@ impl ClientCredentialsBuilder {
     }
 
     /// Build the token source.
+    ///
+    /// The token URL must be `https`, except for a loopback host (local
+    /// development and tests), where `http` is allowed.
     pub fn build(self) -> Result<ClientCredentials, BuildError> {
         let token_url = Url::parse(&self.token_url).map_err(|_| BuildError::InvalidTokenUrl)?;
         if !matches!(token_url.scheme(), "http" | "https") || token_url.host_str().is_none() {
             return Err(BuildError::InvalidTokenUrl);
         }
+        if token_url.scheme() == "http" && !is_loopback(&token_url) {
+            return Err(BuildError::InsecureTokenUrl);
+        }
+        if self.timeout.is_zero() {
+            return Err(BuildError::InvalidTimeout {
+                name: "token request timeout",
+            });
+        }
         let http = reqwest::Client::builder()
             .tls_backend_rustls()
             .user_agent(concat!("sekvent-client/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(BuildError::Backend)?;
         Ok(ClientCredentials {
@@ -416,5 +468,61 @@ mod tests {
         assert!(!debug.contains("s3cr3t"));
         let builder = ClientCredentials::builder("x", "id", Secret::new("hidden"));
         assert!(!format!("{builder:?}").contains("hidden"));
+
+        for insecure in [
+            "http://auth.example/token",
+            "http://10.0.0.1/token",
+            "http://[2001:db8::1]/token",
+        ] {
+            let error = bad(insecure);
+            assert!(matches!(error, BuildError::InsecureTokenUrl), "{insecure}");
+            assert!(!error.to_string().contains("auth.example"));
+        }
+        for local in [
+            "http://localhost:8080/token",
+            "http://127.0.0.1/token",
+            "http://127.1.2.3/token",
+            "http://[::1]:9000/token",
+        ] {
+            assert!(
+                ClientCredentials::builder(local, "id", Secret::new("s"))
+                    .build()
+                    .is_ok(),
+                "{local}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_token_timeout_is_rejected() {
+        let error =
+            ClientCredentials::builder("https://auth.example/token", "id", Secret::new("s"))
+                .timeout(Duration::ZERO)
+                .build()
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            BuildError::InvalidTimeout {
+                name: "token request timeout"
+            }
+        ));
+    }
+
+    #[test]
+    fn token_lifetimes_are_clamped_and_never_zero_for_short_tokens() {
+        let secs = Duration::from_secs;
+        assert_eq!(usable_lifetime(secs(60), secs(10)), secs(50));
+        assert_eq!(usable_lifetime(secs(60), secs(30)), secs(30));
+        assert_eq!(usable_lifetime(secs(20), secs(30)), secs(10));
+        assert_eq!(usable_lifetime(secs(30), secs(30)), secs(15));
+        assert_eq!(usable_lifetime(Duration::ZERO, secs(30)), Duration::ZERO);
+        assert_eq!(
+            usable_lifetime(Duration::MAX, secs(30)),
+            MAX_TOKEN_LIFETIME.checked_sub(secs(30)).unwrap()
+        );
+        assert_eq!(
+            usable_lifetime(secs(u64::MAX), Duration::ZERO),
+            MAX_TOKEN_LIFETIME
+        );
     }
 }

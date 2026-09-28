@@ -1,16 +1,23 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
-use http::{HeaderMap, StatusCode, header::RETRY_AFTER};
+use http::header::{CONTENT_TYPE, RETRY_AFTER};
+use http::{HeaderMap, StatusCode};
 use sekvent_error::{AppError, ErrorCode};
 
-/// Longest upstream body excerpt kept in an error's internal source.
-const BODY_EXCERPT: usize = 512;
+/// Longest content type kept in an error's internal source.
+const CONTENT_TYPE_LIMIT: usize = 64;
 
 /// The [`ErrorCode`] for an upstream HTTP status.
 ///
 /// `408`, `429`, `502`, `503` and `504` map to transient codes; other
-/// `4xx` statuses map to the matching caller-error codes.
+/// `4xx` statuses map to the matching caller-error codes, none of them
+/// transient. In particular `409` maps to `ALREADY_EXISTS`: a conflict is
+/// about the request, so repeating the same request is not retried.
+///
+/// This is the plain status table. [`HttpClient`](crate::HttpClient) refines
+/// it for `401`/`403` unless the upstream is declared a sekvent service; see
+/// [`HttpClientBuilder::sekvent_upstream`](crate::HttpClientBuilder::sekvent_upstream).
 pub fn code_for_status(status: StatusCode) -> ErrorCode {
     match status.as_u16() {
         200..=399 => ErrorCode::Ok,
@@ -20,7 +27,7 @@ pub fn code_for_status(status: StatusCode) -> ErrorCode {
         404 | 410 => ErrorCode::NotFound,
         405 | 501 => ErrorCode::Unimplemented,
         408 | 504 => ErrorCode::DeadlineExceeded,
-        409 => ErrorCode::Aborted,
+        409 => ErrorCode::AlreadyExists,
         416 => ErrorCode::OutOfRange,
         429 => ErrorCode::ResourceExhausted,
         499 => ErrorCode::Cancelled,
@@ -32,10 +39,13 @@ pub fn code_for_status(status: StatusCode) -> ErrorCode {
 }
 
 /// Parse a `Retry-After` value: delay seconds or an HTTP-date, measured
-/// from `now`. A date in the past gives zero; garbage gives `None`.
+/// from `now`. A date in the past gives zero; garbage gives `None`. A number
+/// of seconds too large for a `u64` saturates rather than failing, so a
+/// retry policy sees it as "far too long" instead of "no hint".
 pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
-    if let Ok(secs) = value.parse::<u64>() {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let secs = value.parse::<u64>().unwrap_or(u64::MAX);
         return Some(Duration::from_secs(secs));
     }
     let at = httpdate::parse_http_date(value).ok()?;
@@ -49,26 +59,45 @@ fn retry_after_header(headers: &HeaderMap, now: SystemTime) -> Option<Duration> 
         .and_then(|value| parse_retry_after(value, now))
 }
 
-/// The upstream response body, kept for the server's logs only.
+/// The shape of an upstream error response, attached to an error's source
+/// chain: status, content type and body length. The body itself is never
+/// kept — it may echo credentials or personal data — so neither `Debug`
+/// nor `Display` can leak it into a log line.
 #[derive(Debug)]
 pub(crate) struct UpstreamBody {
     status: u16,
-    excerpt: String,
+    content_type: Option<String>,
+    len: usize,
 }
 
 impl UpstreamBody {
-    pub(crate) fn new(status: StatusCode, body: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(body);
+    pub(crate) fn new(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> Self {
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                let essence = value.split(';').next().unwrap_or_default().trim();
+                sekvent_telemetry::truncate_for_log(essence, CONTENT_TYPE_LIMIT).into_owned()
+            });
         Self {
             status: status.as_u16(),
-            excerpt: sekvent_telemetry::truncate_for_log(&text, BODY_EXCERPT).into_owned(),
+            content_type,
+            len: body.len(),
         }
     }
 }
 
 impl fmt::Display for UpstreamBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "upstream HTTP {} body: {}", self.status, self.excerpt)
+        write!(
+            f,
+            "upstream HTTP {} response with a {}-byte body",
+            self.status, self.len
+        )?;
+        if let Some(content_type) = &self.content_type {
+            write!(f, " of type {content_type}")?;
+        }
+        Ok(())
     }
 }
 
@@ -76,17 +105,23 @@ impl std::error::Error for UpstreamBody {}
 
 /// Map a non-success response to an [`AppError`].
 ///
-/// A sekvent JSON error body is decoded as is. Otherwise the caller-visible
-/// message only names the status, and the body goes to the source chain,
-/// truncated.
+/// With `sekvent_upstream`, a sekvent JSON error body (one whose code agrees
+/// with the status) is adopted as is. Otherwise the error is mapped from the
+/// status alone with a message that only names the status; a `401`/`403`
+/// becomes `INTERNAL`, since it is this service's credentials that were
+/// refused. The body never reaches the error; only its shape goes to the
+/// source chain.
 pub(crate) fn map_status(
     status: StatusCode,
     headers: &HeaderMap,
     body: &[u8],
     now: SystemTime,
+    sekvent_upstream: bool,
 ) -> AppError {
     let retry_after = retry_after_header(headers, now);
-    if let Some(error) = sekvent_error::http::from_json_body(status.as_u16(), body) {
+    if sekvent_upstream
+        && let Some(error) = sekvent_error::http::from_json_body(status.as_u16(), body)
+    {
         return match retry_after {
             Some(after) if error.retry_after().is_none() => error.with_retry_after(after),
             _ => error,
@@ -94,6 +129,9 @@ pub(crate) fn map_status(
     }
     let code = match code_for_status(status) {
         ErrorCode::Ok => ErrorCode::Unknown,
+        ErrorCode::Unauthenticated | ErrorCode::PermissionDenied if !sekvent_upstream => {
+            ErrorCode::Internal
+        }
         code => code,
     };
     let error = AppError::new(
@@ -102,7 +140,7 @@ pub(crate) fn map_status(
     )
     .with_reason("UPSTREAM_HTTP_ERROR")
     .with_metadata("upstream_status", status.as_u16().to_string())
-    .with_source(UpstreamBody::new(status, body));
+    .with_source(UpstreamBody::new(status, headers, body));
     match retry_after {
         Some(after) => error.with_retry_after(after),
         None => error,
@@ -184,7 +222,7 @@ mod tests {
             (404, ErrorCode::NotFound),
             (405, ErrorCode::Unimplemented),
             (408, ErrorCode::DeadlineExceeded),
-            (409, ErrorCode::Aborted),
+            (409, ErrorCode::AlreadyExists),
             (410, ErrorCode::NotFound),
             (412, ErrorCode::FailedPrecondition),
             (416, ErrorCode::OutOfRange),
@@ -206,8 +244,13 @@ mod tests {
                 "{status}"
             );
         }
-        for transient in [408, 429, 502, 503, 504] {
-            assert!(code_for_status(StatusCode::from_u16(transient).unwrap()).is_transient());
+        for status in 100..=599 {
+            let code = code_for_status(StatusCode::from_u16(status).unwrap());
+            assert_eq!(
+                code.is_transient(),
+                matches!(status, 408 | 429 | 502 | 503 | 504),
+                "{status}"
+            );
         }
     }
 
@@ -227,19 +270,30 @@ mod tests {
         assert_eq!(parse_retry_after(&earlier, now), Some(Duration::ZERO));
         assert_eq!(parse_retry_after("soon", now), None);
         assert_eq!(parse_retry_after("-5", now), None);
+        assert_eq!(parse_retry_after("", now), None);
+        assert_eq!(
+            parse_retry_after(&"9".repeat(40), now),
+            Some(Duration::from_secs(u64::MAX)),
+            "an absurd number saturates instead of vanishing"
+        );
     }
 
     #[test]
-    fn unknown_bodies_stay_out_of_the_message() {
+    fn upstream_bodies_never_reach_the_error() {
         let now = SystemTime::UNIX_EPOCH;
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("3"));
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
         let body = format!("secret-token={}", "x".repeat(4000));
         let error = map_status(
             StatusCode::SERVICE_UNAVAILABLE,
             &headers,
             body.as_bytes(),
             now,
+            false,
         );
         assert_eq!(error.code(), ErrorCode::Unavailable);
         assert_eq!(error.message(), "upstream responded with HTTP 503");
@@ -249,18 +303,72 @@ mod tests {
             Some("503")
         );
         assert!(!error.to_string().contains("secret-token"));
+        assert!(!format!("{error:?}").contains("secret-token"));
         assert!(!format!("{:?}", error.to_wire()).contains("secret-token"));
-        let source = error.source().unwrap().to_string();
-        assert!(source.contains("secret-token"));
-        assert!(source.len() < 700, "the excerpt is truncated");
+        let source = error.source().unwrap();
+        assert_eq!(
+            source.to_string(),
+            "upstream HTTP 503 response with a 4013-byte body of type text/plain"
+        );
+        assert!(!format!("{source:?}").contains("secret-token"));
 
         let odd = map_status(
             StatusCode::from_u16(299).unwrap(),
             &HeaderMap::new(),
             b"",
             now,
+            false,
         );
         assert_eq!(odd.code(), ErrorCode::Unknown);
+        assert_eq!(
+            odd.source().unwrap().to_string(),
+            "upstream HTTP 299 response with a 0-byte body"
+        );
+    }
+
+    #[test]
+    fn rejected_credentials_are_this_services_problem() {
+        let now = SystemTime::UNIX_EPOCH;
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let error = map_status(status, &HeaderMap::new(), b"", now, false);
+            assert_eq!(error.code(), ErrorCode::Internal, "{status}");
+        }
+        let passed = map_status(StatusCode::UNAUTHORIZED, &HeaderMap::new(), b"", now, true);
+        assert_eq!(passed.code(), ErrorCode::Unauthenticated);
+        let passed = map_status(StatusCode::FORBIDDEN, &HeaderMap::new(), b"", now, true);
+        assert_eq!(passed.code(), ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn error_envelopes_are_adopted_only_from_sekvent_upstreams() {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("4"));
+        let envelope =
+            br#"{"error":{"code":"NOT_FOUND","message":"order 7 is gone","metadata":{"k":"v"}}}"#;
+
+        let foreign = map_status(StatusCode::NOT_FOUND, &headers, envelope, now, false);
+        assert_eq!(foreign.code(), ErrorCode::NotFound);
+        assert_eq!(foreign.message(), "upstream responded with HTTP 404");
+        assert!(foreign.metadata().get("k").is_none());
+
+        let adopted = map_status(StatusCode::NOT_FOUND, &headers, envelope, now, true);
+        assert_eq!(adopted.message(), "order 7 is gone");
+        assert_eq!(adopted.retry_after(), Some(Duration::from_secs(4)));
+        let hinted = br#"{"error":{"code":"UNAVAILABLE","message":"m","retry_after_ms":1500}}"#;
+        let kept = map_status(StatusCode::SERVICE_UNAVAILABLE, &headers, hinted, now, true);
+        assert_eq!(kept.retry_after(), Some(Duration::from_millis(1500)));
+
+        let ok_in_500 = br#"{"error":{"code":"OK","message":"all good"}}"#;
+        let error = map_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &HeaderMap::new(),
+            ok_in_500,
+            now,
+            true,
+        );
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.message(), "upstream responded with HTTP 500");
     }
 
     #[test]

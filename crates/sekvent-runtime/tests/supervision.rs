@@ -15,6 +15,7 @@ use sekvent_runtime::{
 };
 use tokio::sync::oneshot;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 fn runtime() -> RuntimeBuilder {
     Runtime::builder().without_signals()
@@ -199,9 +200,10 @@ async fn shutdown_interrupts_a_restart_backoff() {
             "loop",
             Stage::Workers,
             UnitPolicy::Restart(policy),
-            move |_ctx| {
+            move |ctx: UnitContext| {
                 let ran = ran();
                 async move {
+                    ctx.ready();
                     if let Some(ran) = ran {
                         let _ = ran.send(());
                     }
@@ -716,6 +718,10 @@ fn invalid_configurations_are_rejected() {
             "zero start timeout",
             runtime().start_timeout(Duration::ZERO),
         ),
+        (
+            "zero restart reset period",
+            runtime().restart_reset_after(Duration::ZERO),
+        ),
         ("empty probe name", runtime().probe(NamedProbe(""))),
         (
             "duplicate probe",
@@ -748,4 +754,397 @@ fn invalid_configurations_are_rejected() {
         assert_eq!(error.code(), ErrorCode::InvalidArgument, "{case}");
     }
     assert!(format!("{:?}", runtime()).contains("RuntimeBuilder"));
+}
+
+/// Waits for a guard's sender to be dropped, failing (instead of hanging)
+/// if the owning unit is never stopped.
+async fn dropped(guard: oneshot::Receiver<()>) -> bool {
+    tokio::time::timeout(Duration::from_secs(3_600), guard)
+        .await
+        .is_ok_and(|received| received.is_err())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "a factory takes its context by value"
+)]
+fn exploding_factory(_ctx: UnitContext) -> std::future::Ready<Result<(), AppError>> {
+    panic!("factory exploded")
+}
+
+#[tokio::test]
+async fn a_panicking_factory_fails_a_critical_unit() {
+    let later_started = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&later_started);
+    let error = runtime()
+        .unit(
+            "boot",
+            Stage::Infrastructure,
+            UnitPolicy::Critical,
+            exploding_factory,
+        )
+        .unit(
+            "api",
+            Stage::Ingress,
+            UnitPolicy::Critical,
+            move |ctx: UnitContext| {
+                flag.store(true, Ordering::SeqCst);
+                until_shutdown(ctx)
+            },
+        )
+        .build()
+        .unwrap()
+        .run()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(error.message(), "unit boot panicked");
+    assert!(!later_started.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restarting_unit_survives_a_panicking_factory() {
+    let handle = runtime()
+        .unit(
+            "consumer",
+            Stage::Workers,
+            UnitPolicy::Restart(RestartPolicy::default()),
+            |ctx: UnitContext| {
+                assert!(ctx.attempt() > 0, "the first build fails");
+                until_shutdown(ctx)
+            },
+        )
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    handle.shutdown();
+    let report = handle.wait().await.unwrap();
+    let unit = report.unit("consumer").unwrap();
+    assert_eq!(unit.restarts, 1);
+    assert_eq!(unit.exit, UnitExit::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restarting_unit_holds_its_stage_until_a_run_is_ready() {
+    let log: Log = Arc::default();
+    let worker_log = Arc::clone(&log);
+    let api_log = Arc::clone(&log);
+    let handle = runtime()
+        .unit(
+            "worker",
+            Stage::Workers,
+            UnitPolicy::Restart(RestartPolicy::default()),
+            move |ctx: UnitContext| {
+                let log = Arc::clone(&worker_log);
+                async move {
+                    if ctx.attempt() == 0 {
+                        push(&log, "worker failed".into());
+                        return Err(AppError::unavailable("broker not up yet"));
+                    }
+                    push(&log, format!("worker ready on attempt {}", ctx.attempt()));
+                    until_shutdown(ctx).await
+                }
+            },
+        )
+        .unit(
+            "api",
+            Stage::Ingress,
+            UnitPolicy::Critical,
+            move |ctx: UnitContext| {
+                push(&api_log, "api started".into());
+                until_shutdown(ctx)
+            },
+        )
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["worker failed", "worker ready on attempt 1", "api started"]
+    );
+    handle.shutdown();
+    let report = handle.wait().await.unwrap();
+    assert_eq!(report.unit("worker").unwrap().restarts, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn restarts_exhausted_during_startup_fail_start() {
+    let later_started = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&later_started);
+    let policy = RestartPolicy {
+        max_restarts: Some(2),
+        ..RestartPolicy::default()
+    };
+    let builder = runtime()
+        .unit(
+            "consumer",
+            Stage::Workers,
+            UnitPolicy::Restart(policy),
+            |_ctx| async { Err(AppError::unavailable("broker down")) },
+        )
+        .unit(
+            "api",
+            Stage::Ingress,
+            UnitPolicy::Critical,
+            move |ctx: UnitContext| {
+                flag.store(true, Ordering::SeqCst);
+                until_shutdown(ctx)
+            },
+        );
+    let health = builder.health();
+    let error = builder.build().unwrap().start().await.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Unavailable);
+    assert!(error.message().contains("consumer") && error.message().contains("2 restarts"));
+    assert!(!later_started.load(Ordering::SeqCst));
+    assert!(!health.is_ready());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restart_loop_during_startup_times_out_naming_the_unit() {
+    let error = runtime()
+        .start_timeout(Duration::from_secs(5))
+        .unit(
+            "consumer",
+            Stage::Workers,
+            UnitPolicy::Restart(RestartPolicy::default()),
+            |_ctx| async { Err(AppError::unavailable("broker down")) },
+        )
+        .unit("api", Stage::Ingress, UnitPolicy::Critical, until_shutdown)
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+    assert!(error.message().contains("consumer"), "{}", error.message());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_healthy_run_resets_the_restart_count() {
+    let attempts: Arc<Mutex<Vec<(u32, Instant)>>> = Arc::default();
+    let seen = Arc::clone(&attempts);
+    let policy = RestartPolicy {
+        initial: Duration::from_secs(1),
+        max: Duration::from_secs(8),
+        multiplier: 2.0,
+        max_restarts: Some(1),
+    };
+    let error = runtime()
+        .restart_reset_after(Duration::from_secs(60))
+        .unit(
+            "consumer",
+            Stage::Workers,
+            UnitPolicy::Restart(policy),
+            move |ctx: UnitContext| {
+                seen.lock().unwrap().push((ctx.attempt(), Instant::now()));
+                async move {
+                    ctx.ready();
+                    if ctx.attempt() == 1 {
+                        // A long, healthy run before failing again.
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    Err(AppError::unavailable("connection lost"))
+                }
+            },
+        )
+        .build()
+        .unwrap()
+        .run()
+        .await
+        .unwrap_err();
+
+    assert!(error.message().contains("consumer") && error.message().contains("1 restarts"));
+    let attempts = attempts.lock().unwrap();
+    let numbers: Vec<u32> = attempts.iter().map(|(n, _)| *n).collect();
+    assert_eq!(numbers, [0, 1, 2], "the healthy run earned a fresh restart");
+    assert_eq!(
+        attempts[2].1 - attempts[1].1,
+        Duration::from_secs(61),
+        "and the backoff started over"
+    );
+}
+
+/// Panics when dropped, standing in for a bug in code the supervisor runs
+/// outside the unit's own future.
+struct Bomb;
+
+impl Drop for Bomb {
+    #[allow(clippy::manual_assert)]
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            panic!("destructor exploded");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_panic_in_supervision_fails_a_critical_unit() {
+    let bomb = Bomb;
+    let handle = runtime()
+        .unit(
+            "flush",
+            Stage::Workers,
+            UnitPolicy::Critical,
+            move |ctx: UnitContext| {
+                let _ = &bomb;
+                until_shutdown(ctx)
+            },
+        )
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    handle.shutdown();
+    let error = handle.wait().await.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(error.message(), "unit flush ended unexpectedly");
+}
+
+#[tokio::test]
+async fn a_panic_in_best_effort_supervision_is_only_reported() {
+    let bomb = Bomb;
+    let handle = runtime()
+        .unit(
+            "warmup",
+            Stage::Workers,
+            UnitPolicy::BestEffort,
+            move |_ctx| {
+                let _ = &bomb;
+                async { Ok(()) }
+            },
+        )
+        .unit("api", Stage::Ingress, UnitPolicy::Critical, until_shutdown)
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    assert!(!handle.is_shutting_down());
+    handle.shutdown();
+    let report = handle.wait().await.unwrap();
+    assert_eq!(report.reason, ShutdownReason::Requested);
+    assert_eq!(
+        report.unit("warmup").unwrap().exit,
+        UnitExit::Failed("INTERNAL: unit warmup ended unexpectedly".into())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_start_that_is_dropped_stops_the_started_units() {
+    let (guard_tx, guard_rx) = oneshot::channel::<()>();
+    let mut guard = once(guard_tx);
+    let (token_tx, token_rx) = oneshot::channel::<CancellationToken>();
+    let mut token = once(token_tx);
+    let builder = runtime()
+        .unit(
+            "store",
+            Stage::Infrastructure,
+            UnitPolicy::Critical,
+            move |ctx: UnitContext| {
+                let guard = guard();
+                let token = token();
+                async move {
+                    let _guard = guard;
+                    if let Some(token) = token {
+                        let _ = token.send(ctx.shutdown());
+                    }
+                    ctx.ready();
+                    std::future::pending::<()>().await;
+                    Ok(())
+                }
+            },
+        )
+        .unit(
+            "api",
+            Stage::Ingress,
+            UnitPolicy::Critical,
+            |ctx: UnitContext| async move {
+                // Never reports ready, so startup waits here.
+                ctx.shutdown().cancelled().await;
+                Ok(())
+            },
+        );
+    let trigger = builder.shutdown_trigger();
+    let start = builder.build().unwrap().start();
+    let outcome = tokio::time::timeout(Duration::from_secs(1), start).await;
+    assert!(
+        outcome.is_err(),
+        "start was still waiting on the ingress stage"
+    );
+
+    assert!(trigger.is_triggered());
+    assert!(token_rx.await.unwrap().is_cancelled());
+    assert!(dropped(guard_rx).await, "the started unit was stopped");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_that_is_dropped_stops_every_unit() {
+    let (guard_tx, guard_rx) = oneshot::channel::<()>();
+    let mut guard = once(guard_tx);
+    let run = runtime()
+        .unit(
+            "worker",
+            Stage::Workers,
+            UnitPolicy::Critical,
+            move |ctx: UnitContext| {
+                let guard = guard();
+                async move {
+                    let _guard = guard;
+                    ctx.ready();
+                    std::future::pending::<()>().await;
+                    Ok(())
+                }
+            },
+        )
+        .build()
+        .unwrap()
+        .run();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .is_err()
+    );
+    assert!(dropped(guard_rx).await, "the unit was stopped");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_wait_still_requests_shutdown() {
+    let (stopped_tx, stopped_rx) = oneshot::channel::<()>();
+    let mut stopped = once(stopped_tx);
+    let handle = runtime()
+        .unit(
+            "api",
+            Stage::Ingress,
+            UnitPolicy::Critical,
+            move |ctx: UnitContext| {
+                let stopped = stopped();
+                async move {
+                    until_shutdown(ctx).await?;
+                    if let Some(stopped) = stopped {
+                        let _ = stopped.send(());
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let trigger = handle.trigger();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), handle.wait())
+            .await
+            .is_err()
+    );
+    assert!(trigger.is_triggered());
+    stopped_rx
+        .await
+        .expect("drained after the wait was dropped");
 }

@@ -11,7 +11,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use sekvent_client::oauth2::{ClientAuthStyle, ClientCredentials};
 use sekvent_client::{BearerSource, HttpClient};
@@ -87,6 +87,14 @@ async fn start(server: TokenServer) -> (Arc<TokenServer>, String) {
         .route(
             "/mac",
             post(|| async { Json(json!({ "access_token": "t", "token_type": "mac" })) }),
+        )
+        .route("/moved", post(|| async { Redirect::temporary("/token") }))
+        .route(
+            "/forever",
+            post(|State(server): State<Arc<TokenServer>>| async move {
+                let n = server.token_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                Json(json!({ "access_token": format!("forever-{n}"), "expires_in": u64::MAX }))
+            }),
         )
         .with_state(Arc::clone(&server));
     let base = serve(router).await;
@@ -228,8 +236,8 @@ async fn a_401_invalidates_and_retries_once() {
     let error = client.post("/secure").send(&ctx).await.unwrap_err();
     assert_eq!(
         error.code(),
-        ErrorCode::Unauthenticated,
-        "only one re-authentication per request"
+        ErrorCode::Internal,
+        "only one re-authentication per request; our credentials are not the user's problem"
     );
     assert_eq!(server.token_hits.load(Ordering::SeqCst), 4);
     assert_eq!(server.api_hits.load(Ordering::SeqCst), 5);
@@ -245,8 +253,10 @@ async fn token_endpoint_failures_are_mapped() {
         .token(&ctx)
         .await
         .unwrap_err();
-    assert_eq!(rejected.code(), ErrorCode::Unauthenticated);
+    assert_eq!(rejected.code(), ErrorCode::Internal);
+    assert_eq!(rejected.reason(), Some("TOKEN_REQUEST_FAILED"));
     assert!(!rejected.to_string().contains("SECRET-DETAIL"));
+    assert!(!format!("{rejected:?}").contains("SECRET-DETAIL"));
 
     let overloaded = credentials(&base, "/overloaded", &clock)
         .token(&ctx)
@@ -258,11 +268,63 @@ async fn token_endpoint_failures_are_mapped() {
         .token(&ctx)
         .await
         .unwrap_err();
-    assert_eq!(garbage.code(), ErrorCode::Unauthenticated);
+    assert_eq!(garbage.code(), ErrorCode::Internal);
 
     let mac = credentials(&base, "/mac", &clock)
         .token(&ctx)
         .await
         .unwrap_err();
-    assert_eq!(mac.code(), ErrorCode::Unauthenticated);
+    assert_eq!(mac.code(), ErrorCode::Internal);
+}
+
+#[tokio::test]
+async fn the_token_endpoint_is_never_redirected() {
+    let (server, base) = start(TokenServer::default()).await;
+    let clock = ManualClock::new(start_time());
+    let error = credentials(&base, "/moved", &clock)
+        .token(&CallContext::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(
+        server.token_hits.load(Ordering::SeqCst),
+        0,
+        "the client secret was not replayed to the redirect target"
+    );
+}
+
+#[tokio::test]
+async fn absurd_lifetimes_are_clamped_to_a_day() {
+    let (server, base) = start(TokenServer::default()).await;
+    let clock = ManualClock::new(start_time());
+    let creds = credentials(&base, "/forever", &clock);
+    let ctx = CallContext::new();
+    assert_eq!(creds.token(&ctx).await.unwrap().expose(), "forever-1");
+    clock.advance(Duration::from_hours(23));
+    assert_eq!(creds.token(&ctx).await.unwrap().expose(), "forever-1");
+    clock.advance(Duration::from_hours(1));
+    assert_eq!(creds.token(&ctx).await.unwrap().expose(), "forever-2");
+    assert_eq!(server.token_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_lifetime_shorter_than_the_skew_is_still_cached() {
+    let (server, base) = start(TokenServer::default()).await;
+    let clock = ManualClock::new(start_time());
+    let creds = ClientCredentials::builder(format!("{base}/token"), "svc", Secret::new("p@ss"))
+        .refresh_skew(Duration::from_secs(90))
+        .clock(Arc::new(clock.clone()))
+        .build()
+        .unwrap();
+    let ctx = CallContext::new();
+    assert_eq!(creds.token(&ctx).await.unwrap().expose(), "token-1");
+    clock.advance(Duration::from_secs(29));
+    assert_eq!(
+        creds.token(&ctx).await.unwrap().expose(),
+        "token-1",
+        "half of the 60 s lifetime"
+    );
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(creds.token(&ctx).await.unwrap().expose(), "token-2");
+    assert_eq!(server.token_hits.load(Ordering::SeqCst), 2);
 }

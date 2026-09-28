@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
@@ -8,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures::FutureExt;
-use futures::future::{BoxFuture, join_all};
-use sekvent_error::AppError;
+use futures::future::{BoxFuture, join_all, try_join_all};
+use sekvent_error::{AppError, ErrorCode};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -38,6 +39,7 @@ struct Settings {
     shutdown_delay: Duration,
     stage_grace: Duration,
     shutdown_deadline: Duration,
+    restart_reset_after: Duration,
 }
 
 /// Why the runtime shut down.
@@ -243,9 +245,10 @@ impl Runtime {
     /// Start configuring a runtime.
     ///
     /// Defaults: a 30 s start timeout per stage, no shutdown delay, a 10 s
-    /// grace period per stage, a 30 s bound on the whole shutdown, `SIGTERM`
-    /// and `SIGINT` (Ctrl-C off unix) as shutdown signals, and dependency
-    /// probes every 10 s with a 2 s timeout.
+    /// grace period per stage, a 30 s bound on the whole shutdown, restart
+    /// counts reset after 60 s of healthy running, `SIGTERM` and `SIGINT`
+    /// (Ctrl-C off unix) as shutdown signals, and dependency probes every
+    /// 10 s with a 2 s timeout.
     pub fn builder() -> RuntimeBuilder {
         RuntimeBuilder {
             units: Vec::new(),
@@ -254,6 +257,7 @@ impl Runtime {
                 shutdown_delay: Duration::ZERO,
                 stage_grace: Duration::from_secs(10),
                 shutdown_deadline: Duration::from_secs(30),
+                restart_reset_after: Duration::from_secs(60),
             },
             signals: true,
             triggers: Vec::new(),
@@ -279,9 +283,12 @@ impl Runtime {
 
     /// Start every stage, run until shutdown is requested, then drain.
     ///
-    /// Returns the first critical failure (a critical unit's error, exhausted
-    /// restarts, or a stage that did not start in time) as `Err`; otherwise a
-    /// report of how every unit ended.
+    /// Returns the first critical failure (a critical unit's error or panic,
+    /// exhausted restarts, or a stage that did not start in time) as `Err`;
+    /// otherwise a report of how every unit ended.
+    ///
+    /// Dropping the returned future stops the runtime on the spot: every
+    /// stage's shutdown token fires and every unit still running is aborted.
     pub async fn run(self) -> Result<RunReport, AppError> {
         let mut supervisor = Supervisor::new(self);
         supervisor.start_stages().await;
@@ -295,6 +302,9 @@ impl Runtime {
     ///
     /// If shutdown begins during startup, the runtime drains and this returns
     /// the critical failure, or a `CANCELLED` error when there was none.
+    ///
+    /// Dropping the returned future (e.g. under a timeout) stops the units
+    /// already started, as for [`run`](Self::run).
     pub async fn start(self) -> Result<RuntimeHandle, AppError> {
         let mut supervisor = Supervisor::new(self);
         supervisor.start_stages().await;
@@ -316,7 +326,8 @@ impl Runtime {
         Ok(RuntimeHandle {
             trigger: ShutdownTrigger { control },
             health,
-            join: Some(join),
+            join,
+            awaited: false,
         })
     }
 }
@@ -378,6 +389,18 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn shutdown_deadline(mut self, deadline: Duration) -> Self {
         self.settings.shutdown_deadline = deadline;
+        self
+    }
+
+    /// How long a restarting unit must keep running before its restart count
+    /// and backoff start over (default 60 s).
+    ///
+    /// A run at least this long counts as healthy, so
+    /// [`RestartPolicy::max_restarts`](crate::RestartPolicy::max_restarts)
+    /// bounds a crash loop rather than the restarts over the unit's lifetime.
+    #[must_use]
+    pub fn restart_reset_after(mut self, period: Duration) -> Self {
+        self.settings.restart_reset_after = period;
         self
     }
 
@@ -449,11 +472,15 @@ impl RuntimeBuilder {
     /// Validate the configuration.
     ///
     /// Fails on an empty or duplicate unit or probe name, an invalid restart
-    /// policy, or a zero start timeout, probe interval or probe timeout.
+    /// policy, or a zero start timeout, restart reset period, probe interval
+    /// or probe timeout.
     pub fn build(mut self) -> Result<Runtime, AppError> {
         let invalid = |message: String| Err(AppError::invalid_argument(message));
         if self.settings.start_timeout.is_zero() {
             return invalid("the stage start timeout must be positive".into());
+        }
+        if self.settings.restart_reset_after.is_zero() {
+            return invalid("the restart reset period must be positive".into());
         }
 
         if !self.probes.is_empty() {
@@ -516,7 +543,8 @@ impl RuntimeBuilder {
 pub struct RuntimeHandle {
     trigger: ShutdownTrigger,
     health: HealthRegistry,
-    join: Option<JoinHandle<Result<RunReport, AppError>>>,
+    join: JoinHandle<Result<RunReport, AppError>>,
+    awaited: bool,
 }
 
 impl fmt::Debug for RuntimeHandle {
@@ -550,20 +578,31 @@ impl RuntimeHandle {
 
     /// Wait until the runtime has shut down (for any reason) and drained;
     /// the result is as for [`Runtime::run`]. Does not request shutdown.
+    ///
+    /// Cancel-safe: dropping the returned future drops the handle, which
+    /// requests shutdown like any dropped handle.
     pub async fn wait(mut self) -> Result<RunReport, AppError> {
-        let Some(join) = self.join.take() else {
-            return Err(AppError::internal("the runtime was already awaited"));
-        };
-        join.await
-            .unwrap_or_else(|error| Err(AppError::internal(error)))
+        let outcome = (&mut self.join).await;
+        self.awaited = true;
+        outcome.unwrap_or_else(|error| Err(AppError::internal(error)))
     }
 }
 
 impl Drop for RuntimeHandle {
     fn drop(&mut self) {
-        if self.join.is_some() {
+        if !self.awaited {
             self.trigger.shutdown();
         }
+    }
+}
+
+/// A spawned task that is aborted when dropped, so a dropped supervisor
+/// never leaves a unit running unsupervised.
+struct Task<T>(JoinHandle<T>);
+
+impl<T> Drop for Task<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -572,7 +611,7 @@ struct RunningUnit {
     stage: Stage,
     restarts: Arc<AtomicU32>,
     ready: watch::Receiver<bool>,
-    handle: JoinHandle<UnitReport>,
+    handle: Task<UnitReport>,
 }
 
 struct RunningStage {
@@ -588,6 +627,20 @@ struct Supervisor {
     pending: Vec<UnitSpec>,
     stages: Vec<RunningStage>,
     not_started: Vec<UnitReport>,
+    _signals: Task<()>,
+}
+
+impl Drop for Supervisor {
+    /// Reached early only when `start` or `run` is dropped mid-way: the
+    /// units go down with the supervisor instead of running on detached.
+    fn drop(&mut self) {
+        if !self.control.requested.is_cancelled() {
+            self.control.request(ShutdownReason::Requested);
+        }
+        for stage in &self.stages {
+            stage.token.cancel();
+        }
+    }
 }
 
 impl Supervisor {
@@ -598,12 +651,12 @@ impl Supervisor {
             triggers.extend(os_signals());
         }
         let control = Arc::clone(&runtime.control);
-        tokio::spawn(async move {
+        let signals = Task(tokio::spawn(async move {
             tokio::select! {
                 () = any_trigger(triggers) => control.request(ShutdownReason::Signal),
                 () = control.requested.cancelled() => {}
             }
-        });
+        }));
         Self {
             control: runtime.control,
             health: runtime.health,
@@ -611,6 +664,7 @@ impl Supervisor {
             pending: runtime.units,
             stages: Vec::new(),
             not_started: Vec::new(),
+            _signals: signals,
         }
     }
 
@@ -649,22 +703,30 @@ impl Supervisor {
             .into_iter()
             .map(|spec| self.spawn_unit(spec, token.clone()))
             .collect();
-        let mut signals: Vec<watch::Receiver<bool>> =
-            units.iter().map(|unit| unit.ready.clone()).collect();
+        let signals: Vec<(Arc<str>, watch::Receiver<bool>)> = units
+            .iter()
+            .map(|unit| (Arc::clone(&unit.name), unit.ready.clone()))
+            .collect();
         self.stages.push(RunningStage {
             stage,
             token,
             units,
         });
 
-        let all_ready = join_all(signals.iter_mut().map(|ready| async move {
-            // An error means the unit is gone, which also settles it.
-            let _settled = ready.wait_for(|ready| *ready).await;
-        }));
         tokio::select! {
             biased;
             () = self.control.requested.cancelled() => {}
-            _ = all_ready => tracing::debug!(stage = stage.as_str(), "stage started"),
+            settled = all_ready(signals) => match settled {
+                Ok(()) => tracing::debug!(stage = stage.as_str(), "stage started"),
+                Err(unit) => {
+                    let message = format!("unit {unit} stopped without reporting ready");
+                    tracing::error!(stage = stage.as_str(), "{message}");
+                    self.control.fail(AppError::new(ErrorCode::Internal, message));
+                    self.control.request(ShutdownReason::UnitFailed {
+                        unit: unit.to_string(),
+                    });
+                }
+            },
             () = tokio::time::sleep(self.settings.start_timeout) => {
                 let waiting: Vec<&str> = self
                     .stages
@@ -699,13 +761,14 @@ impl Supervisor {
             health: self.health.clone(),
             ready: Arc::new(ready_tx),
             restarts: Arc::clone(&restarts),
+            settings: self.settings,
         };
         RunningUnit {
             name,
             stage,
             restarts,
             ready,
-            handle: tokio::spawn(driver.drive()),
+            handle: Task(tokio::spawn(driver.supervise())),
         }
     }
 
@@ -746,6 +809,28 @@ fn instant_after(duration: Duration) -> Instant {
     now.checked_add(duration.min(FAR_FUTURE)).unwrap_or(now)
 }
 
+/// Resolve once every unit has reported ready (or settled for good), or
+/// with the name of the first whose supervision ended without doing so.
+async fn all_ready(signals: Vec<(Arc<str>, watch::Receiver<bool>)>) -> Result<(), Arc<str>> {
+    try_join_all(signals.into_iter().map(|(name, mut ready)| async move {
+        match ready.wait_for(|ready| *ready).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(name),
+        }
+    }))
+    .await
+    .map(|_| ())
+}
+
+/// The text of a panic payload, when it is one.
+pub(crate) fn panic_detail(panic: &(dyn Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
+}
+
 /// Cancel one stage and wait for all its units together, aborting those
 /// still running at `grace_end`.
 async fn drain_stage(stage: RunningStage, grace_end: Instant) -> Vec<UnitReport> {
@@ -759,11 +844,11 @@ async fn drain_stage(stage: RunningStage, grace_end: Instant) -> Vec<UnitReport>
             mut handle,
             ..
         } = unit;
-        let exit = match tokio::time::timeout_at(grace_end, &mut handle).await {
+        let exit = match tokio::time::timeout_at(grace_end, &mut handle.0).await {
             Ok(Ok(report)) => return report,
             Ok(Err(_)) => UnitExit::Failed("the unit's task ended abnormally".into()),
             Err(_) => {
-                handle.abort();
+                drop(handle);
                 tracing::warn!(
                     unit = &*name,
                     "unit did not stop within its grace period; aborted"
@@ -789,18 +874,63 @@ struct Driver {
     health: HealthRegistry,
     ready: Arc<watch::Sender<bool>>,
     restarts: Arc<AtomicU32>,
+    settings: Settings,
 }
 
 impl Driver {
+    /// Drive the unit, turning a panic in its supervision (outside the
+    /// unit's own code, e.g. a factory's destructor) into a failure of the
+    /// unit under its policy instead of a silently finished task.
+    async fn supervise(self) -> UnitReport {
+        let name = Arc::clone(&self.spec.name);
+        let stage = self.spec.stage;
+        let policy = self.spec.policy;
+        let control = Arc::clone(&self.control);
+        let ready = Arc::clone(&self.ready);
+        let restarts = Arc::clone(&self.restarts);
+        match AssertUnwindSafe(self.drive()).catch_unwind().await {
+            Ok(report) => report,
+            Err(panic) => {
+                let detail = panic_detail(&*panic);
+                tracing::error!(unit = &*name, panic = %detail, "unit supervision panicked");
+                let error = AppError::new(
+                    ErrorCode::Internal,
+                    format!("unit {name} ended unexpectedly"),
+                );
+                let shown = error.to_string();
+                if policy == UnitPolicy::BestEffort {
+                    ready.send_replace(true);
+                } else {
+                    control.fail(error);
+                    control.request(ShutdownReason::UnitFailed {
+                        unit: name.to_string(),
+                    });
+                }
+                UnitReport {
+                    name: name.to_string(),
+                    stage,
+                    restarts: restarts.load(Ordering::Relaxed),
+                    exit: UnitExit::Failed(shown),
+                }
+            }
+        }
+    }
+
     async fn drive(mut self) -> UnitReport {
+        // Every restart, for the report and `UnitContext::attempt`.
         let mut restarts = 0_u32;
+        // Restarts since the unit last ran healthily, for backoff and the limit.
+        let mut streak = 0_u32;
         loop {
+            let started = Instant::now();
             let result = self.run_once(restarts).await;
-            // An exited unit no longer holds up its stage's start.
-            self.ready.send_replace(true);
+            let policy = self.spec.policy;
+            if !matches!(policy, UnitPolicy::Restart(_)) {
+                // Gone for good, so it no longer holds up its stage's start.
+                self.ready.send_replace(true);
+            }
 
             let name = &*self.spec.name;
-            let policy = self.spec.policy;
             let stopping = self.token.is_cancelled() || self.control.requested.is_cancelled();
             if stopping {
                 return match result {
@@ -816,41 +946,52 @@ impl Driver {
                 };
             }
 
-            match policy {
+            let policy = match policy {
                 UnitPolicy::BestEffort => {
                     let shown = result.as_ref().err().map(ToString::to_string);
                     tracing::warn!(unit = name, error = ?shown, "best-effort unit exited");
                     return self.finish(restarts, result);
                 }
-                UnitPolicy::Restart(policy)
-                    if policy.max_restarts.is_none_or(|max| restarts < max) =>
-                {
-                    let delay = policy.delay(restarts);
-                    let shown = result.as_ref().err().map(ToString::to_string);
-                    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                    tracing::warn!(unit = name, error = ?shown, delay_ms, "unit exited; restarting");
-                    restarts += 1;
-                    self.restarts.store(restarts, Ordering::Relaxed);
-                    tokio::select! {
-                        () = self.token.cancelled() => return self.finish(restarts, result),
-                        () = self.control.requested.cancelled() => return self.finish(restarts, result),
-                        () = tokio::time::sleep(delay) => {}
-                    }
-                }
-                UnitPolicy::Restart(_) => {
-                    let mut error = AppError::unavailable(format!(
-                        "unit {name} exited after exhausting its {restarts} restarts"
-                    ));
-                    if let Err(last) = result {
-                        error = error.with_source(last);
-                    }
-                    return self.critical(restarts, Err(error));
-                }
                 UnitPolicy::Critical => return self.critical(restarts, result),
+                UnitPolicy::Restart(policy) => policy,
+            };
+            if started.elapsed() >= self.settings.restart_reset_after {
+                streak = 0;
+            }
+            if policy.max_restarts.is_some_and(|max| streak >= max) {
+                let mut error = AppError::unavailable(format!(
+                    "unit {name} exited after exhausting its {streak} restarts"
+                ));
+                if let Err(last) = result {
+                    error = error.with_source(last);
+                }
+                return self.critical(restarts, Err(error));
+            }
+
+            let delay = policy.delay(streak);
+            let shown = result.as_ref().err().map(ToString::to_string);
+            let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+            let was_ready = *self.ready.borrow();
+            tracing::warn!(
+                unit = name,
+                error = ?shown,
+                delay_ms,
+                was_ready,
+                "unit exited; restarting"
+            );
+            streak = streak.saturating_add(1);
+            restarts = restarts.saturating_add(1);
+            self.restarts.store(restarts, Ordering::Relaxed);
+            tokio::select! {
+                () = self.token.cancelled() => return self.finish(restarts, result),
+                () = self.control.requested.cancelled() => return self.finish(restarts, result),
+                () = tokio::time::sleep(delay) => {}
             }
         }
     }
 
+    /// One run of the unit. A panic, in the factory or in the future it
+    /// returned, is an `INTERNAL` failure like any other.
     async fn run_once(&mut self, attempt: u32) -> Result<(), AppError> {
         let ctx = UnitContext::new(
             Arc::clone(&self.spec.name),
@@ -859,24 +1000,23 @@ impl Driver {
             self.token.clone(),
             Arc::clone(&self.ready),
             self.health.clone(),
+            self.settings.stage_grace,
         );
-        let run = (self.spec.factory)(ctx);
+        let run = match std::panic::catch_unwind(AssertUnwindSafe(|| (self.spec.factory)(ctx))) {
+            Ok(run) => run,
+            Err(panic) => return Err(self.panicked(&*panic)),
+        };
         match AssertUnwindSafe(run).catch_unwind().await {
             Ok(result) => result,
-            Err(panic) => {
-                let detail = panic
-                    .downcast_ref::<&str>()
-                    .map(|text| (*text).to_owned())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_default();
-                let name = &*self.spec.name;
-                tracing::error!(unit = name, panic = %detail, "unit panicked");
-                Err(AppError::new(
-                    sekvent_error::ErrorCode::Internal,
-                    format!("unit {name} panicked"),
-                ))
-            }
+            Err(panic) => Err(self.panicked(&*panic)),
         }
+    }
+
+    fn panicked(&self, panic: &(dyn Any + Send)) -> AppError {
+        let name = &*self.spec.name;
+        let detail = panic_detail(panic);
+        tracing::error!(unit = name, panic = %detail, "unit panicked");
+        AppError::new(ErrorCode::Internal, format!("unit {name} panicked"))
     }
 
     /// A critical exit: shut everything down, failing the run on error.
@@ -912,5 +1052,56 @@ impl Driver {
             restarts,
             exit,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signal(name: &str) -> (watch::Sender<bool>, (Arc<str>, watch::Receiver<bool>)) {
+        let (tx, rx) = watch::channel(false);
+        (tx, (Arc::from(name), rx))
+    }
+
+    #[tokio::test]
+    async fn a_stage_is_ready_once_every_unit_is() {
+        let (first, first_rx) = signal("first");
+        let (second, second_rx) = signal("second");
+        first.send_replace(true);
+        second.send_replace(true);
+        assert_eq!(all_ready(vec![first_rx, second_rx]).await, Ok(()));
+        assert_eq!(all_ready(Vec::new()).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_unit_gone_without_reporting_ready_is_named() {
+        let (ready, ready_rx) = signal("ready");
+        let (lost, lost_rx) = signal("lost");
+        ready.send_replace(true);
+        drop(lost);
+        let error = all_ready(vec![ready_rx, lost_rx]).await.unwrap_err();
+        assert_eq!(&*error, "lost");
+    }
+
+    #[test]
+    fn panic_payloads_are_read_when_they_are_text() {
+        let literal: Box<dyn Any + Send> = Box::new("boom");
+        let owned: Box<dyn Any + Send> = Box::new(String::from("bang"));
+        let other: Box<dyn Any + Send> = Box::new(7_u8);
+        assert_eq!(panic_detail(&*literal), "boom");
+        assert_eq!(panic_detail(&*owned), "bang");
+        assert_eq!(panic_detail(&*other), "");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_task_is_aborted() {
+        let (guard_tx, guard_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = Task(tokio::spawn(async move {
+            let _guard = guard_tx;
+            std::future::pending::<()>().await;
+        }));
+        drop(task);
+        assert!(guard_rx.await.is_err(), "the task's future was dropped");
     }
 }

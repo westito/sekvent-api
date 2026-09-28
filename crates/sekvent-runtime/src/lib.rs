@@ -5,7 +5,8 @@
 //! A [`Runtime`] runs named *units*: futures produced by a factory, so a
 //! unit can be restarted. Each unit belongs to a [`Stage`]. Stages start in
 //! order (infrastructure, components, workers, ingress); a stage counts as
-//! started once every unit in it has called [`UnitContext::ready`] or exited.
+//! started once every unit in it has called [`UnitContext::ready`], or, for
+//! a critical or best-effort unit, exited.
 //! Shutdown, triggered by a signal, a critical unit exiting or a
 //! [`ShutdownTrigger`], first turns health to not-serving, waits the
 //! configured delay, then drains stages in reverse order, each within its
@@ -13,7 +14,8 @@
 //!
 //! What happens when a unit exits on its own is its [`UnitPolicy`]:
 //! critical units take everything down, restarting units back off and retry,
-//! best-effort units are logged and forgotten.
+//! best-effort units are logged and forgotten. A panic, in a unit's future or
+//! in the factory that builds it, is a failure like any other.
 //!
 //! # Health
 //!

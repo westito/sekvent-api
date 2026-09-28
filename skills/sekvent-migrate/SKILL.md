@@ -13,7 +13,9 @@ The service must behave the same on the wire when you are done.
 Where commands run is the `build-on-rtx` skill's business: everything that
 compiles (`cargo sekvent check|clippy|test|gate|coverage`) goes to the remote
 builder; `cargo fmt`, `cargo update` and edits stay local. If the builder is
-unreachable, stop and report — never fall back to a local build. For a test
+unreachable, stop and report — never fall back to a local build. (A project
+without a remote builder opts out explicitly with `[remote].mode = "local"`
+in `sekvent.toml`; that is a configuration choice, not a fallback.) For a test
 suite that is slow or flaky once it compiles, use the `rust-testing` skill.
 
 ## 0. Work on a branch in a worktree

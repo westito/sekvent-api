@@ -98,6 +98,11 @@ pub fn normalize_args(mut argv: Vec<String>) -> Vec<String> {
     argv
 }
 
+/// How to build without a remote builder, appended to every "rrb is
+/// missing" error.
+pub const LOCAL_HINT: &str = "to compile on this machine instead, set `[remote].mode = \"local\"` \
+     in sekvent.toml or export SEKVENT_LOCAL=1; there is no automatic local fallback";
+
 /// The `rrb` executable: the configured path (with `~` expanded) or, for a
 /// bare name, a `PATH` lookup.
 pub fn resolve_rrb(remote: &RemoteConfig, home: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -105,15 +110,14 @@ pub fn resolve_rrb(remote: &RemoteConfig, home: Option<&Path>) -> anyhow::Result
     if path.components().count() == 1 && !remote.rrb.contains('/') {
         return which::which(&path).with_context(|| {
             format!(
-                "`{}` is not on PATH; remote builds need rrb (set [remote].rrb)",
+                "`{}` is not on PATH; remote builds need rrb (set [remote].rrb); {LOCAL_HINT}",
                 remote.rrb
             )
         });
     }
     if !path.is_file() {
         bail!(
-            "rrb not found at {}; remote builds need it (set [remote].rrb). \
-             There is no local fallback: compiling commands never run on this machine",
+            "rrb not found at {}; remote builds need it (set [remote].rrb); {LOCAL_HINT}",
             path.display()
         );
     }
@@ -319,14 +323,21 @@ mod tests {
         let ctx = context(config, &[], &runner, &sweeper);
         let error =
             compile_or_forward(&ctx, &args(&["gate"]), |_| panic!("no fallback")).unwrap_err();
-        assert!(error.to_string().contains("no local fallback"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("rrb not found at /nonexistent/rrb"),
+            "{message}"
+        );
+        assert!(message.contains("mode = \"local\""), "{message}");
+        assert!(message.contains("SEKVENT_LOCAL=1"), "{message}");
         assert!(runner.calls().is_empty());
 
         let bare = RemoteConfig {
             rrb: "sekvent-no-such-rrb-binary".into(),
             ..RemoteConfig::default()
         };
-        assert!(resolve_rrb(&bare, None).is_err());
+        let error = resolve_rrb(&bare, None).unwrap_err();
+        assert!(format!("{error:#}").contains(LOCAL_HINT), "{error:#}");
     }
 
     #[test]

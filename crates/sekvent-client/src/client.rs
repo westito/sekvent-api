@@ -14,6 +14,50 @@ use sekvent_resilience::{Policy, RetryPolicy, Timeout};
 use crate::mapping::{map_status, map_transport_error};
 use crate::{BearerSource, HttpResponse, RequestBuilder};
 
+/// Most redirects [`RedirectPolicy::SameOrigin`] follows for one request.
+const MAX_REDIRECTS: usize = 5;
+
+/// Which redirects an [`HttpClient`] follows.
+///
+/// Headers set on the client or the request (API keys, identity headers,
+/// idempotency keys) travel with every followed redirect, so the client
+/// never follows one off the origin it was sent to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RedirectPolicy {
+    /// Follow up to five redirects that stay on the original origin
+    /// (scheme, host and port). A redirect anywhere else, or one past the
+    /// limit, is not followed: the `3xx` response is returned as is.
+    #[default]
+    SameOrigin,
+    /// Never follow redirects; every `3xx` response is returned as is.
+    None,
+}
+
+impl RedirectPolicy {
+    fn to_reqwest(self) -> reqwest::redirect::Policy {
+        match self {
+            Self::SameOrigin => reqwest::redirect::Policy::custom(|attempt| {
+                if follows_same_origin(attempt.url(), attempt.previous()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }),
+            Self::None => reqwest::redirect::Policy::none(),
+        }
+    }
+}
+
+/// Whether a redirect to `next` stays on the origin of the first request in
+/// `previous` (which holds every URL requested so far) and within the limit.
+fn follows_same_origin(next: &Url, previous: &[Url]) -> bool {
+    previous.len() <= MAX_REDIRECTS
+        && previous
+            .first()
+            .is_some_and(|first| first.origin() == next.origin())
+}
+
 /// Why an [`HttpClient`] (or a token source) could not be built.
 ///
 /// Messages name the offending setting, never its value: a URL may carry
@@ -27,6 +71,16 @@ pub enum BuildError {
     /// The token endpoint URL is not an absolute `http` or `https` URL.
     #[error("the token URL is not a valid absolute http(s) URL")]
     InvalidTokenUrl,
+    /// The token endpoint URL uses plain `http` for a host other than a
+    /// loopback address; client secrets and tokens would travel in clear.
+    #[error("the token URL must use https unless it points at a loopback host")]
+    InsecureTokenUrl,
+    /// A timeout setting is zero, which would fail every request.
+    #[error("the {name} must be longer than zero")]
+    InvalidTimeout {
+        /// The setting, e.g. `request timeout`.
+        name: &'static str,
+    },
     /// A default header name or value is invalid.
     #[error("the default header {name} is invalid")]
     InvalidHeader {
@@ -53,6 +107,7 @@ pub(crate) struct Inner {
     pub(crate) auth: Auth,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) propagate_context: bool,
+    pub(crate) sekvent_upstream: bool,
 }
 
 /// An outbound HTTP client. Cheap to clone; clones share the connection
@@ -151,7 +206,7 @@ impl HttpClient {
     ) -> Result<HttpResponse, AppError> {
         let mut headers = headers.clone();
         if self.inner.propagate_context {
-            sekvent_context::headers::inject(ctx, &mut headers);
+            sekvent_context::headers::propagate(ctx, &mut headers);
         }
         let mut response = self.send_once(ctx, method, url, &headers, body).await?;
         if response.status() == StatusCode::UNAUTHORIZED
@@ -173,6 +228,7 @@ impl HttpClient {
                 &response_headers,
                 &bytes,
                 self.inner.clock.now(),
+                self.inner.sekvent_upstream,
             ))
         }
     }
@@ -228,6 +284,8 @@ pub struct HttpClientBuilder {
     auth: Auth,
     clock: Arc<dyn Clock>,
     propagate_context: bool,
+    sekvent_upstream: bool,
+    redirects: RedirectPolicy,
 }
 
 impl fmt::Debug for HttpClientBuilder {
@@ -236,6 +294,8 @@ impl fmt::Debug for HttpClientBuilder {
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("read_timeout", &self.read_timeout)
+            .field("sekvent_upstream", &self.sekvent_upstream)
+            .field("redirects", &self.redirects)
             .finish_non_exhaustive()
     }
 }
@@ -253,6 +313,8 @@ impl Default for HttpClientBuilder {
             auth: Auth::None,
             clock: Arc::new(SystemClock),
             propagate_context: true,
+            sekvent_upstream: false,
+            redirects: RedirectPolicy::SameOrigin,
         }
     }
 }
@@ -333,15 +395,49 @@ impl HttpClientBuilder {
     /// Whether to send the call context (request id, `grpc-timeout`,
     /// trace, identity headers) upstream. On by default; turn it off for
     /// third-party APIs that should not see internal identifiers.
+    ///
+    /// Headers set on the request win over the context, and the context's
+    /// idempotency key is never forwarded (see
+    /// [`sekvent_context::headers::propagate`]): set one per request with
+    /// [`RequestBuilder::header`] when the upstream needs it.
     #[must_use]
     pub fn propagate_context(mut self, propagate: bool) -> Self {
         self.propagate_context = propagate;
+        self
+    }
+    /// Declare that the upstream is a sekvent service (off by default).
+    ///
+    /// When on, a sekvent JSON error body is adopted as the error —
+    /// code, message, reason and metadata reach this client's callers — and
+    /// an upstream `401`/`403` keeps its `UNAUTHENTICATED`/`PERMISSION_DENIED`
+    /// code. When off, every error body is ignored: the error is mapped from
+    /// the status with a generic message, and `401`/`403` become `INTERNAL`,
+    /// because they mean this service's own credentials or configuration
+    /// were refused, not that the end user is unauthenticated.
+    #[must_use]
+    pub fn sekvent_upstream(mut self, sekvent: bool) -> Self {
+        self.sekvent_upstream = sekvent;
+        self
+    }
+    /// Which redirects to follow (default [`RedirectPolicy::SameOrigin`]).
+    #[must_use]
+    pub fn redirects(mut self, policy: RedirectPolicy) -> Self {
+        self.redirects = policy;
         self
     }
 
     /// Build the client.
     pub fn build(self) -> Result<HttpClient, BuildError> {
         let base_url = self.base_url.as_deref().map(parse_base_url).transpose()?;
+        for (name, timeout) in [
+            ("connect timeout", self.connect_timeout),
+            ("request timeout", self.request_timeout),
+            ("read timeout", self.read_timeout),
+        ] {
+            if timeout.is_some_and(|timeout| timeout.is_zero()) {
+                return Err(BuildError::InvalidTimeout { name });
+            }
+        }
 
         let mut headers = HeaderMap::new();
         for (name, value) in &self.default_headers {
@@ -358,6 +454,7 @@ impl HttpClientBuilder {
         let mut http = reqwest::Client::builder()
             .tls_backend_rustls()
             .user_agent(self.user_agent)
+            .redirect(self.redirects.to_reqwest())
             .default_headers(headers);
         if let Some(timeout) = self.connect_timeout {
             http = http.connect_timeout(timeout);
@@ -385,6 +482,7 @@ impl HttpClientBuilder {
                 auth: self.auth,
                 clock: self.clock,
                 propagate_context: self.propagate_context,
+                sekvent_upstream: self.sekvent_upstream,
             }),
         })
     }
@@ -503,6 +601,55 @@ mod tests {
         assert!(debug.contains("HttpClient"));
         let builder = HttpClient::builder().read_timeout(Duration::from_secs(1));
         assert!(format!("{builder:?}").contains("read_timeout"));
+    }
+
+    #[test]
+    fn zero_timeouts_are_rejected() {
+        let zero = Duration::ZERO;
+        for (builder, name) in [
+            (
+                HttpClient::builder().connect_timeout(zero),
+                "connect timeout",
+            ),
+            (
+                HttpClient::builder().request_timeout(zero),
+                "request timeout",
+            ),
+            (HttpClient::builder().read_timeout(zero), "read timeout"),
+        ] {
+            let error = builder.build().unwrap_err();
+            assert!(matches!(error, BuildError::InvalidTimeout { name: named } if named == name));
+            assert_eq!(
+                error.to_string(),
+                format!("the {name} must be longer than zero")
+            );
+        }
+    }
+
+    #[test]
+    fn redirects_stay_on_the_first_origin_within_the_limit() {
+        let url = |raw: &str| Url::parse(raw).unwrap();
+        let first = [url("https://h.example/a")];
+        assert!(follows_same_origin(&url("https://h.example/b"), &first));
+        assert!(follows_same_origin(&url("https://h.example:443/b"), &first));
+        for elsewhere in [
+            "https://other.example/b",
+            "http://h.example/b",
+            "https://h.example:8443/b",
+            "https://sub.h.example/b",
+        ] {
+            assert!(!follows_same_origin(&url(elsewhere), &first), "{elsewhere}");
+        }
+        let hops: Vec<Url> = (0..MAX_REDIRECTS)
+            .map(|hop| url(&format!("https://h.example/{hop}")))
+            .collect();
+        assert!(follows_same_origin(&url("https://h.example/x"), &hops));
+        let mut too_many = hops;
+        too_many.push(url("https://h.example/last"));
+        assert!(!follows_same_origin(&url("https://h.example/x"), &too_many));
+        assert!(!follows_same_origin(&url("https://h.example/x"), &[]));
+        assert_eq!(RedirectPolicy::default(), RedirectPolicy::SameOrigin);
+        assert!(format!("{:?}", RedirectPolicy::None.to_reqwest()).contains("None"));
     }
 
     #[tokio::test]

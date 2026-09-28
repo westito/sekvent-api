@@ -3,6 +3,11 @@
 # of the `cli-latest` prerelease, which `scripts/install.sh` and
 # `cargo sekvent self-update` download.
 #
+# The full gate (gate.yml, called as a reusable workflow) runs on the same
+# commit in this run; nothing is published unless it and every build pass.
+# The release is created once and afterwards updated in place (assets
+# replaced, tag moved), so there is never a moment without a release.
+#
 # Assets per target:
 #   cargo-sekvent-<target>.tar.gz         the binary at the archive root
 #   cargo-sekvent-<target>.tar.gz.sha256  "<hex>  <name>"
@@ -24,8 +29,8 @@ on:
 permissions:
   contents: read
 
-# Queue rather than cancel: a release job stopped between deleting and
-# recreating the release would leave no assets at all.
+# Queue rather than cancel, so the newest commit is always the last one
+# published and two runs never update the release at the same time.
 concurrency:
   group: cli-release
   cancel-in-progress: false
@@ -34,6 +39,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  gate:
+    name: gate
+    uses: ./.github/workflows/gate.yml
+
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -91,7 +100,9 @@ jobs:
 
   release:
     name: publish cli-latest
-    needs: build
+    needs: [gate, build]
+    # A manual run from another branch builds and gates, but never publishes.
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -102,17 +113,27 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Replace the cli-latest release
+      - name: Update the cli-latest release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: cli-latest
         run: |
           set -euo pipefail
           ls -l dist
-          gh release delete cli-latest --yes --cleanup-tag || true
-          gh release create cli-latest \
-            --prerelease \
-            --title "cargo-sekvent (latest master)" \
-            --notes "Rolling build of cargo-sekvent from ${GITHUB_SHA}. Install with scripts/install.sh or update with \`cargo sekvent self-update\`." \
-            --target "${GITHUB_SHA}" \
-            dist/*.tar.gz dist/*.tar.gz.sha256
+          notes="Rolling build of cargo-sekvent from ${GITHUB_SHA}. Install with scripts/install.sh or update with \`cargo sekvent self-update\`."
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+          else
+            gh release create "${TAG}" \
+              --prerelease \
+              --title "cargo-sekvent (latest master)" \
+              --notes "${notes}" \
+              --target "${GITHUB_SHA}" \
+              dist/*.tar.gz dist/*.tar.gz.sha256
+          fi
+          # Point the tag at the released commit (a no-op right after
+          # `create`); install.sh builds from this tag when no asset fits.
+          gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${TAG}" \
+            -f sha="${GITHUB_SHA}" -F force=true >/dev/null
+          gh release edit "${TAG}" --notes "${notes}"

@@ -8,7 +8,7 @@ use std::path::Path;
 use sekvent_testing::DOCKER_TESTS_ENV;
 use thiserror::Error;
 
-use crate::config::{Config, FeatureSet, Features, GateConfig, HarnessConfig};
+use crate::config::{Config, FeatureSet, Features, GateConfig};
 use crate::location::EnvMap;
 use crate::metadata::Metadata;
 use crate::process::Cmd;
@@ -38,6 +38,9 @@ pub struct Selection {
     pub members: Vec<String>,
     /// Excluded members, in configuration order.
     pub exclude: Vec<String>,
+    /// Some selected member has a library target, so `cargo test --lib` and
+    /// `--doc` have something to select (cargo rejects both otherwise).
+    pub libraries: bool,
 }
 
 impl Selection {
@@ -54,9 +57,14 @@ impl Selection {
         if members.is_empty() {
             return Err(PlanError::NothingSelected);
         }
+        let libraries = meta
+            .members()
+            .iter()
+            .any(|package| members.contains(&package.name) && package.has_library());
         Ok(Self {
             members,
             exclude: gate.exclude.clone(),
+            libraries,
         })
     }
 
@@ -140,19 +148,42 @@ pub fn test_env(config: &Config, env: &EnvMap) -> Vec<(String, String)> {
     vars
 }
 
-/// Arguments for the test binaries: `extra`, plus [`INCLUDE_IGNORED`] with
-/// `[harness].docker_tests` unless `extra` already selects ignored tests
-/// (libtest rejects `--ignored` together with `--include-ignored`).
-pub fn test_binary_args(harness: &HarnessConfig, extra: &[String]) -> Vec<String> {
+/// The container-backed tests are on: `[harness].docker_tests` is set and
+/// the environment does not switch them off. `SEKVENT_DOCKER_TESTS` counts
+/// as on only when unset (the gate then exports `1`) or set to `1` or
+/// `true`, the values the harness itself accepts; `SEKVENT_DOCKER_TESTS=0`
+/// therefore also drops [`INCLUDE_IGNORED`].
+pub fn docker_tests_active(config: &Config, env: &EnvMap) -> bool {
+    config.harness.docker_tests
+        && env
+            .get(DOCKER_TESTS_ENV)
+            .is_none_or(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+/// Arguments for the test binaries: `extra`, plus [`INCLUDE_IGNORED`] when
+/// `docker_tests` unless `extra` already selects ignored tests (libtest
+/// rejects `--ignored` together with `--include-ignored`).
+pub fn test_binary_args(docker_tests: bool, extra: &[String]) -> Vec<String> {
     let mut out = extra.to_vec();
-    let selects_ignored = extra
-        .iter()
-        .any(|arg| arg == INCLUDE_IGNORED || arg == "--ignored");
-    if harness.docker_tests && !selects_ignored {
+    if docker_tests && !selects_ignored(extra) {
         out.push(INCLUDE_IGNORED.to_owned());
     }
     out
 }
+
+fn selects_ignored(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == INCLUDE_IGNORED || arg == IGNORED)
+}
+
+/// Libtest flag that runs only `#[ignore]`d tests.
+pub const IGNORED: &str = "--ignored";
+
+/// The test targets of a run that selects ignored tests: everything
+/// `cargo test` runs by default except doctests, which run separately so
+/// rustdoc never tries to execute a code block marked `ignore`. Benches are
+/// left out as `cargo test` leaves them out by default.
+pub const TEST_TARGETS: [&str; 4] = ["--lib", "--bins", "--tests", "--examples"];
 
 fn with_binary_args(cmd: Cmd, args: &[String]) -> Cmd {
     if args.is_empty() {
@@ -162,20 +193,63 @@ fn with_binary_args(cmd: Cmd, args: &[String]) -> Cmd {
     }
 }
 
-/// `cargo test` over the selection; [`test_binary_args`] go after `--`.
-pub fn test_command(
+fn test_base(root: &Path, selection: &Selection, config: &Config, env: &EnvMap) -> Cmd {
+    cargo(root, "test")
+        .args(selection.workspace_args())
+        .args(feature_args(&config.gate.features))
+        .arg("--locked")
+        .envs(&test_env(config, env))
+}
+
+/// The `cargo test` commands over the selection, [`test_binary_args`] after
+/// `--`.
+///
+/// One command when no ignored tests are selected. Otherwise the test
+/// targets ([`TEST_TARGETS`], without `--lib` when no selected member has a
+/// library) run with the ignore flag and, unless only ignored tests were
+/// asked for or there is no library to document, the doctests run in a
+/// second command (`--doc`) with the remaining arguments.
+pub fn test_commands(
     root: &Path,
     selection: &Selection,
     config: &Config,
     env: &EnvMap,
     extra: &[String],
-) -> Cmd {
-    let cmd = cargo(root, "test")
-        .args(selection.workspace_args())
-        .args(feature_args(&config.gate.features))
-        .arg("--locked")
-        .envs(&test_env(config, env));
-    with_binary_args(cmd, &test_binary_args(&config.harness, extra))
+) -> Vec<Cmd> {
+    let args = test_binary_args(docker_tests_active(config, env), extra);
+    let base = test_base(root, selection, config, env);
+    if !selects_ignored(&args) {
+        return vec![with_binary_args(base, &args)];
+    }
+    let target_args = TEST_TARGETS
+        .into_iter()
+        .filter(|target| selection.libraries || *target != "--lib");
+    let targets = with_binary_args(base.clone().args(target_args), &args);
+    if !selection.libraries || args.iter().any(|arg| arg == IGNORED) {
+        return vec![targets];
+    }
+    let doc_args: Vec<String> = args
+        .into_iter()
+        .filter(|arg| arg != INCLUDE_IGNORED)
+        .collect();
+    vec![targets, with_binary_args(base.arg("--doc"), &doc_args)]
+}
+
+/// [`test_commands`] as steps named `test` and `doctest`, each with
+/// `harness_env` added.
+pub fn test_steps(
+    root: &Path,
+    selection: &Selection,
+    config: &Config,
+    env: &EnvMap,
+    extra: &[String],
+    harness_env: &[(String, String)],
+) -> Vec<Step> {
+    test_commands(root, selection, config, env, extra)
+        .into_iter()
+        .zip(["test", "doctest"])
+        .map(|(cmd, name)| Step::run(name, cmd.envs(harness_env)))
+        .collect()
 }
 
 /// `cargo doc --no-deps` with warnings denied.
@@ -263,10 +337,7 @@ pub fn gate_steps(
         "clippy",
         clippy_command(root, selection, gate).envs(harness_env),
     ));
-    steps.push(Step::run(
-        "test",
-        test_command(root, selection, config, env, &[]).envs(harness_env),
-    ));
+    steps.extend(test_steps(root, selection, config, env, &[], harness_env));
     if gate.doc {
         steps.push(Step::run(
             "doc",
@@ -302,7 +373,10 @@ pub fn coverage_run_command(
         .args(feature_args(&config.gate.features))
         .args(["--locked", "--no-report"])
         .envs(&test_env(config, env));
-    with_binary_args(cmd, &test_binary_args(&config.harness, &[]))
+    with_binary_args(
+        cmd,
+        &test_binary_args(docker_tests_active(config, env), &[]),
+    )
 }
 
 /// `cargo llvm-cov report --json` into `output`; `summary_only` drops the
@@ -486,13 +560,15 @@ mod tests {
         let selection = Selection::new(&meta(), &gate(&[])).unwrap();
         let mut env = EnvMap::new();
         env.insert("RUST_TEST_THREADS".into(), "2".into());
-        let cmd = test_command(
+        let cmds = test_commands(
             Path::new("/w"),
             &selection,
             &Config::with_name("orders"),
             &env,
             &["--nocapture".into()],
         );
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
         assert_eq!(cmd.env_value("RUST_TEST_THREADS"), None);
         assert_eq!(cmd.env_value("SEKVENT_DOCKER_TESTS"), None);
         assert_eq!(
@@ -556,52 +632,121 @@ mod tests {
         config
     }
 
+    fn command_lines(cmds: &[Cmd]) -> Vec<String> {
+        cmds.iter().map(ToString::to_string).collect()
+    }
+
     #[test]
     fn docker_tests_opt_in_to_ignored_tests_in_the_gate() {
         let config = docker_config();
         let selection = Selection::new(&meta(), &config.gate).unwrap();
-        let steps = gate_steps(Path::new("/w"), &config, &selection, &EnvMap::new(), &[]);
-        let Some(Step::Run { cmd: test, .. }) = steps.iter().find(|step| step.name() == "test")
-        else {
-            panic!("test step")
-        };
-        assert_eq!(
-            test.to_string(),
-            "cargo test --workspace --all-features --locked -- --include-ignored"
+        let harness = vec![("SEKVENT_TEST_RUN_ID".to_owned(), "r1".to_owned())];
+        let steps = gate_steps(
+            Path::new("/w"),
+            &config,
+            &selection,
+            &EnvMap::new(),
+            &harness,
         );
-        assert_eq!(test.env_value("SEKVENT_DOCKER_TESTS"), Some("1"));
-        assert_eq!(test.env_value("RUST_TEST_THREADS"), Some("8"));
+        assert_eq!(
+            lines(&steps)[2..],
+            [
+                "test: cargo test --workspace --all-features --locked --lib --bins --tests \
+                 --examples -- --include-ignored",
+                "doctest: cargo test --workspace --all-features --locked --doc",
+            ]
+        );
+        for step in &steps[2..] {
+            let Step::Run { cmd, .. } = step else {
+                panic!("run step")
+            };
+            assert_eq!(cmd.env_value("SEKVENT_DOCKER_TESTS"), Some("1"));
+            assert_eq!(cmd.env_value("RUST_TEST_THREADS"), Some("8"));
+            assert_eq!(cmd.env_value("SEKVENT_TEST_RUN_ID"), Some("r1"));
+        }
     }
 
     #[test]
     fn docker_tests_merge_with_user_test_arguments() {
         let config = docker_config();
         let selection = Selection::new(&meta(), &config.gate).unwrap();
-        let cmd = test_command(
-            Path::new("/w"),
-            &selection,
-            &config,
-            &EnvMap::new(),
-            &["orders::".into(), "--nocapture".into()],
-        );
-        assert_eq!(
-            cmd.to_string(),
-            "cargo test --workspace --all-features --locked -- orders:: --nocapture \
-             --include-ignored"
-        );
-        for selects_ignored in ["--ignored", "--include-ignored"] {
-            let cmd = test_command(
+        let run = |extra: &[&str]| {
+            let extra: Vec<String> = extra.iter().map(|arg| (*arg).to_owned()).collect();
+            command_lines(&test_commands(
                 Path::new("/w"),
                 &selection,
                 &config,
                 &EnvMap::new(),
-                &[selects_ignored.into()],
-            );
-            assert_eq!(
-                cmd.to_string(),
-                format!("cargo test --workspace --all-features --locked -- {selects_ignored}")
-            );
-        }
+                &extra,
+            ))
+        };
+        assert_eq!(
+            run(&["orders::", "--nocapture"]),
+            [
+                "cargo test --workspace --all-features --locked --lib --bins --tests --examples \
+                 -- orders:: --nocapture --include-ignored",
+                "cargo test --workspace --all-features --locked --doc -- orders:: --nocapture",
+            ]
+        );
+        assert_eq!(
+            run(&["--include-ignored"]),
+            [
+                "cargo test --workspace --all-features --locked --lib --bins --tests --examples \
+                 -- --include-ignored",
+                "cargo test --workspace --all-features --locked --doc",
+            ]
+        );
+        assert_eq!(
+            run(&["--ignored"]),
+            [
+                "cargo test --workspace --all-features --locked --lib --bins --tests --examples \
+              -- --ignored"
+            ]
+        );
+    }
+
+    #[test]
+    fn ignored_tests_split_off_the_doctests_without_docker_tests_too() {
+        let config = Config::with_name("orders");
+        let selection = Selection::new(&meta(), &config.gate).unwrap();
+        let steps = test_steps(
+            Path::new("/w"),
+            &selection,
+            &config,
+            &EnvMap::new(),
+            &["--include-ignored".into()],
+            &[],
+        );
+        let names: Vec<&str> = steps.iter().map(Step::name).collect();
+        assert_eq!(names, ["test", "doctest"]);
+    }
+
+    #[test]
+    fn a_selection_without_libraries_has_no_lib_or_doc_step() {
+        let config = docker_config();
+        let mut selection = Selection::new(&meta(), &config.gate).unwrap();
+        assert!(selection.libraries);
+        selection.libraries = false;
+        assert_eq!(
+            command_lines(&test_commands(
+                Path::new("/w"),
+                &selection,
+                &config,
+                &EnvMap::new(),
+                &[]
+            )),
+            [
+                "cargo test --workspace --all-features --locked --bins --tests --examples \
+              -- --include-ignored"
+            ]
+        );
+
+        let bins_only = METADATA.replace(
+            "\"targets\": []",
+            "\"targets\": [{\"kind\": [\"bin\"], \"name\": \"x\"}]",
+        );
+        let meta = Metadata::parse(&bins_only).unwrap();
+        assert!(!Selection::new(&meta, &config.gate).unwrap().libraries);
     }
 
     #[test]
@@ -618,6 +763,40 @@ mod tests {
                 ("SEKVENT_DOCKER_TESTS".to_owned(), "1".to_owned()),
             ]
         );
+        let selection = Selection::new(&meta(), &config.gate).unwrap();
+        assert_eq!(
+            command_lines(&test_commands(
+                Path::new("/w"),
+                &selection,
+                &config,
+                &env,
+                &[]
+            )),
+            ["cargo test --workspace --all-features --locked"]
+        );
+        assert_eq!(
+            coverage_run_command(Path::new("/w"), &selection, &config, &env).to_string(),
+            "cargo llvm-cov --workspace --all-features --locked --no-report"
+        );
+    }
+
+    #[test]
+    fn only_enabling_values_keep_docker_tests_active() {
+        let config = docker_config();
+        let with = |value: &str| {
+            let mut env = EnvMap::new();
+            env.insert("SEKVENT_DOCKER_TESTS".into(), value.into());
+            docker_tests_active(&config, &env)
+        };
+        assert!(docker_tests_active(&config, &EnvMap::new()));
+        assert!(with("1"));
+        assert!(with(" TRUE "));
+        for off in ["0", "", "false", "no", "yes"] {
+            assert!(!with(off), "{off:?}");
+        }
+        let mut env = EnvMap::new();
+        env.insert("SEKVENT_DOCKER_TESTS".into(), "1".into());
+        assert!(!docker_tests_active(&Config::with_name("orders"), &env));
     }
 
     #[test]
@@ -634,8 +813,8 @@ mod tests {
 
     #[test]
     fn without_docker_tests_no_binary_arguments_are_added() {
-        let harness = HarnessConfig::default();
-        assert!(test_binary_args(&harness, &[]).is_empty());
-        assert_eq!(test_binary_args(&harness, &["x".into()]), ["x"]);
+        assert!(test_binary_args(false, &[]).is_empty());
+        assert_eq!(test_binary_args(false, &["x".into()]), ["x"]);
+        assert_eq!(test_binary_args(true, &["--ignored".into()]), ["--ignored"]);
     }
 }

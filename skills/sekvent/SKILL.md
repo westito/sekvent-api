@@ -14,8 +14,9 @@ code needs `use sekvent::prelude::*;` (`AppError`, `ErrorCode`, `CallContext`,
 
 Where commands run is the `build-on-rtx` skill's business: compile, lint and
 test through `cargo sekvent check|clippy|test|gate|coverage` (forwarded to the
-remote builder), `cargo fmt` locally. Test speed and flakes: the
-`rust-testing` skill.
+remote builder, or run here when `sekvent.toml` sets `[remote].mode =
+"local"`), `cargo fmt` locally. Test speed and flakes: the `rust-testing`
+skill.
 
 ## Crate map — which one to reach for
 
@@ -158,7 +159,9 @@ Runtime::builder().unit("sync", Stage::Workers, UnitPolicy::Critical, move |ctx:
 
 `UnitPolicy::Restart(RestartPolicy { .. })` restarts a failing unit with
 backoff; `BestEffort` logs and forgets; `Critical` (default choice) stops the
-process.
+process. A restarting unit holds its stage until one of its runs calls
+`ctx.ready()`; a run longer than `RuntimeBuilder::restart_reset_after`
+(default 60s) resets the restart count, so `max_restarts` bounds crash loops.
 
 ### Outbound client with a policy
 
@@ -207,7 +210,9 @@ let pg = pools.get("db")?.postgres().expect("a Postgres pool");
   errors with `sekvent::db::to_app_error` (constraint violations become
   `ALREADY_EXISTS`/`FAILED_PRECONDITION`, never SQL text).
 - sea-orm: `pools.get("db")?.sea_orm()`; list endpoints use
-  `sekvent::db::list` (`ListParams`, column filters).
+  `sekvent::db::list` (`ListParams`, `paginate`, and a `ListSpec` that
+  allow-lists sortable and filterable columns; anything else is
+  `INVALID_ARGUMENT`).
 - Connect errors name the pool and a failure class, never the URL.
 
 ### JWT login
@@ -275,7 +280,8 @@ async fn orders_are_persisted() {
 after `SIGKILL`; `cargo sekvent harness-clean` sweeps leftovers.
 `cargo sekvent gate`/`test`/`coverage` skip these tests unless `sekvent.toml`
 sets `[harness] docker_tests = true` (exports `SEKVENT_DOCKER_TESTS=1` and
-passes `--include-ignored`).
+passes `--include-ignored` to the test targets; doctests run in their own
+step without it). `SEKVENT_DOCKER_TESTS=0` turns them off for one run.
 
 ### Proto build
 

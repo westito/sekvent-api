@@ -1,5 +1,6 @@
 //! `#[derive(EnvConfig)]`: attribute parsing and code generation.
 
+use proc_macro_crate::FoundCrate;
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
 use syn::ext::IdentExt;
@@ -14,7 +15,7 @@ const FALSE_WORDS: [&str; 4] = ["false", "0", "no", "off"];
 
 /// Expand the derive for one input item.
 pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
-    let prefix = container_prefix(&input.attrs)?;
+    let container = container_attrs(&input.attrs)?;
     let named = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(named) => &named.named,
@@ -59,7 +60,39 @@ pub(crate) fn expand(input: &DeriveInput) -> Result<TokenStream> {
     }) {
         return Err(error);
     }
-    Ok(generate(input, &prefix, &fields))
+    let krate = match &container.krate {
+        Some(path) => quote!(#path),
+        None => runtime_path(proc_macro_crate::crate_name("sekvent-config").ok(), || {
+            proc_macro_crate::crate_name("sekvent").ok()
+        }),
+    };
+    Ok(generate(input, &container.prefix, &krate, &fields))
+}
+
+/// The path of the `sekvent_config` runtime as seen from the crate being
+/// compiled: a direct `sekvent-config` dependency first (under its possibly
+/// renamed name), else the `config` module of the `sekvent` facade, else
+/// `::sekvent_config` (inside sekvent-config itself, which aliases itself
+/// under that name, and when the manifest cannot be read).
+fn runtime_path(
+    config: Option<FoundCrate>,
+    facade: impl FnOnce() -> Option<FoundCrate>,
+) -> TokenStream {
+    match config {
+        Some(FoundCrate::Name(name)) => {
+            let ident = Ident::new(&name, Span::call_site());
+            quote!(::#ident)
+        }
+        Some(FoundCrate::Itself) => quote!(::sekvent_config),
+        None => match facade() {
+            Some(FoundCrate::Name(name)) => {
+                let ident = Ident::new(&name, Span::call_site());
+                quote!(::#ident::config)
+            }
+            Some(FoundCrate::Itself) => quote!(crate::config),
+            None => quote!(::sekvent_config),
+        },
+    }
 }
 
 /// How a field is read, decided by its type (or by `nested`).
@@ -181,24 +214,44 @@ fn check_default(shape: &Shape, lit: &LitStr) -> Result<()> {
     Err(Error::new_spanned(lit, message))
 }
 
-fn container_prefix(attrs: &[Attribute]) -> Result<String> {
+/// Attributes on the struct itself.
+struct ContainerAttrs {
+    prefix: String,
+    /// `#[config(crate = "...")]`: where the `sekvent_config` runtime lives.
+    krate: Option<Path>,
+}
+
+fn container_attrs(attrs: &[Attribute]) -> Result<ContainerAttrs> {
     let mut prefix: Option<LitStr> = None;
+    let mut krate: Option<Path> = None;
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("config")) {
         attr.parse_nested_meta(|meta| {
             let name = path_name(&meta.path);
-            if name != "prefix" {
-                return Err(meta.error(format!(
-                    "unknown config attribute `{name}` on a struct; expected `prefix`"
-                )));
+            let taken = match name.as_str() {
+                "prefix" => prefix.is_some(),
+                "crate" => krate.is_some(),
+                _ => {
+                    return Err(meta.error(format!(
+                        "unknown config attribute `{name}` on a struct; expected `prefix` or `crate`"
+                    )));
+                }
+            };
+            if taken {
+                return Err(meta.error(format!("duplicate config attribute `{name}`")));
             }
-            if prefix.is_some() {
-                return Err(meta.error("duplicate config attribute `prefix`"));
+            let lit: LitStr = meta.value()?.parse()?;
+            if name == "prefix" {
+                prefix = Some(lit);
+            } else {
+                krate = Some(lit.parse()?);
             }
-            prefix = Some(meta.value()?.parse()?);
             Ok(())
         })?;
     }
-    Ok(prefix.as_ref().map(LitStr::value).unwrap_or_default())
+    Ok(ContainerAttrs {
+        prefix: prefix.as_ref().map(LitStr::value).unwrap_or_default(),
+        krate,
+    })
 }
 
 fn field_attrs(attrs: &[Attribute]) -> Result<FieldAttrs> {
@@ -346,14 +399,19 @@ fn doc_of(attrs: &[Attribute]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
-fn generate(input: &DeriveInput, prefix: &str, fields: &[FieldSpec]) -> TokenStream {
+fn generate(
+    input: &DeriveInput,
+    prefix: &str,
+    krate: &TokenStream,
+    fields: &[FieldSpec],
+) -> TokenStream {
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     let scope = (!prefix.is_empty()).then(|| {
         quote! {
-            let __sekvent_scoped = ::sekvent_config::Prefixed::new(__sekvent_source, #prefix);
-            let __sekvent_source: &dyn ::sekvent_config::ConfigSource = &__sekvent_scoped;
+            let __sekvent_scoped = #krate::Prefixed::new(__sekvent_source, #prefix);
+            let __sekvent_source: &dyn #krate::ConfigSource = &__sekvent_scoped;
         }
     });
 
@@ -364,14 +422,14 @@ fn generate(input: &DeriveInput, prefix: &str, fields: &[FieldSpec]) -> TokenStr
             .map(|index| format_ident!("__sekvent_field_{}", index))
             .collect();
         let reads = fields.iter().zip(&vars).map(|(field, var)| {
-            let expr = read_expr(field);
+            let expr = read_expr(field, krate);
             quote! {
-                let #var = ::sekvent_config::__private::take(&mut __sekvent_errors, #expr);
+                let #var = #krate::__private::take(&mut __sekvent_errors, #expr);
             }
         });
         let idents = fields.iter().map(|field| &field.ident);
         quote! {
-            let mut __sekvent_errors: ::std::vec::Vec<::sekvent_config::ConfigError> =
+            let mut __sekvent_errors: ::std::vec::Vec<#krate::ConfigError> =
                 ::std::vec::Vec::new();
             #(#reads)*
             match (#(#vars,)*) {
@@ -379,7 +437,7 @@ fn generate(input: &DeriveInput, prefix: &str, fields: &[FieldSpec]) -> TokenStr
                     ::core::result::Result::Ok(Self { #(#idents: #vars),* })
                 }
                 _ => ::core::result::Result::Err(
-                    ::sekvent_config::__private::finish(__sekvent_errors),
+                    #krate::__private::finish(__sekvent_errors),
                 ),
             }
         }
@@ -388,7 +446,7 @@ fn generate(input: &DeriveInput, prefix: &str, fields: &[FieldSpec]) -> TokenStr
     let keys_body = if fields.is_empty() {
         quote!(::std::vec::Vec::new())
     } else {
-        let pushes = fields.iter().map(|field| key_info(field, prefix));
+        let pushes = fields.iter().map(|field| key_info(field, prefix, krate));
         quote! {
             let mut __sekvent_keys = ::std::vec::Vec::new();
             #(#pushes)*
@@ -398,79 +456,77 @@ fn generate(input: &DeriveInput, prefix: &str, fields: &[FieldSpec]) -> TokenStr
 
     quote! {
         #[automatically_derived]
-        impl #impl_generics ::sekvent_config::FromConfig for #name #ty_generics #where_clause {
+        impl #impl_generics #krate::FromConfig for #name #ty_generics #where_clause {
             fn from_config(
-                __sekvent_source: &dyn ::sekvent_config::ConfigSource,
-            ) -> ::core::result::Result<Self, ::sekvent_config::ConfigError> {
+                __sekvent_source: &dyn #krate::ConfigSource,
+            ) -> ::core::result::Result<Self, #krate::ConfigError> {
                 #scope
                 #body
             }
 
-            fn keys() -> ::std::vec::Vec<::sekvent_config::KeyInfo> {
+            fn keys() -> ::std::vec::Vec<#krate::KeyInfo> {
                 #keys_body
             }
         }
     }
 }
 
-fn read_expr(field: &FieldSpec) -> TokenStream {
+fn read_expr(field: &FieldSpec, krate: &TokenStream) -> TokenStream {
     let key = &field.key;
     let ty = &field.ty;
     let base = match (&field.shape, &field.default) {
         (Shape::Nested, _) => {
             let nested_prefix = format!("{key}_");
-            let from =
-                quote_spanned!(ty.span()=> <#ty as ::sekvent_config::FromConfig>::from_config);
-            quote!(#from(&::sekvent_config::Prefixed::new(__sekvent_source, #nested_prefix)))
+            let from = quote_spanned!(ty.span()=> <#ty as #krate::FromConfig>::from_config);
+            quote!(#from(&#krate::Prefixed::new(__sekvent_source, #nested_prefix)))
         }
-        (Shape::Secret, _) => quote!(::sekvent_config::req_secret(__sekvent_source, #key)),
-        (Shape::OptionalSecret, _) => quote!(::sekvent_config::opt_secret(__sekvent_source, #key)),
+        (Shape::Secret, _) => quote!(#krate::req_secret(__sekvent_source, #key)),
+        (Shape::OptionalSecret, _) => quote!(#krate::opt_secret(__sekvent_source, #key)),
         (Shape::OptionalDuration, _) => {
-            quote!(::sekvent_config::__private::opt_duration_value(__sekvent_source, #key))
+            quote!(#krate::__private::opt_duration_value(__sekvent_source, #key))
         }
         (Shape::OptionalBool, _) => {
-            quote!(::sekvent_config::__private::opt_bool_value(__sekvent_source, #key))
+            quote!(#krate::__private::opt_bool_value(__sekvent_source, #key))
         }
         (Shape::Optional(inner), _) => {
-            let read =
-                quote_spanned!(inner.span()=> ::sekvent_config::__private::opt_value::<#inner>);
+            let read = quote_spanned!(inner.span()=> #krate::__private::opt_value::<#inner>);
             quote!(#read(__sekvent_source, #key))
         }
-        (Shape::Duration, None) => quote!(::sekvent_config::req_duration(__sekvent_source, #key)),
+        (Shape::Duration, None) => quote!(#krate::req_duration(__sekvent_source, #key)),
         (Shape::Duration, Some(lit)) => {
-            quote!(::sekvent_config::__private::duration_or(__sekvent_source, #key, #lit))
+            quote!(#krate::__private::duration_or(__sekvent_source, #key, #lit))
         }
-        (Shape::Bool, None) => quote!(::sekvent_config::req_bool(__sekvent_source, #key)),
+        (Shape::Bool, None) => quote!(#krate::req_bool(__sekvent_source, #key)),
         (Shape::Bool, Some(lit)) => {
             // `check_default` already rejected anything that is not a bool word.
             let value = bool_word(&lit.value()).unwrap_or_default();
-            quote!(::sekvent_config::opt_bool(__sekvent_source, #key, #value))
+            quote!(#krate::opt_bool(__sekvent_source, #key, #value))
         }
         (Shape::Parsed, None) => {
-            let read = quote_spanned!(ty.span()=> ::sekvent_config::req_parse::<#ty>);
+            let read = quote_spanned!(ty.span()=> #krate::req_parse::<#ty>);
             quote!(#read(__sekvent_source, #key))
         }
         (Shape::Parsed, Some(lit)) => {
-            let read = quote_spanned!(ty.span()=> ::sekvent_config::__private::parse_or::<#ty>);
+            let read = quote_spanned!(ty.span()=> #krate::__private::parse_or::<#ty>);
             quote!(#read(__sekvent_source, #key, #lit))
         }
     };
     match &field.validate {
         Some(check) => quote! {
             ::core::result::Result::and_then(#base, |__sekvent_value| {
-                ::sekvent_config::__private::validate(__sekvent_source, #key, __sekvent_value, #check)
+                #krate::__private::validate(__sekvent_source, #key, __sekvent_value, #check)
             })
         },
         None => base,
     }
 }
 
-fn key_info(field: &FieldSpec, prefix: &str) -> TokenStream {
+fn key_info(field: &FieldSpec, prefix: &str, krate: &TokenStream) -> TokenStream {
     let full = format!("{prefix}{}", field.key);
     if matches!(field.shape, Shape::Nested) {
         let ty = &field.ty;
         let nested_prefix = format!("{full}_");
-        let keys = quote_spanned!(ty.span()=> <#ty as ::sekvent_config::FromConfig>::keys);
+        let keys = quote_spanned!(ty.span()=> <#ty as #krate::FromConfig>::keys);
         return quote! {
             for mut __sekvent_key in #keys() {
                 __sekvent_key.key = ::std::format!("{}{}", #nested_prefix, __sekvent_key.key);
@@ -488,7 +544,7 @@ fn key_info(field: &FieldSpec, prefix: &str) -> TokenStream {
     let default = option_string(default_text.as_deref());
     let doc = option_string(field.doc.as_deref());
     quote! {
-        __sekvent_keys.push(::sekvent_config::KeyInfo {
+        __sekvent_keys.push(#krate::KeyInfo {
             key: ::std::string::String::from(#full),
             required: #required,
             secret: #secret,
@@ -590,6 +646,96 @@ mod tests {
                 out.contains(&compact(needle)),
                 "missing `{needle}` in\n{out}"
             );
+        }
+    }
+
+    #[test]
+    fn the_runtime_path_follows_the_dependency_graph() {
+        let name = |name: &str| Some(FoundCrate::Name(name.to_owned()));
+        let unreachable = || -> Option<FoundCrate> { panic!("the facade is not consulted") };
+        let path = |tokens: TokenStream| compact(&tokens.to_string());
+
+        assert_eq!(
+            path(runtime_path(name("sekvent_config"), unreachable)),
+            "::sekvent_config"
+        );
+        assert_eq!(path(runtime_path(name("cfg"), unreachable)), "::cfg");
+        assert_eq!(
+            path(runtime_path(Some(FoundCrate::Itself), unreachable)),
+            "::sekvent_config"
+        );
+        assert_eq!(
+            path(runtime_path(None, || name("sekvent"))),
+            "::sekvent::config"
+        );
+        assert_eq!(path(runtime_path(None, || name("fw"))), "::fw::config");
+        assert_eq!(
+            path(runtime_path(None, || Some(FoundCrate::Itself))),
+            "crate::config"
+        );
+        assert_eq!(path(runtime_path(None, || None)), "::sekvent_config");
+    }
+
+    #[test]
+    fn an_explicit_crate_path_replaces_the_runtime_path() {
+        let input: DeriveInput = parse_quote! {
+            #[config(crate = "::my_sekvent::config", prefix = "APP_")]
+            struct Config {
+                #[config(nested)]
+                db: Db,
+                port: u16,
+            }
+        };
+        let out = compact(&expand_ok(&input));
+        assert!(!out.contains("::sekvent_config"), "{out}");
+        for needle in [
+            "impl::my_sekvent::config::FromConfigforConfig",
+            "::my_sekvent::config::Prefixed::new(__sekvent_source,\"APP_\")",
+            "::my_sekvent::config::req_parse::<u16>(__sekvent_source,\"PORT\")",
+            "<Dbas::my_sekvent::config::FromConfig>::keys()",
+            "::my_sekvent::config::KeyInfo{",
+        ] {
+            assert!(
+                out.contains(&compact(needle)),
+                "missing `{needle}` in\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn crate_attribute_errors() {
+        let cases: [(DeriveInput, &str); 3] = [
+            (
+                parse_quote!(
+                    #[config(crate = "a", crate = "b")]
+                    struct C {
+                        a: u8,
+                    }
+                ),
+                "duplicate config attribute `crate`",
+            ),
+            (
+                parse_quote!(
+                    #[config(crate = "not a path")]
+                    struct C {
+                        a: u8,
+                    }
+                ),
+                "unexpected token",
+            ),
+            (
+                parse_quote!(
+                    #[config(crate = sekvent::config)]
+                    struct C {
+                        a: u8,
+                    }
+                ),
+                "expected string literal",
+            ),
+        ];
+        for (input, needle) in cases {
+            let error = expand_err(&input);
+            assert!(error.contains(needle), "`{needle}` not in `{error}`");
         }
     }
 

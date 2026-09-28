@@ -6,8 +6,11 @@
 #   docker build --build-arg BIN={{crate_name}} -t {{crate_name}} .
 #
 # RUST_VERSION must equal the channel in rust-toolchain.toml, so the image is
-# built with exactly the compiler the gate ran. `cargo sekvent sdk update`
-# moves both together; do not bump one by hand.
+# built with exactly the compiler the gate ran. Nothing updates it for you
+# (`cargo sekvent sdk update` only moves the locked sekvent revision): when
+# you change the toolchain, change it in the same commit in
+# rust-toolchain.toml, here, `rust-version` in Cargo.toml, the [toolchain]
+# channel in .remote-build.toml and the toolchain of the CI workflow.
 ARG RUST_VERSION={{rust_version}}
 
 FROM rust:${RUST_VERSION}-bookworm AS chef

@@ -97,10 +97,14 @@ impl CallContext {
         });
         self
     }
-    /// Set a deadline relative to now (same narrowing rule).
+    /// Set a deadline relative to now (same narrowing rule). A timeout too
+    /// large to represent as an instant sets no tighter deadline.
     #[must_use]
     pub fn with_timeout(self, timeout: Duration) -> Self {
-        self.with_deadline(Instant::now() + timeout)
+        match Instant::now().checked_add(timeout) {
+            Some(deadline) => self.with_deadline(deadline),
+            None => self,
+        }
     }
     /// Use this cancellation token.
     #[must_use]
@@ -314,6 +318,16 @@ mod tests {
 
         let narrowed = ctx.with_timeout(Duration::from_hours(2));
         assert_eq!(narrowed.deadline(), Some(deadline));
+    }
+
+    #[test]
+    fn an_unrepresentable_timeout_adds_no_deadline() {
+        let ctx = CallContext::new().with_timeout(Duration::MAX);
+        assert_eq!(ctx.deadline(), None);
+        let bounded = CallContext::new()
+            .with_timeout(Duration::from_secs(5))
+            .with_timeout(Duration::MAX);
+        assert!(bounded.remaining().unwrap() <= Duration::from_secs(5));
     }
 
     #[test]

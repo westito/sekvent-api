@@ -1,7 +1,8 @@
 //! Procedural macros for sekvent.
 //!
-//! Use them through the crates that re-export them (`sekvent_config::EnvConfig`);
-//! the generated code refers to those crates by absolute path.
+//! Use them through the crates that re-export them (`sekvent_config::EnvConfig`
+//! or the facade's `sekvent::EnvConfig`). The generated code refers to the
+//! runtime crate by absolute path, found in the calling crate's manifest.
 
 #![forbid(unsafe_code)]
 
@@ -23,7 +24,13 @@ use proc_macro::TokenStream;
 /// | `bool`             | `true/false/1/0/yes/no/on/off`           |
 /// | anything else      | `FromStr`, required unless defaulted     |
 ///
-/// Container attribute: `#[config(prefix = "BILLING_")]` scopes every key.
+/// Container attributes:
+///
+/// - `prefix = "BILLING_"` scopes every key;
+/// - `crate = "::path::to::config"` names the `sekvent_config` runtime
+///   explicitly. Without it the path is taken from the calling crate's
+///   `Cargo.toml`: a direct `sekvent-config` dependency (renames included),
+///   else `<sekvent>::config` through the facade.
 ///
 /// Field attributes, combinable inside one `#[config(...)]`:
 ///

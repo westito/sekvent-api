@@ -10,8 +10,23 @@
 //! The reader functions ([`req`], [`opt_parse`], [`req_secret`], …) are the
 //! building blocks; `#[derive(EnvConfig)]` generates a [`FromConfig`] impl
 //! out of them and reports every problem at once, the way [`collect`] does.
+//!
+//! # The reserved namespace
+//!
+//! Keys starting with [`RESERVED_PREFIX`] (`SEKVENT_`) belong to the
+//! framework. [`from_env`] and [`load`] reject any such key that is set but
+//! neither read by the config type nor listed in [`FRAMEWORK_KEYS`] or
+//! [`FRAMEWORK_PREFIXES`], so a typo such as `SEKVENT_LOG_FORMT` fails at
+//! startup instead of being ignored. The error names the key and, when one
+//! is close, the key that was probably meant. Keys outside the namespace are
+//! never checked: the process environment holds plenty of unrelated
+//! variables.
 
 #![forbid(unsafe_code)]
+
+// Lets `#[derive(EnvConfig)]` name this crate `::sekvent_config` from inside
+// it (unit tests and doctests).
+extern crate self as sekvent_config;
 
 mod secret;
 mod source;
@@ -27,6 +42,54 @@ use std::time::Duration;
 
 /// The reserved key namespace. Unknown keys under it are rejected.
 pub const RESERVED_PREFIX: &str = "SEKVENT_";
+
+/// Keys under [`RESERVED_PREFIX`] that the framework reads itself, outside
+/// any application config struct. [`load`] accepts them in every source.
+///
+/// | Key | Read by |
+/// |---|---|
+/// | `SEKVENT_LOG`, `SEKVENT_LOG_FORMAT` | `sekvent-telemetry`: log filter and output format |
+/// | `SEKVENT_LINK_TRUSTED` | `sekvent-link`: links that may assert end-user identity |
+/// | `SEKVENT_DOCKER_TESTS` | `sekvent-testing`: opt in to container-backed tests |
+/// | `SEKVENT_HARNESS_NAMESPACE` | `sekvent-testing`: container label namespace |
+/// | `SEKVENT_LOCAL`, `SEKVENT_NO_UPDATE_CHECK`, `SEKVENT_GIT_URL`, `SEKVENT_BRANCH` | `cargo sekvent` |
+/// | `SEKVENT_SRC` | a generated workspace's `.sekvent/run.sh`: build the CLI from a checkout |
+/// | `SEKVENT_INSTALL_DIR` | the install script |
+///
+/// Keep this list in step with the crates: a framework key missing here is
+/// rejected as unknown by [`load`].
+pub const FRAMEWORK_KEYS: &[&str] = &[
+    "SEKVENT_BRANCH",
+    "SEKVENT_DOCKER_TESTS",
+    "SEKVENT_GIT_URL",
+    "SEKVENT_HARNESS_NAMESPACE",
+    "SEKVENT_INSTALL_DIR",
+    "SEKVENT_LINK_TRUSTED",
+    "SEKVENT_LOCAL",
+    "SEKVENT_LOG",
+    "SEKVENT_LOG_FORMAT",
+    "SEKVENT_NO_UPDATE_CHECK",
+    "SEKVENT_SRC",
+];
+
+/// Key families under [`RESERVED_PREFIX`] that the framework reads by
+/// prefix. [`load`] accepts every key that starts with one of them.
+///
+/// - `SEKVENT_LINK_INBOUND_` and `SEKVENT_LINK_OUTBOUND_`: one service-link
+///   token per link name (`sekvent-link` validates the names and tokens);
+/// - `SEKVENT_TEST_`: test-only settings such as `SEKVENT_TEST_RUN_ID` and
+///   `SEKVENT_TEST_POSTGRES_IMAGE` (`sekvent-testing`, `cargo sekvent`).
+pub const FRAMEWORK_PREFIXES: &[&str] = &[
+    "SEKVENT_LINK_INBOUND_",
+    "SEKVENT_LINK_OUTBOUND_",
+    "SEKVENT_TEST_",
+];
+
+/// Whether the framework itself reads `key` (a full key name), per
+/// [`FRAMEWORK_KEYS`] and [`FRAMEWORK_PREFIXES`].
+pub fn is_framework_key(key: &str) -> bool {
+    FRAMEWORK_KEYS.contains(&key) || FRAMEWORK_PREFIXES.iter().any(|p| key.starts_with(p))
+}
 
 const DURATION_EXPECTED: &str = "a duration such as 500ms, 5s or 2m, or whole seconds";
 const BOOL_EXPECTED: &str = "a boolean (true/false, 1/0, yes/no, on/off)";
@@ -63,10 +126,16 @@ pub enum ConfigError {
         reason: String,
     },
     /// Keys under [`RESERVED_PREFIX`] that no component declared.
-    #[error("unknown configuration keys under {RESERVED_PREFIX}: {}", keys.join(", "))]
+    #[error(
+        "unknown configuration keys under {RESERVED_PREFIX}: {}",
+        unknown_list(keys, suggestions)
+    )]
     UnknownKeys {
-        /// The offending full key names.
+        /// The offending full key names, sorted.
         keys: Vec<String>,
+        /// `(unknown key, closest known key)` for every unknown key with a
+        /// close known match; probably a typo.
+        suggestions: Vec<(String, String)>,
     },
     /// Several errors at once (all problems are reported, not just the first).
     #[error("{} configuration errors: {}", .0.len(), .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
@@ -101,9 +170,37 @@ pub struct KeyInfo {
     pub doc: Option<String>,
 }
 
-/// Read a type from the process environment.
+/// Read a type from the process environment, rejecting unknown keys under
+/// [`RESERVED_PREFIX`]; see [`load`].
 pub fn from_env<T: FromConfig>() -> Result<T, ConfigError> {
-    T::from_config(&EnvSource)
+    load(&EnvSource)
+}
+
+/// Read a type from `source` and reject every key under [`RESERVED_PREFIX`]
+/// that is set in `source` but read neither by `T` (per
+/// [`FromConfig::keys`]) nor by the framework ([`is_framework_key`]).
+///
+/// Read failures and unknown keys are reported together. Use
+/// [`FromConfig::from_config`] directly to read without the check, for
+/// example for one of several config structs sharing a source; then run
+/// [`check_unknown_keys`] once with every struct's keys.
+pub fn load<T: FromConfig>(source: &dyn ConfigSource) -> Result<T, ConfigError> {
+    let known: Vec<String> = T::keys()
+        .iter()
+        .map(|info| source.describe(&info.key))
+        .collect();
+    let reserved = check_unknown_keys(source, &known);
+    match T::from_config(source) {
+        Ok(value) => reserved.map(|()| value),
+        Err(error) => {
+            let mut errors = Vec::new();
+            flatten_into(&mut errors, error);
+            if let Err(error) = reserved {
+                flatten_into(&mut errors, error);
+            }
+            Err(__private::finish(errors))
+        }
+    }
 }
 
 /// Required string.
@@ -190,20 +287,116 @@ pub fn opt_secret(source: &dyn ConfigSource, key: &str) -> Result<Option<Secret>
 ///
 /// Keys are compared by their full name as reported by
 /// [`ConfigSource::describe`], so a [`Prefixed`] view is checked against the
-/// names an operator actually sets. The error lists the keys sorted.
+/// names an operator actually sets. The error lists the keys sorted and
+/// suggests the closest entry of `known` for likely typos. Only `known` is
+/// accepted here; [`check_unknown_keys`] accepts the framework's own keys
+/// too.
 pub fn check_reserved(source: &dyn ConfigSource, known: &[String]) -> Result<(), ConfigError> {
+    unknown_reserved(source, known, &[])
+}
+
+/// [`check_reserved`] that also accepts the framework's own keys
+/// ([`FRAMEWORK_KEYS`] and [`FRAMEWORK_PREFIXES`]); the check [`load`] runs.
+///
+/// `known` holds full key names, e.g. every config struct's
+/// [`FromConfig::keys`] passed through [`ConfigSource::describe`].
+pub fn check_unknown_keys(source: &dyn ConfigSource, known: &[String]) -> Result<(), ConfigError> {
+    let mut all = known.to_vec();
+    all.extend(FRAMEWORK_KEYS.iter().map(|key| (*key).to_owned()));
+    unknown_reserved(source, &all, FRAMEWORK_PREFIXES)
+}
+
+fn unknown_reserved(
+    source: &dyn ConfigSource,
+    known: &[String],
+    known_prefixes: &[&str],
+) -> Result<(), ConfigError> {
     let mut unknown: Vec<String> = source
         .keys()
         .iter()
         .map(|key| source.describe(key))
-        .filter(|full| full.starts_with(RESERVED_PREFIX) && !known.contains(full))
+        .filter(|full| {
+            full.starts_with(RESERVED_PREFIX)
+                && !known.contains(full)
+                && !known_prefixes.iter().any(|prefix| full.starts_with(prefix))
+        })
         .collect();
     if unknown.is_empty() {
         return Ok(());
     }
     unknown.sort();
     unknown.dedup();
-    Err(ConfigError::UnknownKeys { keys: unknown })
+    let mut candidates: Vec<&str> = known
+        .iter()
+        .map(String::as_str)
+        .filter(|key| key.starts_with(RESERVED_PREFIX))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let suggestions = unknown
+        .iter()
+        .filter_map(|key| closest(key, &candidates).map(|near| (key.clone(), near.to_owned())))
+        .collect();
+    Err(ConfigError::UnknownKeys {
+        keys: unknown,
+        suggestions,
+    })
+}
+
+/// The candidate closest to `key` by edit distance (a swap of two adjacent
+/// characters counts once), if it is close enough to be a plausible typo:
+/// at most one edit per three characters after [`RESERVED_PREFIX`], and at
+/// least one. Ties go to the first candidate.
+fn closest<'a>(key: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let tail = key.strip_prefix(RESERVED_PREFIX).unwrap_or(key);
+    let limit = (tail.chars().count() / 3).max(1);
+    let mut best: Option<(usize, &'a str)> = None;
+    for &candidate in candidates {
+        let distance = edit_distance(key, candidate);
+        if distance <= limit && best.is_none_or(|(least, _)| distance < least) {
+            best = Some((distance, candidate));
+        }
+    }
+    best.map(|(_, candidate)| candidate)
+}
+
+/// Optimal string alignment distance: insertions, deletions, substitutions
+/// and adjacent transpositions each cost one.
+fn edit_distance(from: &str, to: &str) -> usize {
+    let from: Vec<char> = from.chars().collect();
+    let to: Vec<char> = to.chars().collect();
+    let mut table = vec![vec![0_usize; to.len() + 1]; from.len() + 1];
+    for (i, row) in table.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in table[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=from.len() {
+        for j in 1..=to.len() {
+            let cost = usize::from(from[i - 1] != to[j - 1]);
+            let mut distance = (table[i - 1][j] + 1)
+                .min(table[i][j - 1] + 1)
+                .min(table[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && from[i - 1] == to[j - 2] && from[i - 2] == to[j - 1] {
+                distance = distance.min(table[i - 2][j - 2] + 1);
+            }
+            table[i][j] = distance;
+        }
+    }
+    table[from.len()][to.len()]
+}
+
+fn unknown_list(keys: &[String], suggestions: &[(String, String)]) -> String {
+    keys.iter()
+        .map(
+            |key| match suggestions.iter().find(|(unknown, _)| unknown == key) {
+                Some((_, near)) => format!("{key} (did you mean {near}?)"),
+                None => key.clone(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Merge the outcome of several independent checks into one result.
@@ -597,7 +790,8 @@ mod tests {
         assert_eq!(
             check_reserved(&s, &["SEKVENT_LOG".into()]),
             Err(ConfigError::UnknownKeys {
-                keys: vec!["SEKVENT_ALPHA".into(), "SEKVENT_ZED".into()]
+                keys: vec!["SEKVENT_ALPHA".into(), "SEKVENT_ZED".into()],
+                suggestions: Vec::new(),
             })
         );
         let all = ["SEKVENT_ZED", "SEKVENT_LOG", "SEKVENT_ALPHA"].map(String::from);
@@ -616,8 +810,211 @@ mod tests {
         assert_eq!(
             check_reserved(&scoped, &["SEKVENT_DB_URL".into()]),
             Err(ConfigError::UnknownKeys {
-                keys: vec!["SEKVENT_DB_TYPO".into()]
+                keys: vec!["SEKVENT_DB_TYPO".into()],
+                suggestions: Vec::new(),
             })
+        );
+    }
+
+    #[test]
+    fn check_reserved_suggests_the_closest_known_key() {
+        let s = src(&[
+            ("SEKVENT_POTR", "9000"),
+            ("SEKVENT_LGO", "debug"),
+            ("SEKVENT_UNRELATED", "x"),
+        ]);
+        let known = ["SEKVENT_PORT", "SEKVENT_LOG", "SEKVENT_HOST", "OTHER_POTR"].map(String::from);
+        let error = check_reserved(&s, &known).unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::UnknownKeys {
+                keys: ["SEKVENT_LGO", "SEKVENT_POTR", "SEKVENT_UNRELATED"]
+                    .map(String::from)
+                    .to_vec(),
+                suggestions: vec![
+                    ("SEKVENT_LGO".into(), "SEKVENT_LOG".into()),
+                    ("SEKVENT_POTR".into(), "SEKVENT_PORT".into()),
+                ],
+            }
+        );
+        let text = error.to_string();
+        assert_eq!(
+            text,
+            "unknown configuration keys under SEKVENT_: \
+             SEKVENT_LGO (did you mean SEKVENT_LOG?), \
+             SEKVENT_POTR (did you mean SEKVENT_PORT?), SEKVENT_UNRELATED"
+        );
+        assert!(!text.contains("9000") && !text.contains("debug"), "{text}");
+    }
+
+    #[test]
+    fn framework_keys_are_recognised() {
+        for key in FRAMEWORK_KEYS {
+            assert!(key.starts_with(RESERVED_PREFIX), "{key}");
+            assert!(is_framework_key(key), "{key}");
+        }
+        for prefix in FRAMEWORK_PREFIXES {
+            assert!(prefix.starts_with(RESERVED_PREFIX), "{prefix}");
+        }
+        assert!(is_framework_key("SEKVENT_LINK_INBOUND_BILLING"));
+        assert!(is_framework_key("SEKVENT_LINK_OUTBOUND_ORDERS"));
+        assert!(is_framework_key("SEKVENT_TEST_RUN_ID"));
+        assert!(is_framework_key("SEKVENT_TEST_POSTGRES_IMAGE"));
+        assert!(!is_framework_key("SEKVENT_POTR"));
+        assert!(!is_framework_key("SEKVENT_LOGS"));
+        assert!(!is_framework_key("LOG"));
+        assert!(FRAMEWORK_KEYS.is_sorted());
+    }
+
+    #[test]
+    fn check_unknown_keys_accepts_the_framework_keys() {
+        let s = src(&[
+            ("SEKVENT_LOG", "info"),
+            ("SEKVENT_TEST_RUN_ID", "7"),
+            ("SEKVENT_LINK_OUTBOUND_BILLING", "x"),
+            ("SEKVENT_APP_PORT", "80"),
+        ]);
+        assert_eq!(check_unknown_keys(&s, &["SEKVENT_APP_PORT".into()]), Ok(()));
+        assert_eq!(
+            check_unknown_keys(&s, &[]),
+            Err(ConfigError::UnknownKeys {
+                keys: vec!["SEKVENT_APP_PORT".into()],
+                suggestions: Vec::new(),
+            })
+        );
+        assert!(check_reserved(&s, &["SEKVENT_APP_PORT".into()]).is_err());
+    }
+
+    #[test]
+    fn closest_needs_a_plausible_typo() {
+        let candidates = ["SEKVENT_LOG", "SEKVENT_LOG_FORMAT", "SEKVENT_PORT"];
+        assert_eq!(closest("SEKVENT_LOGS", &candidates), Some("SEKVENT_LOG"));
+        assert_eq!(
+            closest("SEKVENT_LOG_FROMAT", &candidates),
+            Some("SEKVENT_LOG_FORMAT")
+        );
+        assert_eq!(closest("SEKVENT_PROT", &candidates), Some("SEKVENT_PORT"));
+        assert_eq!(closest("SEKVENT_X", &candidates), None);
+        assert_eq!(closest("SEKVENT_DATABASE", &candidates), None);
+        assert_eq!(closest("SEKVENT_LOG", &[]), None);
+        assert_eq!(
+            closest("SEKVENT_AB", &["SEKVENT_AC", "SEKVENT_AD"]),
+            Some("SEKVENT_AC")
+        );
+    }
+
+    #[test]
+    fn edit_distances() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("abc", ""), 3);
+        assert_eq!(edit_distance("", "ab"), 2);
+        assert_eq!(edit_distance("PORT", "PORT"), 0);
+        assert_eq!(edit_distance("POTR", "PORT"), 1);
+        assert_eq!(edit_distance("PORT", "PART"), 1);
+        assert_eq!(edit_distance("PORT", "PORTS"), 1);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[derive(Debug)]
+    struct Port(u16);
+
+    impl FromConfig for Port {
+        fn from_config(source: &dyn ConfigSource) -> Result<Self, ConfigError> {
+            req_parse(source, "SEKVENT_PORT").map(Self)
+        }
+        fn keys() -> Vec<KeyInfo> {
+            vec![KeyInfo {
+                key: "SEKVENT_PORT".into(),
+                required: true,
+                secret: false,
+                default: None,
+                doc: None,
+            }]
+        }
+    }
+
+    #[test]
+    fn load_rejects_unknown_reserved_keys() {
+        let s = src(&[
+            ("SEKVENT_PORT", "80"),
+            ("SEKVENT_LOG", "debug"),
+            ("SEKVENT_LINK_INBOUND_BILLING", "x"),
+            ("SEKVENT_TEST_RUN_ID", "1"),
+            ("UNRELATED", "x"),
+        ]);
+        assert_eq!(load::<Port>(&s).unwrap().0, 80);
+
+        let typo = src(&[("SEKVENT_PORT", "80"), ("SEKVENT_POTR", "9000")]);
+        assert_eq!(
+            load::<Port>(&typo).unwrap_err(),
+            ConfigError::UnknownKeys {
+                keys: vec!["SEKVENT_POTR".into()],
+                suggestions: vec![("SEKVENT_POTR".into(), "SEKVENT_PORT".into())],
+            }
+        );
+
+        let near_framework = src(&[("SEKVENT_PORT", "80"), ("SEKVENT_LOG_FORMT", "json")]);
+        let text = load::<Port>(&near_framework).unwrap_err().to_string();
+        assert!(text.contains("did you mean SEKVENT_LOG_FORMAT?"), "{text}");
+    }
+
+    #[test]
+    fn load_reports_read_errors_and_unknown_keys_together() {
+        let s = src(&[("SEKVENT_POTR", "9000")]);
+        assert_eq!(
+            load::<Port>(&s).unwrap_err(),
+            ConfigError::Multiple(vec![
+                missing("SEKVENT_PORT"),
+                ConfigError::UnknownKeys {
+                    keys: vec!["SEKVENT_POTR".into()],
+                    suggestions: vec![("SEKVENT_POTR".into(), "SEKVENT_PORT".into())],
+                },
+            ])
+        );
+        assert_eq!(
+            load::<Port>(&MapSource::new()).unwrap_err(),
+            missing("SEKVENT_PORT")
+        );
+    }
+
+    #[test]
+    fn load_compares_full_names_through_a_prefixed_source() {
+        let base = src(&[
+            ("SEKVENT_APP_SEKVENT_PORT", "80"),
+            ("SEKVENT_APP_SEKVENT_PROT", "81"),
+        ]);
+        let scoped = Prefixed::new(&base, "SEKVENT_APP_");
+        let error = load::<Port>(&scoped).unwrap_err();
+        assert_eq!(
+            error,
+            ConfigError::UnknownKeys {
+                keys: vec!["SEKVENT_APP_SEKVENT_PROT".into()],
+                suggestions: vec![(
+                    "SEKVENT_APP_SEKVENT_PROT".into(),
+                    "SEKVENT_APP_SEKVENT_PORT".into()
+                )],
+            }
+        );
+    }
+
+    #[cfg(feature = "derive")]
+    #[test]
+    fn the_derive_works_inside_this_crate() {
+        #[derive(Debug, crate::EnvConfig)]
+        #[config(prefix = "SEKVENT_")]
+        struct Inner {
+            #[config(default = "8080")]
+            port: u16,
+        }
+        let config: Inner = load(&src(&[("SEKVENT_PORT", "81")])).unwrap();
+        assert_eq!(config.port, 81);
+        assert_eq!(Inner::keys()[0].key, "SEKVENT_PORT");
+        let error = load::<Inner>(&src(&[("SEKVENT_PROT", "81")])).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("SEKVENT_PROT (did you mean SEKVENT_PORT?)"),
+            "{error}"
         );
     }
 
@@ -770,7 +1167,12 @@ mod tests {
 
     #[test]
     fn from_env_reads_through_env_source() {
-        assert!(from_env::<Nothing>().is_ok());
+        // Only reserved keys can fail, and the test environment sets none
+        // outside the framework's own.
+        match from_env::<Nothing>() {
+            Ok(Nothing) => {}
+            Err(error) => panic!("{error}"),
+        }
         assert!(Nothing::keys().is_empty());
     }
 }

@@ -4,11 +4,20 @@
 #
 # Used inside the remote builder container (`rrb run sekvent <args>`) and in
 # CI, where cargo-sekvent runs its commands locally. The revision comes from
-# Cargo.lock, so the CLI and the libraries can never disagree. The installed
-# revision is stamped in $CARGO_HOME and reinstalled only when it moves.
+# Cargo.lock, so the CLI and the libraries can never disagree.
+#
+# Each revision is installed into its own root,
+# $CARGO_HOME/sekvent-cli/<rev>, and that binary is executed directly, never
+# looked up on PATH. A root is written once and never changed afterwards, so
+# `cargo sekvent self-update`, install.sh or another project sharing
+# CARGO_HOME cannot swap the CLI underneath this one. The binary is built in
+# a temporary root and renamed into place, so concurrent runs are safe.
 #
 # A project that depends on sekvent by path (framework development) has no
-# git revision; set SEKVENT_SRC to the sekvent checkout instead.
+# git revision; set SEKVENT_SRC to the sekvent checkout instead. That CLI
+# lives in $CARGO_HOME/sekvent-cli/path-<hash of SEKVENT_SRC> and is rebuilt
+# on every run, since the checkout can change at any time (cargo reuses the
+# build in $CARGO_TARGET_DIR/sekvent-cli, so an unchanged tree is quick).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -16,7 +25,26 @@ cd "$(dirname "$0")/.."
 git_url="{{sekvent_git_url}}"
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export PATH="$CARGO_HOME/bin:$PATH"
-stamp="$CARGO_HOME/.sekvent-cli-rev"
+cli_home="$CARGO_HOME/sekvent-cli"
+
+# install_cli ROOT CARGO_INSTALL_ARGS...: build cargo-sekvent into a fresh
+# temporary root and rename the binary to ROOT/bin/cargo-sekvent. rename(2)
+# replaces the file atomically; a process already running the old file keeps
+# it.
+install_cli() {
+  local root="$1"
+  shift
+  mkdir -p "$cli_home" "$root/bin"
+  local tmp
+  tmp="$(mktemp -d "$cli_home/.install.XXXXXX")"
+  if ! cargo install --locked --root "$tmp" "$@"; then
+    rm -rf "$tmp"
+    echo "error: installing cargo-sekvent failed" >&2
+    exit 1
+  fi
+  mv -f "$tmp/bin/cargo-sekvent" "$root/bin/cargo-sekvent"
+  rm -rf "$tmp"
+}
 
 if [[ ! -f Cargo.lock ]]; then
   echo "error: Cargo.lock is missing; run \`cargo generate-lockfile\` and commit it" >&2
@@ -43,11 +71,14 @@ if [[ -n "$source_line" ]]; then
       ;;
   esac
   rev="${source##*#}"
-  installed="$(cat "$stamp" 2>/dev/null || true)"
-  if [[ "$installed" != "$rev" ]] || ! command -v cargo-sekvent >/dev/null 2>&1; then
-    echo "installing cargo-sekvent at ${rev:0:12}" >&2
-    cargo install --locked --force --git "$git_url" --rev "$rev" cargo-sekvent
-    printf '%s\n' "$rev" > "$stamp"
+  if [[ ! "$rev" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+    echo "error: sekvent in Cargo.lock has no full commit id: $source" >&2
+    exit 1
+  fi
+  root="$cli_home/$rev"
+  if [[ ! -x "$root/bin/cargo-sekvent" ]]; then
+    echo "installing cargo-sekvent at ${rev:0:12} into $root" >&2
+    install_cli "$root" --git "$git_url" --rev "$rev" cargo-sekvent
   fi
 elif grep -q '^name = "sekvent"$' Cargo.lock; then
   # A path dependency: no source line, no revision to pin.
@@ -56,13 +87,15 @@ elif grep -q '^name = "sekvent"$' Cargo.lock; then
     echo "       the CLI from; set SEKVENT_SRC to the sekvent checkout" >&2
     exit 1
   fi
-  echo "installing cargo-sekvent from $SEKVENT_SRC" >&2
-  cargo install --locked --force --path "$SEKVENT_SRC/crates/cargo-sekvent" \
-    --target-dir "${CARGO_TARGET_DIR:-target}/sekvent-cli"
-  printf 'path:%s\n' "$SEKVENT_SRC" > "$stamp"
+  src="$(cd "$SEKVENT_SRC" && pwd -P)"
+  key="$(printf '%s' "$src" | cksum | awk '{ print $1 }')"
+  root="$cli_home/path-$key"
+  echo "installing cargo-sekvent from $src into $root" >&2
+  install_cli "$root" --path "$src/crates/cargo-sekvent" \
+    --target-dir "${CARGO_TARGET_DIR:-$PWD/target}/sekvent-cli"
 else
   echo "error: Cargo.lock has no sekvent package; is sekvent in [workspace.dependencies]?" >&2
   exit 1
 fi
 
-exec cargo sekvent "$@"
+exec "$root/bin/cargo-sekvent" sekvent "$@"

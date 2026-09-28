@@ -1,6 +1,9 @@
 # sekvent's own gate: format check, clippy with warnings denied, the test
 # suite (including the Docker-backed harness tests) and a 95 % line coverage
 # floor. The commands match `.remote-build.toml`.
+#
+# `cli-release.yml` calls this workflow (`workflow_call`) for the commit it
+# is about to release, so a commit that fails the gate is never published.
 
 name: gate
 
@@ -9,12 +12,16 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+# `github.workflow` is the caller's name under `workflow_call`, so a release
+# run never cancels (or is cancelled by) the push-triggered gate of the same
+# ref.
 concurrency:
-  group: gate-${{ github.ref }}
+  group: ${{ github.workflow }}-gate-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -44,15 +51,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace --all-features --locked
-
       # The container tests are `#[ignore]`d and gated on SEKVENT_DOCKER_TESTS;
-      # the runner has Docker, so run them here.
-      - name: Test (Docker-backed)
+      # the runner has Docker, so the test targets run with them included.
+      # Doctests run separately without the flag: passed to rustdoc it would
+      # try to execute ```ignore blocks.
+      - name: Test
         env:
           SEKVENT_DOCKER_TESTS: "1"
-        run: cargo test --workspace --all-features --locked -- --ignored
+        run: cargo test --workspace --all-features --locked --lib --bins --tests --examples -- --include-ignored
+
+      - name: Doctests
+        run: cargo test --workspace --all-features --locked --doc
 
   coverage:
     name: coverage

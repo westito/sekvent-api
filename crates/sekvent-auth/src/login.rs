@@ -1,10 +1,12 @@
 //! A login check that does not reveal whether an account exists.
 //!
 //! [`authenticate`] always performs one password verification: against the
-//! stored hash when the account exists, against
-//! [`PasswordHasher::dummy_verify`] when it does not. An unknown account
-//! and a wrong password produce the same [`LoginRejected::InvalidCredentials`]
-//! after the same amount of work. An account's disabled state is only
+//! stored hash when the account exists and the hash is usable, against
+//! [`PasswordHasher::dummy_verify`] when the account is unknown or its
+//! stored value cannot be checked (an empty hash for a single-sign-on-only
+//! account, a malformed or over-limit hash). An unknown account and a wrong
+//! password produce the same [`LoginRejected::InvalidCredentials`] after the
+//! same amount of work. An account's disabled state is only
 //! reported once the password has been proven, so it cannot be probed
 //! either.
 
@@ -78,8 +80,9 @@ impl From<LoginRejected> for AppError {
 /// Check `password` for the account found by the caller's lookup.
 ///
 /// `lookup` is `None` for an unknown account, otherwise the account, its
-/// stored password hash and whether it is enabled. Exactly one password
-/// verification runs either way.
+/// stored password hash (empty when it has none) and whether it is enabled.
+/// Exactly one password verification runs either way; an unusable stored
+/// hash is verified against the dummy hash.
 pub fn authenticate<U>(
     hasher: &PasswordHasher,
     lookup: Option<(U, &str, bool)>,
@@ -105,7 +108,7 @@ pub fn authenticate<U>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::password::PasswordParams;
+    use crate::password::{PasswordParams, dummy_runs};
 
     fn hasher() -> PasswordHasher {
         PasswordHasher::new(PasswordParams {
@@ -169,6 +172,27 @@ mod tests {
             authenticate(&hasher(), Some(("ada", "garbage", true)), "pw"),
             Err(LoginRejected::InvalidCredentials)
         );
+    }
+
+    #[test]
+    fn every_rejection_without_a_usable_hash_does_the_dummy_work() {
+        let hasher = hasher();
+        for (lookup, enabled) in [
+            (None, true),
+            (Some(""), true),
+            (Some(""), false),
+            (Some("garbage"), true),
+            (Some("$2b$31$tooexpensive"), true),
+        ] {
+            let before = dummy_runs();
+            let outcome = authenticate(&hasher, lookup.map(|hash| ("ada", hash, enabled)), "pw");
+            assert_eq!(outcome, Err(LoginRejected::InvalidCredentials));
+            assert_eq!(dummy_runs(), before + 1, "{lookup:?}");
+        }
+        let stored = hasher.hash("pw").unwrap();
+        let before = dummy_runs();
+        let _ = authenticate(&hasher, Some(("ada", stored.as_str(), true)), "nope");
+        assert_eq!(dummy_runs(), before);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+[package]
+name = "sekvent-facade-check"
+description = "Compile guard: sekvent's derives used through the facade crate alone."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The only sekvent dependency is the facade, as in a consumer's manifest.
+# A path dependency so `default-features = false` is honoured (see the
+# facade's own manifest for the edition 2024 rule).
+[dependencies]
+sekvent = { path = "../sekvent", default-features = false, features = ["config"] }
+
+[lints]
+workspace = true

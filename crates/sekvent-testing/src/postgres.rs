@@ -7,12 +7,13 @@ use testcontainers::{ContainerAsync, GenericImage};
 use tokio::sync::OnceCell;
 
 use crate::addr::server_url;
-use crate::server::{ServerSpec, retry_until_ready, start_server, unique_database_name};
+use crate::server::{
+    ServerSpec, random_password, retry_until_ready, start_server, unique_database_name,
+};
 use crate::{Harness, HarnessError, Reaper, ServerImage, TestDatabase};
 
 const PORT: u16 = 5432;
 const USER: &str = "sekvent";
-const PASSWORD: &str = "sekvent";
 const ADMIN_DATABASE: &str = "postgres";
 
 /// Overrides the shared container's image (`name:tag`).
@@ -46,6 +47,7 @@ pub struct PostgresHarness {
     _reaper: Reaper,
     host: String,
     port: u16,
+    password: String,
     image: ServerImage,
 }
 
@@ -89,6 +91,7 @@ impl PostgresHarness {
     /// Start a dedicated server. The container is removed when the returned
     /// value is dropped or, failing that, when the process exits.
     pub async fn start(harness: &Harness, image: ServerImage) -> Result<Self, HarnessError> {
+        let password = random_password();
         let spec = ServerSpec {
             image: &image,
             port: PORT,
@@ -101,7 +104,7 @@ impl PostgresHarness {
             ),
             env: vec![
                 ("POSTGRES_USER", USER.to_owned()),
-                ("POSTGRES_PASSWORD", PASSWORD.to_owned()),
+                ("POSTGRES_PASSWORD", password.clone()),
                 ("POSTGRES_DB", ADMIN_DATABASE.to_owned()),
             ],
             cmd: server_command(),
@@ -113,6 +116,7 @@ impl PostgresHarness {
             _reaper: started.reaper,
             host: started.host,
             port: started.port,
+            password,
             image,
         };
         let admin = this.admin_url();
@@ -124,7 +128,7 @@ impl PostgresHarness {
 
     /// The server URL without a database path.
     pub fn url(&self) -> String {
-        server_url("postgres", USER, PASSWORD, &self.host, self.port, "")
+        server_url("postgres", USER, &self.password, &self.host, self.port, "")
     }
 
     /// The URL of the admin database (`postgres`).
@@ -134,7 +138,14 @@ impl PostgresHarness {
 
     /// The URL of database `name` on this server.
     pub fn url_for(&self, name: &str) -> String {
-        server_url("postgres", USER, PASSWORD, &self.host, self.port, name)
+        server_url(
+            "postgres",
+            USER,
+            &self.password,
+            &self.host,
+            self.port,
+            name,
+        )
     }
 
     /// The published host.

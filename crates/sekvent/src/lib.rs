@@ -56,6 +56,9 @@
 pub use sekvent_config as config;
 
 /// Derive `FromConfig` for a config struct.
+///
+/// Works with `sekvent` as the only dependency: the generated code finds the
+/// runtime at `sekvent::config` (under whatever name the dependency has).
 #[cfg(feature = "config")]
 pub use sekvent_config::EnvConfig;
 

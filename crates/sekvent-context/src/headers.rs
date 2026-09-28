@@ -80,12 +80,17 @@ pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> Cal
     ctx.sanitize_for_caller()
 }
 
-/// Write the context onto outbound headers (the remaining deadline as
+/// Write the whole context onto a header map (the remaining deadline as
 /// `grpc-timeout`). Existing values for these names are replaced.
 ///
 /// A field the context does not carry removes any stale header of that name,
 /// so a reused header map never leaks a previous call's values. An expired
 /// deadline is sent as `1n`, the shortest positive timeout.
+///
+/// This mirrors the context exactly, idempotency key included, which suits
+/// re-encoding a context. For a request to another service use
+/// [`propagate`], which leaves the caller's own headers alone and does not
+/// forward the idempotency key.
 pub fn inject(ctx: &CallContext, headers: &mut HeaderMap) {
     set(headers, REQUEST_ID, Some(ctx.request_id()));
     let timeout = ctx.remaining().map(encode_grpc_timeout);
@@ -94,6 +99,33 @@ pub fn inject(ctx: &CallContext, headers: &mut HeaderMap) {
     set(headers, SUBJECT, ctx.subject());
     set(headers, TENANT, ctx.tenant());
     set(headers, IDEMPOTENCY_KEY, ctx.idempotency_key());
+}
+
+/// Add the context to the headers of an outbound request without touching
+/// what the caller set.
+///
+/// Request id, `traceparent`, subject and tenant are written only when the
+/// caller has not set that header; nothing is ever removed. The one
+/// exception is `grpc-timeout`: a caller value longer than the time this
+/// context has left (or one that does not parse) is replaced by the
+/// remaining time, because a callee must never get more time than its
+/// caller has.
+///
+/// The idempotency key is never propagated: it identifies one request to
+/// one service, and reusing an inbound key for several different upstream
+/// calls would make the upstream treat them as duplicates. Set it on each
+/// outbound request that needs one.
+pub fn propagate(ctx: &CallContext, headers: &mut HeaderMap) {
+    set_if_absent(headers, REQUEST_ID, Some(ctx.request_id()));
+    if let Some(left) = ctx.remaining() {
+        let theirs = header_str(headers, GRPC_TIMEOUT).and_then(parse_grpc_timeout);
+        if theirs.is_none_or(|theirs| theirs > left) {
+            set(headers, GRPC_TIMEOUT, Some(&encode_grpc_timeout(left)));
+        }
+    }
+    set_if_absent(headers, TRACEPARENT, ctx.traceparent());
+    set_if_absent(headers, SUBJECT, ctx.subject());
+    set_if_absent(headers, TENANT, ctx.tenant());
 }
 
 /// Encode a duration as a `grpc-timeout` value (at most 8 digits, choosing
@@ -188,6 +220,16 @@ fn set(headers: &mut HeaderMap, name: &'static str, value: Option<&str>) {
         None => {
             headers.remove(name);
         }
+    }
+}
+
+/// Insert `name` with `value` unless the header is already present.
+fn set_if_absent(headers: &mut HeaderMap, name: &'static str, value: Option<&str>) {
+    if headers.contains_key(name) {
+        return;
+    }
+    if let Some(value) = value.and_then(|value| HeaderValue::from_str(value).ok()) {
+        headers.insert(name, value);
     }
 }
 
@@ -413,6 +455,72 @@ mod tests {
         let mut map = HeaderMap::new();
         inject(&ctx, &mut map);
         assert_eq!(map[GRPC_TIMEOUT], "1n");
+    }
+
+    #[test]
+    fn propagate_fills_only_what_the_caller_left_unset() {
+        let ctx = CallContext::new()
+            .with_request_id("req-9")
+            .with_traceparent(TRACE)
+            .with_subject("user-1")
+            .with_tenant("acme")
+            .with_idempotency_key("inbound-key");
+        let mut map = headers(&[(REQUEST_ID, "caller-id"), (SUBJECT, "caller-subject")]);
+        propagate(&ctx, &mut map);
+        assert_eq!(map[REQUEST_ID], "caller-id");
+        assert_eq!(map[SUBJECT], "caller-subject");
+        assert_eq!(map[TRACEPARENT], TRACE);
+        assert_eq!(map[TENANT], "acme");
+        assert!(
+            map.get(IDEMPOTENCY_KEY).is_none(),
+            "the inbound idempotency key is per hop"
+        );
+        assert!(map.get(GRPC_TIMEOUT).is_none(), "no deadline, no timeout");
+
+        let mut own_key = headers(&[(IDEMPOTENCY_KEY, "outbound-key")]);
+        propagate(&ctx, &mut own_key);
+        assert_eq!(own_key[IDEMPOTENCY_KEY], "outbound-key");
+        assert_eq!(own_key[REQUEST_ID], "req-9");
+    }
+
+    #[test]
+    fn propagate_never_removes_headers() {
+        let mut map = headers(&[
+            (TRACEPARENT, TRACE),
+            (SUBJECT, "caller"),
+            (TENANT, "caller"),
+            (GRPC_TIMEOUT, "1H"),
+        ]);
+        propagate(&CallContext::new().with_request_id("bad\nid"), &mut map);
+        assert!(map.get(REQUEST_ID).is_none(), "an invalid value is skipped");
+        assert_eq!(map[TRACEPARENT], TRACE);
+        assert_eq!(map[SUBJECT], "caller");
+        assert_eq!(map[TENANT], "caller");
+        assert_eq!(
+            map[GRPC_TIMEOUT], "1H",
+            "no deadline keeps the caller's value"
+        );
+    }
+
+    #[test]
+    fn propagate_only_ever_narrows_grpc_timeout() {
+        let ctx = CallContext::new().with_timeout(Duration::from_secs(30));
+        let mut longer = headers(&[(GRPC_TIMEOUT, "1H")]);
+        propagate(&ctx, &mut longer);
+        let sent = parse_grpc_timeout(longer[GRPC_TIMEOUT].to_str().unwrap()).unwrap();
+        assert!(sent <= Duration::from_secs(30), "narrowed to the time left");
+
+        let mut shorter = headers(&[(GRPC_TIMEOUT, "5S")]);
+        propagate(&ctx, &mut shorter);
+        assert_eq!(shorter[GRPC_TIMEOUT], "5S", "a tighter caller value stays");
+
+        let mut malformed = headers(&[(GRPC_TIMEOUT, "soon")]);
+        propagate(&ctx, &mut malformed);
+        assert!(parse_grpc_timeout(malformed[GRPC_TIMEOUT].to_str().unwrap()).is_some());
+
+        let mut absent = HeaderMap::new();
+        propagate(&ctx, &mut absent);
+        assert_eq!(absent.get_all(GRPC_TIMEOUT).iter().count(), 1);
     }
 
     #[test]

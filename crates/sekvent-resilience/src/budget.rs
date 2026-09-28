@@ -43,12 +43,19 @@ impl RetryBudget {
     /// A budget depositing `ratio` tokens per success (`0.0..=1000.0`,
     /// resolved to thousandths) with a floor of `min_per_sec` retries per
     /// second. At most 100 tokens are banked; see [`RetryBudget::with_max_tokens`].
+    ///
+    /// A ratio of zero together with a zero floor is rejected: such a budget
+    /// could never pay for a retry. Use [`RetryPolicy::none`](crate::RetryPolicy::none)
+    /// to disable retries.
     pub fn new(ratio: f64, min_per_sec: u32) -> Result<Self, PolicyError> {
-        Ok(Self::from_parts(
-            ratio_to_units(ratio)?,
-            min_per_sec,
-            100 * UNIT,
-        ))
+        let deposit = ratio_to_units(ratio)?;
+        if deposit == 0 && min_per_sec == 0 {
+            return Err(PolicyError::new(
+                "retry_budget.ratio",
+                "and retry_budget.min_per_sec cannot both be zero; no retry could ever run",
+            ));
+        }
+        Ok(Self::from_parts(deposit, min_per_sec, 100 * UNIT))
     }
 
     fn from_parts(deposit: u64, min_per_sec: u32, capacity: u64) -> Self {
@@ -216,6 +223,13 @@ mod tests {
         assert!(RetryBudget::new(-0.1, 0).is_err());
         assert!(RetryBudget::new(f64::INFINITY, 0).is_err());
         assert!(RetryBudget::new(1001.0, 0).is_err());
+        let useless = RetryBudget::new(0.0, 0).unwrap_err();
+        assert_eq!(useless.parameter(), "retry_budget.ratio");
+        assert!(useless.reason().contains("retry_budget.min_per_sec"));
+        assert!(
+            RetryBudget::new(0.0001, 0).is_err(),
+            "rounds to a zero deposit"
+        );
         assert_eq!(ratio_to_units(0.2).unwrap(), 200);
         assert_eq!(ratio_to_units(0.0012).unwrap(), 1);
     }

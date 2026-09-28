@@ -42,7 +42,7 @@ use sekvent::prelude::*; // AppError, ErrorCode, CallContext, Secret, EnvConfig,
 ## Quick start
 
 Install the CLI (a prebuilt binary checked against its SHA-256, or a source
-build when no binary exists for your platform):
+build of the same `cli-latest` tag when no binary exists for your platform):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/westito/sekvent/master/scripts/install.sh | sh
@@ -123,7 +123,27 @@ every section except `[project]` is optional.
 
 Compiling commands (`gate`, `check`, `clippy`, `test`, `coverage`,
 `harness-clean`) are forwarded to the remote builder when `[remote] mode` is
-`rrb`, and run on the current machine in CI or with `mode = "local"`.
+`rrb`, and run on the current machine in CI (`CI` set to anything but empty,
+`0`, `false` or `no`), inside the builder, with `SEKVENT_LOCAL=1` or with
+`mode = "local"`.
+
+The default `[remote]` expects the maintainers' `rrb` remote-build tool at
+`~/.kodein/skills/build-on-rtx/bin/rrb` (change it with `[remote].rrb`). If
+you do not use a remote builder, set this in `sekvent.toml`:
+
+```toml
+[remote]
+mode = "local"
+```
+
+or export `SEKVENT_LOCAL=1` for a single shell. A missing `rrb` is an error
+that says so; it never silently turns into a local build.
+
+Inside the builder and in CI, `.sekvent/run.sh` runs the CLI at the exact
+sekvent revision `Cargo.lock` pins. Each revision is built once into its own
+directory, `$CARGO_HOME/sekvent-cli/<rev>`, and executed from there, so a
+`self-update` or another project sharing `CARGO_HOME` never changes which
+CLI a project runs. CI caches that directory.
 Unknown subcommands are passed to the workspace's `xtask` package when there
 is one.
 

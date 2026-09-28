@@ -122,17 +122,15 @@ pub fn single(ctx: &Context<'_>, step: &SingleStep) -> anyhow::Result<i32> {
             )
         }
         SingleStep::Test(extra) => with_harness(ctx, |harness_env| {
-            let cmd = plan::test_command(&ctx.root, &selection, &ctx.config, &ctx.env, extra)
-                .envs(harness_env);
-            run_steps(
-                ctx,
-                "test",
-                &[Step::Run {
-                    name: "test".into(),
-                    cmd,
-                }],
-                None,
-            )
+            let steps = plan::test_steps(
+                &ctx.root,
+                &selection,
+                &ctx.config,
+                &ctx.env,
+                extra,
+                harness_env,
+            );
+            run_steps(ctx, "test", &steps, None)
         }),
     }
 }
@@ -166,7 +164,11 @@ pub fn coverage(ctx: &Context<'_>, options: &CoverageOptions) -> anyhow::Result<
     {
         bail!("--misses: `{package}` is not a selected workspace member");
     }
-    let regex = coverage::ignore_regex(&ctx.config.coverage);
+    let regex = coverage::ignore_regex(
+        &meta.workspace_root,
+        &meta.target_dir(),
+        &ctx.config.coverage,
+    );
     let work = tempfile::tempdir().context("cannot create a temporary directory")?;
     let json_path = work.path().join("coverage.json");
     let root = &ctx.root;
@@ -208,6 +210,9 @@ pub fn coverage(ctx: &Context<'_>, options: &CoverageOptions) -> anyhow::Result<
     let export = Export::parse(&json).context("cannot parse the llvm-cov JSON export")?;
     let rows = coverage::aggregate(&export, &meta, &selection, &ctx.config.coverage);
     print!("{}", coverage::render_table(&rows));
+    if let Some(error) = coverage::no_data_error(&rows, &regex) {
+        bail!(error);
+    }
     if let Some(package) = &options.misses {
         println!("==> coverage: missed lines in {package}");
         print!(
@@ -402,6 +407,7 @@ mod tests {
     /// export to `--output-path`.
     struct Reporting {
         inner: FakeRunner,
+        export: &'static str,
     }
 
     impl Runner for Reporting {
@@ -413,7 +419,7 @@ mod tests {
                     .skip_while(|arg| *arg != "--output-path")
                     .nth(1)
                     .expect("--output-path");
-                std::fs::write(output, COVERAGE)?;
+                std::fs::write(output, self.export)?;
             }
             self.inner.status(cmd)
         }
@@ -434,6 +440,7 @@ mod tests {
     fn reporting(codes: &[i32]) -> Reporting {
         let runner = Reporting {
             inner: FakeRunner::with_codes(codes),
+            export: COVERAGE,
         };
         runner.inner.push_output(METADATA);
         runner
@@ -501,6 +508,34 @@ mod tests {
     }
 
     #[test]
+    fn a_report_with_no_data_for_any_package_fails() {
+        let runner = Reporting {
+            export: r#"{"data": [{"files": [{"filename": "/elsewhere/lib.rs",
+                "summary": {"lines": {"count": 4, "covered": 4}}}]}]}"#,
+            ..reporting(&[])
+        };
+        let sweeper = FakeSweeper::default();
+        let ctx = context(passing_config(), &runner, &sweeper);
+        let error = coverage(&ctx, &CoverageOptions::default()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("no instrumented lines"), "{message}");
+        assert!(message.contains("orders-api"), "{message}");
+        let report = runner
+            .inner
+            .calls()
+            .into_iter()
+            .find(|cmd| cmd.args.iter().any(|arg| arg == "--json"))
+            .unwrap();
+        assert!(
+            report
+                .to_string()
+                .contains("^/work/(.*/)?(tests|benches|examples)/"),
+            "{report}"
+        );
+        assert!(report.to_string().contains("(^/work/target/)"), "{report}");
+    }
+
+    #[test]
     fn a_missing_coverage_export_is_an_error() {
         let runner = FakeRunner::default();
         runner.push_output(METADATA);
@@ -520,23 +555,27 @@ mod tests {
         let sweeper = FakeSweeper::default();
         let ctx = context(config.clone(), &runner, &sweeper);
         assert_eq!(gate(&ctx).unwrap(), 0);
-        let test = &runner.calls()[3];
+        let lines = runner.lines();
         assert!(
-            test.to_string().ends_with("--locked -- --include-ignored"),
-            "{test}"
+            lines[3].ends_with("--locked --lib --bins --tests --examples -- --include-ignored"),
+            "{lines:?}"
         );
-        assert_eq!(test.env_value("SEKVENT_DOCKER_TESTS"), Some("1"));
+        assert!(lines[4].ends_with("--locked --doc"), "{lines:?}");
+        for test in &runner.calls()[3..] {
+            assert_eq!(test.env_value("SEKVENT_DOCKER_TESTS"), Some("1"));
+        }
 
         let runner = FakeRunner::default();
         runner.push_output(METADATA);
         let ctx = context(config.clone(), &runner, &sweeper);
         let step = SingleStep::Test(vec!["--nocapture".into()]);
         assert_eq!(single(&ctx, &step).unwrap(), 0);
+        let lines = runner.lines();
         assert!(
-            runner.lines()[1].ends_with("-- --nocapture --include-ignored"),
-            "{:?}",
-            runner.lines()
+            lines[1].ends_with("--examples -- --nocapture --include-ignored"),
+            "{lines:?}"
         );
+        assert!(lines[2].ends_with("--doc -- --nocapture"), "{lines:?}");
 
         let runner = FakeRunner::with_codes(&[0, 0, 1]);
         runner.push_output(METADATA);
@@ -548,11 +587,7 @@ mod tests {
         };
         assert_eq!(coverage(&ctx, &CoverageOptions::default()).unwrap(), 1);
         let run = &runner.calls()[2];
-        assert!(
-            run.to_string()
-                .ends_with("--no-report -- --include-ignored"),
-            "{run}"
-        );
+        assert!(run.to_string().ends_with("--no-report"), "{run}");
         assert_eq!(run.env_value("SEKVENT_DOCKER_TESTS"), None);
     }
 
