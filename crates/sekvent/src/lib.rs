@@ -1,8 +1,8 @@
 //! The sekvent backend framework: one dependency for the `sekvent-*` crates.
 //!
 //! Each library crate is re-exported as a module behind a feature of the
-//! same name, so a service depends on `sekvent` alone and pays only for what
-//! it enables.
+//! same name, so a service depends on this package alone and pays only for
+//! what it enables. The package is `sekvent-api`; its library is `sekvent`.
 //!
 //! | Module | Crate | Feature | What it is for |
 //! |---|---|---|---|

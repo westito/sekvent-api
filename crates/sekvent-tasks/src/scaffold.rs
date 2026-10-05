@@ -13,6 +13,7 @@ use crate::agents;
 use crate::config::{CONFIG_FILE, find_workspace_root};
 use crate::process::{Cmd, Runner};
 use crate::remote_build::{self, BOOTSTRAP, Edit, REMOTE_BUILD_FILE};
+use crate::sdk::FACADE_PACKAGE;
 use crate::template::{
     self, RenderedFile, SekventSource, ServiceKind, Vars, WriteOutcome, current_year, summary,
     variables,
@@ -256,12 +257,12 @@ pub fn init(cwd: &Path, kind: ServiceKind, force: bool) -> anyhow::Result<PathBu
 }
 
 /// The sekvent source an existing workspace uses, read from its root
-/// `[workspace.dependencies].sekvent`.
+/// `[workspace.dependencies].sekvent-api`.
 pub fn workspace_sekvent_source(manifest: &str) -> SekventSource {
     let path = manifest.parse::<DocumentMut>().ok().and_then(|doc| {
         doc.get("workspace")?
             .get("dependencies")?
-            .get("sekvent")?
+            .get(FACADE_PACKAGE)?
             .get("path")?
             .as_str()
             .map(str::to_owned)
@@ -573,18 +574,18 @@ mod tests {
     #[test]
     fn path_sources_are_detected() {
         let manifest =
-            "[workspace.dependencies]\nsekvent = { path = \"/src/sekvent/crates/sekvent\" }\n";
+            "[workspace.dependencies]\nsekvent-api = { path = \"/src/sekvent/crates/sekvent\" }\n";
         assert_eq!(
             workspace_sekvent_source(manifest),
             SekventSource::Path("/src/sekvent".into())
         );
         assert_eq!(
-            workspace_sekvent_source("[workspace.dependencies]\nsekvent = { git = \"x\" }\n"),
+            workspace_sekvent_source("[workspace.dependencies]\nsekvent-api = { git = \"x\" }\n"),
             SekventSource::Git
         );
         assert_eq!(
             workspace_sekvent_source(
-                "[workspace.dependencies]\nsekvent = { path = \"sekvent\" }\n"
+                "[workspace.dependencies]\nsekvent-api = { path = \"sekvent\" }\n"
             ),
             SekventSource::Path("sekvent".into())
         );

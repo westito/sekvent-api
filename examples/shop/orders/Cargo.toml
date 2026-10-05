@@ -12,7 +12,7 @@ publish = false
 inventory-api = { path = "../inventory-api" }
 notifications-api = { path = "../notifications-api" }
 orders-api = { path = "../orders-api" }
-sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
 tracing = { workspace = true }
 
 [lints]

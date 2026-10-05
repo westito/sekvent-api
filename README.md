@@ -8,15 +8,16 @@ pools and migrations, a container-backed test harness and protobuf codegen
 helpers — plus `cargo sekvent`, a CLI that scaffolds workspaces and runs the
 quality gate.
 
-Services depend on one facade crate, `sekvent`, and turn on only the modules
-they use. The code is written for edition 2024 and tonic 0.14, axum 0.8,
+Services depend on one facade package, `sekvent-api`, and turn on only the
+modules they use. Its library is named `sekvent`, so code writes
+`use sekvent::…`. The code is written for edition 2024 and tonic 0.14, axum 0.8,
 sqlx 0.9 and sea-orm 2.0.
 
 ## Crates
 
 | Crate | Facade module / feature | Responsibility |
 |---|---|---|
-| `sekvent` | — | Facade re-exporting the libraries below behind features, plus `sekvent::prelude` |
+| `sekvent-api` (lib `sekvent`) | — | Facade re-exporting the libraries below behind features, plus `sekvent::prelude` |
 | `sekvent-config` | `config` (default) | `ConfigSource`, `Secret`, readers, `FromConfig`, `#[derive(EnvConfig)]` |
 | `sekvent-macros` | (via `config`, `component`) | Procedural macros (`EnvConfig`, `component`, `ComponentError`) |
 | `sekvent-error` | `error` (default); `error-http`, `error-grpc` | `ErrorCode`, `AppError`, `WireError`; HTTP and gRPC mappings |
@@ -46,7 +47,7 @@ Install the CLI (a prebuilt binary checked against its SHA-256, or a source
 build of the same `cli-latest` tag when no binary exists for your platform):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/westito/sekvent/master/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/westito/sekvent-api/master/scripts/install.sh | sh
 ```
 
 Create a workspace with its first service:
@@ -78,9 +79,9 @@ Generated workspaces depend on sekvent through git on the `master` branch:
 
 ```toml
 [workspace.dependencies]
-sekvent = { git = "https://github.com/westito/sekvent", branch = "master" }
-sekvent-testing = { git = "https://github.com/westito/sekvent", branch = "master" }
-sekvent-proto-build = { git = "https://github.com/westito/sekvent", branch = "master" }
+sekvent-api = { git = "https://github.com/westito/sekvent-api", branch = "master" }
+sekvent-testing = { git = "https://github.com/westito/sekvent-api", branch = "master" }
+sekvent-proto-build = { git = "https://github.com/westito/sekvent-api", branch = "master" }
 ```
 
 `Cargo.lock` records the exact revision, so builds are reproducible until you

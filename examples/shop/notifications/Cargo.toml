@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 notifications-api = { path = "../notifications-api" }
-sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 inventory = { path = "../inventory" }
 inventory-api = { path = "../inventory-api" }
-sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component", "component-grpc", "config", "runtime"] }
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component", "component-grpc", "config", "runtime"] }
 tokio = { workspace = true }
 
 [lints]

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install the `cargo sekvent` CLI.
 #
-#   curl -fsSL https://raw.githubusercontent.com/westito/sekvent/master/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/westito/sekvent-api/master/scripts/install.sh | sh
 #
 # Downloads the prebuilt binary of the rolling `cli-latest` release for this
 # platform, checks its SHA-256 and installs it into
@@ -16,7 +16,7 @@
 #   CARGO_HOME           used for the default directory (default: ~/.cargo)
 set -eu
 
-repo_url="https://github.com/westito/sekvent"
+repo_url="https://github.com/westito/sekvent-api"
 release_tag="cli-latest"
 binary="cargo-sekvent"
 

@@ -1,8 +1,8 @@
 //! Compile guard for consumers of the `sekvent` facade.
 //!
-//! This crate depends on `sekvent` and no other sekvent crate, the way a
-//! service's manifest does, so `#[derive(EnvConfig)]` here has to find its
-//! runtime through `sekvent::config`, and `#[sekvent::component]` and
+//! This crate depends on `sekvent-api` (lib `sekvent`) and no other sekvent
+//! crate, the way a service's manifest does, so `#[derive(EnvConfig)]` here
+//! has to find its runtime through `sekvent::config`, and `#[sekvent::component]` and
 //! `#[derive(sekvent::ComponentError)]` (in [`component`]) theirs through
 //! `sekvent::component`. If a macro ever names a crate the consumer does not
 //! depend on, this crate stops compiling. The facade's `component-grpc`

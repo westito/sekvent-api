@@ -1,12 +1,13 @@
 ---
 name: sekvent
-description: Write or change code in a Rust backend built on the sekvent framework (a workspace with `sekvent.toml` and a `sekvent` dependency). Use when adding a config struct, an error, a gRPC or REST endpoint, a background worker, an outbound HTTP client with retries or a breaker, a database pool, a JWT login, service-to-service authentication, a container-backed test, protobuf codegen or a component (a trait that runs in-process now and can move to its own service later) — and before hand-rolling any of those, since sekvent already has them. Gives the crate map, copy-ready recipes with the real API names, and the pitfalls (secrets in logs, fail-open defaults, missing deadlines, retrying non-idempotent calls). For creating a project use `sekvent-new-project`; for moving an existing backend onto sekvent use `sekvent-migrate`.
+description: Write or change code in a Rust backend built on the sekvent framework (a workspace with `sekvent.toml` and a `sekvent-api` dependency). Use when adding a config struct, an error, a gRPC or REST endpoint, a background worker, an outbound HTTP client with retries or a breaker, a database pool, a JWT login, service-to-service authentication, a container-backed test, protobuf codegen or a component (a trait that runs in-process now and can move to its own service later) — and before hand-rolling any of those, since sekvent already has them. Gives the crate map, copy-ready recipes with the real API names, and the pitfalls (secrets in logs, fail-open defaults, missing deadlines, retrying non-idempotent calls). For creating a project use `sekvent-new-project`; for moving an existing backend onto sekvent use `sekvent-migrate`.
 ---
 
 # Building on sekvent
 
-sekvent is a Rust backend framework: one facade crate (`sekvent`) re-exporting
-focused libraries behind features, plus the `cargo sekvent` CLI. Most service
+sekvent is a Rust backend framework: one facade package (`sekvent-api`, whose
+library is `sekvent`) re-exporting focused libraries behind features, plus the
+`cargo sekvent` CLI. Most service
 code needs `use sekvent::prelude::*;` (`AppError`, `ErrorCode`, `CallContext`,
 `Secret`, `EnvConfig`, `FromConfig`, `Runtime`, `RuntimeBuilder`,
 `RuntimeHandle`, `Server`, `ServerBuilder`, `Stage`, `UnitPolicy`,
@@ -37,7 +38,7 @@ skill.
 | Postgres/MySQL test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
 
-Enable features on the crate's own `sekvent = { workspace = true, features = [...] }`
+Enable features on the crate's own `sekvent-api = { workspace = true, features = [...] }`
 line; never add a sekvent sub-crate directly.
 
 ## Recipes

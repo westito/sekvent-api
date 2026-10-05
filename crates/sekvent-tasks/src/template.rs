@@ -24,7 +24,7 @@ use thiserror::Error;
 
 use crate::deps::pinned_block;
 use crate::embedded::{EDITION, ROOT_CARGO_TOML, RRB_IMAGE, TEMPLATES, rust_version};
-use crate::sdk::{SDK_PACKAGES, SEKVENT_BRANCH, SEKVENT_GIT_URL};
+use crate::sdk::{SDK_PACKAGES, SEKVENT_BRANCH, SEKVENT_GIT_URL, crate_dir};
 
 /// Every template kind the CLI renders.
 pub const KINDS: [&str; 7] = [
@@ -383,7 +383,13 @@ pub fn sekvent_deps_block(source: &SekventSource) -> String {
             ),
             SekventSource::Path(root) => format!(
                 "{name} = {{ path = {} }}",
-                toml_string(&root.join("crates").join(name).display().to_string())
+                toml_string(
+                    &root
+                        .join("crates")
+                        .join(crate_dir(name))
+                        .display()
+                        .to_string()
+                )
             ),
         })
         .collect::<Vec<_>>()
@@ -763,13 +769,18 @@ mod tests {
     fn sekvent_deps_follow_the_source() {
         assert_eq!(
             sekvent_deps_block(&SekventSource::Git),
-            "sekvent = { git = \"https://github.com/westito/sekvent\", branch = \"master\" }\n\
-             sekvent-testing = { git = \"https://github.com/westito/sekvent\", branch = \"master\" }\n\
-             sekvent-proto-build = { git = \"https://github.com/westito/sekvent\", branch = \"master\" }"
+            "sekvent-api = { git = \"https://github.com/westito/sekvent-api\", branch = \"master\" }\n\
+             sekvent-testing = { git = \"https://github.com/westito/sekvent-api\", branch = \"master\" }\n\
+             sekvent-proto-build = { git = \"https://github.com/westito/sekvent-api\", branch = \"master\" }"
         );
         let local = sekvent_deps_block(&SekventSource::Path("/src/sekvent".into()));
         assert!(
-            local.starts_with("sekvent = { path = \"/src/sekvent/crates/sekvent\" }\n"),
+            local.starts_with("sekvent-api = { path = \"/src/sekvent/crates/sekvent\" }\n"),
+            "{local}"
+        );
+        assert!(
+            local
+                .contains("sekvent-testing = { path = \"/src/sekvent/crates/sekvent-testing\" }\n"),
             "{local}"
         );
         assert!(toml::from_str::<toml::Table>(&local).is_ok());

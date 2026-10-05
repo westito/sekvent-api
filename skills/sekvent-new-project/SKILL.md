@@ -8,7 +8,7 @@ description: Create a new Rust backend project on the sekvent framework, or add 
 ## 0. The CLI
 
 ```sh
-cargo sekvent --version || curl -fsSL https://raw.githubusercontent.com/westito/sekvent/master/scripts/install.sh | sh
+cargo sekvent --version || curl -fsSL https://raw.githubusercontent.com/westito/sekvent-api/master/scripts/install.sh | sh
 ```
 
 The installer puts a prebuilt `cargo-sekvent` into `${CARGO_HOME:-~/.cargo}/bin`

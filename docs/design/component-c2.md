@@ -866,7 +866,7 @@ delete its baseline.
   `proto = "crate::proto::shop::<name>::v1"`; `build.rs` is unchanged
   (service constants are on by default).
 - **`examples/shop/inventory-svc`** (new member; lib + thin `main.rs`;
-  depends on `inventory`, `inventory-api`, `sekvent` with
+  depends on `inventory`, `inventory-api`, `sekvent-api` with
   `["component", "component-grpc", "config", "runtime"]`, `tokio`):
 
   ```rust

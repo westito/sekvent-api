@@ -65,9 +65,9 @@ overwrites without `--force`. It does not edit `Cargo.toml`; add the sekvent
 crates to `[workspace.dependencies]` yourself:
 
 ```toml
-sekvent = { git = "https://github.com/westito/sekvent", branch = "master" }
-sekvent-testing = { git = "https://github.com/westito/sekvent", branch = "master" }       # if tests need containers
-sekvent-proto-build = { git = "https://github.com/westito/sekvent", branch = "master" }   # if a build.rs compiles protos
+sekvent-api = { git = "https://github.com/westito/sekvent-api", branch = "master" }   # the facade; code writes `use sekvent::…`
+sekvent-testing = { git = "https://github.com/westito/sekvent-api", branch = "master" }       # if tests need containers
+sekvent-proto-build = { git = "https://github.com/westito/sekvent-api", branch = "master" }   # if a build.rs compiles protos
 ```
 
 Set `edition = "2024"` in `[workspace.package]` (and in members that do not
@@ -125,7 +125,7 @@ replacements.
 ## 4. Replace hand-rolled pieces with sekvent modules
 
 One concern at a time, each ending in a green `cargo sekvent test`. Enable
-features on the crate's own `sekvent = { workspace = true, features = [...] }`
+features on the crate's own `sekvent-api = { workspace = true, features = [...] }`
 line. The `sekvent` skill has the recipes with real API names.
 
 | Hand-rolled | Replace with |

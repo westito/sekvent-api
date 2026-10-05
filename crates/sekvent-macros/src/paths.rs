@@ -7,7 +7,7 @@ use syn::Ident;
 
 /// The path of the runtime library `lib` (for example `sekvent_config`):
 /// a direct dependency first (`direct`, under its possibly renamed name),
-/// else the `module` of the `sekvent` facade (`facade`), else `::<lib>`
+/// else the `module` of the facade (`facade`), else `::<lib>`
 /// (inside the runtime crate itself, which aliases itself under that name,
 /// and when the manifest cannot be read).
 pub(crate) fn runtime_path(
@@ -44,12 +44,32 @@ pub(crate) fn runtime_path(
     }
 }
 
+/// The facade's Cargo package. Its library is named `sekvent`.
+const FACADE_PACKAGE: &str = "sekvent-api";
+
+/// The extern crate name of the facade dependency `found`.
+///
+/// proc-macro-crate derives a name from the dependency key (`-` becomes
+/// `_`), not from the library name, so an unrenamed `sekvent-api`
+/// dependency, like the facade's own integration tests, comes back as
+/// `sekvent_api` while the crate is `sekvent`. A renamed key is the extern
+/// name as is; only a key spelled `sekvent_api` is ambiguous, and it is read
+/// as the unrenamed dependency.
+fn facade_name(found: Option<FoundCrate>) -> Option<FoundCrate> {
+    match found {
+        Some(FoundCrate::Name(name)) if name == "sekvent_api" => {
+            Some(FoundCrate::Name("sekvent".to_owned()))
+        }
+        other => other,
+    }
+}
+
 /// [`runtime_path`] for the Cargo package `package`, read from the calling
 /// crate's manifest.
 pub(crate) fn resolve(package: &str, lib: &str, module: &str) -> TokenStream {
     runtime_path(
         proc_macro_crate::crate_name(package).ok(),
-        || proc_macro_crate::crate_name("sekvent").ok(),
+        || facade_name(proc_macro_crate::crate_name(FACADE_PACKAGE).ok()),
         lib,
         module,
     )
@@ -124,6 +144,28 @@ mod tests {
             "crate::component"
         );
         assert_eq!(component(None, || None), "::sekvent_component");
+    }
+
+    #[test]
+    fn the_facade_is_named_by_its_library() {
+        assert_eq!(
+            facade_name(Some(name("sekvent_api"))),
+            Some(name("sekvent"))
+        );
+        assert_eq!(facade_name(Some(name("fw"))), Some(name("fw")));
+        assert_eq!(facade_name(Some(name("sekvent"))), Some(name("sekvent")));
+        assert_eq!(
+            facade_name(Some(FoundCrate::Itself)),
+            Some(FoundCrate::Itself)
+        );
+        assert_eq!(facade_name(None), None);
+        let config = path(&runtime_path(
+            None,
+            || facade_name(Some(name("sekvent_api"))),
+            "sekvent_config",
+            "config",
+        ));
+        assert_eq!(config, "::sekvent::config");
     }
 
     #[test]

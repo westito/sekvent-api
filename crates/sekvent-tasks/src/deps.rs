@@ -29,7 +29,7 @@ pub struct Pin {
 }
 
 fn is_internal(name: &str) -> bool {
-    name == "sekvent" || name.starts_with("sekvent-")
+    name.starts_with("sekvent-")
 }
 
 fn dependencies(doc: &DocumentMut) -> Option<&dyn TableLike> {

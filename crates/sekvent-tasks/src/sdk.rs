@@ -14,13 +14,26 @@ use crate::location::{EnvMap, NO_UPDATE_CHECK_ENV, is_set};
 use crate::process::{Cmd, Runner};
 
 /// The sekvent repository.
-pub const SEKVENT_GIT_URL: &str = "https://github.com/westito/sekvent";
+pub const SEKVENT_GIT_URL: &str = "https://github.com/westito/sekvent-api";
 
 /// The branch projects track.
 pub const SEKVENT_BRANCH: &str = "master";
 
+/// The facade package. Its library is named `sekvent`, so code writes
+/// `use sekvent::…`; it lives in `crates/sekvent` of a checkout.
+pub const FACADE_PACKAGE: &str = "sekvent-api";
+
 /// sekvent crates a project may depend on directly.
-pub const SDK_PACKAGES: [&str; 3] = ["sekvent", "sekvent-testing", "sekvent-proto-build"];
+pub const SDK_PACKAGES: [&str; 3] = [FACADE_PACKAGE, "sekvent-testing", "sekvent-proto-build"];
+
+/// The directory of `package` under `crates/` in a sekvent checkout.
+pub fn crate_dir(package: &str) -> &str {
+    if package == FACADE_PACKAGE {
+        "sekvent"
+    } else {
+        package
+    }
+}
 
 /// Time box for the gate's update check.
 pub const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -137,11 +150,11 @@ fn is_safe_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
 }
 
-/// The locked `sekvent` package and its source.
+/// The locked facade package (`sekvent-api`) and its source.
 pub fn locked_sdk(packages: &[LockedPackage]) -> Option<(&LockedPackage, Source)> {
     packages
         .iter()
-        .find(|package| package.name == "sekvent")
+        .find(|package| package.name == FACADE_PACKAGE)
         .map(|package| (package, parse_source(package.source.as_deref())))
 }
 
@@ -279,17 +292,17 @@ version = 4
 [[package]]
 name = "orders"
 version = "0.1.0"
-dependencies = ["sekvent"]
+dependencies = ["sekvent-api"]
 
 [[package]]
-name = "sekvent"
+name = "sekvent-api"
 version = "0.1.0"
-source = "git+https://github.com/westito/sekvent?branch=master#{REV}"
+source = "git+https://github.com/westito/sekvent-api?branch=master#{REV}"
 
 [[package]]
 name = "sekvent-testing"
 version = "0.1.0"
-source = "git+https://github.com/westito/sekvent?branch=master#{REV}"
+source = "git+https://github.com/westito/sekvent-api?branch=master#{REV}"
 
 [[package]]
 name = "serde"
@@ -332,11 +345,11 @@ checksum = "00"
     #[test]
     fn only_plain_repository_urls_are_git_sources() {
         for good in [
-            "https://github.com/westito/sekvent",
+            "https://github.com/westito/sekvent-api",
             "https://user@git.example.com:8443/team/repo.git",
             "ssh://git@git.example.com/team/repo.git",
             "ssh://git.example.com:2222/repo",
-            "git@github.com:westito/sekvent.git",
+            "git@github.com:westito/sekvent-api.git",
         ] {
             assert!(is_safe_git_url(good), "{good}");
         }
@@ -371,7 +384,7 @@ checksum = "00"
             Source::Other(malicious.to_owned())
         );
         let text = lock().replace(
-            "source = \"git+https://github.com/westito/sekvent?branch=master#",
+            "source = \"git+https://github.com/westito/sekvent-api?branch=master#",
             "source = \"git+--upload-pack=touch /tmp/x?branch=master#",
         );
         let runner = FakeRunner::default();
@@ -415,12 +428,12 @@ checksum = "00"
         );
         assert_eq!(
             runner.lines()[0],
-            "git ls-remote -- https://github.com/westito/sekvent refs/heads/master"
+            "git ls-remote -- https://github.com/westito/sekvent-api refs/heads/master"
         );
         let offline = status(&runner, &lock(), false).unwrap();
         assert_eq!(
             offline,
-            "sekvent 0.1.0 from https://github.com/westito/sekvent (master) at 0123456789"
+            "sekvent 0.1.0 from https://github.com/westito/sekvent-api (master) at 0123456789"
         );
         assert_eq!(runner.calls().len(), 2);
     }
@@ -431,9 +444,15 @@ checksum = "00"
         let cmd = update_command(Path::new("/w"), &packages).unwrap();
         assert_eq!(
             cmd.to_string(),
-            "cargo update -p sekvent -p sekvent-testing"
+            "cargo update -p sekvent-api -p sekvent-testing"
         );
         assert!(update_command(Path::new("/w"), &[]).is_none());
+    }
+
+    #[test]
+    fn the_facade_lives_in_crates_sekvent() {
+        assert_eq!(crate_dir(FACADE_PACKAGE), "sekvent");
+        assert_eq!(crate_dir("sekvent-testing"), "sekvent-testing");
     }
 
     #[test]

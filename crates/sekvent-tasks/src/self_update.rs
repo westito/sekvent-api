@@ -181,7 +181,7 @@ mod tests {
     fn asset_names_follow_the_release_layout() {
         assert_eq!(
             asset_url("x86_64-unknown-linux-gnu"),
-            "https://github.com/westito/sekvent/releases/download/cli-latest/\
+            "https://github.com/westito/sekvent-api/releases/download/cli-latest/\
              cargo-sekvent-x86_64-unknown-linux-gnu.tar.gz"
         );
         assert!(!BUILD_TARGET.is_empty());

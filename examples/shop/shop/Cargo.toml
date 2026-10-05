@@ -15,7 +15,7 @@ notifications = { path = "../notifications" }
 notifications-api = { path = "../notifications-api" }
 orders = { path = "../orders" }
 orders-api = { path = "../orders-api" }
-sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component", "component-grpc", "config", "resilience", "runtime"] }
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component", "component-grpc", "config", "resilience", "runtime"] }
 tokio = { workspace = true }
 
 [dev-dependencies]

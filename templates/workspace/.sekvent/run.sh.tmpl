@@ -51,11 +51,11 @@ if [[ ! -f Cargo.lock ]]; then
   exit 1
 fi
 
-# The `source` line of the `sekvent` package, e.g.
-#   source = "git+https://github.com/westito/sekvent?branch=master#0123abcd…"
+# The `source` line of the `sekvent-api` package (the facade), e.g.
+#   source = "git+https://github.com/westito/sekvent-api?branch=master#0123abcd…"
 source_line="$(awk '
   /^\[\[package\]\]/ { in_sekvent = 0; next }
-  /^name = "sekvent"$/ { in_sekvent = 1; next }
+  /^name = "sekvent-api"$/ { in_sekvent = 1; next }
   in_sekvent && /^source = / { print; exit }
 ' Cargo.lock)"
 
@@ -80,7 +80,7 @@ if [[ -n "$source_line" ]]; then
     echo "installing cargo-sekvent at ${rev:0:12} into $root" >&2
     install_cli "$root" --git "$git_url" --rev "$rev" cargo-sekvent
   fi
-elif grep -q '^name = "sekvent"$' Cargo.lock; then
+elif grep -q '^name = "sekvent-api"$' Cargo.lock; then
   # A path dependency: no source line, no revision to pin.
   if [[ -z "${SEKVENT_SRC:-}" ]]; then
     echo "error: sekvent is a path dependency, so there is no git revision to install" >&2
@@ -94,7 +94,7 @@ elif grep -q '^name = "sekvent"$' Cargo.lock; then
   install_cli "$root" --path "$src/crates/cargo-sekvent" \
     --target-dir "${CARGO_TARGET_DIR:-$PWD/target}/sekvent-cli"
 else
-  echo "error: Cargo.lock has no sekvent package; is sekvent in [workspace.dependencies]?" >&2
+  echo "error: Cargo.lock has no sekvent-api package; is sekvent-api in [workspace.dependencies]?" >&2
   exit 1
 fi
 

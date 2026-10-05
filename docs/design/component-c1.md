@@ -926,7 +926,7 @@ const _: () = {
 Generalize `runtime_path` of `src/env_config.rs` into `src/paths.rs`:
 
 ```rust
-/// `direct` = crate_name(<package>), `facade` = crate_name("sekvent").
+/// `direct` = crate_name(<package>), `facade` = crate_name("sekvent-api"), `sekvent_api` read as `sekvent`.
 pub(crate) fn runtime_path(direct: Option<FoundCrate>, facade: impl FnOnce() -> Option<FoundCrate>,
                            lib: &str, module: &str) -> TokenStream;
 pub(crate) fn resolve(package: &str, lib: &str, module: &str) -> TokenStream;
@@ -1129,7 +1129,7 @@ and `#[sekvent::component(...)]` both resolve. The macro finds the runtime
 as `::sekvent::component` when a crate depends only on the facade (3.6).
 
 `crates/sekvent-facade-check`: dependencies become
-`sekvent = { path = "../sekvent", default-features = false, features = ["config", "component"] }`
+`sekvent-api = { path = "../sekvent", default-features = false, features = ["config", "component"] }`
 and `prost = { workspace = true }`; dev-dependency
 `tokio = { workspace = true }`. New `src/component.rs` (declared from
 `lib.rs`) with, through the facade only: two hand-written
@@ -1177,7 +1177,7 @@ Explicit paths, not a glob, so `examples/shop/README.md` is never taken for
 a member. Example crates are never added to `[workspace.dependencies]`.
 Every example manifest uses the workspace `package` fields and
 `[lints] workspace = true`; framework crates by relative path
-(`sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }`,
+(`sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }`,
 build-dependency `sekvent-proto-build = { path = "../../../crates/sekvent-proto-build" }`),
 sibling example crates by relative path (`inventory-api = { path = "../inventory-api" }`),
 third-party crates with `{ workspace = true }` (`prost`, `tokio`, `tracing`,

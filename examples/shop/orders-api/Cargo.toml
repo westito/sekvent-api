@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 prost = { workspace = true }
-sekvent = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
 
 [build-dependencies]
 sekvent-proto-build = { path = "../../../crates/sekvent-proto-build" }

@@ -13,7 +13,7 @@ publish = false
 # facade's own manifest for the edition 2024 rule). `component-grpc` checks
 # that the gRPC binding builds from the facade alone.
 [dependencies]
-sekvent = { path = "../sekvent", default-features = false, features = ["config", "component", "component-grpc"] }
+sekvent-api = { path = "../sekvent", default-features = false, features = ["config", "component", "component-grpc"] }
 # `#[derive(prost::Message)]` names `::prost`, so a crate with protobuf
 # messages depends on prost itself.
 prost = { workspace = true }
