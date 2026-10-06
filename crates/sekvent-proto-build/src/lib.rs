@@ -48,9 +48,8 @@
 //!
 //! Unless [`ProtoBuild::emit_rerun_if_changed`] turns it off, the build
 //! script is rerun when a compiled file, a file it imports from the proto
-//! root or an [`include`](ProtoBuild::include) directory, a discovered
-//! directory or `PROTOC` changes. Files served by protoc's own include
-//! directory (the `google/protobuf` well-known types) are not watched.
+//! root or an [`include`](ProtoBuild::include) directory, or a discovered
+//! directory changes. The bundled well-known types are not watched.
 //!
 //! # Including generated code
 //!
@@ -100,11 +99,17 @@
 //! messages. Do not declare it in application protos, and do not name
 //! anything in a proto package `__sekvent_*`.
 //!
-//! # protoc
+//! # No protoc
 //!
-//! `protoc` is taken from the `PROTOC` environment variable, else from
-//! `PATH`. When it cannot be run, [`ProtoBuild::compile`] fails with
-//! [`ProtoBuildError::ProtocMissing`], which says how to install it.
+//! The `.proto` files are parsed and checked in-process by
+//! [protox](https://docs.rs/protox), a protobuf compiler written in Rust,
+//! so neither a build machine nor a container image needs `protoc`, and
+//! `PROTOC` is ignored. The well-known types (`google/protobuf/*.proto`:
+//! `timestamp`, `duration`, `empty`, `any`, `struct`, `wrappers`,
+//! `field_mask`, `descriptor`, …) are bundled and resolve after the proto
+//! root and the include directories. A file that does not compile fails
+//! with [`ProtoBuildError::Protobuf`], naming the file and, for syntax
+//! and type errors, the line and column.
 
 #![forbid(unsafe_code)]
 
@@ -115,7 +120,6 @@ mod wrapper;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub use prost_build::ServiceGenerator;
 
@@ -138,16 +142,15 @@ const WELL_KNOWN_PACKAGE: &str = "google.protobuf";
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProtoBuildError {
-    /// `protoc` could not be run.
-    #[error(
-        "could not run protoc (`{protoc}`). Set the PROTOC environment variable to the protoc \
-         binary, or install it: macOS `brew install protobuf`, Debian/Ubuntu \
-         `apt-get install protobuf-compiler`, Alpine `apk add protobuf-dev`, others \
-         https://github.com/protocolbuffers/protobuf/releases"
-    )]
-    ProtocMissing {
-        /// The executable that was tried.
-        protoc: String,
+    /// A `.proto` file could not be read, parsed, resolved or checked.
+    #[error("protobuf compilation failed: {message}")]
+    Protobuf {
+        /// The file the problem is in, as named relative to its import
+        /// path, when known.
+        file: Option<String>,
+        /// What is wrong, prefixed with `file:line:column:` for syntax
+        /// and type errors.
+        message: String,
     },
     /// Neither an explicit output directory nor `OUT_DIR` is set.
     #[error("OUT_DIR is not set; call from build.rs or set ProtoBuild::out_dir")]
@@ -175,8 +178,8 @@ pub enum ProtoBuildError {
         #[source]
         source: std::io::Error,
     },
-    /// prost or protoc reported an error.
-    #[error("protobuf compilation failed: {0}")]
+    /// prost failed to generate or write the Rust code.
+    #[error("protobuf code generation failed: {0}")]
     Compile(#[source] std::io::Error),
 }
 
@@ -236,7 +239,6 @@ pub struct ProtoBuild {
     out_dir: Option<PathBuf>,
     wrapper_file: String,
     emit_rerun: bool,
-    protoc: Option<PathBuf>,
 }
 
 impl ProtoBuild {
@@ -260,7 +262,6 @@ impl ProtoBuild {
             out_dir: None,
             wrapper_file: DEFAULT_WRAPPER_FILE.to_owned(),
             emit_rerun: true,
-            protoc: None,
         }
     }
 
@@ -391,14 +392,8 @@ impl ProtoBuild {
         self
     }
 
-    /// Use this `protoc` instead of `PROTOC` or `PATH`.
-    #[must_use]
-    pub fn protoc(mut self, executable: impl AsRef<Path>) -> Self {
-        self.protoc = Some(executable.as_ref().to_path_buf());
-        self
-    }
-
-    /// Run protoc and prost, then write the wrapper module.
+    /// Compile the protos with protox, generate the code with prost (and
+    /// tonic), then write the wrapper module.
     pub fn compile(self) -> Result<Compiled, ProtoBuildError> {
         let out_dir = match &self.out_dir {
             Some(dir) => dir.clone(),
@@ -426,12 +421,6 @@ impl ProtoBuild {
             });
         }
 
-        let protoc = self
-            .protoc
-            .clone()
-            .unwrap_or_else(prost_build::protoc_from_env);
-        check_protoc(&protoc)?;
-
         let emit_rerun = self.emit_rerun;
         if emit_rerun {
             for line in rerun_lines(&files, &watched_dirs) {
@@ -443,11 +432,20 @@ impl ProtoBuild {
         let wrapper = out_dir.join(&self.wrapper_file);
         let mut includes = vec![self.root.clone()];
         includes.extend(self.includes.iter().cloned());
+        let descriptors = {
+            let compiler = load(&files, &includes)?;
+            if let Some(path) = &descriptor_set {
+                std::fs::write(path, compiler.encode_file_descriptor_set()).map_err(|source| {
+                    ProtoBuildError::Io {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+            }
+            compiler.file_descriptor_set()
+        };
         let mode = self.mode.clone();
-        let mut config = self.prost_config(&protoc, &out_dir, descriptor_set.as_deref());
-        let descriptors = config
-            .load_fds(&files, &includes)
-            .map_err(ProtoBuildError::Compile)?;
+        let mut config = self.prost_config(&out_dir);
         let described: Vec<(String, String)> = descriptors
             .file
             .iter()
@@ -491,14 +489,8 @@ impl ProtoBuild {
         })
     }
 
-    fn prost_config(
-        self,
-        protoc: &Path,
-        out_dir: &Path,
-        descriptor_set: Option<&Path>,
-    ) -> prost_build::Config {
+    fn prost_config(self, out_dir: &Path) -> prost_build::Config {
         let mut config = prost_build::Config::new();
-        config.protoc_executable(protoc);
         config.out_dir(out_dir);
         if !matches!(self.mode, Mode::ServicesOnly { .. }) {
             config.enable_type_names();
@@ -511,9 +503,6 @@ impl ProtoBuild {
         }
         for (path, attribute) in &self.field_attributes {
             config.field_attribute(path, attribute);
-        }
-        if let Some(path) = descriptor_set {
-            config.file_descriptor_set_path(path);
         }
         let mut generators: Vec<Box<dyn ServiceGenerator>> = Vec::new();
         if emits_service_contracts(&self.mode, self.service_contracts) {
@@ -582,20 +571,26 @@ pub fn read_packages(files: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, ProtoB
         .collect()
 }
 
-/// Fail with install hints unless `protoc --version` runs successfully.
-/// Returns the reported version.
-pub fn check_protoc(protoc: &Path) -> Result<String, ProtoBuildError> {
-    let missing = || ProtoBuildError::ProtocMissing {
-        protoc: protoc.display().to_string(),
-    };
-    let output = Command::new(protoc)
-        .arg("--version")
-        .output()
-        .map_err(|_| missing())?;
-    if !output.status.success() {
-        return Err(missing());
+/// Parse and check `files` and everything they import, searching
+/// `includes` in order and then the bundled well-known types. Imports and
+/// source info are kept: prost generates imported packages and turns
+/// comments into docs, and the descriptor set file carries both.
+fn load(files: &[PathBuf], includes: &[PathBuf]) -> Result<protox::Compiler, ProtoBuildError> {
+    let mut compiler = protox::Compiler::new(includes).map_err(|error| protobuf_error(&error))?;
+    compiler.include_imports(true).include_source_info(true);
+    compiler
+        .open_files(files)
+        .map_err(|error| protobuf_error(&error))?;
+    Ok(compiler)
+}
+
+/// protox's `Debug` form names the file, line and column; `Display` does
+/// not.
+fn protobuf_error(error: &protox::Error) -> ProtoBuildError {
+    ProtoBuildError::Protobuf {
+        file: error.file().map(str::to_owned),
+        message: format!("{error:?}"),
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn generated_file_name(package: &str) -> String {
@@ -632,9 +627,9 @@ fn check_imported_packages(described: &[(String, String)]) -> Result<(), ProtoBu
 }
 
 /// The files behind descriptor names (relative to an import path) that
-/// exist under one of `includes`, searched in order like protoc does,
-/// excluding those in `known`. Names that resolve nowhere come from protoc's
-/// own include directory (the well-known types) and are skipped.
+/// exist under one of `includes`, searched in order like the compiler does,
+/// excluding those in `known`. Names that resolve nowhere are the bundled
+/// well-known types and are skipped.
 fn imported_files(
     described: &[(String, String)],
     includes: &[PathBuf],
@@ -666,7 +661,6 @@ fn changed_lines(paths: &[PathBuf]) -> Vec<String> {
 fn rerun_lines(files: &[PathBuf], dirs: &[PathBuf]) -> Vec<String> {
     let mut lines = changed_lines(files);
     lines.extend(changed_lines(dirs));
-    lines.push("cargo:rerun-if-env-changed=PROTOC".to_owned());
     lines
 }
 
@@ -816,7 +810,6 @@ mod tests {
             .out_dir("/tmp/out")
             .wrapper_file("protos.rs")
             .emit_rerun_if_changed(false)
-            .protoc("/usr/bin/protoc")
             .service_contracts(false);
         assert_eq!(build.files, [PathBuf::from("proto/a/v1/a.proto")]);
         assert_eq!(build.includes, [PathBuf::from("vendor")]);
@@ -829,7 +822,6 @@ mod tests {
         assert_eq!(build.out_dir.as_deref(), Some(Path::new("/tmp/out")));
         assert_eq!(build.wrapper_file, "protos.rs");
         assert!(!build.emit_rerun);
-        assert_eq!(build.protoc.as_deref(), Some(Path::new("/usr/bin/protoc")));
         assert!(!build.service_contracts);
         assert!(ProtoBuild::new("p").service_contracts);
         assert_eq!(ProtoBuild::new("p").both().mode, Mode::Both);
@@ -841,20 +833,111 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_missing_protoc_names_the_variable_and_install_hints() {
-        let error = check_protoc(Path::new("/nonexistent/protoc-for-sekvent-tests")).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("/nonexistent/protoc-for-sekvent-tests"));
-        assert!(message.contains("PROTOC"));
-        assert!(message.contains("brew install protobuf"));
-        assert!(message.contains("apt-get install protobuf-compiler"));
+    fn write(dir: &Path, name: &str, source: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, source).unwrap();
+        path
     }
 
     #[test]
-    fn a_failing_protoc_is_reported_as_missing() {
-        let error = check_protoc(Path::new("false")).unwrap_err();
-        assert!(matches!(error, ProtoBuildError::ProtocMissing { .. }));
+    fn a_syntax_error_names_the_file_line_and_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = write(
+            dir.path(),
+            "bad/v1/bad.proto",
+            "syntax = \"proto3\";\nmessage {\n",
+        );
+        let error = load(&[bad], &[dir.path().to_path_buf()]).unwrap_err();
+        let ProtoBuildError::Protobuf { file, message } = &error else {
+            panic!("unexpected {error:?}");
+        };
+        assert_eq!(file.as_deref(), Some("bad/v1/bad.proto"));
+        assert!(message.starts_with("bad/v1/bad.proto:2:"), "{message}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("protobuf compilation failed: bad/v1/bad.proto:2:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_import_names_the_importing_file_and_the_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = write(
+            dir.path(),
+            "svc.proto",
+            "syntax = \"proto3\";\npackage svc.v1;\nimport \"gone/v1/gone.proto\";\n",
+        );
+        let error = load(&[svc], &[dir.path().to_path_buf()]).unwrap_err();
+        let ProtoBuildError::Protobuf { file, message } = &error else {
+            panic!("unexpected {error:?}");
+        };
+        assert_eq!(file.as_deref(), Some("svc.proto"));
+        assert!(message.starts_with("svc.proto:"), "{message}");
+        assert!(message.contains("gone/v1/gone.proto"), "{message}");
+    }
+
+    #[test]
+    fn a_type_error_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = write(
+            dir.path(),
+            "svc.proto",
+            "syntax = \"proto3\";\npackage svc.v1;\nmessage A { Missing b = 1; }\n",
+        );
+        let error = load(&[svc], &[dir.path().to_path_buf()]).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.starts_with("protobuf compilation failed: svc.proto:"),
+            "{message}"
+        );
+        assert!(message.contains("Missing"), "{message}");
+    }
+
+    #[test]
+    fn a_file_outside_every_include_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let stray = write(dir.path(), "elsewhere/x.proto", "syntax = \"proto3\";\n");
+        let error = load(&[stray], &[dir.path().join("proto")]).unwrap_err();
+        let ProtoBuildError::Protobuf { file, message } = &error else {
+            panic!("unexpected {error:?}");
+        };
+        assert_eq!(file, &None);
+        assert!(message.contains("elsewhere/x.proto"), "{message}");
+        assert!(message.contains("not in any include path"), "{message}");
+    }
+
+    #[test]
+    fn well_known_types_resolve_after_the_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = write(
+            dir.path(),
+            "svc.proto",
+            "syntax = \"proto3\";\npackage svc.v1;\n\
+             import \"google/protobuf/timestamp.proto\";\n\
+             import \"google/protobuf/struct.proto\";\n\
+             message At { google.protobuf.Timestamp at = 1; google.protobuf.Struct meta = 2; }\n",
+        );
+        let includes = [dir.path().to_path_buf(), dir.path().join("none")];
+        let compiler = load(&[svc], &includes).unwrap();
+        let names: Vec<String> = compiler
+            .file_descriptor_set()
+            .file
+            .iter()
+            .map(|file| file.name().to_owned())
+            .collect();
+        assert!(names.contains(&"google/protobuf/timestamp.proto".to_owned()));
+        assert!(names.contains(&"google/protobuf/struct.proto".to_owned()));
+        assert_eq!(names.last().map(String::as_str), Some("svc.proto"));
+        let own = compiler
+            .file_descriptor_set()
+            .file
+            .into_iter()
+            .find(|file| file.name() == "svc.proto")
+            .unwrap();
+        assert!(own.source_code_info.is_some(), "comments reach prost");
     }
 
     #[test]
@@ -864,14 +947,13 @@ mod tests {
     }
 
     #[test]
-    fn rerun_lines_cover_files_dirs_and_protoc() {
+    fn rerun_lines_cover_files_and_dirs() {
         let lines = rerun_lines(&[PathBuf::from("p/a.proto")], &[PathBuf::from("p")]);
         assert_eq!(
             lines,
             [
                 "cargo:rerun-if-changed=p/a.proto",
-                "cargo:rerun-if-changed=p",
-                "cargo:rerun-if-env-changed=PROTOC"
+                "cargo:rerun-if-changed=p"
             ]
         );
     }
@@ -929,19 +1011,40 @@ mod tests {
     }
 
     #[test]
-    fn compile_with_a_missing_protoc_fails_before_generating() {
+    fn compile_with_a_broken_proto_fails_before_generating() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("x.proto"),
-            "syntax = \"proto3\"; package x.v1;",
-        )
-        .unwrap();
+        write(
+            dir.path(),
+            "x.proto",
+            "syntax = \"proto3\"; package x.v1; message {",
+        );
         let error = ProtoBuild::new(dir.path())
             .out_dir(dir.path())
-            .protoc("/nonexistent/protoc-for-sekvent-tests")
+            .emit_rerun_if_changed(false)
             .compile()
             .unwrap_err();
-        assert!(matches!(error, ProtoBuildError::ProtocMissing { .. }));
+        assert!(
+            matches!(&error, ProtoBuildError::Protobuf { file: Some(file), .. } if file == "x.proto"),
+            "{error:?}"
+        );
+        assert!(!dir.path().join(DEFAULT_WRAPPER_FILE).exists());
+        assert!(!dir.path().join("x.v1.rs").exists());
+    }
+
+    #[test]
+    fn an_unwritable_descriptor_set_is_an_io_error_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "x.proto", "syntax = \"proto3\"; package x.v1;");
+        let error = ProtoBuild::new(dir.path())
+            .out_dir(dir.path())
+            .file_descriptor_set("missing/fds.bin")
+            .emit_rerun_if_changed(false)
+            .compile()
+            .unwrap_err();
+        let ProtoBuildError::Io { path, .. } = &error else {
+            panic!("unexpected {error:?}");
+        };
+        assert_eq!(path, &dir.path().join("missing/fds.bin"));
         assert!(!dir.path().join(DEFAULT_WRAPPER_FILE).exists());
     }
 }

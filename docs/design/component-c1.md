@@ -1469,8 +1469,9 @@ looks obvious.
 - **Dev-dependency cycle** between sekvent-macros and sekvent-component
   compiles sekvent-macros twice in test builds; harmless for a proc macro,
   but a surprise when reading build logs.
-- **Build time.** Seven example crates, three `protoc` runs and trybuild
-  cases join every gate run.
+- **Build time.** Seven example crates, three proto compilations and
+  trybuild cases join every gate run. (Since then `sekvent-proto-build`
+  compiles protos in-process with protox; `protoc` is no longer needed.)
 - **Generated code under the workspace lints.** Missing docs on user trait
   methods propagate to the handle; the blanket `#[allow(clippy::all,
   clippy::pedantic)]` on generated impls could hide a real problem in

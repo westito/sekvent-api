@@ -389,8 +389,7 @@ impl ClientCredentialsBuilder {
                 name: "token request timeout",
             });
         }
-        let http = reqwest::Client::builder()
-            .tls_backend_rustls()
+        let http = crate::tls::internal_builder()?
             .user_agent(concat!("sekvent-client/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .build()

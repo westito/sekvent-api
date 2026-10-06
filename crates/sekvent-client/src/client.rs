@@ -87,9 +87,19 @@ pub enum BuildError {
         /// The header name as given.
         name: String,
     },
+    /// The TLS configuration could not be created, e.g. no platform root
+    /// certificates could be loaded.
+    #[error("the TLS configuration could not be initialised")]
+    Tls(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The underlying HTTP client could not be created.
     #[error("the HTTP client could not be initialised")]
     Backend(#[source] reqwest::Error),
+}
+
+impl BuildError {
+    pub(crate) fn tls(error: rustls::Error) -> Self {
+        Self::Tls(Box::new(error))
+    }
 }
 
 pub(crate) enum Auth {
@@ -465,8 +475,7 @@ impl HttpClientBuilder {
             name: "user-agent".to_owned(),
         })?;
 
-        let mut http = reqwest::Client::builder()
-            .tls_backend_rustls()
+        let mut http = crate::tls::internal_builder()?
             .user_agent(self.user_agent)
             .redirect(self.redirects.to_reqwest())
             .default_headers(headers);
@@ -615,6 +624,17 @@ mod tests {
         assert!(debug.contains("HttpClient"));
         let builder = HttpClient::builder().read_timeout(Duration::from_secs(1));
         assert!(format!("{builder:?}").contains("read_timeout"));
+    }
+
+    #[test]
+    fn tls_errors_keep_their_cause_out_of_the_message() {
+        let error = BuildError::tls(rustls::Error::General("no roots".to_owned()));
+        assert_eq!(
+            error.to_string(),
+            "the TLS configuration could not be initialised"
+        );
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(source.to_string().contains("no roots"));
     }
 
     #[test]

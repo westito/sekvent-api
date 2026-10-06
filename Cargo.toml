@@ -67,11 +67,17 @@ http-body-util = "0.1.5"
 hyper = "1.11.1"
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
 bytes = "1.12.1"
-# One TLS stack: rustls. Never enable native-tls anywhere in the graph.
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "gzip", "charset", "http2", "query"] }
+# One TLS stack: rustls with the ring crypto provider. Never enable native-tls
+# or aws-lc-rs (C build, post-quantum key exchange) anywhere in the graph.
+# reqwest gets no provider of its own; sekvent-client hands it a ready
+# rustls config built on ring and the platform verifier.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "gzip", "charset", "http2", "query"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7.1"
 
 # --- persistence ---
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "macros", "migrate", "chrono", "uuid", "json"] }
+# ring with the bundled webpki-roots, as the aws-lc-rs variant had.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "chrono", "uuid", "json"] }
 sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "with-uuid", "with-rust_decimal"] }
 sea-orm-migration = { version = "2.0.4", default-features = false, features = ["runtime-tokio-rustls"] }
 rust_decimal = "1"

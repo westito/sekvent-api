@@ -1,26 +1,16 @@
 //! End-to-end generation from `tests/fixtures` into a temporary directory.
 //!
-//! Needs `protoc` (from `PROTOC` or `PATH`); each test skips with a message
-//! when it is absent.
+//! The protos are compiled in-process, so these tests need no `protoc`.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sekvent_proto_build::{ProtoBuild, ServiceGenerator, check_protoc};
+use prost::Message as _;
+use sekvent_proto_build::{ProtoBuild, ProtoBuildError, ServiceGenerator};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-fn protoc_available() -> bool {
-    match check_protoc(&prost_build::protoc_from_env()) {
-        Ok(_) => true,
-        Err(error) => {
-            eprintln!("skipped: {error}");
-            false
-        }
-    }
 }
 
 fn read(path: &Path) -> String {
@@ -29,9 +19,6 @@ fn read(path: &Path) -> String {
 
 #[test]
 fn messages_only_generates_named_types_and_a_wrapper() {
-    if !protoc_available() {
-        return;
-    }
     let out = tempfile::tempdir().unwrap();
     let compiled = ProtoBuild::new(fixtures())
         .messages_only()
@@ -58,7 +45,12 @@ fn messages_only_generates_named_types_and_a_wrapper() {
         "bytes mapping applies"
     );
     assert!(!billing.contains("invoices_server"), "no service stubs");
-    assert!(read(&out.path().join("common.v1.rs")).contains("Eq, Hash"));
+    let common = read(&out.path().join("common.v1.rs"));
+    assert!(common.contains("Eq, Hash"));
+    assert!(
+        common.contains("An amount in minor units of a currency."),
+        "proto comments become docs"
+    );
 
     let wrapper = read(&compiled.wrapper);
     assert!(wrapper.contains("pub mod billing {"));
@@ -69,9 +61,6 @@ fn messages_only_generates_named_types_and_a_wrapper() {
 
 #[test]
 fn services_only_points_at_the_messages_crate() {
-    if !protoc_available() {
-        return;
-    }
     let out = tempfile::tempdir().unwrap();
     let compiled = ProtoBuild::new(fixtures())
         .files(["billing/v1/billing.proto", "common/v1/money.proto"])
@@ -96,14 +85,23 @@ fn services_only_points_at_the_messages_crate() {
     assert!(billing.contains("::billing_proto::billing::v1::Invoice"));
 
     let descriptors = compiled.descriptor_set.unwrap();
-    assert!(fs::metadata(descriptors).unwrap().len() > 0);
+    assert_eq!(descriptors, out.path().join("billing.bin"));
+    let bytes = fs::read(descriptors).unwrap();
+    let set = prost_types::FileDescriptorSet::decode(bytes.as_slice()).unwrap();
+    let names: Vec<&str> = set
+        .file
+        .iter()
+        .map(prost_types::FileDescriptorProto::name)
+        .collect();
+    assert_eq!(names, ["common/v1/money.proto", "billing/v1/billing.proto"]);
+    assert!(
+        set.file.iter().all(|file| file.source_code_info.is_some()),
+        "source info is kept for reflection"
+    );
 }
 
 #[test]
 fn services_only_maps_packages_imported_by_listed_files() {
-    if !protoc_available() {
-        return;
-    }
     let out = tempfile::tempdir().unwrap();
     let compiled = ProtoBuild::new(fixtures())
         .files(["billing/v1/billing.proto"])
@@ -127,9 +125,6 @@ fn services_only_maps_packages_imported_by_listed_files() {
 
 #[test]
 fn listed_files_bring_their_imports_into_the_wrapper() {
-    if !protoc_available() {
-        return;
-    }
     let out = tempfile::tempdir().unwrap();
     let compiled = ProtoBuild::new(fixtures())
         .files(["billing/v1/billing.proto"])
@@ -146,9 +141,6 @@ fn listed_files_bring_their_imports_into_the_wrapper() {
 
 #[test]
 fn services_only_rejects_a_package_less_import() {
-    if !protoc_available() {
-        return;
-    }
     let src = tempfile::tempdir().unwrap();
     fs::write(
         src.path().join("loose.proto"),
@@ -187,9 +179,6 @@ impl ServiceGenerator for Marker {
 
 #[test]
 fn both_runs_tonic_and_the_hook() {
-    if !protoc_available() {
-        return;
-    }
     let out = tempfile::tempdir().unwrap();
     ProtoBuild::new(fixtures())
         .both()
@@ -281,9 +270,6 @@ const AUDIT_CONTRACT: &str = r#"
 
 #[test]
 fn messages_only_emits_a_contract_per_service() {
-    if !protoc_available() {
-        return;
-    }
     let src = tempfile::tempdir().unwrap();
     contract_fixture(src.path());
     let out = tempfile::tempdir().unwrap();
@@ -319,9 +305,6 @@ fn messages_only_emits_a_contract_per_service() {
 
 #[test]
 fn both_emits_contracts_next_to_the_stubs() {
-    if !protoc_available() {
-        return;
-    }
     let out = tempfile::tempdir().unwrap();
     ProtoBuild::new(fixtures())
         .both()
@@ -351,9 +334,6 @@ fn both_emits_contracts_next_to_the_stubs() {
 
 #[test]
 fn empty_is_the_unit_type_in_the_rpc_types() {
-    if !protoc_available() {
-        return;
-    }
     let src = tempfile::tempdir().unwrap();
     fs::create_dir_all(src.path().join("chores/v1")).unwrap();
     fs::write(
@@ -389,9 +369,6 @@ fn empty_is_the_unit_type_in_the_rpc_types() {
 
 #[test]
 fn contracts_can_be_turned_off_and_services_only_never_emits_them() {
-    if !protoc_available() {
-        return;
-    }
     let src = tempfile::tempdir().unwrap();
     contract_fixture(src.path());
     let off = tempfile::tempdir().unwrap();
@@ -422,14 +399,71 @@ fn contracts_can_be_turned_off_and_services_only_never_emits_them() {
 }
 
 #[test]
-fn a_syntax_error_is_a_compile_error() {
-    if !protoc_available() {
-        return;
-    }
+fn well_known_imports_compile_without_protoc() {
     let src = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("audit/v1")).unwrap();
     fs::write(
-        src.path().join("bad.proto"),
-        "syntax = \"proto3\"; package bad.v1; message {",
+        src.path().join("audit/v1/audit.proto"),
+        "syntax = \"proto3\";\n\
+         package audit.v1;\n\
+         import \"google/protobuf/timestamp.proto\";\n\
+         import \"google/protobuf/empty.proto\";\n\
+         message Event { string id = 1; google.protobuf.Timestamp at = 2; }\n\
+         service Events {\n\
+           rpc Record(Event) returns (google.protobuf.Empty);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let both = tempfile::tempdir().unwrap();
+    let compiled = ProtoBuild::new(src.path())
+        .file_descriptor_set("audit.bin")
+        .out_dir(both.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+    assert_eq!(compiled.packages, ["audit.v1"]);
+    assert_eq!(compiled.generated, [both.path().join("audit.v1.rs")]);
+    let audit = read(&both.path().join("audit.v1.rs"));
+    assert!(audit.contains("::prost_types::Timestamp"), "{audit}");
+    assert!(audit.contains("events_server"), "{audit}");
+    assert!(
+        compact(&audit).contains("pubtype__sekvent_rpc_Events__Record=(Event,());"),
+        "{audit}"
+    );
+    let bytes = fs::read(compiled.descriptor_set.unwrap()).unwrap();
+    let set = prost_types::FileDescriptorSet::decode(bytes.as_slice()).unwrap();
+    let names: Vec<&str> = set
+        .file
+        .iter()
+        .map(prost_types::FileDescriptorProto::name)
+        .collect();
+    assert!(
+        names.contains(&"google/protobuf/timestamp.proto"),
+        "{names:?}"
+    );
+    assert!(names.contains(&"google/protobuf/empty.proto"), "{names:?}");
+    assert_eq!(names.last(), Some(&"audit/v1/audit.proto"));
+
+    let services = tempfile::tempdir().unwrap();
+    ProtoBuild::new(src.path())
+        .services_only("::audit_proto")
+        .out_dir(services.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+    let audit = read(&services.path().join("audit.v1.rs"));
+    assert!(audit.contains("::audit_proto::audit::v1::Event"), "{audit}");
+    assert!(!audit.contains("pub struct Event {"), "{audit}");
+}
+
+#[test]
+fn a_syntax_error_names_the_file() {
+    let src = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("bad/v1")).unwrap();
+    fs::write(
+        src.path().join("bad/v1/bad.proto"),
+        "syntax = \"proto3\";\npackage bad.v1;\nmessage {\n",
     )
     .unwrap();
     let error = ProtoBuild::new(src.path())
@@ -437,5 +471,32 @@ fn a_syntax_error_is_a_compile_error() {
         .emit_rerun_if_changed(false)
         .compile()
         .unwrap_err();
-    assert!(error.to_string().starts_with("protobuf compilation failed"));
+    let message = error.to_string();
+    assert!(
+        message.starts_with("protobuf compilation failed: bad/v1/bad.proto:3:"),
+        "{message}"
+    );
+    let ProtoBuildError::Protobuf { file, .. } = &error else {
+        panic!("unexpected {error:?}");
+    };
+    assert_eq!(file.as_deref(), Some("bad/v1/bad.proto"));
+}
+
+#[test]
+fn an_import_missing_from_every_include_names_it() {
+    let src = tempfile::tempdir().unwrap();
+    fs::write(
+        src.path().join("svc.proto"),
+        "syntax = \"proto3\";\npackage svc.v1;\nimport \"vendor/v1/thing.proto\";\n",
+    )
+    .unwrap();
+    let error = ProtoBuild::new(src.path())
+        .include(src.path().join("vendor-is-missing"))
+        .out_dir(src.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("svc.proto"), "{message}");
+    assert!(message.contains("vendor/v1/thing.proto"), "{message}");
 }

@@ -84,10 +84,10 @@ cargo sekvent ci generate bitbucket    # bitbucket-pipelines.yml
 ```
 
 Both run the same gate and coverage through `.sekvent/run.sh` with `CI=true`
-(the CLI then runs locally on the runner), install `protoc`, pin the
-toolchain to `rust-toolchain.toml` and enable Docker for the harness tests.
-Both are gate-only: image publishing and deployment belong to the
-environment, not to this template.
+(the CLI then runs locally on the runner), pin the toolchain to
+`rust-toolchain.toml` and enable Docker for the harness tests. Neither
+installs `protoc`: protos compile in-process. Both are gate-only: image
+publishing and deployment belong to the environment, not to this template.
 
 ## Later
 

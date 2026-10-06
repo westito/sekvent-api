@@ -1,6 +1,8 @@
 //! Outbound HTTP client with resilience, context propagation and OAuth 2.0 token caching.
 //!
-//! [`HttpClient`] wraps `reqwest` (rustls only) and adds:
+//! [`HttpClient`] wraps `reqwest` (rustls with the ring crypto provider and
+//! the platform certificate verifier; no process-wide rustls provider needs
+//! to be installed) and adds:
 //!
 //! - a [`Policy`](sekvent_resilience::Policy) around every request — by
 //!   default a timeout plus retries, which only ever apply to idempotent
@@ -49,9 +51,10 @@ mod mapping;
 pub mod oauth2;
 mod request;
 mod response;
-
+mod tls;
 pub use auth::BearerSource;
 pub use client::{BuildError, HttpClient, HttpClientBuilder, RedirectPolicy};
 pub use mapping::{code_for_status, parse_retry_after};
 pub use request::RequestBuilder;
 pub use response::HttpResponse;
+pub use tls::reqwest_builder;

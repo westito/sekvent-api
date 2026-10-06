@@ -20,7 +20,7 @@ async fn the_api_and_health_are_served() {
         .start()
         .await
         .unwrap();
-    let http = reqwest::Client::new();
+    let http = sekvent::client::reqwest_builder().build().unwrap();
 
     let ready = http
         .get(format!("http://{addr}/readyz"))

@@ -30,7 +30,6 @@ pipelines:
             services: [docker]
             caches: [cargo-home, cargo-target]
             script:
-              - apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
               - rustup component add rustfmt clippy
               - export CI=true
               - export SEKVENT_DOCKER_TESTS=1
@@ -42,7 +41,6 @@ pipelines:
             services: [docker]
             caches: [cargo-home]
             script:
-              - apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
               - rustup component add llvm-tools-preview
               - command -v cargo-llvm-cov >/dev/null || cargo install --locked cargo-llvm-cov
               - export CI=true

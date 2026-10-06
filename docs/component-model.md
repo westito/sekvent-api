@@ -192,7 +192,8 @@ stable. Removing the flag and adding the proto `service` with
   generated handle. Callers depend only on the `-api` crate; the
   implementation lives in its own crate.
 - **The proto is the contract.** The `.proto` declares the component's
-  `service` next to its messages; `sekvent-proto-build` emits a constant
+  `service` next to its messages; `sekvent-proto-build` (which compiles
+  protos in-process with `protox`, so builds need no `protoc`) emits a constant
   describing each service, and `#[component(proto = …)]` checks the trait
   against it at compile time, so the trait and the proto cannot drift. The
   wire is plain gRPC: a client generated from the `.proto` by any toolchain

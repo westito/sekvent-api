@@ -14,10 +14,6 @@
 ARG RUST_VERSION={{rust_version}}
 
 FROM rust:${RUST_VERSION}-bookworm AS chef
-# protoc for the protobuf build scripts.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 

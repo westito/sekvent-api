@@ -39,7 +39,9 @@ Read the root `Cargo.toml`, every member's `Cargo.toml`, `build.rs` files and
   `tower-http`, `sqlx`, `sea-orm`, `sea-orm-migration`, `reqwest`, `tokio`,
   `jsonwebtoken`, `argon2`/`bcrypt`;
 - which crates declare versions directly instead of `{ workspace = true }`;
-- native-tls anywhere in the graph (sekvent is rustls-only);
+- native-tls or aws-lc-rs/aws-lc-sys anywhere in the graph (sekvent is
+  rustls-only, with the ring crypto provider:
+  `cargo tree -e features -i aws-lc-sys`);
 - the wire contract: custom request/trace header names, error body shape,
   gRPC error detail trailers, health endpoints the platform probes.
 
@@ -113,10 +115,18 @@ after each. Typical fallout:
   notes for entity and query API changes; keep behaviour, do not redesign
   the schema.
 - **sqlx 0.9.** Re-check feature names (sekvent uses
-  `runtime-tokio` + `tls-rustls-aws-lc-rs`) and regenerate offline query
-  data if the project uses `query!` macros with `SQLX_OFFLINE`.
-- **rustls only.** Remove `native-tls`/`default-tls` features; reqwest uses
-  the `rustls` feature from the pin.
+  `runtime-tokio` + `tls-rustls-ring-webpki`) and regenerate offline query
+  data if the project uses `query!` macros with `SQLX_OFFLINE`. Remove
+  `tls-rustls-aws-lc-rs` and `tls-native-tls` by hand: `deps sync` only
+  appends features.
+- **rustls with ring only.** Remove `native-tls`/`default-tls` and the
+  aws-lc-backed `rustls` feature from reqwest (again by hand); the pin uses
+  `rustls-no-provider`. Code that builds its own `reqwest::Client` must then
+  supply a provider, or `build()`/`Client::new()` panics: prefer
+  `sekvent::client::HttpClient`, otherwise start from
+  `sekvent::client::reqwest_builder()` (feature `client`), which installs
+  ring as the process-wide rustls provider unless one is installed and
+  leaves every reqwest TLS setting in effect.
 
 Commit nothing yet; get `cargo sekvent gate` green on the upgraded but
 otherwise unchanged code before step 4, so later diffs are pure

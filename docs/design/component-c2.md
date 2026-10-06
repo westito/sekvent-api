@@ -1135,10 +1135,10 @@ B's snapshot of 5.2 token for token, and C's dogfood test reads D's
 - **Const-panic diagnostics** are rustc's `evaluation of constant value
   failed` with our message; wording and spans are whatever the toolchain
   prints, recorded in `.stderr` files and exposed to toolchain changes.
-- **protox versus protoc:** builds compile protos with `protoc`, contracts
-  with `protox`. Both produce standard descriptors and the canonical form
-  drops options and source info, but a proto one accepts and the other
-  rejects would split build and gate.
+- **protox versus protoc:** builds compiled protos with `protoc`, contracts
+  with `protox`, so a proto one accepts and the other rejects would split
+  build and gate. Resolved since: `sekvent-proto-build` uses protox too, and
+  `protoc` is needed nowhere.
 - **Retry amplification across hops:** each remote hop may retry three
   times, so a chain of n hops can multiply load by 3ⁿ under failure; budgets
   and deadlines bound it, and inner hops can set `RETRY_MAX_ATTEMPTS=1`.

@@ -195,6 +195,12 @@ let created: Invoice = billing.post("/invoices").json(&draft)
 - For non-HTTP calls wrap the operation: `policy.call(&ctx, idempotent, || op()).await`.
 - OAuth 2.0 client credentials: `sekvent::client::oauth2::ClientCredentials::builder(..)`,
   then `.with_bearer_source(Arc::new(creds))`; one retry after a `401`.
+- The workspace `reqwest` pin has no built-in crypto provider (rustls with
+  ring, supplied by sekvent), so `reqwest::Client::new()` panics. A plain
+  `reqwest` client, e.g. in tests, starts from
+  `sekvent::client::reqwest_builder()`, which installs ring as the
+  process-wide rustls provider unless one is installed; reqwest's own TLS
+  settings then apply.
 
 ### Database pools
 
@@ -309,8 +315,10 @@ Generated code is included with the lint allowances it needs; never commit
 generated `.rs`. The package `sekvent.v1` and the names `__sekvent_*` are
 reserved. `messages_only()` and `both()` also emit one
 `__sekvent_service_<Service>` constant per proto `service`, which
-`#[component(proto = …)]` checks (`.service_contracts(false)` turns it off). `protoc` must be on
-`PATH` (or `PROTOC`).
+`#[component(proto = …)]` checks (`.service_contracts(false)` turns it off).
+Protos are compiled in-process with protox: no `protoc` is needed anywhere
+(machine, CI, Docker), and the `google/protobuf/*` well-known types are
+bundled.
 
 ### Components
 

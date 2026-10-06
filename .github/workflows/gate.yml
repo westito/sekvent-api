@@ -34,9 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
-
       # Must match rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -68,9 +65,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - uses: dtolnay/rust-toolchain@master
         with:

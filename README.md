@@ -31,7 +31,7 @@ sqlx 0.9 and sea-orm 2.0.
 | `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` | Named pools, migrations, distinct-target check, list filters |
 | `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |
 | `sekvent-testing` | not re-exported (`[dev-dependencies]`) | Postgres and MySQL test containers, a reaper, `await_until!` |
-| `sekvent-proto-build` | not re-exported (`[build-dependencies]`) | `build.rs` protobuf codegen on top of `tonic-prost-build` |
+| `sekvent-proto-build` | not re-exported (`[build-dependencies]`) | `build.rs` protobuf codegen on top of `tonic-prost-build`; protos compile in-process with protox, so no `protoc` is needed |
 | `cargo-sekvent` | — | The `cargo sekvent` CLI |
 | `sekvent-tasks` | — | The CLI's task library (gate, coverage, scaffolding, pins) |
 
