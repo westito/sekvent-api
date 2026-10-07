@@ -16,32 +16,35 @@ repository; describe behaviour in your own words and use neutral examples
 
 ## Repository and consumption
 
-- Remote: `git@github.com:westito/sekvent-api.git` (private for now),
-  branch `master`. Projects track `master`; there are no release tags yet.
+- Remote: `git@github.com:westito/sekvent-api.git` (public; anonymous
+  `https://github.com/westito/sekvent-api` works for clones, git
+  dependencies, the install script and `self-update`), branch `master`.
+  Projects track `master`; the only tag is the rolling `cli-latest`
+  prerelease that `cli-release.yml` moves on every push.
+- The repository is public: no client names, client paths, hosts or
+  session notes in any committed file, history included. Handoff state
+  lives outside the repo.
 - The facade is the package **`sekvent-api`** with lib name **`sekvent`**
   (directory `crates/sekvent`). Consumers depend on it under the key
   `sekvent-api` and write `use sekvent::…`. Internal crates keep their
   `sekvent-*` names; the CLI stays `cargo sekvent`.
-- While the repo is private, local projects consume sekvent through **path
-  dependencies on a local checkout**, not git:
+- Projects consume sekvent either as git dependencies on `branch =
+  "master"` (what `cargo sekvent init` and `new` write by default) or as
+  **path dependencies** on a checkout, e.g. a submodule:
   ```toml
-  sekvent-api = { path = "../sekvent/crates/sekvent", features = ["…"] }
-  sekvent-testing = { path = "../sekvent/crates/sekvent-testing" }         # dev
-  sekvent-proto-build = { path = "../sekvent/crates/sekvent-proto-build" } # build
+  sekvent-api = { path = "vendor/sekvent-api/crates/sekvent", features = ["…"] }
+  sekvent-testing = { path = "vendor/sekvent-api/crates/sekvent-testing" }         # dev
+  sekvent-proto-build = { path = "vendor/sekvent-api/crates/sekvent-proto-build" } # build
   ```
-  `cargo sekvent new --sekvent-path <checkout>` writes these; `cargo sekvent
-  add` keeps the source an existing workspace already uses. `cargo sekvent
-  init` still assumes git (`scaffold.rs` ~202).
+  `cargo sekvent new --sekvent-path <checkout>` writes path deps; `cargo
+  sekvent add` keeps the source an existing workspace already uses.
 - The proc macros locate the facade with proc-macro-crate, which reports the
   dependency *key*. `sekvent-api` (mapped to `sekvent`) and any rename via
   `package = "sekvent-api"` work; the key `sekvent_api` does not.
-- Private-repo consequences: the `raw.githubusercontent` install script,
-  `cargo sekvent self-update` and git dependencies in CI/containers need
-  GitHub credentials.
 - rrb syncs only a project's own git file set to rtx, so a path dependency
-  outside the consuming project does not exist on rtx. Solve this per
-  project before relying on remote builds (submodule, or a sync root that
-  contains both trees).
+  outside the consuming project does not exist on rtx. Use git
+  dependencies or a submodule inside the project (rrb syncs submodule
+  contents) before relying on remote builds.
 
 ## Crate map
 
