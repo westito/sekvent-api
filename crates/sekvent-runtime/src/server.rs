@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::FromRequestParts;
+use axum::extract::{DefaultBodyLimit, FromRequestParts, MatchedPath};
+use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
+use axum::routing::Route;
 use futures::future::BoxFuture;
 use http::header::CONTENT_TYPE;
 use http::request::Parts;
@@ -21,6 +23,7 @@ use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use hyper_util::service::TowerToHyperService;
 use sekvent_context::{CallContext, ServiceIdentity, headers};
 use sekvent_error::AppError;
+use sekvent_telemetry::access_log::{AccessLogLayer, RouteTemplate};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -30,14 +33,26 @@ use tonic::service::Routes;
 use tower::ServiceExt;
 use tower::util::MapRequestLayer;
 
-use crate::{HealthRegistry, HealthVisibility, UnitContext};
+use crate::{Cors, HealthRegistry, HealthVisibility, UnitContext};
 
 /// Establishes who is calling from the request head, typically by checking a
 /// service token. `None` means an anonymous (untrusted) caller.
 pub type Authenticator = Arc<dyn Fn(&Parts) -> Option<ServiceIdentity> + Send + Sync>;
 
+/// An application layer, applied to the routes inside the call context.
+type ServerLayer = Arc<dyn Fn(Router) -> Router + Send + Sync>;
+
 /// The health endpoints, which always live at the root.
 const HEALTH_PATHS: [&str; 3] = ["/livez", "/readyz", "/healthz"];
+
+/// Path of the gRPC health service, without the trailing slash.
+const GRPC_HEALTH_SERVICE: &str = "/grpc.health.v1.Health";
+
+/// Route of the gRPC health service's methods.
+const GRPC_HEALTH_ROUTE: &str = "/grpc.health.v1.Health/{*method}";
+
+/// Default largest REST body, axum's own default.
+const DEFAULT_REST_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Pause after the first accept failure that is not about one connection.
 const ACCEPT_BACKOFF_FIRST: Duration = Duration::from_millis(100);
@@ -89,6 +104,10 @@ pub struct ServerBuilder {
     authenticator: Option<Authenticator>,
     header_read_timeout: Option<Duration>,
     max_connections: Option<usize>,
+    cors: Option<Cors>,
+    rest_body_limit: usize,
+    layers: Vec<ServerLayer>,
+    access_log: bool,
     problems: Vec<String>,
 }
 
@@ -103,6 +122,10 @@ impl fmt::Debug for ServerBuilder {
             .field("visibility", &self.visibility)
             .field("header_read_timeout", &self.header_read_timeout)
             .field("max_connections", &self.max_connections)
+            .field("cors", &self.cors)
+            .field("rest_body_limit", &self.rest_body_limit)
+            .field("layers", &self.layers.len())
+            .field("access_log", &self.access_log)
             .finish_non_exhaustive()
     }
 }
@@ -132,6 +155,10 @@ impl ServerBuilder {
     }
 
     /// Serve one more gRPC service.
+    ///
+    /// Message-size limits stay with each generated service; tonic's
+    /// default is 4 MiB for decoding. Raise them on the service itself, e.g.
+    /// `OrdersServer::new(svc).max_decoding_message_size(16 << 20)`.
     #[must_use]
     pub fn add_service<S>(mut self, service: S) -> Self
     where
@@ -150,6 +177,12 @@ impl ServerBuilder {
 
     /// Merge REST routes (plain axum). Panics on overlapping routes, like
     /// [`Router::merge`].
+    ///
+    /// Extractors refuse bodies above [`rest_body_limit`](Self::rest_body_limit)
+    /// with `413`. An upload route raises the limit for itself alone with
+    /// `.layer(DefaultBodyLimit::max(16 * 1024 * 1024))` on its method
+    /// router. A handler reading the raw `Body` must bound it itself, e.g.
+    /// with `http_body_util::Limited`.
     #[must_use]
     pub fn rest(mut self, router: Router) -> Self {
         self.rest = self.rest.merge(router);
@@ -189,7 +222,10 @@ impl ServerBuilder {
     }
 
     /// Whether to serve `grpc.health.v1.Health` from the runtime's registry
-    /// (default on). Turn it off when adding your own health service.
+    /// (default on): at the root when native gRPC is served there, and
+    /// under the prefix. Like the HTTP health endpoints it bypasses the
+    /// authenticator and the application layers. Turn it off when adding
+    /// your own health service.
     #[must_use]
     pub fn grpc_health(mut self, enabled: bool) -> Self {
         self.grpc_health = enabled;
@@ -226,6 +262,57 @@ impl ServerBuilder {
         self
     }
 
+    /// Answer browsers' cross-origin requests (REST and gRPC-Web). Off by
+    /// default. Preflights are answered before authentication and handlers,
+    /// other `OPTIONS` requests reach the application, and these rules
+    /// replace any `access-control-*` headers set by layers or handlers;
+    /// [`bind`](Self::bind) runs [`Cors::validate`].
+    #[must_use]
+    pub fn cors(mut self, cors: Cors) -> Self {
+        self.cors = Some(cors);
+        self
+    }
+
+    /// Largest body REST extractors accept unless a route sets its own
+    /// `axum::extract::DefaultBodyLimit` (default 2 MiB, axum's own
+    /// default). Must be positive. gRPC limits are per service (see
+    /// [`add_service`](Self::add_service)).
+    #[must_use]
+    pub fn rest_body_limit(mut self, bytes: usize) -> Self {
+        self.rest_body_limit = bytes;
+        self
+    }
+
+    /// Wrap every REST, gRPC and gRPC-Web request (inside the call context,
+    /// outside routing; never the HTTP or gRPC health endpoints). Same
+    /// bounds as [`Router::layer`]; the layer must be `Clone`. A later call
+    /// wraps the earlier ones.
+    ///
+    /// Component calls served on this listener pass through the layer too,
+    /// so an end-user authentication layer must let link-authenticated
+    /// component paths through, or be applied per service instead.
+    #[must_use]
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<Request<Body>> + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Response: IntoResponse + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Error: Into<Infallible> + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Future: Send + 'static,
+    {
+        self.layers
+            .push(Arc::new(move |router: Router| router.layer(layer.clone())));
+        self
+    }
+
+    /// Whether to log one event per request (target `sekvent::access`,
+    /// default on). Request ids and the `request` span stay on either way.
+    #[must_use]
+    pub fn access_log(mut self, enabled: bool) -> Self {
+        self.access_log = enabled;
+        self
+    }
+
     /// Validate and bind `addr` (port 0 picks a free port).
     pub async fn bind(self, addr: SocketAddr) -> Result<Server, AppError> {
         self.validate()?;
@@ -257,6 +344,10 @@ impl ServerBuilder {
                     authenticator: self.authenticator,
                     header_read_timeout: self.header_read_timeout,
                     max_connections: self.max_connections,
+                    cors: self.cors,
+                    rest_body_limit: self.rest_body_limit,
+                    layers: self.layers,
+                    access_log: self.access_log,
                 },
             }),
         })
@@ -295,6 +386,22 @@ impl ServerBuilder {
                     "the path prefix {prefix} collides with a health route"
                 )));
             }
+            if self.grpc_health
+                && (prefix == GRPC_HEALTH_SERVICE
+                    || prefix.starts_with(&format!("{GRPC_HEALTH_SERVICE}/")))
+            {
+                return Err(AppError::invalid_argument(format!(
+                    "the path prefix {prefix} collides with the gRPC health service"
+                )));
+            }
+        }
+        if self.rest_body_limit == 0 {
+            return Err(AppError::invalid_argument(
+                "the REST body limit must be positive",
+            ));
+        }
+        if let Some(cors) = &self.cors {
+            cors.validate()?;
         }
         Ok(())
     }
@@ -331,6 +438,92 @@ struct ServerConfig {
     authenticator: Option<Authenticator>,
     header_read_timeout: Option<Duration>,
     max_connections: Option<usize>,
+    cors: Option<Cors>,
+    rest_body_limit: usize,
+    layers: Vec<ServerLayer>,
+    access_log: bool,
+}
+
+impl ServerConfig {
+    /// The REST routes with the body limit and the route recorder.
+    fn rest_router(&self) -> Router {
+        let rest = if self.rest.has_routes() {
+            self.rest.clone().route_layer(from_fn(record_route))
+        } else {
+            self.rest.clone()
+        };
+        rest.layer(DefaultBodyLimit::max(self.rest_body_limit))
+    }
+
+    /// Whether native gRPC is served at the root.
+    fn serves_grpc_at_root(&self) -> bool {
+        self.prefix.is_none() || self.grpc_at_root
+    }
+
+    /// Request ids and the access log, with the health traffic (every path
+    /// a health endpoint is mounted at) at `debug`.
+    fn access_log_layer(&self) -> AccessLogLayer {
+        let mut quiet: Vec<String> = Vec::new();
+        if self.health_routes {
+            quiet.extend(HEALTH_PATHS.map(str::to_owned));
+        }
+        if self.grpc_health {
+            if self.serves_grpc_at_root() {
+                quiet.push(format!("{GRPC_HEALTH_SERVICE}/"));
+            }
+            if let Some(prefix) = &self.prefix {
+                quiet.push(format!("{prefix}{GRPC_HEALTH_SERVICE}/"));
+            }
+        }
+        AccessLogLayer::new().quiet(quiet).events(self.access_log)
+    }
+
+    /// `router` behind the gRPC-Web translation, when enabled.
+    fn with_grpc_web(&self, router: Router) -> Router {
+        #[cfg(feature = "grpc-web")]
+        let router = if self.grpc_web {
+            router.layer(tonic_web::GrpcWebLayer::new())
+        } else {
+            router
+        };
+        #[cfg(not(feature = "grpc-web"))]
+        let _ = self.grpc_web;
+        router
+    }
+
+    /// The gRPC health service at the root (when native gRPC is served
+    /// there) and under the prefix, gRPC by content type only.
+    fn grpc_health_routes(&self, health: &HealthRegistry) -> Router {
+        if !self.grpc_health {
+            return Router::new();
+        }
+        let service = Dispatch {
+            grpc: self.with_grpc_web(Routes::new(health.grpc_service()).into_axum_router()),
+            rest: None,
+        };
+        let routes = Router::new().route_service(GRPC_HEALTH_ROUTE, service);
+        match &self.prefix {
+            Some(prefix) if self.serves_grpc_at_root() => routes.clone().nest(prefix, routes),
+            Some(prefix) => Router::new().nest(prefix, routes),
+            None => routes,
+        }
+    }
+}
+
+/// Copy the matched route template (prefix included when nested) into the
+/// response, where the access log reads it.
+async fn record_route(request: Request<Body>, next: Next) -> Response {
+    let template = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| RouteTemplate(path.as_str().to_owned()));
+    let mut response = next.run(request).await;
+    if let Some(template) = template
+        && response.extensions().get::<RouteTemplate>().is_none()
+    {
+        response.extensions_mut().insert(template);
+    }
+    response
 }
 
 struct ServerInner {
@@ -344,8 +537,12 @@ struct ServerInner {
 /// One listener serving native gRPC, gRPC-Web and REST, plus the health
 /// endpoints.
 ///
-/// Every request gets a [`CallContext`] built from its headers (see
-/// [`Ctx`]). Run it as an ingress unit with [`into_unit`](Self::into_unit).
+/// Every request carries an `x-request-id` (echoed on the response) and is
+/// logged once at completion (target `sekvent::access`, health traffic at
+/// `debug`). Every request except the HTTP and gRPC health endpoints gets a
+/// [`CallContext`] built from its headers (see [`Ctx`]) and passes the
+/// application layers; see [`router`](Self::router) for the full stack.
+/// Run it as an ingress unit with [`into_unit`](Self::into_unit).
 #[derive(Clone)]
 pub struct Server {
     inner: Arc<ServerInner>,
@@ -375,6 +572,10 @@ impl Server {
             authenticator: None,
             header_read_timeout: Some(Duration::from_secs(30)),
             max_connections: Some(10_000),
+            cors: None,
+            rest_body_limit: DEFAULT_REST_BODY_LIMIT,
+            layers: Vec::new(),
+            access_log: true,
             problems: Vec::new(),
         }
     }
@@ -384,23 +585,28 @@ impl Server {
         self.inner.local_addr
     }
 
-    /// The complete request router, health endpoints and context layer
-    /// included, for serving elsewhere or testing without a socket.
+    /// The complete request router, for serving elsewhere or testing
+    /// without a socket. Outermost first:
+    ///
+    /// 1. request id (a valid `x-request-id` is kept, anything else
+    ///    replaced), the `request` span and the access log;
+    /// 2. CORS, when configured;
+    /// 3. the health endpoints (`/livez`, `/readyz`, `/healthz` and
+    ///    `grpc.health.v1.Health`, also under the prefix), or else
+    /// 4. the call context (its request id is the one above), the
+    ///    application layers, then the prefix strip and the split between
+    ///    gRPC (by content type) and the REST routes with their body limit.
     pub fn router(&self, health: &HealthRegistry) -> Router {
         let config = &self.inner.config;
-        let grpc = self.grpc_router(health);
-        let mut app = if config.health_routes {
-            health.http_routes(config.visibility)
-        } else {
-            Router::new()
-        };
-        app = match &config.prefix {
+        let grpc = self.grpc_router();
+        let rest = config.rest_router();
+        let mut services = match &config.prefix {
             Some(prefix) => {
-                let nested = app.nest_service(
+                let nested = Router::new().nest_service(
                     prefix,
                     Dispatch {
                         grpc: grpc.clone(),
-                        rest: Some(config.rest.clone()),
+                        rest: Some(rest),
                     },
                 );
                 if config.grpc_at_root {
@@ -409,15 +615,32 @@ impl Server {
                     nested
                 }
             }
-            None => app.fallback_service(Dispatch {
+            None => Router::new().fallback_service(Dispatch {
                 grpc,
-                rest: Some(config.rest.clone()),
+                rest: Some(rest),
             }),
         };
+        for layer in &config.layers {
+            services = layer(services);
+        }
         let authenticator = config.authenticator.clone();
-        app.layer(MapRequestLayer::new(move |request: Request<Body>| {
+        services = services.layer(MapRequestLayer::new(move |request: Request<Body>| {
             attach_context(request, authenticator.as_ref())
-        }))
+        }));
+        let health_routes = if config.health_routes {
+            health
+                .http_routes(config.visibility)
+                .route_layer(from_fn(record_route))
+        } else {
+            Router::new()
+        };
+        let mut app = health_routes
+            .merge(config.grpc_health_routes(health))
+            .fallback_service(services);
+        if let Some(cors) = &config.cors {
+            app = cors.apply(app);
+        }
+        app.layer(config.access_log_layer())
     }
 
     /// The unit that serves this listener: ready once listening, stops
@@ -438,22 +661,9 @@ impl Server {
         }
     }
 
-    fn grpc_router(&self, health: &HealthRegistry) -> Router {
+    fn grpc_router(&self) -> Router {
         let config = &self.inner.config;
-        let mut services = config.grpc.clone().unwrap_or_default();
-        if config.grpc_health {
-            services = services.add_service(health.grpc_service());
-        }
-        let router = services.into_axum_router();
-        #[cfg(feature = "grpc-web")]
-        let router = if config.grpc_web {
-            router.layer(tonic_web::GrpcWebLayer::new())
-        } else {
-            router
-        };
-        #[cfg(not(feature = "grpc-web"))]
-        let _ = config.grpc_web;
-        router
+        config.with_grpc_web(config.grpc.clone().unwrap_or_default().into_axum_router())
     }
 
     async fn serve(self, ctx: UnitContext) -> Result<(), AppError> {
@@ -910,7 +1120,16 @@ mod tests {
     #[tokio::test]
     async fn invalid_configurations_are_rejected() {
         for prefix in [
-            "api", "/", "/api/", "/a//b", "/a b", "/{x}", "/*rest", "/livez",
+            "api",
+            "/",
+            "/api/",
+            "/a//b",
+            "/a b",
+            "/{x}",
+            "/*rest",
+            "/livez",
+            "/grpc.health.v1.Health",
+            "/grpc.health.v1.Health/v2",
         ] {
             let result = Server::builder().prefix(prefix).bind(localhost()).await;
             assert!(result.is_err(), "{prefix:?} must be rejected");
@@ -919,6 +1138,21 @@ mod tests {
             Server::builder()
                 .health_routes(false)
                 .prefix("/livez")
+                .bind(localhost())
+                .await
+                .is_ok()
+        );
+        assert!(
+            Server::builder()
+                .grpc_health(false)
+                .prefix("/grpc.health.v1.Health")
+                .bind(localhost())
+                .await
+                .is_ok()
+        );
+        assert!(
+            Server::builder()
+                .prefix("/grpc.health.v1.HealthX")
                 .bind(localhost())
                 .await
                 .is_ok()

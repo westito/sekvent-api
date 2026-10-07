@@ -4,6 +4,8 @@
 //! Its own test binary: no other test in this process can install a
 //! default provider before (or while) this one runs.
 
+use std::sync::Arc;
+
 use rustls::crypto::CryptoProvider;
 use sekvent_client::HttpClient;
 use sekvent_client::oauth2::ClientCredentials;
@@ -23,10 +25,21 @@ fn clients_build_without_installing_a_default_crypto_provider() {
 
     assert!(CryptoProvider::get_default().is_none());
 
-    sekvent_client::reqwest_builder().build().unwrap();
+    sekvent_client::reqwest_builder()
+        .tls_version_min(reqwest::tls::Version::TLS_1_3)
+        .http1_only()
+        .build()
+        .unwrap();
     let installed = CryptoProvider::get_default().unwrap();
     assert_eq!(
         installed.cipher_suites,
         rustls::crypto::ring::default_provider().cipher_suites
     );
+
+    // An installed provider is kept.
+    sekvent_client::reqwest_builder().build().unwrap();
+    assert!(Arc::ptr_eq(
+        CryptoProvider::get_default().unwrap(),
+        installed
+    ));
 }

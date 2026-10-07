@@ -1,6 +1,6 @@
 [package]
 name = "sekvent-telemetry"
-description = "Tracing initialisation, in-memory log buffer and request-id propagation."
+description = "Tracing initialisation, in-memory log buffer, request ids and the per-request access log."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 pin-project-lite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,6 +26,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+http-body-util = { workspace = true }
 log = "0.4.34"
 tokio = { workspace = true }
 

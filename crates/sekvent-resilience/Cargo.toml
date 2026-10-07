@@ -1,6 +1,6 @@
 [package]
 name = "sekvent-resilience"
-description = "Timeouts, retries with budgets, rate gates, bulkheads and circuit breakers."
+description = "Timeouts, retries with budgets, rate gates, bulkheads, circuit breakers and a TTL cache."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

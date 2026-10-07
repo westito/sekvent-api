@@ -1,6 +1,6 @@
 [package]
 name = "sekvent-runtime"
-description = "Service lifecycle, supervision, health and the combined gRPC/gRPC-Web/REST server."
+description = "Service lifecycle, supervision, health, jobs and the combined gRPC/gRPC-Web/REST server."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,10 +12,14 @@ publish.workspace = true
 default = ["grpc-web"]
 # Serve gRPC-Web (browser clients) on the same listener as native gRPC.
 grpc-web = ["dep:tonic-web"]
+# Cron schedules for jobs (UTC).
+cron = ["dep:croner", "dep:chrono"]
 
 [dependencies]
 sekvent-error = { workspace = true, features = ["http", "grpc"] }
 sekvent-context = { workspace = true }
+sekvent-config = { workspace = true }
+sekvent-telemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -28,10 +32,14 @@ tonic-web = { workspace = true, optional = true }
 tonic-health = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+croner = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-bytes = { workspace = true }
+tracing-subscriber = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 prost = { workspace = true }

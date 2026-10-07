@@ -71,19 +71,4 @@ mod tests {
         );
         assert!(config.enable_sni);
     }
-
-    #[test]
-    fn reqwest_builder_installs_ring_and_accepts_reqwest_tls_settings() {
-        reqwest_builder()
-            .tls_version_min(reqwest::tls::Version::TLS_1_3)
-            .http1_only()
-            .build()
-            .unwrap();
-        let installed = rustls::crypto::CryptoProvider::get_default().unwrap();
-        assert_eq!(
-            installed.cipher_suites,
-            rustls::crypto::ring::default_provider().cipher_suites
-        );
-        reqwest_builder().build().unwrap();
-    }
 }

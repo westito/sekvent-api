@@ -52,15 +52,15 @@ repository; describe behaviour in your own words and use neutral examples
 |---|---|---|
 | `sekvent-config` | `ConfigSource`, `Secret`, readers, `FromConfig`, reserved `SEKVENT_*` keys | macros (derive) |
 | `sekvent-macros` | proc macros (`EnvConfig`, `component`, `ComponentError`) | — |
-| `sekvent-telemetry` | tracing init, log ring buffer, request-id layer, `truncate_for_log` | — |
+| `sekvent-telemetry` | tracing init, log ring buffer, request-id and access-log layers, `truncate_for_log` | — |
 | `sekvent-error` | `ErrorCode`, `AppError`, `WireError`, HTTP + gRPC mappings | — |
 | `sekvent-context` | `CallContext`, `ServiceIdentity`, `Clock`, header codec (peer vs external propagation) | — |
-| `sekvent-runtime` | staged lifecycle, supervision, health, combined server | config, error, context |
-| `sekvent-resilience` | backoff, retry budget, rate gate, timeout, bulkhead, circuit breaker | config, error, context |
-| `sekvent-auth` | argon2/bcrypt, JWT with the time passed in; runtime-free, wasm-compatible core | error |
+| `sekvent-runtime` | staged lifecycle, supervision, health, combined server (CORS, limits, layers, access log), jobs, downloads | config, error, context, telemetry |
+| `sekvent-resilience` | backoff, retry budget, rate gate, timeout, bulkhead, circuit breaker, TTL cache | config, error, context |
+| `sekvent-auth` | argon2id and bcrypt schemes, JWT with the time passed in; runtime-free, wasm-compatible core | error, config, context (optional) |
 | `sekvent-link` | service tokens, `TokenMap`, middleware, interceptor | config, context, error |
 | `sekvent-client` | reqwest builder, resilience, context propagation, OAuth2 cache | config, context, error, resilience, telemetry |
-| `sekvent-db` | named pools, migrations, distinct-target check, sea-orm filters | config, error |
+| `sekvent-db` | named pools, migrations, distinct-target check, sea-orm filters, probes, leases | config, error, runtime (optional) |
 | `sekvent-component` | components, App builder, local, serialized and gRPC bindings | config, error, context, resilience, link (optional), macros, runtime (optional) |
 | `sekvent-testing` | Postgres/MySQL containers, reaper, `await_until!` | — |
 | `sekvent-proto-build` | build.rs codegen helpers, component service-contract constants and RPC type aliases | — |
@@ -98,9 +98,11 @@ cycle, and keep `sekvent-error` and `sekvent-context` dependency-light.
 ## Components
 
 Specs: `docs/component-model.md` (overview), `docs/design/component-c1.md`
-(local bindings, lifecycle), `docs/design/component-c2.md` (gRPC, contracts).
-Milestones C1 and C2 are done; C3–C5 (bus, async/deferred calls, schedule,
-NATS, extraction tooling) are not started.
+(local bindings, lifecycle), `docs/design/component-c2.md` (gRPC, contracts),
+`docs/design/p8-service-essentials.md` (jobs, leases).
+Milestones C1, C2 and C4 are done (C4: jobs in `sekvent-runtime`, leases in
+`sekvent-db`); C3 and C5 (bus, async/deferred calls, NATS, extraction
+tooling) are not started.
 
 - Every component that may cross a process boundary (standard and
   `remote_only`) declares its `service` in the `-api` crate's `.proto` and

@@ -57,6 +57,13 @@ per package by default) must pass before work is done.
 - Map at the edge only: `AppError` converts to `tonic::Status` and to an
   axum response; do not hand-roll status mapping.
 
+### Building blocks
+
+- Use sekvent's jobs (`RuntimeBuilder::job`), leases (`LeaseStore`,
+  `LeaseGuard`), pool probes (`PoolRegistry::probes`) and `Download`
+  instead of hand-written timer loops, lease rows, health checks and
+  download headers.
+
 ### Tests
 
 - Unit tests next to the code, integration tests in `tests/`.

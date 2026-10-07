@@ -1,6 +1,6 @@
 ---
 name: sekvent-migrate
-description: Move an EXISTING Rust backend workspace (tonic, axum, sqlx or sea-orm services) onto the sekvent framework with `cargo sekvent init` and `cargo sekvent deps sync`. Use when the user wants an existing backend "on sekvent", wants its dependencies aligned with sekvent's pinned set, or wants hand-rolled config readers, error enums, tracing setup, password hashing, outbound HTTP clients, rate limits or protobuf codegen replaced by sekvent modules. Covers the inventory, the upgrade fallout (edition 2024, tonic 0.14 and `tonic-prost`, axum 0.8 paths, sea-orm 2.0, sqlx 0.9), keeping the wire format compatible, and verifying with the gate. Not for new projects (use `sekvent-new-project`) or for day-to-day code in a project already on sekvent (use `sekvent`).
+description: Move an EXISTING Rust backend workspace (tonic, axum, sqlx or sea-orm services) onto the sekvent framework with `cargo sekvent init` and `cargo sekvent deps sync`. Use when the user wants an existing backend "on sekvent", wants its dependencies aligned with sekvent's pinned set, or wants hand-rolled config readers, error enums, tracing setup, CORS and request-id layers, password hashing, timer loops and lease rows, download handlers, caches, outbound HTTP clients, rate limits or protobuf codegen replaced by sekvent modules. Covers the inventory, the upgrade fallout (edition 2024, tonic 0.14 and `tonic-prost`, axum 0.8 paths, sea-orm 2.0, sqlx 0.9), keeping the wire format compatible, and verifying with the gate. Not for new projects (use `sekvent-new-project`) or for day-to-day code in a project already on sekvent (use `sekvent`).
 ---
 
 # Migrating a backend onto sekvent
@@ -144,6 +144,15 @@ line. The `sekvent` skill has the recipes with real API names.
 | `std::env::var` readers, ad-hoc parsing, defaults in code | a config struct with `#[derive(EnvConfig)]`, `Secret` for credentials, `sekvent::config::from_env()` in `main`, `MapSource` in tests |
 | per-crate error enums with manual `Status`/`IntoResponse` impls | `AppError` with an `ErrorCode` and a stable `with_reason(..)`; features `error-grpc`, `error-http` provide the mappings |
 | argon2/bcrypt wrappers, login checks | `sekvent::auth::PasswordHasher` and `authenticate` (constant work for unknown users, rehash on login) |
+| direct `bcrypt` crate calls, a store shared with other applications | `PasswordHasher::bcrypt(BcryptParams::new(10).prefixed())` (match the cost and prefix the store uses); `authenticate_async` with `auth-tokio` |
+| tower-http `CorsLayer` | `ServerBuilder::cors` with `Cors::origins([..])` or `Cors::from_config(source, "APP_CORS_")` |
+| hand-rolled request-id and trace layers, access logging middleware | built in: the server keeps or mints `x-request-id`, opens one `request` span and logs one `sekvent::access` event per request |
+| `DefaultBodyLimit` / `RequestBodyLimitLayer` on the whole router | `ServerBuilder::rest_body_limit`; raise it per route with `DefaultBodyLimit::max` |
+| `tokio::time::interval` loops, cron crates, admin "run now" flags | `RuntimeBuilder::job` with `JobSpec::interval`, `JobSpec::cron` (`runtime-cron`) or `JobSpec::manual`; `JobHandle::trigger` for run-now |
+| lease or lock rows with heartbeats, "only one replica runs this" | `sekvent::db::LeaseStore` (`try_acquire`, `keep_alive`, fencing tokens) and `JobSpec::singleton(LeaseGuard::new(store))` (`db-lease`) |
+| download handlers setting `Content-Disposition` and content types by hand | `sekvent::runtime::Download` (`sanitize_filename`, `sniff_content_type` for uploads) |
+| hand-made caches (a `Mutex<HashMap>` with timestamps, `moka` for a few keys) | `sekvent::resilience::TtlCache` (single flight, stale on transient errors) |
+| database health checks in a readiness handler | `PoolRegistry::probes()` registered with `RuntimeBuilder::probe` |
 | list endpoints building filters and pagination by hand | `sekvent::db::list` (`ListParams`, column filters) with sea-orm; pools via `PoolSpec` / `PoolRegistry` |
 | reqwest wrappers with retry loops, token caches | `sekvent::client::HttpClient` with a `PolicySpec`; `client::oauth2::ClientCredentials` for OAuth 2.0 |
 | semaphores or token buckets guarding an upstream quota | `sekvent::resilience::RateGate`; timeouts, bulkheads and breakers from the same module |
@@ -181,6 +190,18 @@ Clients and other services must not notice the migration.
 - **HTTP error bodies.** If the old JSON error shape differs from
   `{"error": {"code": ...}}`, keep a mapping at the edge rather than
   changing what clients parse, and tell the user.
+- **Password hashes.** When other applications read the same password
+  store, keep writing what they understand: `{bcrypt}`-prefixed hashes
+  stay `{bcrypt}` (`BcryptParams::new(cost).prefixed()`, the store's
+  cost), unprefixed ones stay unprefixed. Under the bcrypt scheme argon2
+  hashes are rewritten to bcrypt on the next login, never the other way
+  round. Existing logins with passwords over 72 bytes keep working
+  (verification reads the first 72 bytes, as bcrypt writers did), but new
+  bcrypt hashes refuse them; tell the user if the old sign-up or
+  change-password code accepted them.
+- **CORS and request ids.** Carry the old allowed origins, credentials
+  flag and exposed headers over to `Cors`; the response `x-request-id` is
+  now set on every answer, health included.
 - **Routes, proto packages, field numbers, status codes** stay as they were.
   An integration test that pins the old responses is the proof.
 

@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::job::{self, JobContext, JobSpec};
 use crate::probe::{DependencyProbe, probe_unit};
 use crate::signal::{Trigger, any_trigger, os_signals, signal_arrived};
 use crate::unit::StopWindow;
@@ -229,6 +230,8 @@ pub struct RuntimeBuilder {
     probe_timeout: Duration,
     health: HealthRegistry,
     control: Arc<Control>,
+    /// Problems found when jobs were registered, reported by `build`.
+    job_problems: Vec<String>,
 }
 
 impl fmt::Debug for RuntimeBuilder {
@@ -267,6 +270,7 @@ impl Runtime {
             probe_timeout: Duration::from_secs(2),
             health: HealthRegistry::new(),
             control: Arc::new(Control::new()),
+            job_problems: Vec::new(),
         }
     }
 
@@ -359,6 +363,36 @@ impl RuntimeBuilder {
             factory: Box::new(move |ctx: UnitContext| -> UnitFuture { Box::pin(factory(ctx)) }),
         });
         self
+    }
+
+    /// Register `run` as job `name` in `stage`: one unit, policy
+    /// [`UnitPolicy::Critical`], that runs `run` as `spec` schedules it.
+    ///
+    /// The unit reports ready at once and never fails because a run failed:
+    /// an error, a panic, a timeout or a lost guard is logged and recorded
+    /// in the job's [`JobStatus`](crate::JobStatus), and the next tick still
+    /// runs. When the stage drains, the run in progress is cancelled
+    /// ([`CancelReason::Shutdown`](crate::CancelReason::Shutdown)) and
+    /// awaited until the unit's stop deadline. The name and the spec are
+    /// checked by [`build`](Self::build).
+    #[must_use]
+    pub fn job<F, Fut>(
+        mut self,
+        name: impl Into<String>,
+        stage: Stage,
+        spec: JobSpec,
+        run: F,
+    ) -> Self
+    where
+        F: Fn(JobContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), AppError>> + Send + 'static,
+    {
+        let name = name.into();
+        if let Err(problem) = job::validate(&name, &spec) {
+            self.job_problems.push(problem);
+        }
+        let factory = job::factory(&name, spec, run);
+        self.unit(name, stage, UnitPolicy::Critical, factory)
     }
 
     /// Longest a stage may take to start (default 30 s). Exceeding it is a
@@ -475,8 +509,17 @@ impl RuntimeBuilder {
     /// Fails on an empty or duplicate unit or probe name, an invalid restart
     /// policy, or a zero start timeout, restart reset period, probe interval
     /// or probe timeout.
+    ///
+    /// A [job](Self::job) also fails, naming it, on a name outside
+    /// `[A-Za-z0-9._:-]{1,100}`; a zero interval; a singleton interval below
+    /// 1 s or not a whole number of milliseconds; a jitter not below the
+    /// interval (interval schedules) or above 1 h (cron); a zero timeout;
+    /// and a jitter, initial delay or misfire grace on a manual job.
     pub fn build(mut self) -> Result<Runtime, AppError> {
         let invalid = |message: String| Err(AppError::invalid_argument(message));
+        if let Some(problem) = self.job_problems.first() {
+            return invalid(problem.clone());
+        }
         if self.settings.start_timeout.is_zero() {
             return invalid("the stage start timeout must be positive".into());
         }

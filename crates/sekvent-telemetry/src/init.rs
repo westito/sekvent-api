@@ -318,6 +318,7 @@ mod tests {
         buffer: Option<LogBuffer>,
         emit: impl FnOnce(),
     ) -> String {
+        crate::test_support::keep_interest_open();
         let out = Captured::default();
         let writer = out.clone();
         let settings = Settings {

@@ -321,6 +321,7 @@ mod tests {
     }
 
     fn capture(buffer: &LogBuffer, emit: impl FnOnce()) {
+        crate::test_support::keep_interest_open();
         with_default(Registry::default().with(buffer.layer()), emit);
     }
 

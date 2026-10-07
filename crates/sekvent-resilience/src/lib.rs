@@ -1,4 +1,5 @@
-//! Timeouts, retries with budgets, rate gates, bulkheads and circuit breakers.
+//! Timeouts, retries with budgets, rate gates, bulkheads, circuit breakers
+//! and a TTL cache.
 //!
 //! The building blocks are transport-agnostic: they work on
 //! [`AppError`](sekvent_error::AppError) and [`CallContext`], so the same
@@ -13,13 +14,15 @@
 //! - [`CircuitBreaker`]: stops calling an unhealthy dependency for a while.
 //! - [`Policy`] composes all of them in a fixed order; [`PolicySpec`] is its
 //!   serializable, layerable description; [`PolicyLayer`] adapts it to tower.
+//! - [`TtlCache`]: a small in-memory cache with per-key single flight and
+//!   optional stale serving when a reload fails transiently.
 //!
 //! # Time
 //!
 //! Every wait uses tokio's clock, so tests drive it with
 //! `tokio::time::pause` and `advance`. Deadlines are read from the context
 //! and measured against tokio's clock as well (see [`remaining`]). The
-//! breaker takes an injectable [`MonotonicClock`].
+//! breaker and the cache take an injectable [`MonotonicClock`].
 
 #![forbid(unsafe_code)]
 
@@ -27,6 +30,7 @@ mod backoff;
 mod breaker;
 mod budget;
 mod bulkhead;
+mod cache;
 mod error;
 mod policy;
 mod rate_gate;
@@ -47,6 +51,7 @@ pub use breaker::{
 };
 pub use budget::RetryBudget;
 pub use bulkhead::{Bulkhead, BulkheadPermit};
+pub use cache::{TtlCache, TtlCacheBuilder};
 pub use error::PolicyError;
 pub use policy::Policy;
 pub use rate_gate::RateGate;

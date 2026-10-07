@@ -1,4 +1,5 @@
-//! Database pools, migrations and generic list filtering for sqlx and sea-orm.
+//! Database pools, migrations, probes, leases and generic list filtering for
+//! sqlx and sea-orm.
 //!
 //! Every integration is behind a feature; with none enabled the crate offers
 //! only the backend-neutral pieces ([`PoolSpec`], [`assert_distinct_targets`]).
@@ -11,6 +12,30 @@
 //! | `migrate` | `migrate_on_boot`, [`PoolRegistry::migrate_all`] |
 //! | `sea-orm-migrate` | `run_sea_orm_migrations` |
 //! | `serde` | serde derives on the list parameters |
+//! | `runtime` (with a sqlx backend) | `PoolProbe`, `PoolRegistry::probes` for `sekvent-runtime` readiness |
+//! | `lease` (with a sqlx backend) | `LeaseStore`, `Lease`, `HeldLease`: leases with fencing tokens |
+//! | `lease` + `runtime` | `LeaseGuard`: singleton jobs for `sekvent-runtime` |
+//!
+//! # Probes
+//!
+//! `registry.probes()` returns one readiness probe per connected pool,
+//! required exactly when the pool's spec was:
+//!
+//! ```ignore
+//! let builder = registry.probes().into_iter().fold(Runtime::builder(), |b, p| b.probe(p));
+//! ```
+//!
+//! # Leases
+//!
+//! A lease is one row per name in a table the application owns
+//! (`LeaseStore::schema_sql` for its migrations, or `ensure_schema`). Expiry
+//! is computed by the database's clock; every acquisition increments the
+//! row's fencing token, so a write that must not come from a stale holder
+//! checks it (`check_fence_postgres` / `check_fence_mysql`) in its own
+//! transaction. `Lease::keep_alive` renews in the background and reports a
+//! lost lease through a cancellation token. `LeaseGuard` turns a
+//! `sekvent-runtime` job into a singleton: each tick runs on one instance,
+//! once.
 //!
 //! # Secrets
 //!
@@ -48,6 +73,22 @@ mod migrate;
 #[cfg(feature = "sea-orm")]
 pub mod list;
 
+#[cfg(all(
+    feature = "runtime",
+    any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+))]
+mod probe;
+
+#[cfg(all(
+    feature = "lease",
+    any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+))]
+mod lease;
+
+/// Stable `reason` values of the errors this crate returns.
+#[cfg(any(feature = "lease", feature = "sqlx-postgres", feature = "sqlx-mysql"))]
+pub mod reasons;
+
 pub use error::{ConnectFailure, DbError, public_message};
 pub use spec::PoolSpec;
 pub use target::{Target, assert_distinct_targets, parse_target};
@@ -61,6 +102,27 @@ pub use error::{classify_db_err, db_err_to_app_error};
 
 #[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql"))]
 pub use registry::{Pool, PoolRegistry};
+
+#[cfg(all(
+    feature = "runtime",
+    any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+))]
+pub use probe::PoolProbe;
+
+#[cfg(all(
+    feature = "lease",
+    any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+))]
+pub use lease::{
+    DEFAULT_LEASE_TABLE, DEFAULT_LEASE_TTL, FencingToken, HeldLease, Lease, LeaseInfo, LeaseStore,
+};
+
+#[cfg(all(
+    feature = "lease",
+    feature = "runtime",
+    any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+))]
+pub use lease::LeaseGuard;
 
 #[cfg(all(
     feature = "migrate",

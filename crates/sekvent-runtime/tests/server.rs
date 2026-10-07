@@ -2,18 +2,19 @@
 //! health, driven by the runtime, then shut down gracefully.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
 use bytes::Bytes;
 use http::request::Parts;
-use http::{Request, StatusCode};
+use http::{Method, Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use prost::Message;
 use sekvent_context::ServiceIdentity;
-use sekvent_runtime::{Ctx, Runtime, Server, Stage, UnitExit, UnitPolicy};
+use sekvent_runtime::{Cors, Ctx, Runtime, Server, Stage, UnitExit, UnitPolicy};
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
@@ -186,4 +187,133 @@ async fn one_listener_serves_every_protocol_and_drains() {
         )
         .await;
     assert!(closed.is_err());
+}
+
+const ORIGIN: &str = "https://app.example.com";
+
+/// What a browser sends before a gRPC-Web call from another origin.
+async fn browser_preflight(http: &HttpClient, url: &str) {
+    let preflight = Request::builder()
+        .method(Method::OPTIONS)
+        .uri(url)
+        .header("origin", ORIGIN)
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "content-type,x-grpc-web,x-user-agent",
+        )
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = http.request(preflight).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers["access-control-allow-origin"], ORIGIN);
+    let allowed = headers["access-control-allow-headers"].to_str().unwrap();
+    for name in ["content-type", "x-grpc-web", "x-user-agent"] {
+        assert!(allowed.contains(name), "{allowed}");
+    }
+    assert_eq!(headers["access-control-max-age"], "3600");
+    assert!(headers.contains_key("x-request-id"));
+    response.into_body().collect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_browser_preflight_then_a_grpc_web_call() {
+    let run = async {
+        let server = Server::builder()
+            .prefix("/api")
+            .cors(Cors::origins([ORIGIN]).unwrap())
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let handle = Runtime::builder()
+            .without_signals()
+            .unit(
+                "api",
+                Stage::Ingress,
+                UnitPolicy::Critical,
+                server.into_unit(),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
+        let http: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+        let url = format!("http://{addr}/api/grpc.health.v1.Health/Check");
+
+        browser_preflight(&http, &url).await;
+
+        let call = Request::post(&url)
+            .header("origin", ORIGIN)
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            .body(Full::new(Bytes::from_static(&[0, 0, 0, 0, 0])))
+            .unwrap();
+        let response = http.request(call).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["access-control-allow-origin"], ORIGIN);
+        let exposed = response.headers()["access-control-expose-headers"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(exposed.contains("grpc-status"), "{exposed}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let (message, trailers) = grpc_web_frames(&body);
+        let decoded = HealthCheckResponse::decode(message.as_slice()).unwrap();
+        assert_eq!(decoded.status(), ServingStatus::Serving);
+        assert!(trailers.contains("grpc-status:0"), "{trailers}");
+
+        drop(http);
+        handle.shutdown();
+        handle.wait().await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("the exchange finished within 30 s");
+}
+
+#[tokio::test]
+async fn a_rejecting_layer_leaves_the_grpc_health_check_alone() {
+    let run = async {
+        let server = Server::builder()
+            .rest(whoami())
+            .layer(axum::middleware::from_fn(
+                |_request: axum::extract::Request, _next: axum::middleware::Next| async {
+                    StatusCode::UNAUTHORIZED
+                },
+            ))
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        let handle = Runtime::builder()
+            .without_signals()
+            .unit(
+                "api",
+                Stage::Ingress,
+                UnitPolicy::Critical,
+                server.into_unit(),
+            )
+            .build()
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
+
+        native_grpc_is_served(addr).await;
+        let http: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+        let (status, _) = get_path(&http, addr, "/whoami", false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = get_path(&http, addr, "/livez", false).await;
+        assert_eq!(status, StatusCode::OK);
+
+        drop(http);
+        handle.shutdown();
+        handle.wait().await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("the exchange finished within 30 s");
 }

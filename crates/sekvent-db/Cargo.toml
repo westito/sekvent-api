@@ -1,6 +1,6 @@
 [package]
 name = "sekvent-db"
-description = "Database pools, migrations and generic list filtering for sqlx and sea-orm."
+description = "Database pools, migrations, probes, leases and generic list filtering for sqlx and sea-orm."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -27,6 +27,11 @@ migrate = []
 sea-orm-migrate = ["sea-orm", "migrate", "dep:sea-orm-migration"]
 # `Deserialize`/`Serialize` for `ListParams` and `ColumnFilter`.
 serde = ["dep:serde"]
+# Leases with fencing tokens over a sqlx pool (`LeaseStore`); needs a sqlx backend.
+lease = ["dep:tokio", "dep:tokio-util", "dep:uuid"]
+# Readiness probes per pool (`PoolProbe`) and, with `lease`, the singleton
+# job guard (`LeaseGuard`).
+runtime = ["dep:sekvent-runtime", "dep:futures", "dep:tokio"]
 
 [dependencies]
 sekvent-config = { workspace = true }
@@ -37,10 +42,16 @@ sqlx = { workspace = true, optional = true }
 sea-orm = { workspace = true, optional = true }
 sea-orm-migration = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+# Path, not workspace: keeps sekvent-runtime's default grpc-web feature off.
+sekvent-runtime = { path = "../sekvent-runtime", default-features = false, optional = true }
 
 [dev-dependencies]
 sekvent-testing = { workspace = true, features = ["postgres", "mysql"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

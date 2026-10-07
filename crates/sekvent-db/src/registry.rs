@@ -78,6 +78,8 @@ impl Pool {
 pub struct PoolRegistry {
     pools: BTreeMap<String, Pool>,
     unconfigured: BTreeSet<String>,
+    /// Connected pools whose spec was optional; every other pool is required.
+    optional: BTreeSet<String>,
     migrations: BTreeMap<String, PathBuf>,
 }
 
@@ -116,16 +118,41 @@ impl PoolRegistry {
             if let Some(dir) = spec.migrations {
                 registry.migrations.insert(spec.name.clone(), dir);
             }
+            if !spec.required {
+                registry.optional.insert(spec.name.clone());
+            }
             registry.pools.insert(spec.name, pool);
         }
         Ok(registry)
     }
 
-    /// Register an already-built pool (tests, custom setups).
+    /// Register an already-built pool (tests, custom setups) as required.
     pub fn insert(&mut self, name: impl Into<String>, pool: Pool) {
         let name = name.into();
         self.unconfigured.remove(&name);
+        self.optional.remove(&name);
         self.pools.insert(name, pool);
+    }
+
+    /// One probe per connected pool, named after it, required exactly when
+    /// its spec was. Unconfigured optional pools get none.
+    ///
+    /// ```ignore
+    /// let builder = registry.probes().into_iter().fold(Runtime::builder(), |b, p| b.probe(p));
+    /// ```
+    #[cfg(feature = "runtime")]
+    pub fn probes(&self) -> Vec<crate::PoolProbe> {
+        self.pools
+            .iter()
+            .map(|(name, pool)| {
+                let probe = crate::PoolProbe::new(name.clone(), pool.clone());
+                if self.optional.contains(name) {
+                    probe.optional()
+                } else {
+                    probe
+                }
+            })
+            .collect()
     }
 
     /// The pool called `name`. The error names the pool and says whether it
@@ -570,6 +597,42 @@ mod tests {
         .unwrap();
         let pool = registry.get("legacy").unwrap();
         assert_eq!(pool.mysql().unwrap().size(), 0);
+        registry.close().await;
+    }
+
+    #[cfg(all(feature = "runtime", feature = "sqlx-postgres"))]
+    #[tokio::test]
+    async fn probes_follow_the_specs() {
+        use sekvent_runtime::DependencyProbe;
+
+        let mut registry = PoolRegistry::build(vec![
+            spec("orders", "postgres://u@192.0.2.1:1/orders").lazy(),
+            spec("reports", "postgres://u@192.0.2.1:1/reports")
+                .lazy()
+                .optional(),
+            PoolSpec::new("audit", Secret::new("")).optional(),
+        ])
+        .await
+        .unwrap();
+        let flags = |registry: &PoolRegistry| -> Vec<(String, bool)> {
+            registry
+                .probes()
+                .iter()
+                .map(|probe| (probe.name().to_owned(), probe.required()))
+                .collect()
+        };
+        assert_eq!(
+            flags(&registry),
+            [("orders".to_owned(), true), ("reports".to_owned(), false)]
+        );
+
+        // An inserted pool is required, even under an optional pool's name.
+        let reports = registry.get("reports").unwrap().clone();
+        registry.insert("reports", reports);
+        assert_eq!(
+            flags(&registry),
+            [("orders".to_owned(), true), ("reports".to_owned(), true)]
+        );
         registry.close().await;
     }
 

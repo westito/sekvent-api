@@ -6,9 +6,10 @@
 //! stored value cannot be checked (an empty hash for a single-sign-on-only
 //! account, a malformed or over-limit hash). An unknown account and a wrong
 //! password produce the same [`LoginRejected::InvalidCredentials`] after the
-//! same amount of work. An account's disabled state is only
-//! reported once the password has been proven, so it cannot be probed
-//! either.
+//! same amount of work: the dummy runs the hasher's configured scheme at its
+//! configured cost, the form every current stored hash has. An account's
+//! disabled state is only reported once the password has been proven, so it
+//! cannot be probed either.
 
 use sekvent_error::{AppError, ErrorCode};
 
@@ -105,10 +106,34 @@ pub fn authenticate<U>(
     })
 }
 
+/// [`authenticate`] on tokio's blocking pool.
+///
+/// `lookup` carries the stored hash by value so it can move to the blocking
+/// thread. A task that fails (panics or is cancelled) is logged and reported
+/// as [`LoginRejected::InvalidCredentials`].
+#[cfg(feature = "tokio")]
+pub async fn authenticate_async<U: Send + 'static>(
+    hasher: &PasswordHasher,
+    lookup: Option<(U, String, bool)>,
+    password: sekvent_config::Secret,
+) -> LoginOutcome<U> {
+    let hasher = hasher.clone();
+    crate::password::run_blocking(move || {
+        let (account, stored) = match lookup {
+            Some((user, stored, enabled)) => (Some((user, enabled)), stored),
+            None => (None, String::new()),
+        };
+        let lookup = account.map(|(user, enabled)| (user, stored.as_str(), enabled));
+        authenticate(&hasher, lookup, password.expose())
+    })
+    .await
+    .unwrap_or(Err(LoginRejected::InvalidCredentials))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::password::{PasswordParams, dummy_runs};
+    use crate::password::{BcryptParams, PasswordParams, dummy_runs};
 
     fn hasher() -> PasswordHasher {
         PasswordHasher::new(PasswordParams {
@@ -222,5 +247,108 @@ mod tests {
             assert_eq!(error.message(), rejected.user_message());
             assert_eq!(error.reason(), Some(reason));
         }
+    }
+
+    #[test]
+    fn bcrypt_scheme_logins() {
+        let hasher = PasswordHasher::bcrypt(BcryptParams::new(4).prefixed()).unwrap();
+        let stored = hasher.hash("pw").unwrap();
+        assert_eq!(
+            authenticate(&hasher, Some(("ada", stored.as_str(), true)), "pw"),
+            Ok(Authenticated {
+                user: "ada",
+                needs_rehash: false
+            })
+        );
+        let argon = PasswordHasher::new(PasswordParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        })
+        .unwrap()
+        .hash("pw")
+        .unwrap();
+        let migrated = authenticate(&hasher, Some(("ada", argon.as_str(), true)), "pw").unwrap();
+        assert!(migrated.needs_rehash);
+    }
+
+    #[test]
+    fn an_unknown_user_runs_one_bcrypt_dummy_under_bcrypt() {
+        let hasher = PasswordHasher::bcrypt(BcryptParams::new(4)).unwrap();
+        let before = dummy_runs();
+        assert_eq!(
+            authenticate::<&str>(&hasher, None, "pw"),
+            Err(LoginRejected::InvalidCredentials)
+        );
+        assert_eq!(dummy_runs(), before + 1);
+        let stored = hasher.hash("pw").unwrap();
+        let before = dummy_runs();
+        assert_eq!(
+            authenticate(&hasher, Some(("ada", stored.as_str(), true)), "nope"),
+            Err(LoginRejected::InvalidCredentials)
+        );
+        assert_eq!(dummy_runs(), before);
+        let too_long = "x".repeat(73);
+        let before = dummy_runs();
+        assert_eq!(
+            authenticate(&hasher, Some(("ada", stored.as_str(), true)), &too_long),
+            Err(LoginRejected::InvalidCredentials)
+        );
+        assert_eq!(dummy_runs(), before);
+    }
+
+    #[test]
+    fn a_long_password_logs_in_against_a_truncating_legacy_hash() {
+        let long = "x".repeat(80);
+        let legacy = bcrypt::hash(&long, 4).unwrap();
+        let bcrypt_hasher = PasswordHasher::bcrypt(BcryptParams::new(4)).unwrap();
+        assert_eq!(
+            authenticate(&bcrypt_hasher, Some(("ada", legacy.as_str(), true)), &long),
+            Ok(Authenticated {
+                user: "ada",
+                needs_rehash: false
+            })
+        );
+        let migrated =
+            authenticate(&hasher(), Some(("ada", legacy.as_str(), true)), &long).unwrap();
+        assert!(migrated.needs_rehash);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn authenticate_on_the_blocking_pool() {
+        use sekvent_config::Secret;
+
+        let hasher = PasswordHasher::bcrypt(BcryptParams::new(4)).unwrap();
+        let stored = hasher.hash("pw").unwrap();
+        assert_eq!(
+            authenticate_async(
+                &hasher,
+                Some((7_u32, stored.clone(), true)),
+                Secret::new("pw")
+            )
+            .await,
+            Ok(Authenticated {
+                user: 7,
+                needs_rehash: false
+            })
+        );
+        assert_eq!(
+            authenticate_async(
+                &hasher,
+                Some((7_u32, stored.clone(), false)),
+                Secret::new("pw")
+            )
+            .await,
+            Err(LoginRejected::Disabled)
+        );
+        assert_eq!(
+            authenticate_async(&hasher, Some((7_u32, stored, true)), Secret::new("nope")).await,
+            Err(LoginRejected::InvalidCredentials)
+        );
+        assert_eq!(
+            authenticate_async::<u32>(&hasher, None, Secret::new("pw")).await,
+            Err(LoginRejected::InvalidCredentials)
+        );
     }
 }

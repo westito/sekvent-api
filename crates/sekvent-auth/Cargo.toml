@@ -14,6 +14,8 @@ default = []
 axum = ["dep:axum", "dep:http", "dep:sekvent-context", "sekvent-error/http"]
 # Request interceptor and role guard for tonic. Not wasm.
 tonic = ["dep:tonic", "dep:sekvent-context", "sekvent-error/grpc"]
+# Password hashing and login on tokio's blocking pool. Not wasm.
+tokio = ["dep:tokio"]
 
 [dependencies]
 sekvent-error = { workspace = true }
@@ -30,6 +32,7 @@ sekvent-context = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

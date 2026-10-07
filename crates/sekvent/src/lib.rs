@@ -9,13 +9,13 @@
 //! | [`config`] | `sekvent-config` | `config` (default) | `ConfigSource`, `Secret`, readers, `#[derive(EnvConfig)]` |
 //! | [`error`] | `sekvent-error` | `error` (default) | `ErrorCode`, `AppError`, `WireError`; HTTP and gRPC mappings |
 //! | [`context`] | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
-//! | [`telemetry`] | `sekvent-telemetry` | `telemetry` (default) | tracing init, log buffer, request ids, `truncate_for_log` |
-//! | [`runtime`] | `sekvent-runtime` | `runtime` (default) | staged lifecycle, supervision, health, the combined server |
-//! | [`resilience`] | `sekvent-resilience` | `resilience` | backoff, retry budget, rate gate, timeout, bulkhead, breaker |
-//! | [`auth`] | `sekvent-auth` | `auth` | password hashing, JWT with injected time, login helper |
+//! | [`telemetry`] | `sekvent-telemetry` | `telemetry` (default) | tracing init, log buffer, request ids, access log, `truncate_for_log` |
+//! | [`runtime`] | `sekvent-runtime` | `runtime` (default) | staged lifecycle, supervision, health, the combined server (CORS, limits, layers, access log), jobs, downloads |
+//! | [`resilience`] | `sekvent-resilience` | `resilience` | backoff, retry budget, rate gate, timeout, bulkhead, breaker, TTL cache |
+//! | [`auth`] | `sekvent-auth` | `auth` | argon2id and bcrypt password hashing, JWT with injected time, login helper |
 //! | [`link`] | `sekvent-link` | `link` | service-to-service tokens, middleware, interceptors |
 //! | [`client`] | `sekvent-client` | `client` | outbound HTTP with policy, context propagation, OAuth 2.0 |
-//! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, list filters |
+//! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, list filters, readiness probes, leases |
 //! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local, serialized and gRPC bindings |
 //!
 //! # Sub-features
@@ -27,11 +27,18 @@
 //!   mappings for `AppError`.
 //! - `runtime-grpc-web`: serve gRPC-Web on the same listener as native gRPC.
 //!   Off in the facade's defaults, unlike the `sekvent-runtime` crate's.
+//! - `runtime-cron`: cron schedules for jobs (`JobSpec::cron`, UTC).
 //! - `auth-axum`, `auth-tonic`: bearer extractors, interceptors, role guards.
+//! - `auth-tokio`: password hashing and verification on tokio's blocking
+//!   pool (`hash_async`, `verify_async`, `authenticate_async`).
 //! - `link-axum`, `link-tonic`: inbound middleware and interceptors.
 //! - `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`,
 //!   `db-sea-orm-mysql`: database backends.
 //! - `db-migrate`, `db-sea-orm-migrate`: migrations on boot.
+//! - `db-lease`: database leases with fencing tokens (`LeaseStore`), on a
+//!   sqlx backend; with `runtime` also `LeaseGuard` for singleton jobs.
+//! - `db` and `runtime` together give pool readiness probes
+//!   (`PoolRegistry::probes`) on a sqlx backend.
 //! - `component` also turns on `config`, `error` and `context`; with
 //!   `runtime` on as well, `App::register` runs the App as a runtime unit.
 //! - `component-grpc`: the component `grpc` binding and serving components
@@ -52,7 +59,8 @@
 //!
 //! [`prelude`] brings the handful of names nearly every service touches:
 //! `AppError`, `ErrorCode`, `CallContext`, `Secret`, `EnvConfig`,
-//! `FromConfig` and the runtime and server builders, and with `component`
+//! `FromConfig`, the runtime and server builders and `JobSpec` and
+//! `JobContext` for background jobs, and with `component`
 //! the `App`, the `ComponentError` trait and derive, and `Lifecycle`.
 //!
 //! # Components
@@ -135,8 +143,8 @@ pub mod prelude {
 
     #[cfg(feature = "runtime")]
     pub use sekvent_runtime::{
-        Ctx, Runtime, RuntimeBuilder, RuntimeHandle, Server, ServerBuilder, ShutdownTrigger, Stage,
-        UnitContext, UnitPolicy,
+        Ctx, JobContext, JobSpec, Runtime, RuntimeBuilder, RuntimeHandle, Server, ServerBuilder,
+        ShutdownTrigger, Stage, UnitContext, UnitPolicy,
     };
 
     #[cfg(feature = "component")]

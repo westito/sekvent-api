@@ -1,6 +1,6 @@
 # The sekvent component model
 
-> **Status: milestones C1 and C2 implemented.** C1: the `local` and
+> **Status: milestones C1, C2 and C4 implemented.** C1: the `local` and
 > `local-serialized` bindings, `#[call]` methods, the fail-closed App
 > builder, lifecycle hooks with draining, per-method timeouts and bulkheads,
 > `ComponentError` and the `local_only` / `remote_only` modes, in
@@ -10,13 +10,18 @@
 > authentication, retries, circuit breakers, named policies, bulkhead
 > queues, the call-hop limit, proto-first contracts checked at compile time,
 > and `cargo sekvent contract emit | check`; see
-> [design/component-c2.md](design/component-c2.md). The specs win where they
-> are more specific than this document, and
-> [examples/shop](../examples/shop) shows them end to end, including a
-> split topology. Everything from milestone C3 on (see the roadmap below) is
-> still planned: names and syntax shown for it are illustrative. The
-> `cargo sekvent` subcommand names `component`, `extract`, `queue` and
-> `schedule` are reserved for this work; today they exit with status 2.
+> [design/component-c2.md](design/component-c2.md). C4: interval, cron
+> and manual jobs in `sekvent-runtime` (`RuntimeBuilder::job`, facade
+> feature `runtime-cron` for cron) and singleton jobs over a database lease
+> with fencing tokens in `sekvent-db` (`LeaseStore`, `LeaseGuard`, facade
+> feature `db-lease`); see
+> [design/p8-service-essentials.md](design/p8-service-essentials.md). The
+> specs win where they are more specific than this document, and
+> [examples/shop](../examples/shop) shows C1 and C2 end to end, including a
+> split topology. C3 and C5 (see the roadmap below) are still planned: names
+> and syntax shown for them are illustrative. The `cargo sekvent` subcommand
+> names `component`, `extract`, `queue` and `schedule` are reserved; today
+> they exit with status 2 (C4 needs no subcommand: jobs are code).
 
 ## Goal
 
@@ -340,17 +345,53 @@ belongs to the endpoint. A reference to a policy with no keys, or a
 
 ## Schedule
 
-Cron and interval jobs, parsed with `croner`:
+A job is one runtime unit, registered with `RuntimeBuilder::job(name,
+stage, spec, run)`; `run` receives a `JobContext` per run (run id, trigger,
+tick, fence, cancellation, a root `CallContext`). A failed or panicking run
+is recorded in the job's `JobStatus` and never stops or restarts the unit:
+the next tick runs. The rules, specified in
+[design/p8-service-essentials.md](design/p8-service-essentials.md):
 
-- A **singleton** job runs on one instance at a time. The instance holds a
-  lease row in the database with a fencing token; expiry is computed from
-  the database clock, not the instance clock. The token is handed to the job
-  so its writes can be guarded against a stale holder.
-- Losing the lease cancels the running job.
+- **Schedules.** `JobSpec::interval(period)`, `JobSpec::cron(pattern)`
+  (feature `cron`, parsed with `croner`: five fields, or six with leading
+  seconds) and `JobSpec::manual()` (runs only when triggered through its
+  `JobHandle`). **Cron runs in UTC**; other time zones are not supported.
+- **Fixed cadence.** In-process intervals tick at `start + initial_delay +
+  k × period` on tokio's clock, however long the runs take. **Singleton
+  intervals are aligned to the Unix epoch** on the wall clock
+  (`interval(15m)` fires at :00, :15, :30, :45 UTC), so every instance
+  computes the same ticks. Jitter delays a scheduled run without moving the
+  grid. The wall clock is injected (`JobSpec::clock`; `TokioWallClock`
+  follows `tokio::time::pause`).
 - **Overlap:** a run that is still going when the next tick arrives is not
   started twice; the tick is skipped.
-- **Misfire:** after downtime, at most one catch-up run happens within a
-  grace window; missed ticks never replay as a burst.
+- **Misfire:** a tick that starts later than `misfire_grace` (default
+  1 min, at least 1 s) is skipped. After a clock jump or a stall, the
+  ticks passed over yield one run, never a burst, and count as skipped.
+  After downtime, a singleton job runs at most one catch-up for the latest
+  missed tick, and only within the grace. In-process jobs have no catch-up
+  across restarts.
+- **At most once per tick.** A run that died with its process is not
+  retried; a timed-out run is dropped (`DEADLINE_EXCEEDED` /
+  `JOB_TIMED_OUT`).
+- **Singleton jobs** run on one instance at a time:
+  `spec.singleton(LeaseGuard::new(LeaseStore::new(&pool)))`. The guard takes
+  a per-run lease row in the database at each tick and releases it after
+  the run; expiry is computed from the database clock, not the instance
+  clock, and a heartbeat renews it while the run lasts. The row remembers
+  the last tick, so each tick runs once across all instances. Every
+  acquisition increments the row's **fencing token**, which the run reads
+  from `JobContext::fence` so its writes can be guarded against a stale
+  holder (`LeaseStore::check_fence_postgres` / `check_fence_mysql` inside
+  the transaction).
+- Losing the lease cancels the running job (`ABORTED` / `LEASE_LOST`).
+- **On demand.** `JobHandle::trigger` starts a run now, or fails with
+  `JOB_ALREADY_RUNNING`, `JOB_HELD_ELSEWHERE` or `JOB_NOT_RUNNING`. Jobs
+  and direct `LeaseStore::try_acquire` users that share a lease name
+  (`LeaseGuard::with_lease_name`) exclude each other.
+- The application owns the lease table: `LeaseStore::schema_sql` gives
+  the DDL for its migrations, `ensure_schema` creates it, `verify_schema`
+  fails startup when it is missing.
 
 ## Bus
 
@@ -400,5 +441,5 @@ Call sites do not change: callers already hold the handle.
 | C1 (implemented) | `local` and `local-serialized` bindings, `#[call]`, the App builder, timeout and bulkhead, `ComponentError`, `local_only` / `remote_only`, an `examples/shop` workspace |
 | C2 (implemented) | `grpc` binding and serving with link authentication, circuit breaker, retry and named policies, the hop limit, proto-first contracts with `contract emit` / `contract check`, a `split-grpc` profile in `examples/shop` |
 | C3 | The bus (SQL outbox, inbox, relay), `#[async_call]`, `#[deferred]`, topics |
-| C4 | Schedule |
+| C4 (implemented) | Schedule: interval, cron and manual jobs (`sekvent-runtime`); singleton jobs over a database lease with fencing tokens (`sekvent-db`) |
 | C5 | NATS JetStream, `extract` |

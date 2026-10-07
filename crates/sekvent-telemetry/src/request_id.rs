@@ -125,8 +125,8 @@ where
 }
 
 /// Keep a valid incoming id (collapsing repeated headers to one); replace
-/// anything else with a fresh id.
-fn ensure_request_id<B>(request: &mut Request<B>) -> HeaderValue {
+/// anything else with a fresh id. Shared with the access log layer.
+pub(crate) fn ensure_request_id<B>(request: &mut Request<B>) -> HeaderValue {
     let id = request
         .headers()
         .get(&REQUEST_ID_HEADER)
@@ -284,6 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn records_the_id_on_a_span() {
+        crate::test_support::keep_interest_open();
         let buffer = LogBuffer::new(4);
         let subscriber = Registry::default().with(buffer.layer());
         let _default = tracing::subscriber::set_default(subscriber);

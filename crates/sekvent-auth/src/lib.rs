@@ -23,9 +23,13 @@
 //!
 //! - `axum`: the `axum::Bearer` extractor and `axum::RequireRole` guard.
 //! - `tonic`: the `tonic::BearerInterceptor` and role helpers.
+//! - `tokio`: `PasswordHasher::hash_async`, `PasswordHasher::verify_async`
+//!   and `authenticate_async`, which run the expensive work on tokio's
+//!   blocking pool. Not wasm.
 //!
-//! Both adapters verify through a `BearerAuth`, which reads the time from an
-//! injected `sekvent_context::Clock`; they are not wasm-compatible.
+//! The `axum` and `tonic` adapters verify through a `BearerAuth`, which
+//! reads the time from an injected `sekvent_context::Clock`; they are not
+//! wasm-compatible.
 
 #![forbid(unsafe_code)]
 
@@ -44,6 +48,11 @@ pub mod tonic;
 #[cfg(any(feature = "axum", feature = "tonic"))]
 pub use adapter::BearerAuth;
 pub use jwt::{Claims, DEVELOPMENT_SECRET, JwtKeys, NoClaims, TokenRejected, Validation};
+#[cfg(feature = "tokio")]
+pub use login::authenticate_async;
 pub use login::{Authenticated, LoginOutcome, LoginRejected, authenticate};
-pub use password::{MAX_BCRYPT_COST, PasswordHasher, PasswordParams, Verification};
+pub use password::{
+    BCRYPT_MAX_PASSWORD_BYTES, BcryptParams, BcryptVersion, MAX_BCRYPT_COST, PasswordHasher,
+    PasswordParams, PasswordScheme, Verification,
+};
 pub use roles::{HasRoles, require_any_role};

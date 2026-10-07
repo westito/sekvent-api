@@ -20,7 +20,7 @@ config = ["dep:sekvent-config"]
 error = ["dep:sekvent-error"]
 context = ["dep:sekvent-context"]
 telemetry = ["dep:sekvent-telemetry"]
-runtime = ["dep:sekvent-runtime", "sekvent-component?/runtime"]
+runtime = ["dep:sekvent-runtime", "sekvent-component?/runtime", "sekvent-db?/runtime"]
 resilience = ["dep:sekvent-resilience"]
 auth = ["dep:sekvent-auth"]
 link = ["dep:sekvent-link"]
@@ -37,10 +37,14 @@ error-grpc = ["error", "sekvent-error/grpc"]
 
 # sekvent-runtime: serve gRPC-Web next to native gRPC on the same listener.
 runtime-grpc-web = ["runtime", "sekvent-runtime/grpc-web"]
+# sekvent-runtime: cron schedules for jobs (UTC).
+runtime-cron = ["runtime", "sekvent-runtime/cron"]
 
 # sekvent-auth adapters.
 auth-axum = ["auth", "sekvent-auth/axum"]
 auth-tonic = ["auth", "sekvent-auth/tonic"]
+# sekvent-auth: password hashing on tokio's blocking pool.
+auth-tokio = ["auth", "sekvent-auth/tokio"]
 
 # sekvent-link adapters.
 link-axum = ["link", "sekvent-link/axum"]
@@ -53,6 +57,8 @@ db-sea-orm-postgres = ["db", "sekvent-db/sea-orm-postgres"]
 db-sea-orm-mysql = ["db", "sekvent-db/sea-orm-mysql"]
 db-migrate = ["db", "sekvent-db/migrate"]
 db-sea-orm-migrate = ["db", "sekvent-db/sea-orm-migrate"]
+# sekvent-db: leases with fencing tokens; with `runtime`, singleton jobs.
+db-lease = ["db", "sekvent-db/lease"]
 
 full = [
     "config",
@@ -70,8 +76,10 @@ full = [
     "error-http",
     "error-grpc",
     "runtime-grpc-web",
+    "runtime-cron",
     "auth-axum",
     "auth-tonic",
+    "auth-tokio",
     "link-axum",
     "link-tonic",
     "db-sqlx-postgres",
@@ -80,6 +88,7 @@ full = [
     "db-sea-orm-mysql",
     "db-migrate",
     "db-sea-orm-migrate",
+    "db-lease",
 ]
 
 [dependencies]

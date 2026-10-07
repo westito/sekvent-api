@@ -1,6 +1,6 @@
 ---
 name: sekvent
-description: Write or change code in a Rust backend built on the sekvent framework (a workspace with `sekvent.toml` and a `sekvent-api` dependency). Use when adding a config struct, an error, a gRPC or REST endpoint, a background worker, an outbound HTTP client with retries or a breaker, a database pool, a JWT login, service-to-service authentication, a container-backed test, protobuf codegen or a component (a trait that runs in-process now and can move to its own service later) — and before hand-rolling any of those, since sekvent already has them. Gives the crate map, copy-ready recipes with the real API names, and the pitfalls (secrets in logs, fail-open defaults, missing deadlines, retrying non-idempotent calls). For creating a project use `sekvent-new-project`; for moving an existing backend onto sekvent use `sekvent-migrate`.
+description: Write or change code in a Rust backend built on the sekvent framework (a workspace with `sekvent.toml` and a `sekvent-api` dependency). Use when adding a config struct, an error, a gRPC or REST endpoint, CORS or a body limit, a background worker, a periodic or singleton job, a database lease, an outbound HTTP client with retries or a breaker, a small TTL cache, a database pool or its readiness probe, a JWT login or bcrypt-compatible passwords, a file download or upload, service-to-service authentication, a container-backed test, protobuf codegen or a component (a trait that runs in-process now and can move to its own service later) — and before hand-rolling any of those, since sekvent already has them. Gives the crate map, copy-ready recipes with the real API names, and the pitfalls (secrets in logs, fail-open defaults, missing deadlines, retrying non-idempotent calls). For creating a project use `sekvent-new-project`; for moving an existing backend onto sekvent use `sekvent-migrate`.
 ---
 
 # Building on sekvent
@@ -11,7 +11,7 @@ library is `sekvent`) re-exporting focused libraries behind features, plus the
 code needs `use sekvent::prelude::*;` (`AppError`, `ErrorCode`, `CallContext`,
 `Secret`, `EnvConfig`, `FromConfig`, `Runtime`, `RuntimeBuilder`,
 `RuntimeHandle`, `Server`, `ServerBuilder`, `Stage`, `UnitPolicy`,
-`UnitContext`, `Ctx`, `ShutdownTrigger`; with the `component` feature also
+`UnitContext`, `Ctx`, `ShutdownTrigger`, `JobSpec`, `JobContext`; with the `component` feature also
 `App`, `ComponentError`, `Lifecycle`).
 
 Where commands run is the `build-on-rtx` skill's business: compile, lint and
@@ -27,13 +27,17 @@ skill.
 | Read env config, secrets | `config` | default |
 | Return an error from any handler | `error` | default; `error-http`, `error-grpc` for the mappings |
 | Request id, deadline, caller, clock | `context` | default |
-| Logging setup, truncating untrusted text | `telemetry` | default |
-| Lifecycle, health, one listener for gRPC + gRPC-Web + REST | `runtime` | default; `runtime-grpc-web` |
-| Timeout, retry, rate gate, bulkhead, breaker, backoff | `resilience` | `resilience` |
-| Password hashing, JWT, login | `auth` | `auth`; `auth-axum`, `auth-tonic` |
+| Logging setup, request ids, access log, truncating untrusted text | `telemetry` | default |
+| Lifecycle, health, one listener for gRPC + gRPC-Web + REST, CORS, body limits, global layers | `runtime` | default; `runtime-grpc-web` |
+| Interval, cron and manual jobs | `runtime` (`JobSpec`, `RuntimeBuilder::job`) | default; `runtime-cron` for cron |
+| File downloads (safe headers, type sniffing, filenames) | `runtime` (`Download`) | default |
+| Timeout, retry, rate gate, bulkhead, breaker, backoff, TTL cache | `resilience` | `resilience` |
+| Password hashing (argon2id, bcrypt), JWT, login | `auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` (async hashing) |
 | Service-to-service tokens | `link` | `link`; `link-axum`, `link-tonic` |
 | Outbound HTTP, OAuth 2.0 client credentials | `client` | `client` |
 | Pools, migrations, list filters | `db` | `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` |
+| Readiness probes per pool | `db` (`PoolRegistry::probes`) | `db` + `runtime` + a sqlx backend |
+| Leases with fencing tokens, singleton jobs | `db` (`LeaseStore`, `LeaseGuard`) | `db-lease` + a sqlx backend; `runtime` for `LeaseGuard` |
 | A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; `component-grpc` for the `grpc` binding and serving; `runtime` for `App::register` |
 | Postgres/MySQL test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
@@ -126,18 +130,137 @@ runtime.run().await?;               // until SIGINT/SIGTERM, then drain
 
 - Health is automatic: `/livez`, `/readyz`, `/healthz` at the root and
   `grpc.health.v1` (NOT_SERVING while draining).
-- Every request carries a `CallContext`: axum handlers take `Ctx(cx): Ctx`;
-  tonic handlers read `request.extensions().get::<CallContext>()`.
+- Every request except health carries a `CallContext`: axum handlers take
+  `Ctx(cx): Ctx`; tonic handlers read
+  `request.extensions().get::<CallContext>()`. Its request id is the
+  response's `x-request-id` (a valid incoming one is kept, otherwise a
+  UUID v7 is minted).
 - Stages start in order `Infrastructure → Components → Workers → Ingress`
   and drain in reverse. A unit calls `ctx.ready()` once up and returns when
   `ctx.shutdown()` fires.
 - Readiness from dependencies: implement `sekvent::runtime::DependencyProbe`
   and register with `.probe(..)`. `ProbeFailure` details are `&'static str`,
-  never upstream text.
+  never upstream text. Database pools have ready-made probes (see
+  "Database probes").
 - Service-to-service auth on the listener:
   `let auth = sekvent::link::authenticator(link.inbound().clone());`
   `Server::builder().authenticator(move |parts| auth(parts))`.
 
+### Server: CORS, limits, layers, access log
+
+```rust
+use sekvent::runtime::Cors;
+
+let mut builder = Server::builder()
+    .add_service(OrdersServiceServer::new(api).max_decoding_message_size(16 << 20)) // gRPC limits: per service
+    .rest(rest_routes())
+    .prefix("/api")
+    .rest_body_limit(4 * 1024 * 1024)        // REST extractors; default 2 MiB, 413 above
+    .layer(AuditLayer::new(audit))           // every REST, gRPC and gRPC-Web request, never health
+    .access_log(true);                       // default: one event per request
+// APP_CORS_ORIGINS (`*` or a comma list), _CREDENTIALS, _MAX_AGE, _ALLOW_HEADERS, _EXPOSE_HEADERS
+if let Some(cors) = Cors::from_config(&EnvSource, "APP_CORS_")? {   // unset or blank ORIGINS: CORS off
+    builder = builder.cors(cors);
+}
+let server = builder.bind(config.listen_addr).await?;
+// in code: Cors::origins(["https://app.example.com"])?.allow_credentials(true).max_age(Duration::from_secs(600))
+```
+
+- The stack, outermost first: request id and access log, CORS, the health
+  endpoints, the call context (authenticator), your `.layer(..)`s (a later
+  call wraps the earlier ones, as `Router::layer`), then routing. A
+  preflight never reaches the authenticator or a handler; health (HTTP and
+  `grpc.health.v1`) never sees your layers or the authenticator.
+- CORS covers REST and gRPC-Web. Origins are `http(s)://host[:port]`,
+  normalized (IPv6 hosts included, e.g. `http://[::1]:8080`); a path, `*`
+  inside a list, `null` or an empty list is `INVALID_ARGUMENT` naming the
+  key and the entry's index, never its text. Credentials with
+  `Cors::any_origin()` fail `bind`.
+  Defaults allow `authorization`, `content-type`, `grpc-timeout`,
+  `idempotency-key`, `traceparent`, `x-grpc-web`, `x-request-id`,
+  `x-user-agent` and expose `grpc-status`, `grpc-message`,
+  `grpc-status-details-bin`, `content-disposition`, `x-request-id`; add to
+  them with `.allow_headers(&[..])` / `.expose_headers(&[..])`.
+  `Cors::config_keys(prefix)` lists the keys for an env template.
+- Configured CORS is authoritative: `Access-Control-*` headers set by a
+  handler or layer are stripped. Only a real preflight (`OPTIONS` with
+  `Origin` and `Access-Control-Request-Method`) is answered by CORS; any
+  other `OPTIONS` reaches your routes.
+- `rest_body_limit` is axum's `DefaultBodyLimit`, so one route may raise it
+  with its own `DefaultBodyLimit::max(..)` (see "Downloads and uploads").
+  A handler that reads `Body` raw bounds it itself
+  (`http_body_util::Limited`).
+- gRPC message sizes are set on each generated server
+  (`max_decoding_message_size`, `max_encoding_message_size`; tonic's
+  default is 4 MiB); the component service keeps a fixed 4 MiB.
+- The access log is one event per request, target `sekvent::access`,
+  message `request completed`, with `method`, `path` (never the query),
+  `route`, `protocol`, `status`, `grpc_status` (gRPC-Web text included),
+  `latency_ms`, `aborted` (a `HEAD` probe is not aborted) and `request_id`;
+  `warn` for 5xx and gRPC `UNKNOWN`/`INTERNAL`/`DATA_LOSS`, `debug` for
+  health, `info` otherwise. `SEKVENT_LOG=info,sekvent::access=warn`
+  silences routine requests; `.access_log(false)` drops the event but
+  keeps request ids and the `request` span.
+  `sekvent::telemetry::access_log::AccessLogLayer` is the same layer for a
+  router you serve yourself.
+
+### Downloads and uploads
+
+```rust
+use sekvent::runtime::{CacheControl, Disposition, Download};
+
+async fn invoice_pdf(Ctx(cx): Ctx, Path(id): Path<String>) -> Result<Download, AppError> {
+    let pdf = invoices.pdf(&cx, &id).await?;                       // Vec<u8> / Bytes
+    Ok(Download::bytes(pdf)
+        .filename(&format!("invoice-{id}.pdf"))                    // sanitized; filename* for non-ASCII
+        .disposition(Disposition::Inline)                          // default Attachment
+        .cache(CacheControl::NoStore))                             // default: `private, no-cache`
+}
+// Text is never sniffed: set CSV, JSON and plain text explicitly.
+Download::bytes(csv).filename("orders.csv").content_type("text/csv; charset=utf-8")?;
+Download::stream(axum::body::Body::from_stream(rows), Some(len)).filename("export.ndjson");
+```
+
+- Headers: `Content-Type` (explicit, else sniffed from a `bytes` body by
+  magic bytes, else `application/octet-stream`), `Content-Disposition`,
+  `Content-Length`, `Cache-Control`, `X-Content-Type-Options: nosniff`.
+- `Inline` is kept only for PDF, PNG, JPEG, GIF, WebP, AVIF, `text/plain`,
+  audio and video; anything else (HTML, SVG, XML, unknown) is sent as an
+  attachment, which closes stored XSS through downloads.
+- `sanitize_filename`, `content_disposition` and `sniff_content_type` are
+  public for code that builds headers or stores files itself.
+- `Download`'s `Debug` never prints the body.
+
+Uploads: raise the limit on the upload route alone, enable axum's
+`multipart` feature in the service's manifest, cap each field while
+reading it, decide the type from the first bytes and store under a name
+the server chooses:
+
+```rust
+use axum::extract::{DefaultBodyLimit, Multipart};
+use sekvent::runtime::{sanitize_filename, sniff_content_type};
+
+let rest = Router::new()
+    .route("/files", post(upload).route_layer(DefaultBodyLimit::max(16 * 1024 * 1024))) // this route only
+    .route("/orders", post(create_order));                                              // keeps rest_body_limit
+
+async fn upload(Ctx(cx): Ctx, mut multipart: Multipart) -> Result<Json<Stored>, AppError> {
+    let malformed = || AppError::invalid_argument("malformed upload");
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| malformed())? {
+        let original = field.file_name().map(sanitize_filename);          // metadata only
+        let mut data = Vec::new();
+        while let Some(chunk) = field.chunk().await.map_err(|_| malformed())? {
+            if data.len() + chunk.len() > MAX_FILE_BYTES {
+                return Err(AppError::invalid_argument("the file is too large"));
+            }
+            data.extend_from_slice(&chunk);
+        }
+        let content_type = sniff_content_type(&data, original.as_deref()); // never the client's Content-Type
+        files.store(&cx, new_file_id(), content_type, original, data).await?; // server-chosen name
+    }
+    …
+}
+```
 ### Worker unit
 
 ```rust
@@ -166,6 +289,160 @@ process. A restarting unit holds its stage until one of its runs calls
 `ctx.ready()`; a run longer than `RuntimeBuilder::restart_reset_after`
 (default 60s) resets the restart count, so `max_restarts` bounds crash loops.
 
+For periodic or on-demand work use a job instead of a hand-written loop.
+
+### Jobs
+
+```rust
+let cleanup = JobSpec::interval(Duration::from_secs(600))   // ticks at start + 10m, + 20m, … however long runs take
+    .jitter(Duration::from_secs(30))                        // below the interval; never moves the grid
+    .timeout(Duration::from_secs(120));                     // dropped at once: DEADLINE_EXCEEDED / JOB_TIMED_OUT
+let report = JobSpec::cron("0 30 2 * * *")?;                // feature runtime-cron; UTC; 5 fields, or 6 with seconds
+let reindex = JobSpec::manual();                            // runs only when triggered
+let reindex_now = reindex.handle();                         // usable before registration: give it to the admin API
+
+let runtime = Runtime::builder()
+    .job("sessions-cleanup", Stage::Workers, cleanup, {
+        let repo = repo.clone();
+        move |cx: JobContext| {
+            let repo = repo.clone();
+            async move { repo.delete_expired(&cx.call_context()).await }   // Result<(), AppError>
+        }
+    })
+    .job("daily-report", Stage::Workers, report, move |cx| reports.clone().build(cx))
+    .job("reindex", Stage::Workers, reindex, move |cx| search.clone().reindex(cx))
+    .unit("api", Stage::Ingress, UnitPolicy::Critical, server.into_unit())
+    .build()?;
+
+// in the admin handler
+let started = reindex_now.trigger().await.map_err(AppError::from)?;  // RunStarted { run_id, fence }
+let status = reindex_now.status();   // state, current, last, next_tick, runs, failures, skipped
+```
+
+- A job is one unit (`UnitPolicy::Critical`) that never fails because a
+  run failed: an `Err` (`warn!`) or a panic (`error!`, `INTERNAL` /
+  `JOB_PANICKED`) lands in `JobStatus` and the next tick runs. Failed runs
+  are not retried.
+- Fixed cadence: in-process ticks are `start + initial_delay + k × period`
+  on tokio's clock; `initial_delay` defaults to one period
+  (`.initial_delay(Duration::ZERO)` runs at start). A tick that finds the
+  previous run still going is skipped (overlap); a tick that starts later
+  than `.misfire_grace(..)` (default 1 min, at least 1 s) is skipped too.
+  After a clock jump or a stall, every tick due before the current one is
+  passed over: one run per stall, never a burst. Passed-over ticks count
+  in `JobStatus.skipped`; each pass-over logs one `info` event.
+- `JobContext`: `job()`, `run_id()` (a fresh UUID v7, also on the run's
+  `job` span), `trigger()` (`RunTrigger::Schedule`, `CatchUp`, `Manual`),
+  `tick()`, `fence()`, `is_cancelled()`, `cancelled()`, `cancel_token()`
+  (a child token for spawned tasks), `cancel_reason()` (`Shutdown`,
+  `Timeout`, `LeaseLost`) and `call_context()`, a root `CallContext` with
+  the run id, the run's cancellation and the timeout as deadline; pass it
+  to everything the run calls.
+- On drain the run's token fires and the run is awaited until the stop
+  deadline; check `cx.is_cancelled()` between batches (or await
+  `cx.cancelled()` in a `select!`). A timeout or a lost lease drops the
+  run at once, and a run whose lease or time is already gone never starts
+  the closure.
+- `trigger()` starts a run now (`RunTrigger::Manual`, no jitter) or fails
+  with a `TriggerError`; `error.kind()` is a `TriggerErrorKind`:
+  `AlreadyRunning` → `FAILED_PRECONDITION` / `JOB_ALREADY_RUNNING`,
+  `HeldElsewhere` → `FAILED_PRECONDITION` / `JOB_HELD_ELSEWHERE`,
+  `NotRunning` (before start, while draining, after stop) → `UNAVAILABLE`
+  / `JOB_NOT_RUNNING`, `GuardFailed(code)` → `UNAVAILABLE` /
+  `JOB_GUARD_FAILED`. Reasons: `sekvent::runtime::reasons`.
+- Guard calls are bounded: a tick's acquire waits at most its misfire
+  grace (a manual trigger's a fixed cap), and a permit obtained too late
+  is released and the tick skipped. A panicking guard is a guard error
+  (`GUARD_PANICKED`), not a crash.
+- `build()` fails with `INVALID_ARGUMENT` naming the job for a name outside
+  `[A-Za-z0-9._:-]{1,100}`, a zero interval or timeout, jitter not below
+  the interval (or above 1 h for cron), a cron pattern that never fires
+  again, a `misfire_grace` below 1 s, a singleton interval below 1 s or
+  not in whole milliseconds, and `jitter`, `initial_delay` or
+  `misfire_grace` on a manual job.
+- Tests: `#[tokio::test(start_paused = true)]`, a runtime built
+  `without_signals()`, runs reporting through channels. Cron and singleton
+  schedules read the wall clock:
+  `.clock(Arc::new(sekvent::runtime::TokioWallClock::new(start)))`
+  makes it follow the paused tokio clock; `.jitter_rng(StdRng::seed_from_u64(7))`
+  fixes the jitter.
+
+### Singleton jobs and leases
+
+A singleton job runs on one instance at a time across every replica
+(features `db-lease`, `runtime` and a sqlx backend):
+
+```rust
+use sekvent::db::{DEFAULT_LEASE_TTL, FencingToken, LeaseGuard, LeaseStore};
+
+let store = LeaseStore::new(pools.get("orders_db")?).with_holder(&pod_name)?; // holder: shown in `info`, never a secret
+store.verify_schema().await?;      // FAILED_PRECONDITION / LEASE_SCHEMA_MISSING when the table is absent
+// the app owns the table: put store.schema_sql() into a migration (or call store.ensure_schema())
+
+let spec = JobSpec::interval(Duration::from_secs(15 * 60))      // singleton: :00, :15, :30, :45 UTC on every instance
+    .singleton(LeaseGuard::new(store.clone()));                  // lease named after the job, TTL 30 s
+let builder = builder.job("orders-sync", Stage::Workers, spec, move |cx| sync(cx, pg.clone(), store.clone()));
+
+async fn sync(cx: JobContext, pg: PgPool, store: LeaseStore) -> Result<(), AppError> {
+    let fence = FencingToken::new(cx.fence().expect("singleton runs carry a fence"));
+    let mut tx = pg.begin().await.map_err(sekvent::db::to_app_error)?;
+    store.check_fence_postgres(&mut *tx, "orders-sync", fence).await?; // ABORTED / LEASE_LOST after a takeover
+    // … writes …
+    tx.commit().await.map_err(sekvent::db::to_app_error)?;
+    Ok(())
+}
+```
+
+- Each tick runs on exactly one instance: the guard takes the lease row at
+  the tick, releases it after the run, and the row remembers the last tick.
+  Expiry comes from the database clock; a heartbeat renews every `ttl / 3`.
+  A run still going at the next tick holds the lease, so every instance
+  skips that tick. After downtime one catch-up run for the latest missed
+  tick happens if it is within `misfire_grace`; older ticks never run.
+- Losing the lease cancels the run (`cancel_reason()` is `LeaseLost`,
+  outcome `ABORTED` / `LEASE_LOST`). Every acquisition increments the
+  fencing token: guard writes with `check_fence_postgres` /
+  `check_fence_mysql` inside the transaction, or store the fence in the
+  rows (`WHERE last_fence <= $fence`).
+- `LeaseGuard::with_ttl(..)?` changes the TTL (1 s to 24 h);
+  `.with_lease_name("orders-sync")?` shares one lease between several jobs
+  or direct lease users, so they exclude each other.
+- Acquisition is one transaction (claim and fence read); the lease's
+  validity is measured from just before the claim. An acquisition whose
+  outcome is unknown (e.g. the commit's reply was lost) is released in the
+  background by owner id, so it never blocks the lease for a full TTL.
+
+On-demand exclusive work, two shapes:
+
+```rust
+// 1. A manual job: the runtime drives the lease, heartbeat, drain and panics.
+let spec = JobSpec::manual().singleton(LeaseGuard::new(store.clone()).with_lease_name("orders-sync")?);
+let sync = spec.handle();                      // give it to the RPC service
+let builder = builder.job("orders-full-sync", Stage::Workers, spec, move |cx| full_sync(cx));
+// in the RPC: sync.trigger().await.map_err(AppError::from)?  → FAILED_PRECONDITION / JOB_HELD_ELSEWHERE …
+
+// 2. Direct: code that is not a job holds the lease itself.
+let Some(lease) = store.try_acquire("orders-sync", DEFAULT_LEASE_TTL).await? else {
+    return Err(AppError::failed_precondition("a sync is already running").with_reason("SYNC_RUNNING"));
+};
+let held = lease.keep_alive();                 // renews in the background; held.lost() fires when it is gone
+let fence = held.fence();
+let lost = held.lost();                        // an owned token: select! must not borrow a temporary
+tokio::select! {
+    result = sync_all(fence) => { held.release().await?; result }
+    () = lost.cancelled() => Err(AppError::new(ErrorCode::Aborted, "the sync lost its lease")),
+}
+```
+
+`keep_alive()` on a lease that has already expired returns one whose
+`lost()` has fired. A `release()` cancelled midway still releases in the
+background on drop.
+`Lease` also has `renew()` and `release()` for hand-driven renewal;
+`store.info(name)` reports holder, fence and remaining time;
+`store.try_acquire_tick(name, tick, ttl)` and `store.last_tick(name)` are
+the per-tick primitives the guard uses. Lease names are 1–200 bytes of
+`[A-Za-z0-9._:/-]`; the default table is `sekvent_leases`
+(`.with_table(..)?` to change it).
 ### Outbound client with a policy
 
 ```rust
@@ -202,6 +479,32 @@ let created: Invoice = billing.post("/invoices").json(&draft)
   process-wide rustls provider unless one is installed; reqwest's own TLS
   settings then apply.
 
+### TTL cache
+
+```rust
+use sekvent::resilience::TtlCache;
+
+let permissions: TtlCache<String, Arc<Permissions>> = TtlCache::builder(Duration::from_secs(60))
+    .max_entries(1_000)                          // default 10 000
+    .stale_if_error(Duration::from_secs(300))    // serve the expired value while reloads fail transiently
+    .build()?;
+let perms = permissions
+    .get_or_try_insert(user_id.clone(), || iam.load_permissions(&cx, &user_id))   // one load per key, however many wait
+    .await?;
+permissions.invalidate(&user_id);                // after a change
+```
+
+- `TtlCache::new(ttl)?` for the defaults; clones share entries. `get`
+  returns only fresh values; `insert`, `invalidate`, `clear`, `len`.
+- Single flight: concurrent callers of one key wait for one load and get
+  its value or its error (code, message, reason, metadata). A dropped or
+  panicking leader hands the load to a waiter.
+- Stale values are served only for transient errors (`UNAVAILABLE`,
+  `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`) within the window,
+  with a `warn!`; other errors are returned.
+- For small hot sets (tokens, permissions, settings), not as a general
+  cache. TTLs run on a monotonic clock (`.clock(..)`, `TokioClock` in
+  paused tests).
 ### Database pools
 
 ```rust
@@ -223,7 +526,36 @@ let pg = pools.get("db")?.postgres().expect("a Postgres pool");
   allow-lists sortable and filterable columns; anything else is
   `INVALID_ARGUMENT`).
 - Connect errors name the pool and a failure class, never the URL.
+- Statement and grant failures (MySQL errno 1044, 1142, 1143, 1227, 1370;
+  SQLSTATE `42501`) map to `PERMISSION_DENIED` with the message
+  `permission denied`; table and column names never reach it. Rejected
+  connection credentials (MySQL 1045; SQLSTATE `28000`, `28P01`) are the
+  service's own misconfiguration: `INTERNAL` / `DB_CREDENTIALS_REJECTED`,
+  not retryable, as in `sekvent-client`.
 
+### Database probes
+
+```rust
+let pools = PoolRegistry::build(vec![main, reports]).await?;
+let runtime = pools
+    .probes()                                    // one per connected pool, required exactly when its PoolSpec is
+    .into_iter()
+    .fold(Runtime::builder(), |b, p| b.probe(p))
+    .unit("api", Stage::Ingress, UnitPolicy::Critical, server.into_unit())
+    .build()?;
+// by hand: PoolProbe::new("reports", pools.get("reports")?.clone()).optional()
+```
+
+- Needs `db`, `runtime` and a sqlx backend. A probe acquires a connection
+  and pings it, bounded by the runtime's `probe_timeout`. An optional pool
+  that is down is reported down but never makes the service
+  unready; unconfigured optional pools get no probe.
+- A pool whose connections are all in use reuses its previous `Up` while
+  that is fresh (about 30 s) instead of queueing behind the load, so
+  readiness does not flap; a closed pool is down.
+- Failures are `Down(Rejected("credentials rejected"))`,
+  `Down(Rejected("access denied"))` or `Down(Unreachable(..))`; never the
+  URL or driver text.
 ### JWT login
 
 ```rust
@@ -257,6 +589,45 @@ rejection for "no such user" and "wrong password". Do not add an early
 return before it. Bearer guards: `auth-axum` (`Bearer`, `RequireRole`),
 `auth-tonic` (`BearerInterceptor`).
 
+### bcrypt-compatible passwords
+
+A service sharing a password store with applications that read bcrypt
+(for example `{bcrypt}$2b$10$…` from a delegating encoder) writes bcrypt
+itself:
+
+```rust
+use sekvent::auth::{BcryptParams, PasswordHasher, authenticate_async};
+
+let hasher = PasswordHasher::bcrypt(BcryptParams::new(10).prefixed())?;   // cost 4..=14; `$2b$`
+// PasswordHasher::with_scheme(PasswordScheme::Bcrypt(..)) / hasher.scheme() for config-driven setups
+
+// feature auth-tokio: hashing runs on tokio's blocking pool, not the async workers
+let password = Secret::new(body.password);
+let lookup = account.map(|a| (a.user_id, a.password_hash, a.enabled));   // Option<(U, String, bool)>
+let ok = authenticate_async(&hasher, lookup, password.clone()).await.map_err(|rejected| {
+    AppError::new(rejected.error_code(), rejected.user_message()).with_reason(rejected.reason())
+})?;
+if ok.needs_rehash {
+    repo.set_password_hash(&ok.user, &hasher.hash_async(password).await?).await?;
+}
+```
+
+- "Current" is the configured scheme: under bcrypt, a bcrypt hash in the
+  configured form (prefix or not) at or above the configured cost is
+  `Valid`; argon2 hashes and other bcrypt forms verify as
+  `ValidNeedsRehash`, so the store converges on what every reader
+  understands. The version tag (`2a`, `2b`, `2y`) never triggers a rehash;
+  `.version(BcryptVersion::TwoA)` picks the tag written.
+- bcrypt reads only 72 bytes (`BCRYPT_MAX_PASSWORD_BYTES`): longer
+  passwords are refused by `hash` (`INVALID_ARGUMENT` /
+  `PASSWORD_TOO_LONG`), so enforce the limit in the sign-up and
+  change-password forms. `verify` checks a longer password on its first
+  72 bytes, as the writers of existing hashes did; under argon2id that
+  match asks for a rehash, under bcrypt it does not.
+- Unknown accounts cost one dummy verification in the configured scheme,
+  so timing does not reveal them. The default stays argon2id
+  (`PasswordHasher::default()`).
+- `verify_async(password, stored)` is the async form of `verify`.
 ### Service links
 
 ```rust
@@ -575,6 +946,24 @@ listener) with `await_until!`.
   `Secret`, token, password, database URL, `Authorization` header or
   upstream body. `Secret::expose()` only at the point of use. Use
   `sekvent::telemetry::truncate_for_log` for untrusted text you must log.
+- **Secrets in paths.** The access log records every request path (never
+  the query, headers or body). Tokens, reset codes and other secrets
+  travel in headers or bodies, never in a path segment.
+- **Global layers see component calls.** A `ServerBuilder::layer` wraps
+  every REST, gRPC and gRPC-Web request, including component gRPC calls
+  served through `app.grpc_routes()`. An end-user auth layer must let
+  link-authenticated component paths through, or go on each service
+  instead.
+- **gRPC limits are per service.** `rest_body_limit` covers REST only; set
+  `max_decoding_message_size` / `max_encoding_message_size` on each
+  generated tonic server that needs more than 4 MiB.
+- **Cron is UTC.** `JobSpec::cron("0 0 2 * * *")` fires at 02:00 UTC
+  whatever the host's time zone; there are no other zones. Singleton
+  intervals are aligned to the Unix epoch, in-process ones to the unit's
+  start.
+- **Fenced transactions stay short.** `check_fence_*` takes a shared lock
+  on the lease row until the transaction ends; keep such transactions
+  shorter than `ttl / 3` or the heartbeat stalls and the lease is lost.
 - **Fail closed.** A missing key, binding or token is a startup error. No
   "if unset, allow everyone"; no default secrets outside tests
   (`JwtKeys::development()` is for tests).

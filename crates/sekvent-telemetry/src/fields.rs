@@ -99,6 +99,7 @@ mod tests {
     }
 
     fn capture(emit: impl FnOnce()) -> FieldVisitor {
+        crate::test_support::keep_interest_open();
         let slot = std::sync::Arc::default();
         with_default(
             Registry::default().with(Capture(std::sync::Arc::clone(&slot))),

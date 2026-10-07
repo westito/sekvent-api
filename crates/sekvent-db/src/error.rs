@@ -8,7 +8,7 @@ use sekvent_error::{AppError, ErrorCode};
 pub enum ConnectFailure {
     /// The server could not be reached (DNS, refused, TLS, reset).
     Unreachable,
-    /// The server rejected the credentials.
+    /// The server rejected the credentials or denied access to the database.
     Auth,
     /// No connection became available in time.
     Timeout,
@@ -129,16 +129,17 @@ pub fn public_message(code: ErrorCode) -> &'static str {
         ErrorCode::FailedPrecondition => "a related record is missing or still in use",
         ErrorCode::Aborted => "conflicting concurrent update; retry",
         ErrorCode::Unavailable => "database unavailable",
+        ErrorCode::PermissionDenied => "permission denied",
         _ => "internal error",
     }
 }
 
 #[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql"))]
-mod sqlx_impl {
+pub(crate) mod sqlx_impl {
     use sekvent_error::{AppError, ErrorCode};
     use sqlx::error::{DatabaseError, ErrorKind};
 
-    use super::{ConnectFailure, public_message};
+    use super::{ConnectFailure, app_error};
 
     /// SQLSTATE classes and codes that mean the connection, not the query,
     /// failed: `08xxx` connection exceptions, `57P01..03` shutdowns,
@@ -152,7 +153,92 @@ mod sqlx_impl {
         matches!(code, "40001" | "40P01")
     }
 
+    /// A server error that refused us access, decided before the error's
+    /// kind or SQLSTATE class.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Access {
+        /// The server rejected the connection's own credentials: the
+        /// service is misconfigured, so the code is `INTERNAL`.
+        CredentialsRejected,
+        /// A statement lacks a grant: `PERMISSION_DENIED`.
+        Denied,
+    }
+
+    impl Access {
+        pub(crate) fn code(self) -> ErrorCode {
+            match self {
+                Self::CredentialsRejected => ErrorCode::Internal,
+                Self::Denied => ErrorCode::PermissionDenied,
+            }
+        }
+
+        pub(crate) fn reason(self) -> &'static str {
+            match self {
+                Self::CredentialsRejected => crate::reasons::DB_CREDENTIALS_REJECTED,
+                Self::Denied => crate::reasons::DB_PERMISSION_DENIED,
+            }
+        }
+    }
+
+    /// Invalid authorization (`28000`, `28P01`) rejects the credentials;
+    /// Postgres's insufficient privilege (`42501`) denies a statement. Not
+    /// `42000`: MySQL reports syntax errors with it.
+    fn sqlstate_access(code: &str) -> Option<Access> {
+        match code {
+            "28000" | "28P01" => Some(Access::CredentialsRejected),
+            "42501" => Some(Access::Denied),
+            _ => None,
+        }
+    }
+
+    /// The access refusal a MySQL server error number means, where the
+    /// number alone decides it.
+    ///
+    /// | errno | meaning | access |
+    /// |---|---|---|
+    /// | 1045 | access denied for the user | credentials rejected |
+    /// | 1044 | access denied to the database | denied |
+    /// | 1142 | command denied on a table | denied |
+    /// | 1143 | command denied on a column | denied |
+    /// | 1227 | the statement needs a privilege | denied |
+    /// | 1370 | command denied on a routine | denied |
+    #[cfg(feature = "sqlx-mysql")]
+    pub(crate) fn mysql_errno_access(number: u16) -> Option<Access> {
+        match number {
+            1045 => Some(Access::CredentialsRejected),
+            1044 | 1142 | 1143 | 1227 | 1370 => Some(Access::Denied),
+            _ => None,
+        }
+    }
+
+    fn database_access(error: &dyn DatabaseError) -> Option<Access> {
+        #[cfg(feature = "sqlx-mysql")]
+        if let Some(access) = mysql_errno(error).and_then(mysql_errno_access) {
+            return Some(access);
+        }
+        error.code().as_deref().and_then(sqlstate_access)
+    }
+
+    /// The access refusal `error` reports, if any.
+    pub(crate) fn access(error: &sqlx::Error) -> Option<Access> {
+        match error {
+            sqlx::Error::Database(database) => database_access(database.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// The MySQL server error number, when `error` came from MySQL.
+    #[cfg(feature = "sqlx-mysql")]
+    fn mysql_errno(error: &dyn DatabaseError) -> Option<u16> {
+        error
+            .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+            .map(sqlx::mysql::MySqlDatabaseError::number)
+    }
+
     fn classify_database(error: &dyn DatabaseError) -> ErrorCode {
+        if let Some(access) = database_access(error) {
+            return access.code();
+        }
         match error.kind() {
             ErrorKind::UniqueViolation => ErrorCode::AlreadyExists,
             ErrorKind::ForeignKeyViolation => ErrorCode::FailedPrecondition,
@@ -172,6 +258,8 @@ mod sqlx_impl {
     /// | unique violation | `ALREADY_EXISTS` |
     /// | foreign-key violation | `FAILED_PRECONDITION` |
     /// | serialization failure, deadlock | `ABORTED` |
+    /// | MySQL errno 1044, 1142, 1143, 1227, 1370; SQLSTATE `42501` (a missing grant) | `PERMISSION_DENIED` |
+    /// | MySQL errno 1045; SQLSTATE `28000`, `28P01` (the service's own credentials rejected) | `INTERNAL` |
     /// | `RowNotFound` | `NOT_FOUND` |
     /// | anything else | `INTERNAL` |
     pub fn classify(error: &sqlx::Error) -> ErrorCode {
@@ -194,44 +282,78 @@ mod sqlx_impl {
             sqlx::Error::Io(_) | sqlx::Error::Tls(_) => ConnectFailure::Unreachable,
             sqlx::Error::PoolTimedOut => ConnectFailure::Timeout,
             sqlx::Error::Configuration(_) => ConnectFailure::BadUrl,
-            sqlx::Error::Database(database) => match database.code().as_deref() {
-                // Invalid authorization / invalid password (Postgres and
-                // MySQL's SQLSTATE for "access denied").
-                Some("28000" | "28P01") => ConnectFailure::Auth,
-                _ => ConnectFailure::Other,
-            },
+            sqlx::Error::Database(database) => {
+                // MySQL's "access denied to the database" carries SQLSTATE
+                // 42000, which alone also means a syntax error.
+                #[cfg(feature = "sqlx-mysql")]
+                if mysql_errno(database.as_ref()) == Some(1044) {
+                    return ConnectFailure::Auth;
+                }
+                match database.code().as_deref() {
+                    // Invalid authorization / invalid password (Postgres and
+                    // MySQL's SQLSTATE for "access denied").
+                    Some("28000" | "28P01") => ConnectFailure::Auth,
+                    _ => ConnectFailure::Other,
+                }
+            }
             _ => ConnectFailure::Other,
         }
     }
 
     /// An [`AppError`] with the classified code and a generic message; the
-    /// sqlx error is kept only as the internal source.
+    /// sqlx error is kept only as the internal source. A missing grant
+    /// carries the reason `DB_PERMISSION_DENIED`, rejected credentials
+    /// `DB_CREDENTIALS_REJECTED`.
     pub fn to_app_error(error: sqlx::Error) -> AppError {
         let code = classify(&error);
-        AppError::new(code, public_message(code)).with_source(error)
+        let reason = access(&error).map(Access::reason);
+        app_error(code, reason).with_source(error)
     }
 }
 
 #[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql"))]
 pub use sqlx_impl::{classify, classify_connect, to_app_error};
 
+/// The generic error for `code`, with `reason` when there is one.
+#[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql", feature = "sea-orm"))]
+fn app_error(code: ErrorCode, reason: Option<&'static str>) -> AppError {
+    let error = AppError::new(code, public_message(code));
+    match reason {
+        Some(reason) => error.with_reason(reason),
+        None => error,
+    }
+}
+
 #[cfg(feature = "sea-orm")]
 mod sea_orm_impl {
     use sea_orm::{DbErr, SqlErr};
     use sekvent_error::{AppError, ErrorCode};
 
-    use super::public_message;
+    use super::app_error;
+
+    /// The sqlx error a sea-orm error wraps, if any.
+    #[cfg(any(feature = "sea-orm-postgres", feature = "sea-orm-mysql"))]
+    fn wrapped_sqlx(error: &DbErr) -> Option<&sqlx::Error> {
+        match error {
+            DbErr::Conn(sea_orm::RuntimeErr::SqlxError(inner))
+            | DbErr::Exec(sea_orm::RuntimeErr::SqlxError(inner))
+            | DbErr::Query(sea_orm::RuntimeErr::SqlxError(inner)) => Some(inner.as_ref()),
+            _ => None,
+        }
+    }
 
     /// The status code for a sea-orm error, consistent with
-    /// [`classify`](crate::classify) for the sqlx errors it wraps.
+    /// [`classify`](crate::classify) for the sqlx errors it wraps. A failed
+    /// connection is `UNAVAILABLE` unless the server rejected the
+    /// credentials (`INTERNAL`).
     pub fn classify_db_err(error: &DbErr) -> ErrorCode {
         #[cfg(any(feature = "sea-orm-postgres", feature = "sea-orm-mysql"))]
-        if let DbErr::Conn(sea_orm::RuntimeErr::SqlxError(inner))
-        | DbErr::Exec(sea_orm::RuntimeErr::SqlxError(inner))
-        | DbErr::Query(sea_orm::RuntimeErr::SqlxError(inner)) = error
-        {
+        if let Some(inner) = wrapped_sqlx(error) {
             let code = crate::classify(inner);
-            return if matches!(error, DbErr::Conn(_)) && code == ErrorCode::Internal {
+            let unclassified_connect = matches!(error, DbErr::Conn(_))
+                && code == ErrorCode::Internal
+                && super::sqlx_impl::access(inner).is_none();
+            return if unclassified_connect {
                 ErrorCode::Unavailable
             } else {
                 code
@@ -249,10 +371,17 @@ mod sea_orm_impl {
     }
 
     /// An [`AppError`] with the classified code and a generic message; the
-    /// sea-orm error is kept only as the internal source.
+    /// sea-orm error is kept only as the internal source. Wrapped sqlx
+    /// errors carry the same reasons as `to_app_error`.
     pub fn db_err_to_app_error(error: DbErr) -> AppError {
         let code = classify_db_err(&error);
-        AppError::new(code, public_message(code)).with_source(error)
+        #[cfg(any(feature = "sea-orm-postgres", feature = "sea-orm-mysql"))]
+        let reason = wrapped_sqlx(&error)
+            .and_then(super::sqlx_impl::access)
+            .map(super::sqlx_impl::Access::reason);
+        #[cfg(not(any(feature = "sea-orm-postgres", feature = "sea-orm-mysql")))]
+        let reason = None;
+        app_error(code, reason).with_source(error)
     }
 }
 
@@ -402,7 +531,10 @@ mod tests {
         use sekvent_error::ErrorCode;
         use sqlx::error::{DatabaseError, ErrorKind};
 
-        use crate::{ConnectFailure, IntoAppError, classify, classify_connect, to_app_error};
+        use crate::error::sqlx_impl::{Access, access};
+        use crate::{
+            ConnectFailure, IntoAppError, classify, classify_connect, reasons, to_app_error,
+        };
 
         #[derive(Debug)]
         struct FakeDbError {
@@ -443,7 +575,7 @@ mod tests {
             }
         }
 
-        fn database(code: Option<&'static str>, kind: ErrorKind) -> sqlx::Error {
+        pub(super) fn database(code: Option<&'static str>, kind: ErrorKind) -> sqlx::Error {
             sqlx::Error::Database(Box::new(FakeDbError { code, kind }))
         }
 
@@ -493,6 +625,83 @@ mod tests {
                 classify(&database(None, ErrorKind::Other)),
                 ErrorCode::Internal
             );
+        }
+
+        #[test]
+        fn a_missing_privilege_is_permission_denied() {
+            assert_eq!(
+                classify(&database(Some("42501"), ErrorKind::Other)),
+                ErrorCode::PermissionDenied
+            );
+            assert_eq!(
+                access(&database(Some("42501"), ErrorKind::Other)),
+                Some(Access::Denied)
+            );
+            // MySQL uses 42000 for syntax errors too: never enough alone.
+            assert_eq!(
+                classify(&database(Some("42000"), ErrorKind::Other)),
+                ErrorCode::Internal
+            );
+            assert_eq!(access(&database(Some("42000"), ErrorKind::Other)), None);
+            assert_eq!(access(&database(None, ErrorKind::Other)), None);
+            assert_eq!(access(&sqlx::Error::PoolClosed), None);
+        }
+
+        #[test]
+        fn rejected_credentials_are_internal() {
+            for code in ["28000", "28P01"] {
+                let error = database(Some(code), ErrorKind::Other);
+                assert_eq!(classify(&error), ErrorCode::Internal, "{code}");
+                assert_eq!(access(&error), Some(Access::CredentialsRejected), "{code}");
+                assert_eq!(classify_connect(&error), ConnectFailure::Auth, "{code}");
+            }
+        }
+
+        #[test]
+        fn permission_errors_keep_a_generic_message() {
+            let app = to_app_error(database(Some("42501"), ErrorKind::Other));
+            assert_eq!(app.code(), ErrorCode::PermissionDenied);
+            assert_eq!(app.message(), "permission denied");
+            assert_eq!(app.reason(), Some(reasons::DB_PERMISSION_DENIED));
+            assert!(!app.to_wire().message.contains("fake"));
+            assert_eq!(
+                crate::public_message(ErrorCode::PermissionDenied),
+                "permission denied"
+            );
+        }
+
+        #[test]
+        fn rejected_credentials_keep_a_generic_message() {
+            let app = to_app_error(database(Some("28P01"), ErrorKind::Other));
+            assert_eq!(app.code(), ErrorCode::Internal);
+            assert_eq!(app.message(), "internal error");
+            assert_eq!(app.reason(), Some(reasons::DB_CREDENTIALS_REJECTED));
+            assert!(!app.to_wire().message.contains("fake"));
+            assert!(std::error::Error::source(&app).is_some());
+        }
+
+        #[test]
+        fn other_errors_carry_no_reason() {
+            assert_eq!(to_app_error(sqlx::Error::RowNotFound).reason(), None);
+            assert_eq!(
+                to_app_error(database(Some("42000"), ErrorKind::Other)).reason(),
+                None
+            );
+        }
+
+        #[cfg(feature = "sqlx-mysql")]
+        #[test]
+        fn mysql_errnos_split_grants_from_credentials() {
+            use crate::error::sqlx_impl::mysql_errno_access;
+            for number in [1044, 1142, 1143, 1227, 1370] {
+                let access = mysql_errno_access(number);
+                assert_eq!(access, Some(Access::Denied), "{number}");
+                assert_eq!(access.map(Access::code), Some(ErrorCode::PermissionDenied));
+            }
+            assert_eq!(mysql_errno_access(1045), Some(Access::CredentialsRejected));
+            assert_eq!(Access::CredentialsRejected.code(), ErrorCode::Internal);
+            assert_eq!(mysql_errno_access(1064), None);
+            assert_eq!(mysql_errno_access(1146), None);
         }
 
         #[test]
@@ -610,6 +819,49 @@ mod tests {
             assert_eq!(
                 classify_db_err(&DbErr::Conn(wrapped(sqlx::Error::Protocol("x".to_owned())))),
                 ErrorCode::Unavailable
+            );
+        }
+
+        #[cfg(any(feature = "sea-orm-postgres", feature = "sea-orm-mysql"))]
+        #[test]
+        fn wrapped_access_errors_keep_their_codes_and_reasons() {
+            use std::sync::Arc;
+
+            use sqlx::error::ErrorKind;
+
+            use super::sqlx_tests::database;
+            use crate::reasons;
+
+            let wrapped =
+                |code| RuntimeErr::SqlxError(Arc::new(database(Some(code), ErrorKind::Other)));
+
+            // Rejected credentials while connecting are the service's own
+            // misconfiguration, not an outage.
+            let credentials = db_err_to_app_error(DbErr::Conn(wrapped("28P01")));
+            assert_eq!(credentials.code(), ErrorCode::Internal);
+            assert_eq!(credentials.message(), "internal error");
+            assert_eq!(credentials.reason(), Some(reasons::DB_CREDENTIALS_REJECTED));
+            assert_eq!(
+                classify_db_err(&DbErr::Query(wrapped("28000"))),
+                ErrorCode::Internal
+            );
+
+            let denied = db_err_to_app_error(DbErr::Exec(wrapped("42501")));
+            assert_eq!(denied.code(), ErrorCode::PermissionDenied);
+            assert_eq!(denied.message(), "permission denied");
+            assert_eq!(denied.reason(), Some(reasons::DB_PERMISSION_DENIED));
+            assert_eq!(
+                classify_db_err(&DbErr::Conn(wrapped("42501"))),
+                ErrorCode::PermissionDenied
+            );
+
+            // Any other failed connection stays an outage, without a reason.
+            let other = db_err_to_app_error(DbErr::Conn(wrapped("3D000")));
+            assert_eq!(other.code(), ErrorCode::Unavailable);
+            assert_eq!(other.reason(), None);
+            assert_eq!(
+                db_err_to_app_error(DbErr::Custom("x".to_owned())).reason(),
+                None
             );
         }
 

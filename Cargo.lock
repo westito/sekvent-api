@@ -733,8 +733,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -929,6 +931,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "croner"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b5b023fc2978536bbb2a3b71237964fc4630bec1eb31077b4977127f4cdb9c0"
+dependencies = [
+ "chrono",
+ "derive_builder",
+ "strum 0.27.2",
+]
+
+[[package]]
 name = "crossbeam-queue"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1057,6 +1070,7 @@ dependencies = [
  "ident_case",
  "proc-macro2",
  "quote",
+ "strsim",
  "syn 2.0.119",
 ]
 
@@ -1155,6 +1169,37 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "derive_builder"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "507dfb09ea8b7fa618fcf76e953f4f5e192547945816d5358edffe39f6f94947"
+dependencies = [
+ "derive_builder_macro",
+]
+
+[[package]]
+name = "derive_builder_core"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d5bcf7b024d6835cfb3d473887cd966994907effbe9227e8c8219824d06c4e8"
+dependencies = [
+ "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "derive_builder_macro"
+version = "0.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
+dependencies = [
+ "derive_builder_core",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3811,7 +3856,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "sqlx-core",
- "strum",
+ "strum 0.28.0",
  "thiserror",
  "time",
  "tracing",
@@ -4097,16 +4142,20 @@ dependencies = [
 name = "sekvent-db"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "sea-orm",
  "sea-orm-migration",
  "sekvent-config",
  "sekvent-error",
+ "sekvent-runtime",
  "sekvent-testing",
  "serde",
  "sqlx",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4211,14 +4260,19 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "chrono",
+ "croner",
  "futures",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
  "prost",
+ "rand 0.10.3",
+ "sekvent-config",
  "sekvent-context",
  "sekvent-error",
+ "sekvent-telemetry",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -4227,6 +4281,7 @@ dependencies = [
  "tonic-web",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4256,7 +4311,10 @@ dependencies = [
 name = "sekvent-telemetry"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "http",
+ "http-body",
+ "http-body-util",
  "log",
  "pin-project-lite",
  "serde",
@@ -4807,9 +4865,30 @@ dependencies = [
 
 [[package]]
 name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+
+[[package]]
+name = "strum_macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "subtle"

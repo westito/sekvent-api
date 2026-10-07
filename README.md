@@ -22,13 +22,13 @@ sqlx 0.9 and sea-orm 2.0.
 | `sekvent-macros` | (via `config`, `component`) | Procedural macros (`EnvConfig`, `component`, `ComponentError`) |
 | `sekvent-error` | `error` (default); `error-http`, `error-grpc` | `ErrorCode`, `AppError`, `WireError`; HTTP and gRPC mappings |
 | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
-| `sekvent-telemetry` | `telemetry` (default) | Tracing init, log ring buffer, request ids, `truncate_for_log` |
-| `sekvent-runtime` | `runtime` (default); `runtime-grpc-web` | Staged lifecycle, supervision, health, one listener for gRPC, gRPC-Web and REST |
-| `sekvent-resilience` | `resilience` | Backoff, retry budget, rate gate, timeout, bulkhead, circuit breaker |
-| `sekvent-auth` | `auth`; `auth-axum`, `auth-tonic` | Argon2/bcrypt password hashing, JWT with injected time, login helper |
+| `sekvent-telemetry` | `telemetry` (default) | Tracing init, log ring buffer, request ids, access log, `truncate_for_log` |
+| `sekvent-runtime` | `runtime` (default); `runtime-grpc-web`, `runtime-cron` | Staged lifecycle, supervision, health, one listener for gRPC, gRPC-Web and REST with CORS, body limits, global layers and an access log; interval, cron and manual jobs; file downloads |
+| `sekvent-resilience` | `resilience` | Backoff, retry budget, rate gate, timeout, bulkhead, circuit breaker, a TTL cache with single flight |
+| `sekvent-auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` | argon2id and bcrypt password schemes, JWT with injected time, login helper, async hashing helpers |
 | `sekvent-link` | `link`; `link-axum`, `link-tonic` | Service-to-service tokens, middleware, interceptors |
 | `sekvent-client` | `client` | Outbound HTTP (reqwest, rustls) with policies, context propagation, OAuth 2.0 client credentials |
-| `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` | Named pools, migrations, distinct-target check, list filters |
+| `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate`, `db-lease` | Named pools, migrations, distinct-target check, list filters, readiness probes per pool, leases with fencing tokens for singleton jobs |
 | `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |
 | `sekvent-testing` | not re-exported (`[dev-dependencies]`) | Postgres and MySQL test containers, a reaper, `await_until!` |
 | `sekvent-proto-build` | not re-exported (`[build-dependencies]`) | `build.rs` protobuf codegen on top of `tonic-prost-build`; protos compile in-process with protox, so no `protoc` is needed |
@@ -178,12 +178,14 @@ Only directories whose name starts with `sekvent` are written or replaced.
 A component is a trait with a protobuf contract. Callers hold a generated
 handle and never know whether the implementation runs in the same task,
 behind a serialization boundary or in another service; the binding is
-chosen by configuration when the App is built. Milestones C1 and C2 are
+chosen by configuration when the App is built. Milestones C1, C2 and C4 are
 implemented: `local`, `local-serialized` and `grpc` bindings, a fail-closed
 App builder with constructor injection, lifecycle hooks with draining,
 per-method deadlines and bulkheads, and — on the `grpc` binding — link
 authentication, budgeted retries of idempotent methods, a circuit breaker
-per remote component and named policies. Queues follow in later milestones.
+per remote component and named policies; C4 adds interval, cron and manual
+jobs (`sekvent-runtime`) and singleton jobs over a database lease with
+fencing tokens (`sekvent-db`). Queues follow in later milestones.
 
 ```rust
 use sekvent::prelude::*;
@@ -226,8 +228,9 @@ Enable it with the facade feature `component` (plus `component-grpc` for
 the `grpc` binding and serving, and `runtime` for `App::register`, which
 runs every component as one runtime unit). The design is in
 [docs/component-model.md](docs/component-model.md), the specifications in
-[docs/design/component-c1.md](docs/design/component-c1.md) and
-[docs/design/component-c2.md](docs/design/component-c2.md), and
+[docs/design/component-c1.md](docs/design/component-c1.md),
+[docs/design/component-c2.md](docs/design/component-c2.md) and, for jobs and
+leases, [docs/design/p8-service-essentials.md](docs/design/p8-service-essentials.md), and
 [examples/shop](examples/shop) is a complete three-component example whose
 tests run under `monolith-local`, `monolith-serialized` and a `split-grpc`
 topology where inventory runs as its own service
