@@ -11,8 +11,9 @@ publish.workspace = true
 [features]
 default = []
 serde = ["dep:serde", "dep:serde_json"]
-http = ["serde", "dep:http", "dep:axum"]
-grpc = ["dep:tonic", "dep:tonic-types", "dep:prost", "dep:prost-types", "dep:bytes"]
+# The serving-boundary conversions also log server-side failures (`tracing`).
+http = ["serde", "dep:http", "dep:axum", "dep:tracing"]
+grpc = ["dep:tonic", "dep:tonic-types", "dep:prost", "dep:prost-types", "dep:bytes", "dep:tracing"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -25,6 +26,7 @@ tonic-types = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 prost-types = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Enables every mapping for this crate's own unit and integration tests.

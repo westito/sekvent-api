@@ -110,6 +110,13 @@ AppError::unavailable("billing is unavailable").with_retry_after(Duration::from_
   `IntoResponse` with body `{"error": {"code": "NOT_FOUND", ...}}`
   (`error-http`). Clients decode with `sekvent::error::grpc::from_status` and
   `sekvent::error::http::from_json_body`.
+- Those two conversions log a server-side failure (`UNKNOWN`, `INTERNAL`,
+  `DATA_LOSS`) once: `error` event, target `sekvent::error`, message
+  `request failed`, fields `code`, `reason` and `source` (the source chain
+  joined with `": "`, capped at 2 KiB); never the message or metadata. Do not
+  log such an error yourself before returning it. Caller errors are not
+  logged (the access log has them). The component gRPC binding logs the same
+  way; `grpc::to_status` and `to_wire` alone never log.
 
 ### gRPC + REST server with health
 

@@ -24,6 +24,7 @@ store with older applications.
 | 4 | Interval, cron and manual jobs: fixed cadence, overlap skip, misfire grace, jitter, run-now, a guard seam | `sekvent-runtime` | 5 |
 | 5 | C4 Schedule: leases with fencing tokens, singleton jobs, exclusive on-demand work | `sekvent-db` (`lease`) | 6 |
 | 6 | Downloads, upload guidance, a TTL cache with single flight and stale-on-error | `sekvent-runtime`, `sekvent-resilience` | 7 |
+| 7 | Serving-boundary error log: `From<AppError> for Status`, `IntoResponse` and the component gRPC binding log `UNKNOWN`/`INTERNAL`/`DATA_LOSS` once with the capped source chain (target `sekvent::error`) | `sekvent-error`, `sekvent-component` | — |
 
 JWT stays as it is (strict, `kid` required).
 

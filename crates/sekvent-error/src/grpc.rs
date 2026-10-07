@@ -20,6 +20,10 @@ use tonic_types::{ErrorDetails, StatusExt};
 use crate::{AppError, ErrorCode};
 
 /// Encode an error as a status. The internal source is never sent.
+///
+/// This only encodes; a serving boundary that answers with it directly
+/// calls `sekvent_error::log_server_side` itself. `From<AppError> for Status`
+/// does both.
 pub fn to_status(error: &AppError) -> Status {
     let code = Code::from(error.code().as_i32());
     let mut details = ErrorDetails::new();
@@ -122,8 +126,12 @@ pub fn legacy_detail<M: prost::Message + Default>(status: &Status, key: &'static
     M::decode(bytes).ok()
 }
 
+/// The serving-boundary conversion: logs a server-side failure (`UNKNOWN`,
+/// `INTERNAL`, `DATA_LOSS`) once with its source chain, target
+/// `sekvent::error`, then encodes it with [`to_status`].
 impl From<AppError> for Status {
     fn from(error: AppError) -> Self {
+        crate::log_server_side(&error);
         to_status(&error)
     }
 }
@@ -139,6 +147,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::test_support::{capture, field};
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct Legacy {
@@ -221,6 +230,33 @@ mod tests {
         );
         assert_eq!(legacy_detail::<Legacy>(&status, "x-other-bin"), None);
         assert_eq!(legacy_detail::<Legacy>(&status, "not-binary"), None);
+    }
+
+    #[test]
+    fn the_conversion_logs_an_internal_error_once() {
+        let error = AppError::internal(std::io::Error::other("deadlock detected"));
+        let mut status = None;
+        let events = capture(|| status = Some(Status::from(error)));
+        assert_eq!(status.as_ref().map(Status::code), Some(Code::Internal));
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(field(&events[0], "code"), Some("INTERNAL"));
+        assert_eq!(field(&events[0], "source"), Some("deadlock detected"));
+    }
+
+    #[test]
+    fn to_status_alone_never_logs() {
+        let error = AppError::internal(std::io::Error::other("deadlock detected"));
+        let events = capture(|| drop(to_status(&error)));
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn the_conversion_does_not_log_caller_errors() {
+        let events = capture(|| {
+            drop(Status::from(AppError::not_found("no such order")));
+            drop(Status::from(AppError::invalid_argument("bad")));
+        });
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

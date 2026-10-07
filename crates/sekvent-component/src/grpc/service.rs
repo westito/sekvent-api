@@ -187,9 +187,10 @@ fn panicked(descriptor: &'static ComponentDescriptor, method: usize) -> AppError
     tag(descriptor, error, method)
 }
 
-/// The gRPC response for `error`, answered without reading the body.
-fn error_response(error: &AppError) -> http::Response<Body> {
-    sekvent_error::grpc::to_status(error).into_http()
+/// The gRPC response for `error`, answered without reading the body; a
+/// server-side failure is logged once on the way.
+fn error_response(error: AppError) -> http::Response<Body> {
+    tonic::Status::from(error).into_http()
 }
 
 /// The tower service mounted at `/<service>/{*rest}`.
@@ -226,7 +227,7 @@ where
             async move {
                 let (method, cx) = match prepared {
                     Ok(prepared) => prepared,
-                    Err(error) => return Ok(error_response(&error)),
+                    Err(error) => return Ok(error_response(error)),
                 };
                 // Cancels the call's token when the client resets the stream
                 // and this future is dropped, or when the deadline passes.
@@ -240,7 +241,7 @@ where
                         Err(_elapsed) => {
                             let error =
                                 AppError::deadline_exceeded("the call deadline was exceeded");
-                            return Ok(error_response(&tag(descriptor, error, method)));
+                            return Ok(error_response(tag(descriptor, error, method)));
                         }
                     },
                     None => call.await,
@@ -280,7 +281,7 @@ impl tower::Service<tonic::Request<Bytes>> for Unary {
                 .handle(method, cx, body)
                 .await
                 .map(tonic::Response::new)
-                .map_err(|error| sekvent_error::grpc::to_status(&error))
+                .map_err(tonic::Status::from)
         })
     }
 }
@@ -486,7 +487,7 @@ mod tests {
 
     #[test]
     fn errors_answer_without_a_body() {
-        let response = error_response(&AppError::unauthenticated("no"));
+        let response = error_response(AppError::unauthenticated("no"));
         assert_eq!(response.headers()["grpc-status"], "16");
     }
 }

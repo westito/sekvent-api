@@ -22,8 +22,12 @@ struct Envelope {
 /// A body that cannot fail to serialize, used if the real one somehow does.
 const FALLBACK_BODY: &str = r#"{"error":{"code":"INTERNAL","message":"internal error"}}"#;
 
+/// The serving-boundary conversion: logs a server-side failure (`UNKNOWN`,
+/// `INTERNAL`, `DATA_LOSS`) once with its source chain, target
+/// `sekvent::error`, then answers with the caller-visible part only.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        crate::log_server_side(&self);
         let status = StatusCode::from_u16(self.code().http_status())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = serde_json::to_vec(&Envelope {
@@ -68,6 +72,29 @@ fn retry_after_seconds(after: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{capture, field};
+
+    #[test]
+    fn into_response_logs_an_internal_error_once() {
+        let error = AppError::internal(std::io::Error::other("relation does not exist"))
+            .with_reason("DB_FAILURE");
+        let mut status = None;
+        let events = capture(|| status = Some(error.into_response().status()));
+        assert_eq!(status, Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(field(&events[0], "code"), Some("INTERNAL"));
+        assert_eq!(field(&events[0], "reason"), Some("DB_FAILURE"));
+        assert_eq!(field(&events[0], "source"), Some("relation does not exist"));
+    }
+
+    #[test]
+    fn into_response_does_not_log_caller_errors() {
+        let events = capture(|| {
+            drop(AppError::not_found("no such order").into_response());
+            drop(AppError::invalid_argument("bad").into_response());
+        });
+        assert!(events.is_empty(), "{events:?}");
+    }
 
     #[test]
     fn retry_after_rounds_up_to_whole_seconds() {
