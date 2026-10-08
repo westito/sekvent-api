@@ -10,8 +10,9 @@ code is the same under all three.
 This page is the practical guide. For the ideas behind the model and its
 roadmap, see [the component model](../component-model.md). The full design
 notes are [component-c1.md](../design/component-c1.md) (local bindings and
-lifecycle) and [component-c2.md](../design/component-c2.md) (gRPC and
-contracts). Every example here comes from
+lifecycle), [component-c2.md](../design/component-c2.md) (gRPC and
+contracts) and [component-end-user.md](../design/component-end-user.md)
+(serving components to end users). Most examples here come from
 [`examples/shop`](../../examples/shop), a complete project with three
 components: inventory, notifications and orders.
 
@@ -22,6 +23,7 @@ components: inventory, notifications and orders.
 | `component` | `#[sekvent::component]`, `#[derive(sekvent::ComponentError)]`, the `App` builder, the `local` and `local-serialized` bindings. Turns on `config`, `error` and `context`. |
 | `component-grpc` | The `grpc` binding and serving components over gRPC (`App::grpc_routes`). Turns on `component`. |
 | `runtime` (with `component`) | `App::register`, which runs the App as one unit of the [runtime](runtime.md). |
+| `runtime-grpc-web` (with `component-grpc`) | gRPC-Web translation on the runtime server, so browsers can call served components ([end users](#how-to-serve-components-to-end-users-browsers-apps)). |
 
 A component is split over two crates. The **`-api` crate** holds the
 contract: the `.proto`, the generated messages, the trait, the error type
@@ -247,9 +249,12 @@ C3 and are rejected for now.
 | `idempotent` | The method may be retried. Only idempotent methods are retried automatically, and only under `grpc`. |
 | `timeout = "2s"` | A humantime string literal, positive. It bounds the **whole call**, retries included, and never extends the caller's deadline. |
 | `bulkhead = 16` | An integer literal from 1 to `u32::MAX`: the most concurrent executions where the component runs. Calls beyond it fail with `RESOURCE_EXHAUSTED` / `BULKHEAD_FULL`. |
+| `anonymous` | End users may call the method without credentials when the component is served with `SERVE_AUTH=bearer` or `link,bearer`. It waives end-user authentication only, never link authentication. A compile error on a `local_only` component, which is never served. See [How to serve components to end users](#how-to-serve-components-to-end-users-browsers-apps). |
 
-These are defaults. Configuration can override each of them, as described
-in [How to tune resilience per component and method](#how-to-tune-resilience-per-component-and-method).
+`timeout` and `bulkhead` are defaults. Configuration can override each of
+them, as described in
+[How to tune resilience per component and method](#how-to-tune-resilience-per-component-and-method).
+`anonymous` cannot be changed by configuration.
 Unknown or duplicated options are compile errors. The trybuild cases under
 `crates/sekvent-macros/tests/ui/fail/` list every message.
 
@@ -360,9 +365,16 @@ Inside a handler, `cx` is the **callee's** context:
 
 - `cx.caller()` is `ServiceIdentity::trusted("local")` for in-process
   calls, or the authenticated link for gRPC calls (`None` when served with
-  `SERVE_AUTH=none`).
+  `SERVE_AUTH=none`, to an end user, or to an anonymous caller).
+- `cx.end_user()` is `Some(&EndUser)` when an end user called this
+  component directly and the App's end-user authenticator accepted them
+  (`SERVE_AUTH=bearer` or `link,bearer`). `caller()` is then `None`: the
+  direct caller is either a service or an end user, never both. It is
+  `None` for service calls, in-process calls and anonymous calls.
 - `cx.tenant()` and the subject come from the caller. Over gRPC they
-  survive only from a link listed in `SEKVENT_LINK_TRUSTED`.
+  survive only from a link listed in `SEKVENT_LINK_TRUSTED`, or from the
+  authenticated end user. Roles stay with the end user: the components
+  this handler calls see subject and tenant, but no `end_user()`.
 - The deadline is the earlier of the caller's deadline and this method's
   timeout.
 - An idempotency key the caller set for this call arrives here. A key the
@@ -398,6 +410,7 @@ pub fn install(app: &mut AppBuilder<'_>, options: ShopOptions) -> Result<(), Bui
 | `<C>Handle::install_with_lifecycle` | as `install`, with `I: Trait + Lifecycle` | Also runs the `Lifecycle` hooks. |
 | `<C>Handle::install_remote` | `fn install_remote(app: &mut AppBuilder<'_>) -> Result<(), BuildError>` | `remote_only` components only. |
 | `AppBuilder::provide` | `fn provide<T: Clone + Send + Sync + 'static>(&mut self, value: T) -> Result<(), BuildError>` | Shared resources (pools, clients, a `Clock`). A second value of the same type is `DuplicateResource`. |
+| `AppBuilder::end_user_authenticator` | `fn end_user_authenticator(&mut self, authenticator: impl EndUserAuthenticator) -> Result<(), BuildError>` | The App's one end-user authenticator, for components served with `SERVE_AUTH=bearer` or `link,bearer`. A second one is `DuplicateEndUserAuthenticator`. Available without `component-grpc`. See [How to serve components to end users](#how-to-serve-components-to-end-users-browsers-apps). |
 | `AppBuilder::build` | `fn build(self) -> Result<App, BuildError>` | Validates all configuration, then runs the factories in install order. |
 | `Deps::handle` | `fn handle<H: ComponentHandle>(&self) -> Result<H, AppError>` | Only components installed **before** this one. Otherwise `FAILED_PRECONDITION`, naming both components. |
 | `Deps::resource` | `fn resource<T: Clone + Send + Sync + 'static>(&self) -> Result<T, AppError>` | `FAILED_PRECONDITION`, naming the type, when nothing was provided. |
@@ -410,8 +423,10 @@ The build runs in two phases:
    unknown keys under `SEKVENT_COMPONENT_` and `SEKVENT_POLICY_` (with
    suggestions), malformed values, invalid policies, key collisions between
    components or methods, bindings that are unavailable or do not fit the
-   mode, a missing endpoint or link token, and two exposed components
-   with one gRPC service name. All problems come back together, as one
+   mode, a missing endpoint or link token, a component served with
+   end-user authentication while no end-user authenticator is registered,
+   and two exposed components with one gRPC service name. All problems
+   come back together, as one
    `BuildError` or `BuildError::Multiple`. Messages name keys and
    components, never values. No factory runs unless the configuration is
    clean.
@@ -586,13 +601,14 @@ let server = Server::builder()
   `GRPC_NOT_MOUNTED`.
 - The order on the serving side is fixed, and everything up to the gate is
   decided from the request **headers** before the body is read. The link
-  token is authenticated first, so an unauthenticated call gets
-  `UNAUTHENTICATED` even for a method that does not exist. Then exact
-  routing: a path that is not `/<service>/<Rpc>` of a declared method is
-  `UNIMPLEMENTED` / `UNKNOWN_METHOD`. Then the context is decoded from the
-  headers (trailers are never trusted), the hop limit checked, and the
-  deadline narrowed by the method's timeout. Then the call passes the
-  component's gate and bulkhead.
+  token is authenticated first; under `SERVE_AUTH=link` an unauthenticated
+  call gets `UNAUTHENTICATED` even for a method that does not exist. Then
+  exact routing: a path that is not `/<service>/<Rpc>` of a declared method
+  is `UNIMPLEMENTED` / `UNKNOWN_METHOD`. Then the context is decoded from
+  the headers (trailers are never trusted) and the deadline narrowed by the
+  method's timeout. Under the bearer modes the end user is authenticated
+  next ([below](#serving-order-for-end-users)). Then the hop limit is
+  checked and the call passes the component's gate and bulkhead.
 - Requests are capped at 4 MiB. A handler panic answers `INTERNAL` /
   `HANDLER_PANICKED`, and the payload is never shown. A request body that
   does not decode is `INVALID_ARGUMENT` / `MALFORMED_REQUEST`.
@@ -616,7 +632,9 @@ in [link](link.md); the component side works like this:
 | Side | Keys | Behaviour |
 |---|---|---|
 | Caller (`grpc` binding) | `SEKVENT_LINK_OUTBOUND_<LINK>`, where the link is `SEKVENT_COMPONENT_<C>_LINK` (default: the component name) | Every attempt sends `authorization: Bearer <token>`. A missing token is a build error naming the key. `SEKVENT_COMPONENT_<C>_AUTH=none` turns this off explicitly and logs a warning. |
-| Server (`SERVE=grpc`) | `SEKVENT_LINK_INBOUND_<CALLER>`, at least one; `SEKVENT_LINK_TRUSTED` | A missing, malformed or unknown token gets `UNAUTHENTICATED` with one fixed message and no reason. The caller's identity is the link name. Subject and tenant are kept only for trusted links. `SEKVENT_COMPONENT_<C>_SERVE_AUTH=none` turns this off explicitly and logs a warning. |
+| Server (`SERVE=grpc`, `SERVE_AUTH=link`, the default) | `SEKVENT_LINK_INBOUND_<CALLER>`, at least one; `SEKVENT_LINK_TRUSTED` | A missing, malformed or unknown token gets `UNAUTHENTICATED` with one fixed message and no reason. The caller's identity is the link name. Subject and tenant are kept only for trusted links. `SEKVENT_COMPONENT_<C>_SERVE_AUTH=none` turns this off explicitly and logs a warning. |
+| Server (`SERVE_AUTH=link,bearer`) | as above, plus a registered end-user authenticator | A matching link token makes the caller that link, exactly as above. Without a match, the App's end-user authenticator decides ([below](#how-to-serve-components-to-end-users-browsers-apps)). |
+| Server (`SERVE_AUTH=bearer`) | a registered end-user authenticator; no `SEKVENT_LINK_*` key | Only end users: link tokens are not checked. |
 
 A token is the same value on both sides. In the split shop, the service
 knows it as the inbound link `shop` and the shop presents it as the
@@ -630,6 +648,240 @@ The build also rejects:
 - a malformed `LINK` value (letters, digits and underscores only).
 
 A token that is valid under one binding is accepted under every binding.
+
+## How to serve components to end users (browsers, apps)
+
+A browser (over gRPC-Web) or a native app cannot hold a link token. To let
+your own frontend call a component directly, serve it with end-user
+authentication and register one **end-user authenticator** on the App. The
+contract, the error mapping and the gate stay the ones every other caller
+gets; no hand-written gRPC service is needed.
+
+```sh
+SEKVENT_COMPONENT_ORDERS_SERVE=grpc
+SEKVENT_COMPONENT_ORDERS_SERVE_AUTH=bearer          # end users only
+# SEKVENT_COMPONENT_ORDERS_SERVE_AUTH=link,bearer   # peer services with link tokens, and end users
+```
+
+| `SERVE_AUTH` | Who may call a method | Who may call an `anonymous` method |
+|---|---|---|
+| `link` (default) | a peer with an inbound link token | the same: a link token is required |
+| `bearer` | an end user the authenticator accepts | anyone, with no identity |
+| `link,bearer` (or `bearer,link`) | a peer with an inbound link token, else an end user the authenticator accepts | a peer with a valid link token keeps its identity; anyone else is served without one |
+| `none` | anyone (logged once at `warn`) | anyone |
+
+Spellings are exact; anything else is a malformed key. `SERVE_AUTH=bearer`
+alone needs no `SEKVENT_LINK_*` key. A mode that includes `link` still
+needs at least one `SEKVENT_LINK_INBOUND_<CALLER>`, as before.
+
+### Register the end-user authenticator
+
+The authenticator gets the request **head** only (`&http::request::Parts`:
+method, URI, headers, extensions); the body has not been read yet. It
+returns the `EndUser` or an `AppError`. Any sync closure is an
+authenticator:
+
+```rust
+use sekvent::component::EndUser;
+
+builder.end_user_authenticator(|request: &http::request::Parts| {
+    let user = sessions.verify(&request.headers)?;      // your own check; Err(AppError::unauthenticated(..)) when it fails
+    Ok(EndUser::new(user.id).with_tenant(user.tenant).with_roles(user.roles))
+})?;
+```
+
+For JSON Web Tokens, `BearerAuth::end_user` is a ready-made check (facade
+feature `auth-axum` or `auth-tonic`, see [auth](auth.md#authenticate-end-users-of-components)).
+`sub` becomes the subject; tenant and roles come from your custom claims
+through `EndUserClaims`:
+
+```rust
+use std::sync::Arc;
+use sekvent::auth::{BearerAuth, EndUserClaims, Validation};
+use sekvent::context::SystemClock;
+
+#[derive(Debug, serde::Deserialize)]
+struct Profile { tenant: String, roles: Vec<String> }
+
+impl EndUserClaims for Profile {
+    fn tenant(&self) -> Option<&str> { Some(&self.tenant) }
+    fn roles(&self) -> &[String] { &self.roles }
+}
+
+let auth = BearerAuth::new(keys, Validation::new().with_audience("web"), Arc::new(SystemClock));
+builder.end_user_authenticator(move |request: &http::request::Parts| {
+    auth.end_user::<Profile>(&request.headers)
+})?;
+```
+
+When the check needs I/O (a session store, say), implement
+`EndUserAuthenticator` yourself:
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+use sekvent::component::{EndUser, EndUserAuthenticator};
+
+struct SessionAuth { sessions: SessionStore }
+
+impl EndUserAuthenticator for SessionAuth {
+    fn authenticate<'a>(
+        &'a self,
+        request: &'a http::request::Parts,
+    ) -> Pin<Box<dyn Future<Output = Result<EndUser, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            let token = request
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .ok_or_else(|| AppError::unauthenticated("no session token"))?;
+            let session = self.sessions.find(token).await?        // UNAVAILABLE when the store is down
+                .ok_or_else(|| AppError::unauthenticated("unknown session"))?;
+            Ok(EndUser::new(session.user_id).with_tenant(session.tenant).with_roles(session.roles))
+        })
+    }
+}
+
+builder.end_user_authenticator(SessionAuth { sessions })?;
+```
+
+- One authenticator per App. A second registration fails at once with
+  `BuildError::DuplicateEndUserAuthenticator`. If components need
+  different rules, look at `request.uri.path()` in the one authenticator.
+- Fail closed: a component exposed with `SERVE=grpc` whose `SERVE_AUTH`
+  includes `bearer` fails the build with
+  `BuildError::EndUserAuthenticatorMissing`, naming the component and its
+  `SERVE_AUTH` key, when none is registered. An authenticator that no
+  component uses is not an error.
+- `end_user_authenticator` and `EndUser` exist without the
+  `component-grpc` feature, so application code compiles the same way
+  under every feature set.
+- The authenticator runs bounded by the call's deadline; when it passes,
+  the caller gets `DEADLINE_EXCEEDED`. The framework never logs anything
+  about the token.
+
+### Read the end user in a handler
+
+`cx.end_user()` returns the `EndUser` the authenticator accepted. Check
+roles with `sekvent::auth::require_any_role`, which accepts an `EndUser`
+(`HasRoles`):
+
+```rust
+async fn get_order(&self, cx: &CallContext, req: GetOrderRequest) -> Result<Order, OrdersError> {
+    if let Some(user) = cx.end_user() {
+        // A browser: only staff may read any order by id.
+        sekvent::auth::require_any_role(user, &["admin"])?;   // PERMISSION_DENIED otherwise
+    }
+    // Otherwise a peer service (cx.caller()), trusted by its link.
+    // …
+}
+```
+
+`EndUser` has `subject()`, `tenant()`, `roles()` and `has_role(..)`. The
+context's subject and tenant are set from it, so `cx.tenant()` works the
+same for an end user as behind a trusted link. Subject and tenant headers
+the client sent itself are dropped before the authenticator runs, so an end
+user cannot assert another identity. The components this handler calls see
+subject and tenant only; the end user and its roles stay here.
+
+### Public methods: `#[call(anonymous)]`
+
+A few RPCs must work without credentials, such as signing in:
+
+```rust
+#[sekvent::component(name = "accounts", package = "shop.accounts.v1", proto = "crate::proto::shop::accounts::v1")]
+pub trait Accounts: Send + Sync + 'static {
+    /// Exchange a password for a session token.
+    #[call(anonymous, timeout = "2s")]
+    async fn sign_in(&self, cx: &CallContext, req: SignInRequest) -> Result<SignInReply, AccountsError>;
+
+    #[call(idempotent, timeout = "500ms")]
+    async fn profile(&self, cx: &CallContext, req: ProfileRequest) -> Result<ProfileReply, AccountsError>;
+}
+```
+
+- `anonymous` waives **end-user authentication only**. It never waives link
+  authentication: under `SERVE_AUTH=link` an anonymous method still needs a
+  link token, so a component that must stay closed cannot be opened by the
+  attribute alone; the operator has to choose a bearer mode too.
+- Under the local bindings it has no effect. On a `local_only` component it
+  is a compile error (`` `anonymous` has no effect on a local_only
+  component, which is never served; remove it``).
+- An anonymous method never sees an end user. A token sent to it is
+  ignored, not verified, so `cx.end_user()` is `None` there. A method that
+  behaves differently for signed-in users is not anonymous.
+- It combines with the other options (`#[call(anonymous, timeout = "2s")]`)
+  and sets `MethodDescriptor::with_anonymous()` (read back with
+  `is_anonymous()`).
+
+### What a rejected end user sees
+
+| The authenticator returns | The caller gets |
+|---|---|
+| `Ok(user)` | The call runs with `cx.end_user() == Some(&user)`. |
+| `Err(e)` with code `UNAUTHENTICATED` | `UNAUTHENTICATED` with the message `invalid or expired credentials` (`END_USER_REJECTED_MESSAGE`), no reason and no metadata. The answer is the same for a missing, malformed, expired or unknown token. |
+| `Err(e)` with any other code | `e` unchanged, for example `UNAVAILABLE` when the session store is down, so a client retries instead of signing the user out. |
+| nothing before the call's deadline | `DEADLINE_EXCEEDED` |
+
+In every rejected case the request body is never read and the handler
+never runs.
+
+### Serving order for end users
+
+Everything is still decided from the request head before the body is read:
+
+1. **Link.** When the mode includes `link`, the bearer token is compared
+   with the inbound link tokens. A match makes the caller that link, and
+   the end-user authenticator is not consulted.
+2. **Route.** The path must be exactly `/<service>/<Rpc>`; anything else is
+   `UNIMPLEMENTED` / `UNKNOWN_METHOD`. Under the bearer modes routing comes
+   before the end-user authenticator, so an unknown path never costs a
+   token verification.
+3. **Context.** It is decoded from the headers and the deadline narrowed by
+   the method's timeout.
+4. **End user.** When the mode includes `bearer`, no link matched and the
+   method is not anonymous, the authenticator runs. On success the context
+   carries the end user.
+5. **Hop limit**, gate, bulkhead, method timeout and handler, exactly as
+   for a link caller.
+
+### Mount the routes for browsers
+
+Mount `app.grpc_routes()` on the [runtime server](server.md) as usual. With
+the facade feature `runtime-grpc-web` (off in the facade's defaults), the
+server translates gRPC-Web, so the same routes answer browsers over
+HTTP/1.1:
+
+```rust
+use sekvent::runtime::{Cors, Server};
+
+let app = builder.build()?;
+let server = Server::builder()
+    .grpc_routes(app.grpc_routes())
+    .rest(rest_routes())
+    .prefix("/api")
+    .cors(Cors::origins(["https://shop.example.com"])?)
+    .bind(addr)
+    .await?;
+```
+
+- The browser calls `POST /api/shop.orders.v1.Orders/PlaceOrder` with
+  `content-type: application/grpc-web+proto`, `x-grpc-web: 1` and
+  `authorization: Bearer <token>`. Native gRPC clients keep using
+  `/shop.orders.v1.Orders/PlaceOrder` at the root, unless
+  `grpc_at_root(false)`.
+- CORS preflights are answered by the server before any authentication, so
+  they never reach a component. The default allowed and exposed headers
+  already include `authorization`, `x-grpc-web`, `grpc-timeout`,
+  `grpc-status`, `grpc-message` and `grpc-status-details-bin`.
+- `ServerBuilder::authenticator` does not decide component calls. It never
+  rejects a request, and the component service never reads it: component
+  calls are authenticated by `SERVE_AUTH` alone. The end-user authenticator
+  receives the request head with its extensions, so it may read the
+  `CallContext` the server stored there if you want to reuse that decision.
+- Global layers (`ServerBuilder::layer`) wrap component calls too; see
+  [Pitfalls and security](#pitfalls-and-security).
 
 ## How to tune resilience per component and method
 
@@ -714,7 +966,7 @@ requires them.
 | `SEKVENT_COMPONENT_<C>_LINK` | link name `[A-Za-z0-9_]+`, not `local` | the component name |
 | `SEKVENT_COMPONENT_<C>_AUTH` | `link` or `none` | `link` |
 | `SEKVENT_COMPONENT_<C>_SERVE` | `grpc` or `none` | `none` |
-| `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link` or `none` | `link` |
+| `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link`, `bearer`, `link,bearer` (or `bearer,link`), `none`. A mode with `bearer` needs `AppBuilder::end_user_authenticator`. | `link` |
 | `SEKVENT_COMPONENT_<C>_POLICY`, `SEKVENT_COMPONENT_<C>_<M>_POLICY` | a policy name | — |
 | `SEKVENT_COMPONENT_<C>_<FIELD>`, `SEKVENT_COMPONENT_<C>_<M>_<FIELD>` | resilience fields, as in the previous section | attribute and framework defaults |
 | `SEKVENT_POLICY_<NAME>_<FIELD>` | named policy fields | — |
@@ -807,12 +1059,16 @@ metadata the server sent.
 
 The caller's own deadline gives a plain `DEADLINE_EXCEEDED` with no reason.
 Cancellation gives `CANCELLED`. A rejected link token gives
-`UNAUTHENTICATED` with no reason.
+`UNAUTHENTICATED` with no reason. A rejected end user gets
+`UNAUTHENTICATED` with `invalid or expired credentials` and no reason; other
+end-user authenticator errors pass through unchanged
+([details](#what-a-rejected-end-user-sees)).
 
 The `BuildError` variants are `DuplicateInstall`, `DuplicateResource`,
-`KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`, `RemoteOnly`,
-`RemoteOnlyUnbound`, `NotServable`, `Factory` and `Multiple` (flat, never
-nested). The enum is `#[non_exhaustive]`.
+`DuplicateEndUserAuthenticator`, `EndUserAuthenticatorMissing { component,
+key }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
+`RemoteOnly`, `RemoteOnlyUnbound`, `NotServable`, `Factory` and `Multiple`
+(flat, never nested). The enum is `#[non_exhaustive]`.
 
 ## Testing components
 
@@ -872,7 +1128,19 @@ nested). The enum is `#[non_exhaustive]`.
   for the same order), or it deduplicates on the idempotency key.
 - **`AUTH=none` and `SERVE_AUTH=none` turn authentication off.** Each logs
   a warning at build time. Use them only on a trusted private network,
-  and never expose `SERVE_AUTH=none` publicly.
+  and never expose `SERVE_AUTH=none` publicly. To open a component to
+  browsers, use `SERVE_AUTH=bearer` with an end-user authenticator instead.
+- **`anonymous` is for public RPCs only.** Under a bearer mode anyone on
+  the network can call an anonymous method, and any token they send is
+  ignored. Use it for sign-in and similar, never for a method that reads
+  or changes a user's data.
+- **Global layers see component calls.** A `ServerBuilder::layer` that
+  rejects requests without its own credentials also rejects link callers
+  and anonymous methods served on that listener. Put such a layer on the
+  REST router instead, or let the gRPC paths through.
+- **The server's authenticator is not component auth.**
+  `ServerBuilder::authenticator` never rejects, and component calls ignore
+  it; only `SERVE_AUTH` and the App's end-user authenticator decide.
 - **The transport is plaintext HTTP/2.** `https://` endpoints are rejected
   until TLS support lands. Keep component traffic on a private network or
   behind a TLS-terminating proxy.
@@ -889,6 +1157,8 @@ nested). The enum is `#[non_exhaustive]`.
 - [The component model](../component-model.md) — concepts, roadmap, and what C3 and C5 add
 - [proto-build](proto-build.md) — generating messages and contract constants
 - [link](link.md) — service tokens
+- [auth](auth.md) — `BearerAuth::end_user`, `EndUserClaims`, role checks
+- [component-end-user.md](../design/component-end-user.md) — design note on serving components to end users
 - [resilience](resilience.md) — policy fields and their semantics
 - [runtime](runtime.md), [server](server.md) — running the App and serving gRPC
 - [error](error.md), [context](context.md) — `AppError`, `ErrorCode`, `CallContext`

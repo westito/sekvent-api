@@ -48,6 +48,10 @@ tonic-types = { workspace = true }
 tonic-health = { workspace = true }
 # A plain HTTP/2 client for raw serving tests.
 hyper-util = { workspace = true }
+# Request bodies for the HTTP/1.1 gRPC-Web tests.
+http-body-util = { workspace = true }
+# The runtime server with its gRPC-Web translation, for the gRPC-Web tests.
+sekvent-runtime = { path = "../sekvent-runtime", features = ["grpc-web"] }
 
 [lints]
 workspace = true

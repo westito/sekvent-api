@@ -234,6 +234,11 @@ impl ServerBuilder {
 
     /// Identify callers; the result feeds [`headers::from_headers`], so only
     /// a trusted caller may assert `subject` and `tenant`.
+    ///
+    /// It never rejects a request: it only shapes the [`CallContext`] REST
+    /// handlers and hand-written tonic services read. Components served
+    /// through `App::grpc_routes` ignore it and authenticate their callers
+    /// themselves (link tokens or the App's end-user authenticator).
     #[must_use]
     pub fn authenticator(
         mut self,
@@ -289,8 +294,10 @@ impl ServerBuilder {
     /// wraps the earlier ones.
     ///
     /// Component calls served on this listener pass through the layer too,
-    /// so an end-user authentication layer must let link-authenticated
-    /// component paths through, or be applied per service instead.
+    /// so a layer that rejects requests without its own credentials also
+    /// rejects link callers and anonymous component methods: let component
+    /// paths through, apply it per service, or let components authenticate
+    /// end users themselves (`SEKVENT_COMPONENT_<C>_SERVE_AUTH=bearer`).
     #[must_use]
     pub fn layer<L>(mut self, layer: L) -> Self
     where

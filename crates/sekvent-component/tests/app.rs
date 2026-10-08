@@ -70,7 +70,7 @@ fn a_resource_type_is_provided_once() {
     NotesHandle::install(&mut builder, |_| Ok(Counter::plain())).unwrap();
     assert_eq!(
         format!("{builder:?}"),
-        r#"AppBuilder { components: ["notes"], resources: ["alloc::string::String", "u32"], .. }"#
+        r#"AppBuilder { components: ["notes"], resources: ["alloc::string::String", "u32"], end_user_authenticator: false, .. }"#
     );
 }
 

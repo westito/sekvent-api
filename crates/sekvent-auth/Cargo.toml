@@ -13,7 +13,7 @@ default = []
 # Bearer-token extractor and role guard for axum. Not wasm.
 axum = ["dep:axum", "dep:http", "dep:sekvent-context", "sekvent-error/http"]
 # Request interceptor and role guard for tonic. Not wasm.
-tonic = ["dep:tonic", "dep:sekvent-context", "sekvent-error/grpc"]
+tonic = ["dep:tonic", "dep:http", "dep:sekvent-context", "sekvent-error/grpc"]
 # Password hashing and login on tokio's blocking pool. Not wasm.
 tokio = ["dep:tokio"]
 

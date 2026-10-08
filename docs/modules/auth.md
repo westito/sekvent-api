@@ -23,8 +23,8 @@ Service-to-service authentication is a different module: see
 | Facade feature | `sekvent-auth` feature | Adds | wasm |
 |---|---|---|---|
 | `auth` | — | `PasswordHasher`, `authenticate`, `JwtKeys`, `Claims`, `Validation`, `HasRoles`, `require_any_role` | yes, with the facade's default features off ([below](#build-for-the-browser)) |
-| `auth-axum` | `axum` | `BearerAuth`, `sekvent::auth::axum::{Bearer, RequireRole, RoleSet}` | no |
-| `auth-tonic` | `tonic` | `BearerAuth`, `sekvent::auth::tonic::{BearerInterceptor, verified_claims, require_any_role}` | no |
+| `auth-axum` | `axum` | `BearerAuth` (with `verify_headers` and `end_user`), `EndUserClaims`, `HasRoles` for `EndUser`, `sekvent::auth::axum::{Bearer, RequireRole, RoleSet}` | no |
+| `auth-tonic` | `tonic` | `BearerAuth` (with `verify_headers` and `end_user`), `EndUserClaims`, `HasRoles` for `EndUser`, `sekvent::auth::tonic::{BearerInterceptor, verified_claims, require_any_role}` | no |
 | `auth-tokio` | `tokio` | `PasswordHasher::hash_async`, `verify_async`, `authenticate_async` | no |
 
 ```toml
@@ -379,8 +379,9 @@ async fn purge(guard: RequireRole<Admins, Profile>) -> String {
   failure detail is logged at `debug`.
 
 `BearerAuth` also has `keys()` (to issue tokens from the same server),
-`now_unix_secs()` and `verify::<T>(token)`. It is cheap to clone, and its
-`Debug` shows no secret.
+`now_unix_secs()`, `verify::<T>(token)` and `verify_headers::<T>(headers)`
+([below](#authenticate-end-users-of-components)). It is cheap to clone, and
+its `Debug` shows no secret.
 
 ### Guard tonic services
 
@@ -406,6 +407,67 @@ In the handler, `verified_claims::<T, _>(&request)` returns the claims and
 closed with `UNAUTHENTICATED` when no claims are present (the interceptor
 was not installed on this service). `T` must be the same type the
 interceptor was built with.
+
+### Authenticate end users of components
+
+With `auth-axum` or `auth-tonic`. A component served with
+`SEKVENT_COMPONENT_<C>_SERVE_AUTH=bearer` (or `link,bearer`) authenticates
+its end users with the App's end-user authenticator; `BearerAuth` is a
+ready-made one for JWTs. The full setup is in
+[Components: serve to end users](components.md#how-to-serve-components-to-end-users-browsers-apps).
+
+```rust
+impl BearerAuth {
+    pub fn verify_headers<T: DeserializeOwned>(&self, headers: &http::HeaderMap)
+        -> Result<Claims<T>, AppError>;
+    pub fn end_user<T: DeserializeOwned + EndUserClaims>(&self, headers: &http::HeaderMap)
+        -> Result<EndUser, AppError>;
+}
+
+pub trait EndUserClaims {
+    fn tenant(&self) -> Option<&str> { None }
+    fn roles(&self) -> &[String] { &[] }
+}
+impl EndUserClaims for NoClaims {}
+impl HasRoles for EndUser { /* delegates to EndUser::has_role */ }
+```
+
+- `verify_headers` reads `Authorization: Bearer <jwt>` from a header map and
+  verifies it at the clock's current time, like the axum and tonic guards.
+- `end_user` does the same and builds a `sekvent::context::EndUser`: `sub`
+  is the subject, tenant and roles come from your custom claims through
+  `EndUserClaims`. With `NoClaims` the end user has a subject only.
+- Every rejection is `UNAUTHENTICATED` with `invalid or expired
+  credentials`, so the component's own answer stays the same for a
+  missing, malformed, expired or unknown token.
+
+```rust
+use std::sync::Arc;
+use sekvent::auth::{BearerAuth, EndUserClaims, Validation};
+use sekvent::context::SystemClock;
+
+#[derive(Debug, serde::Deserialize)]
+struct Profile { tenant: String, roles: Vec<String> }
+
+impl EndUserClaims for Profile {
+    fn tenant(&self) -> Option<&str> { Some(&self.tenant) }
+    fn roles(&self) -> &[String] { &self.roles }
+}
+
+let auth = BearerAuth::new(keys, Validation::new().with_audience("web"), Arc::new(SystemClock));
+builder.end_user_authenticator(move |request: &http::request::Parts| {
+    auth.end_user::<Profile>(&request.headers)
+})?;
+```
+
+In the component's handler, `EndUser` implements `HasRoles`, so the usual
+role check works on it:
+
+```rust
+if let Some(user) = cx.end_user() {
+    sekvent::auth::require_any_role(user, &["admin"])?;   // PERMISSION_DENIED, "insufficient permissions"
+}
+```
 
 ### Build for the browser
 
@@ -451,6 +513,7 @@ struct (see [config](config.md)) and pass them in.
 | `LoginRejected::Disabled` | `PERMISSION_DENIED` | `ACCOUNT_DISABLED` |
 | `LoginRejected::Locked` | `PERMISSION_DENIED` | `ACCOUNT_LOCKED` |
 | any `TokenRejected` | `UNAUTHENTICATED` | — |
+| `BearerAuth::verify_headers` / `end_user`: missing, malformed or rejected token | `UNAUTHENTICATED` | — |
 | `require_any_role` / `RequireRole` | `PERMISSION_DENIED` | — |
 | bcrypt `hash` of a password over 72 bytes | `INVALID_ARGUMENT` | `PASSWORD_TOO_LONG` |
 | bad hasher parameters, short JWT secret, blank or duplicate `kid` | `INVALID_ARGUMENT` | — |
@@ -493,4 +556,6 @@ struct (see [config](config.md)) and pass them in.
 - [Context](context.md) — `Clock`, `SystemClock`, `ManualClock`
 - [Errors](error.md) — `AppError` and the HTTP/gRPC mappings
 - [Server](server.md) — mounting axum routers and tonic services
+- [Components](components.md#how-to-serve-components-to-end-users-browsers-apps) — serving components to end users with `BearerAuth::end_user`
+- [Design: components served to end users](../design/component-end-user.md)
 - [Design: P8 service essentials](../design/p8-service-essentials.md) — bcrypt and async helpers

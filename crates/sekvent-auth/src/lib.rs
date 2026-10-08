@@ -29,7 +29,10 @@
 //!
 //! The `axum` and `tonic` adapters verify through a `BearerAuth`, which
 //! reads the time from an injected `sekvent_context::Clock`; they are not
-//! wasm-compatible.
+//! wasm-compatible. With either, `BearerAuth::end_user` turns a bearer token
+//! into a `sekvent_context::EndUser` (tenant and roles from claims that
+//! implement `EndUserClaims`), which is what a component end-user
+//! authenticator returns, and `EndUser` implements [`HasRoles`].
 
 #![forbid(unsafe_code)]
 
@@ -46,7 +49,7 @@ pub mod axum;
 pub mod tonic;
 
 #[cfg(any(feature = "axum", feature = "tonic"))]
-pub use adapter::BearerAuth;
+pub use adapter::{BearerAuth, EndUserClaims};
 pub use jwt::{Claims, DEVELOPMENT_SECRET, JwtKeys, NoClaims, TokenRejected, Validation};
 #[cfg(feature = "tokio")]
 pub use login::authenticate_async;

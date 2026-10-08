@@ -2,8 +2,9 @@
 
 `sekvent::context` carries what one logical call needs to know through every
 handler, client and queued job: the request id, the deadline, cancellation,
-the authenticated caller, the end-user subject and tenant, the idempotency
-key, the W3C `traceparent` and the component hop count. It also defines how
+the authenticated caller (a service or an end user), the end-user subject
+and tenant, the idempotency key, the W3C `traceparent` and the component hop
+count. It also defines how
 that context travels as HTTP/gRPC headers (with separate rules for sekvent
 peers and third-party APIs) and the injectable `Clock` that time-dependent
 code should use instead of `SystemTime::now()`.
@@ -13,7 +14,7 @@ code should use instead of `SystemTime::now()`.
 | | |
 |---|---|
 | Facade feature | `context` (on by default) |
-| Module | `use sekvent::context::{CallContext, ServiceIdentity, Clock, SystemClock, ManualClock};` |
+| Module | `use sekvent::context::{CallContext, ServiceIdentity, EndUser, Clock, SystemClock, ManualClock};` |
 | Header codec | `sekvent::context::headers` |
 | Prelude | `CallContext` |
 | Internal crate | `sekvent-context` (no features; depends on `http`, `tokio`, `tokio-util`, `uuid`) |
@@ -56,8 +57,9 @@ extensions), and [component](components.md) handles pass it along.
 | request id | `request_id() -> &str` | Correlates logs across services. A new context gets a UUID v7. |
 | deadline | `deadline() -> Option<Instant>`, `remaining()`, `is_expired()` | Absolute in process; relative `grpc-timeout` on the wire. Only ever narrows. |
 | cancellation | `cancel_token() -> &CancellationToken`, `cancelled().await` | Fires when the token, or the parent it was derived from, is cancelled; see [what cancels a context](#what-cancels-a-context). |
-| caller | `caller() -> Option<&ServiceIdentity>` | Who is calling, as established by authentication. |
-| subject / tenant | `subject()`, `tenant()` | End-user identity, accepted only from a trusted link. |
+| caller | `caller() -> Option<&ServiceIdentity>` | Which service is calling, as established by authentication. |
+| end user | `end_user() -> Option<&EndUser>` | The authenticated end user, when an end user made this call directly (a component served to end users). Never set together with `caller`. |
+| subject / tenant | `subject()`, `tenant()` | End-user identity, accepted only from a trusted link or taken from the authenticated end user. |
 | idempotency key | `idempotency_key()`, `outbound_idempotency_key()` | Names one operation; forwarded only when set for this call. |
 | traceparent | `traceparent()` | W3C trace context. |
 | hops | `hops() -> u32` | How many component calls led to this one (0 at the edge); a guard against call cycles. |
@@ -66,6 +68,26 @@ extensions), and [component](components.md) handles pass it along.
 caller. Build it with `ServiceIdentity::trusted("billing")` (may assert
 subject and tenant on a user's behalf) or `ServiceIdentity::untrusted("web")`.
 The [link](link.md) layer produces it from a service token.
+
+`EndUser` is an end user authenticated at a serving boundary: a component
+served with `SERVE_AUTH=bearer` or `link,bearer` builds it with the App's
+end-user authenticator ([components](components.md#how-to-serve-components-to-end-users-browsers-apps)).
+
+```rust
+use sekvent::context::EndUser;
+
+let user = EndUser::new("user-7")
+    .with_tenant("tenant-a")
+    .with_roles(["admin", "billing"]);
+assert_eq!(user.subject(), "user-7");
+assert_eq!(user.tenant(), Some("tenant-a"));
+assert!(user.has_role("admin"));
+let roles: &[String] = user.roles();
+```
+
+The direct caller is either a service (`caller()`) or an end user
+(`end_user()`), never both. Roles travel with the end user only: they are
+never encoded in headers and never reach the components a handler calls.
 
 ## How to build and derive contexts
 
@@ -78,7 +100,8 @@ Builders (all `#[must_use]`, consuming `self`):
 | `with_deadline(Instant)` | Set the deadline; a later one than the current is ignored. |
 | `with_timeout(Duration)` | Deadline relative to now (same narrowing rule); a timeout too large to represent sets nothing. |
 | `with_cancel(CancellationToken)` | Use this token. |
-| `with_caller(ServiceIdentity)` | Set the authenticated caller. |
+| `with_caller(ServiceIdentity)` | Set the authenticated caller; clears the end user. |
+| `with_end_user(EndUser)` | The end user is the direct caller: sets subject and tenant from it and clears the caller. |
 | `with_subject(s)` / `with_tenant(t)` | Set end-user identity. |
 | `with_idempotency_key(k)` | Set this call's own key (it will be forwarded). |
 | `with_traceparent(tp)` | Set the trace context. |
@@ -88,10 +111,14 @@ Derivations:
 
 | Method | Keeps | Drops / changes |
 |---|---|---|
-| `child()` | request id, deadline, subject, tenant, traceparent, hops, an own idempotency key | caller cleared (the callee learns it from authentication); cancellation becomes a **child token** (cancelling the parent cancels the child, not the reverse); a received idempotency key is not kept |
-| `detached()` | request id, subject, tenant, traceparent, hops, idempotency key (in the same received/own state) | no deadline, a fresh cancellation token, no caller |
+| `child()` | request id, deadline, subject, tenant, traceparent, hops, an own idempotency key | caller and end user cleared (the callee learns its caller from authentication); cancellation becomes a **child token** (cancelling the parent cancels the child, not the reverse); a received idempotency key is not kept |
+| `detached()` | request id, subject, tenant, traceparent, hops, idempotency key (in the same received/own state) | no deadline, a fresh cancellation token, no caller, no end user |
 | `into_inbound()` | everything | marks a present idempotency key as *received*: still readable, no longer forwarded |
-| `sanitize_for_caller()` | everything else | drops subject and tenant unless the caller is a trusted `ServiceIdentity` |
+| `sanitize_for_caller()` | everything else | drops subject and tenant unless the caller is a trusted `ServiceIdentity` or an end user is set |
+
+Because `child()` keeps subject and tenant but drops the end user, a
+component that a handler calls on an end user's behalf sees them exactly as
+a trusted link would assert them, without the end user's roles.
 
 Use `detached()` for anything queued beyond the call's lifetime (a job, an
 outbox row, a spawned task that must finish after the response): it must not
@@ -304,6 +331,8 @@ rejected. Handlers map an expired deadline or cancellation to
   `None` to exercise the trust rule.
 - Cancel with `ctx.cancel_token().cancel()` and await `ctx.cancelled()`
   instead of sleeping.
+- Unit-test a component handler as an end user would call it with
+  `CallContext::new().with_end_user(EndUser::new("user-7").with_roles(["admin"]))`.
 
 ## Pitfalls and security rules
 
@@ -316,14 +345,18 @@ rejected. Handlers map an expired deadline or cancellation to
   time out with the request that enqueued it.
 - Do not forward an inbound idempotency key; set a fresh one per outbound
   operation.
-- `CallContext` derives `Debug`, which includes subject and tenant; avoid
-  logging the whole context where those are sensitive.
+- Never build an `EndUser` from unverified request data. Let the App's
+  end-user authenticator check a credential and the component serving
+  boundary call `with_end_user`.
+- `CallContext` derives `Debug`, which includes subject, tenant and the end
+  user; avoid logging the whole context where those are sensitive.
 
 ## See also
 
 - [Server](server.md): where the inbound context is built and how handlers get it
 - [Client](client.md): outbound propagation
 - [Link](link.md): service identities and trusted links
-- [Components](components.md) and [the component model](../component-model.md): hops, timeouts and idempotency across component calls
+- [Components](components.md) and [the component model](../component-model.md): hops, timeouts and idempotency across component calls, and serving components to end users
+- [Auth](auth.md): `BearerAuth::end_user` and role checks on an `EndUser`
 - [Jobs](jobs.md): detached contexts for background work
 - [Telemetry](telemetry.md): the `x-request-id` layer

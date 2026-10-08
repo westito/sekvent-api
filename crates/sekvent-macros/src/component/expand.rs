@@ -196,11 +196,13 @@ fn method_descriptor(method: &Method, krate: &TokenStream) -> TokenStream {
         quote!(.with_timeout(::core::time::Duration::new(#secs, #nanos)))
     });
     let bulkhead = policy.bulkhead.map(|limit| quote!(.with_bulkhead(#limit)));
+    let anonymous = policy.anonymous.then(|| quote!(.with_anonymous()));
     quote! {
         #krate::MethodDescriptor::call(#name, #rpc)
             #idempotent
             #timeout
             #bulkhead
+            #anonymous
     }
 }
 

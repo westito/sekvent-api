@@ -519,9 +519,15 @@ and [../component-model.md](../component-model.md)):
   component name. `SEKVENT_COMPONENT_<C>_AUTH` is `link` (default) or
   `none`.
 - A component served over gRPC (`SEKVENT_COMPONENT_<C>_SERVE=grpc`) checks
-  the process's inbound tokens unless `SEKVENT_COMPONENT_<C>_SERVE_AUTH=none`.
-  The check runs on the request headers before the body is read. Every
-  configured inbound link may call every exposed component.
+  the process's inbound tokens under `SEKVENT_COMPONENT_<C>_SERVE_AUTH=link`
+  (the default) and `link,bearer`; `none` turns the check off. The check
+  runs on the request headers before the body is read. Every configured
+  inbound link may call every exposed component.
+- `SERVE_AUTH=bearer` serves end users (browsers, apps) through the App's
+  end-user authenticator instead of link tokens and needs no
+  `SEKVENT_LINK_*` key; `link,bearer` tries the link tokens first and falls
+  back to the end-user authenticator. See
+  [components.md](components.md#how-to-serve-components-to-end-users-browsers-apps).
 - The `App` build fails, naming the key, when a needed outbound token is
   missing (`Missing { key: "SEKVENT_LINK_OUTBOUND_<LINK>" }`), when
   inbound auth is on but no `SEKVENT_LINK_INBOUND_*` key exists

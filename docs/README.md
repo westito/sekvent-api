@@ -78,6 +78,7 @@ A typical service:
 | [component-model.md](component-model.md) | The component model: goals, bindings, contracts, milestones |
 | [design/component-c1.md](design/component-c1.md) | Specification of local bindings and the lifecycle (C1) |
 | [design/component-c2.md](design/component-c2.md) | Specification of the gRPC binding, link auth and contracts (C2) |
+| [design/component-end-user.md](design/component-end-user.md) | Specification of serving components to end users: `SERVE_AUTH=bearer`, the end-user authenticator, `#[call(anonymous)]`, gRPC-Web |
 | [design/p8-service-essentials.md](design/p8-service-essentials.md) | Specification of server essentials, probes, password schemes, jobs, leases, HTTP helpers |
 | [examples/shop](../examples/shop/README.md) | Three components (orders, inventory, notifications) in monolith and split topologies |
 

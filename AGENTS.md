@@ -102,6 +102,7 @@ cycle, and keep `sekvent-error` and `sekvent-context` dependency-light.
 
 Specs: `docs/component-model.md` (overview), `docs/design/component-c1.md`
 (local bindings, lifecycle), `docs/design/component-c2.md` (gRPC, contracts),
+`docs/design/component-end-user.md` (serving to end users),
 `docs/design/p8-service-essentials.md` (jobs, leases).
 Milestones C1, C2 and C4 are done (C4: jobs in `sekvent-runtime`, leases in
 `sekvent-db`); C3 and C5 (bus, async/deferred calls, NATS, extraction
@@ -138,6 +139,11 @@ tooling) are not started.
 - Link authentication is fail-closed in both directions; a key that acts
   under one binding is accepted under every binding, so one environment
   serves every topology.
+- Components can be served to end users with `SERVE_AUTH=bearer` or
+  `link,bearer` through the App's one end-user authenticator. It is
+  fail-closed (a bearer mode without it is a build error) and head-only
+  (it runs before the body is read). `#[call(anonymous)]` waives only
+  end-user authentication, never link authentication.
 - `cargo sekvent contract emit` writes baselines (format 2) into the tree:
   run it on the Mac, like other in-tree codegen, and commit the JSON.
   `contract check` runs in-process (protox, no `protoc`, no build) and is

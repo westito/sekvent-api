@@ -6,13 +6,19 @@
 //! the context, the hop limit, the deadline) is read from the request's
 //! HTTP headers before tonic reads the body; request trailers never reach
 //! the call context.
+//!
+//! Callers authenticate as a link (an inbound token), as an end user (the
+//! App's end-user authenticator, which sees the request head only), or
+//! either, by the component's `SERVE_AUTH`. A link token is checked first;
+//! an anonymous method skips the end-user authenticator but never the link
+//! check.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use sekvent_context::{CallContext, headers};
+use sekvent_context::{CallContext, ServiceIdentity, headers};
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_link::TokenMap;
 use tonic::body::Body;
@@ -22,6 +28,7 @@ use tracing::Instrument as _;
 
 use super::codec::BytesCodec;
 use crate::__private::{BoxFuture, Dispatch};
+use crate::end_user::{EndUserAuthenticator, rejection};
 use crate::link::{DOWNSTREAM, depth_exceeded};
 use crate::server::{Server, tag};
 use crate::wire::{CatchPanic, Panicked};
@@ -40,8 +47,12 @@ pub(crate) const DOWNSTREAM_REASON: &str = "downstream_reason";
 pub(crate) struct Served {
     server: Arc<Server>,
     dispatch: Arc<dyn Dispatch>,
-    /// The accepted inbound tokens; `None` with `SERVE_AUTH=none`.
+    /// The accepted inbound tokens; `None` unless `SERVE_AUTH` includes
+    /// `link`.
     inbound: Option<Arc<TokenMap>>,
+    /// The end-user authenticator; `None` unless `SERVE_AUTH` includes
+    /// `bearer`.
+    end_user: Option<Arc<dyn EndUserAuthenticator>>,
     max_hops: u32,
     /// `/<service>/`, the path prefix of every method.
     prefix: String,
@@ -52,6 +63,7 @@ impl std::fmt::Debug for Served {
         f.debug_struct("Served")
             .field("component", &self.descriptor().name())
             .field("authenticated", &self.inbound.is_some())
+            .field("end_user", &self.end_user.is_some())
             .field("max_hops", &self.max_hops)
             .finish_non_exhaustive()
     }
@@ -69,9 +81,20 @@ impl Served {
             server,
             dispatch,
             inbound,
+            end_user: None,
             max_hops,
             prefix,
         }
+    }
+
+    /// Authenticate end users with `authenticator` (`SERVE_AUTH` includes
+    /// `bearer`).
+    pub(crate) fn with_end_user(
+        mut self,
+        authenticator: Option<Arc<dyn EndUserAuthenticator>>,
+    ) -> Self {
+        self.end_user = authenticator;
+        self
     }
 
     pub(crate) fn descriptor(&self) -> &'static ComponentDescriptor {
@@ -90,22 +113,26 @@ impl Served {
             .position(|method| method.rpc() == rpc)
     }
 
-    /// Everything decided from the request headers alone, before the body
-    /// is read: authenticate, route, build the context, check the hop
-    /// limit and narrow the deadline by the method's timeout.
-    fn prepare(
-        &self,
-        path: &str,
-        wire_headers: &http::HeaderMap,
-    ) -> Result<(usize, CallContext), AppError> {
-        let descriptor = self.descriptor();
-        let caller = match &self.inbound {
-            Some(inbound) => Some(
-                sekvent_link::authenticate_headers(inbound, wire_headers)
-                    .ok_or_else(|| AppError::unauthenticated(sekvent_link::REJECTED_MESSAGE))?,
-            ),
-            None => None,
+    /// The link a request's token names, or `None`; under link-only
+    /// serving a request without one is refused.
+    fn link(&self, wire_headers: &http::HeaderMap) -> Result<Option<ServiceIdentity>, AppError> {
+        let Some(inbound) = &self.inbound else {
+            return Ok(None);
         };
+        match sekvent_link::authenticate_headers(inbound, wire_headers) {
+            Some(caller) => Ok(Some(caller)),
+            None if self.end_user.is_some() => Ok(None),
+            None => Err(AppError::unauthenticated(sekvent_link::REJECTED_MESSAGE)),
+        }
+    }
+
+    /// Everything decided from the request headers alone, before the body
+    /// is read and before an end user is authenticated: the link, the
+    /// route, the context and its deadline (the method's timeout narrows
+    /// it), and whether the end-user authenticator must run.
+    fn prepare(&self, path: &str, wire_headers: &http::HeaderMap) -> Result<Prepared, AppError> {
+        let descriptor = self.descriptor();
+        let caller = self.link(wire_headers)?;
         let Some(method) = self.method_of(path) else {
             return Err(AppError::unimplemented(format!(
                 "component {} has no such method",
@@ -114,10 +141,13 @@ impl Served {
             .with_reason(reasons::UNKNOWN_METHOD)
             .with_metadata("component", descriptor.name()));
         };
+        let end_user = caller.is_none()
+            && self.end_user.is_some()
+            && !descriptor
+                .methods()
+                .get(method)
+                .is_some_and(crate::MethodDescriptor::is_anonymous);
         let mut cx = headers::from_headers(wire_headers, caller);
-        if cx.hops() > self.max_hops {
-            return Err(tag(descriptor, depth_exceeded(self.max_hops), method));
-        }
         if let Some(deadline) = self
             .server
             .timeout(method)
@@ -125,7 +155,61 @@ impl Served {
         {
             cx = cx.with_deadline(deadline.into_std());
         }
-        Ok((method, cx))
+        Ok(Prepared {
+            method,
+            cx,
+            end_user,
+        })
+    }
+
+    /// Run the end-user authenticator on the request head within the
+    /// call's deadline, and make the end user the context's caller.
+    async fn authenticate(
+        &self,
+        method: usize,
+        cx: CallContext,
+        head: &http::request::Parts,
+    ) -> Result<CallContext, AppError> {
+        let Some(authenticator) = &self.end_user else {
+            return Ok(cx);
+        };
+        // Deferred into the caught poll, so a sync closure that panics is
+        // caught too.
+        let attempt = CatchPanic::new(async move { authenticator.authenticate(head).await });
+        let outcome = match sekvent_resilience::remaining(&cx) {
+            Some(remaining) => tokio::time::timeout(remaining, attempt)
+                .await
+                .map_err(|_elapsed| deadline_exceeded(self.descriptor(), method))?,
+            None => attempt.await,
+        };
+        match outcome {
+            Ok(Ok(user)) => Ok(cx.with_end_user(user)),
+            Ok(Err(error)) => Err(rejection(error)),
+            Err(Panicked) => Err(tag(
+                self.descriptor(),
+                AppError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "the end-user authenticator of component {} panicked",
+                        self.descriptor().name()
+                    ),
+                )
+                .with_reason(reasons::HANDLER_PANICKED),
+                method,
+            )),
+        }
+    }
+
+    /// The hop limit, checked once the caller is known.
+    fn check_hops(&self, method: usize, cx: &CallContext) -> Result<(), AppError> {
+        if cx.hops() > self.max_hops {
+            return Err(tag(
+                self.descriptor(),
+                depth_exceeded(self.max_hops),
+                method,
+            ));
+        }
+        Ok(())
     }
 
     /// Run one prepared call through the gate and answer.
@@ -187,6 +271,24 @@ fn panicked(descriptor: &'static ComponentDescriptor, method: usize) -> AppError
     tag(descriptor, error, method)
 }
 
+/// What [`Served::prepare`] decided from the headers.
+#[derive(Debug)]
+struct Prepared {
+    method: usize,
+    cx: CallContext,
+    /// Whether the end-user authenticator must run.
+    end_user: bool,
+}
+
+/// The call's deadline passed while it was being served.
+fn deadline_exceeded(descriptor: &'static ComponentDescriptor, method: usize) -> AppError {
+    tag(
+        descriptor,
+        AppError::deadline_exceeded("the call deadline was exceeded"),
+        method,
+    )
+}
+
 /// The gRPC response for `error`, answered without reading the body; a
 /// server-side failure is logged once on the way.
 fn error_response(error: AppError) -> http::Response<Body> {
@@ -225,10 +327,25 @@ where
         let prepared = served.prepare(path, request.headers());
         Box::pin(
             async move {
-                let (method, cx) = match prepared {
+                let Prepared {
+                    method,
+                    mut cx,
+                    end_user,
+                } = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(error_response(error)),
                 };
+                let (head, body) = request.into_parts();
+                if end_user {
+                    cx = match served.authenticate(method, cx, &head).await {
+                        Ok(cx) => cx,
+                        Err(error) => return Ok(error_response(error)),
+                    };
+                }
+                if let Err(error) = served.check_hops(method, &cx) {
+                    return Ok(error_response(error));
+                }
+                let request = http::Request::from_parts(head, body);
                 // Cancels the call's token when the client resets the stream
                 // and this future is dropped, or when the deadline passes.
                 let guard = cx.cancel_token().clone().drop_guard();
@@ -239,9 +356,7 @@ where
                     Some(remaining) => match tokio::time::timeout(remaining, call).await {
                         Ok(response) => response,
                         Err(_elapsed) => {
-                            let error =
-                                AppError::deadline_exceeded("the call deadline was exceeded");
-                            return Ok(error_response(tag(descriptor, error, method)));
+                            return Ok(error_response(deadline_exceeded(descriptor, method)));
                         }
                     },
                     None => call.await,
@@ -302,15 +417,16 @@ mod tests {
     use std::time::Duration;
 
     use sekvent_config::Secret;
+    use sekvent_context::EndUser;
     use sekvent_link::InboundLink;
 
     use super::*;
-    use crate::MethodDescriptor;
     use crate::server::MethodPolicy;
+    use crate::{END_USER_REJECTED_MESSAGE, MethodDescriptor};
 
     const METHODS: &[MethodDescriptor] = &[
         MethodDescriptor::call("reserve", "Reserve"),
-        MethodDescriptor::call("release", "Release"),
+        MethodDescriptor::call("release", "Release").with_anonymous(),
     ];
     const INVENTORY: &ComponentDescriptor =
         &ComponentDescriptor::new("inventory", "Inventory", METHODS).with_package("shop.v1");
@@ -398,9 +514,18 @@ mod tests {
         assert_eq!(error.reason(), Some(reasons::UNKNOWN_METHOD));
         let error = served.prepare(RESERVE, &bearer("wrong")).unwrap_err();
         assert_eq!(error.code(), ErrorCode::Unauthenticated);
-        let (method, cx) = served.prepare(RESERVE, &bearer(TOKEN)).unwrap();
-        assert_eq!(method, 0);
-        assert_eq!(cx.caller().map(|caller| caller.name.as_str()), Some("shop"));
+        // Anonymous methods still need the link under link-only serving.
+        let error = served
+            .prepare("/shop.v1.Inventory/Release", &http::HeaderMap::new())
+            .unwrap_err();
+        assert_eq!(error.message(), sekvent_link::REJECTED_MESSAGE);
+        let prepared = served.prepare(RESERVE, &bearer(TOKEN)).unwrap();
+        assert_eq!(prepared.method, 0);
+        assert!(!prepared.end_user);
+        assert_eq!(
+            prepared.cx.caller().map(|caller| caller.name.as_str()),
+            Some("shop")
+        );
     }
 
     #[tokio::test]
@@ -408,12 +533,17 @@ mod tests {
         let served = authenticated(Some(Duration::from_secs(2)));
         let mut wire = bearer(TOKEN);
         wire.insert(headers::HOPS, "2".parse().unwrap());
-        let error = served.prepare(RESERVE, &wire).unwrap_err();
+        let prepared = served.prepare(RESERVE, &wire).unwrap();
+        let error = served
+            .check_hops(prepared.method, &prepared.cx)
+            .unwrap_err();
         assert_eq!(error.reason(), Some(reasons::CALL_DEPTH_EXCEEDED));
         assert_eq!(error.metadata()["method"], "reserve");
 
         let before = std::time::Instant::now();
-        let (_, cx) = served.prepare(RESERVE, &bearer(TOKEN)).unwrap();
+        let prepared = served.prepare(RESERVE, &bearer(TOKEN)).unwrap();
+        served.check_hops(prepared.method, &prepared.cx).unwrap();
+        let cx = prepared.cx;
         let deadline = cx.deadline().unwrap();
         assert!(deadline > before);
         assert!(deadline <= std::time::Instant::now() + Duration::from_secs(2));
@@ -483,6 +613,176 @@ mod tests {
         assert_eq!(converted.code(), ErrorCode::Internal);
         assert_eq!(converted.metadata()[DOWNSTREAM_CODE], "DEADLINE_EXCEEDED");
         assert!(!converted.metadata().contains_key(DOWNSTREAM_REASON));
+    }
+
+    /// Accepts `Bearer user-<n>`, fails `UNAVAILABLE` for `Bearer down`,
+    /// panics for `Bearer panic`, never answers for `Bearer hang`, and
+    /// rejects anything else with a detailed message.
+    struct Sessions;
+
+    impl EndUserAuthenticator for Sessions {
+        fn authenticate<'a>(
+            &'a self,
+            request: &'a http::request::Parts,
+        ) -> BoxFuture<'a, Result<EndUser, AppError>> {
+            let token = request
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::to_owned);
+            assert!(token.as_deref() != Some("panic-now"), "sync panic");
+            Box::pin(async move {
+                match token.as_deref() {
+                    Some("down") => Err(AppError::unavailable("sessions are down")),
+                    Some("panic") => panic!("secret token"),
+                    Some("hang") => std::future::pending().await,
+                    Some(user) if user.starts_with("user-") => {
+                        Ok(EndUser::new(user).with_tenant("t-1").with_roles(["buyer"]))
+                    }
+                    _ => Err(AppError::unauthenticated("token signature mismatch")),
+                }
+            })
+        }
+    }
+
+    fn end_user_served(link: bool, timeout: Option<Duration>) -> Served {
+        let inbound = link.then(|| {
+            Arc::new(TokenMap::new([InboundLink::trusted("shop", Secret::new(TOKEN))]).unwrap())
+        });
+        let sessions: Arc<dyn EndUserAuthenticator> = Arc::new(Sessions);
+        Served::new(server(timeout), Arc::new(Echo), inbound, 16).with_end_user(Some(sessions))
+    }
+
+    fn head(wire: http::HeaderMap) -> http::request::Parts {
+        let mut request = http::Request::new(());
+        *request.headers_mut() = wire;
+        request.into_parts().0
+    }
+
+    /// `prepare` and, when it asks for one, the end user.
+    async fn admit(
+        served: &Served,
+        path: &str,
+        wire: http::HeaderMap,
+    ) -> Result<Prepared, AppError> {
+        let mut prepared = served.prepare(path, &wire)?;
+        if prepared.end_user {
+            prepared.cx = served
+                .authenticate(prepared.method, prepared.cx, &head(wire))
+                .await?;
+        }
+        Ok(prepared)
+    }
+
+    #[tokio::test]
+    async fn end_users_are_authenticated_from_the_head() {
+        let served = end_user_served(false, None);
+        let mut wire = bearer("user-7");
+        wire.insert(headers::SUBJECT, "someone-else".parse().unwrap());
+        let prepared = admit(&served, RESERVE, wire).await.unwrap();
+        let user = prepared.cx.end_user().unwrap();
+        assert_eq!(user.subject(), "user-7");
+        assert!(user.has_role("buyer"));
+        assert_eq!(prepared.cx.subject(), Some("user-7"), "never the header's");
+        assert_eq!(prepared.cx.tenant(), Some("t-1"));
+        assert_eq!(prepared.cx.caller(), None);
+
+        // Missing and wrong tokens get one answer.
+        let missing = admit(&served, RESERVE, http::HeaderMap::new())
+            .await
+            .unwrap_err();
+        let wrong = admit(&served, RESERVE, bearer("forged")).await.unwrap_err();
+        for error in [&missing, &wrong] {
+            assert_eq!(error.code(), ErrorCode::Unauthenticated);
+            assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+            assert_eq!(error.reason(), None);
+            assert!(error.metadata().is_empty());
+        }
+
+        // Other failures pass; panics are internal without their payload.
+        let error = admit(&served, RESERVE, bearer("down")).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        for token in ["panic", "panic-now"] {
+            let error = admit(&served, RESERVE, bearer(token)).await.unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Internal);
+            assert_eq!(error.reason(), Some(reasons::HANDLER_PANICKED));
+            assert!(!error.message().contains("secret"), "{}", error.message());
+            assert_eq!(error.metadata()["method"], "reserve");
+        }
+
+        // Routing comes before the authenticator; anonymous methods skip it.
+        let error = admit(&served, "/shop.v1.Inventory/Stock", http::HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason(), Some(reasons::UNKNOWN_METHOD));
+        let prepared = admit(&served, "/shop.v1.Inventory/Release", bearer("forged"))
+            .await
+            .unwrap();
+        assert!(!prepared.end_user);
+        assert_eq!(prepared.cx.end_user(), None);
+        assert_eq!(prepared.cx.caller(), None);
+        assert!(format!("{served:?}").contains("end_user: true"));
+    }
+
+    #[tokio::test]
+    async fn links_come_first_when_both_are_served() {
+        let served = end_user_served(true, None);
+        let mut wire = bearer(TOKEN);
+        wire.insert(headers::SUBJECT, "user-3".parse().unwrap());
+        let prepared = admit(&served, RESERVE, wire).await.unwrap();
+        assert!(!prepared.end_user);
+        assert_eq!(
+            prepared.cx.caller(),
+            Some(&ServiceIdentity::trusted("shop"))
+        );
+        assert_eq!(
+            prepared.cx.subject(),
+            Some("user-3"),
+            "asserted by a trusted link"
+        );
+        assert_eq!(prepared.cx.end_user(), None);
+
+        let prepared = admit(&served, RESERVE, bearer("user-9")).await.unwrap();
+        assert_eq!(prepared.cx.end_user().map(EndUser::subject), Some("user-9"));
+
+        let error = admit(&served, RESERVE, bearer("forged")).await.unwrap_err();
+        assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+
+        // An anonymous method keeps a link caller's identity.
+        let prepared = admit(&served, "/shop.v1.Inventory/Release", bearer(TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.cx.caller(),
+            Some(&ServiceIdentity::trusted("shop"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_authenticator_runs_within_the_deadline() {
+        let served = end_user_served(false, Some(Duration::from_millis(50)));
+        let error = admit(&served, RESERVE, bearer("hang")).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(error.metadata()["component"], "inventory");
+
+        let unbounded = end_user_served(false, None);
+        let prepared = unbounded.prepare(RESERVE, &bearer("user-1")).unwrap();
+        let cx = served
+            .authenticate(prepared.method, prepared.cx, &head(bearer("user-1")))
+            .await
+            .unwrap();
+        assert!(cx.end_user().is_some());
+    }
+
+    #[tokio::test]
+    async fn without_an_authenticator_the_context_is_unchanged() {
+        let served = served();
+        let cx = served
+            .authenticate(0, CallContext::new(), &head(bearer("user-1")))
+            .await
+            .unwrap();
+        assert_eq!(cx.end_user(), None);
     }
 
     #[test]

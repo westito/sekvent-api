@@ -15,6 +15,7 @@ use tokio::time::Instant;
 
 use crate::__private::Dispatch;
 use crate::config::{self, Entry, Resolved, Settings};
+use crate::end_user::EndUserAuthenticator;
 use crate::lifecycle::LifecycleDyn;
 use crate::link::Link;
 use crate::server::Server;
@@ -83,6 +84,7 @@ pub struct AppBuilder<'a> {
     source: &'a dyn ConfigSource,
     installs: Vec<Install>,
     resources: HashMap<TypeId, Resource>,
+    end_user: Option<Arc<dyn EndUserAuthenticator>>,
 }
 
 impl AppBuilder<'_> {
@@ -103,6 +105,23 @@ impl AppBuilder<'_> {
                 value: Box::new(value),
             },
         );
+        Ok(())
+    }
+
+    /// Register the authenticator of end users calling components served
+    /// with `SEKVENT_COMPONENT_<C>_SERVE_AUTH=bearer` or `link,bearer`. One
+    /// per App; a second is [`BuildError::DuplicateEndUserAuthenticator`].
+    ///
+    /// Without one, serving a component with end-user authentication fails
+    /// the build with [`BuildError::EndUserAuthenticatorMissing`].
+    pub fn end_user_authenticator(
+        &mut self,
+        authenticator: impl EndUserAuthenticator,
+    ) -> Result<(), BuildError> {
+        if self.end_user.is_some() {
+            return Err(BuildError::DuplicateEndUserAuthenticator);
+        }
+        self.end_user = Some(Arc::new(authenticator));
         Ok(())
     }
 
@@ -147,7 +166,7 @@ impl AppBuilder<'_> {
                 remote: install.factory.is_none(),
             })
             .collect();
-        let settings = config::resolve(self.source, &entries)?;
+        let settings = config::resolve_with(self.source, &entries, self.end_user.is_some())?;
         let installed: Vec<(TypeId, &'static ComponentDescriptor)> = self
             .installs
             .iter()
@@ -212,6 +231,7 @@ impl AppBuilder<'_> {
                     serve,
                     &server,
                     built.dispatch.clone(),
+                    self.end_user.as_ref(),
                 )?);
             }
             handles.push(Some(built.handle));
@@ -359,6 +379,7 @@ fn expose(
     serve: &config::Serve,
     server: &Arc<Server>,
     dispatch: Option<Arc<dyn Dispatch>>,
+    end_user: Option<&Arc<dyn EndUserAuthenticator>>,
 ) -> Result<Exposed, BuildError> {
     let Some(dispatch) = dispatch else {
         return Err(BuildError::NotServable {
@@ -367,7 +388,7 @@ fn expose(
             reason: "its implementation has no byte-level dispatcher",
         });
     };
-    let inbound = if serve.auth {
+    let inbound = if serve.auth.link {
         settings
             .links
             .as_ref()
@@ -375,16 +396,25 @@ fn expose(
     } else {
         None
     };
+    // The configuration already refused bearer serving without one.
+    let end_user = if serve.auth.bearer {
+        end_user.cloned()
+    } else {
+        None
+    };
     Ok(Exposed {
         component: descriptor.name(),
         key: serve.key.clone(),
         service: crate::grpc::service_name(descriptor),
-        served: Arc::new(crate::grpc::service::Served::new(
-            Arc::clone(server),
-            dispatch,
-            inbound,
-            settings.max_hops,
-        )),
+        served: Arc::new(
+            crate::grpc::service::Served::new(
+                Arc::clone(server),
+                dispatch,
+                inbound,
+                settings.max_hops,
+            )
+            .with_end_user(end_user),
+        ),
     })
 }
 
@@ -396,6 +426,7 @@ fn expose(
     serve: &config::Serve,
     _server: &Arc<Server>,
     _dispatch: Option<Arc<dyn Dispatch>>,
+    _end_user: Option<&Arc<dyn EndUserAuthenticator>>,
 ) -> Result<Exposed, BuildError> {
     Ok(Exposed {
         component: descriptor.name(),
@@ -422,6 +453,7 @@ impl fmt::Debug for AppBuilder<'_> {
         f.debug_struct("AppBuilder")
             .field("components", &components)
             .field("resources", &resources)
+            .field("end_user_authenticator", &self.end_user.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -560,6 +592,7 @@ impl App {
             source,
             installs: Vec::new(),
             resources: HashMap::new(),
+            end_user: None,
         }
     }
 

@@ -78,7 +78,8 @@ impl InventoryHandle {
             .with_timeout(::core::time::Duration::new(2u64, 0u32))
             .with_bulkhead(16u32),
         ::sekvent_component::MethodDescriptor::call("release", "Release")
-            .with_timeout(::core::time::Duration::new(0u64, 500000000u32)),
+            .with_timeout(::core::time::Duration::new(0u64, 500000000u32))
+            .with_anonymous(),
     ];
     /// Reserve stock for an order.
     pub fn reserve<'a>(

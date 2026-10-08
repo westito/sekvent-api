@@ -23,6 +23,7 @@ pub struct MethodDescriptor {
     idempotent: bool,
     timeout: Option<Duration>,
     bulkhead: Option<u32>,
+    anonymous: bool,
 }
 
 impl MethodDescriptor {
@@ -37,6 +38,7 @@ impl MethodDescriptor {
             idempotent: false,
             timeout: None,
             bulkhead: None,
+            anonymous: false,
         }
     }
 
@@ -58,6 +60,15 @@ impl MethodDescriptor {
     #[must_use]
     pub const fn with_bulkhead(mut self, max_concurrent: u32) -> Self {
         self.bulkhead = Some(max_concurrent);
+        self
+    }
+
+    /// Let end users call the method without credentials when the component
+    /// is served with end-user authentication; link authentication still
+    /// applies.
+    #[must_use]
+    pub const fn with_anonymous(mut self) -> Self {
+        self.anonymous = true;
         self
     }
 
@@ -89,6 +100,11 @@ impl MethodDescriptor {
     /// The declared bulkhead size, if any.
     pub const fn bulkhead(&self) -> Option<u32> {
         self.bulkhead
+    }
+
+    /// Whether end users may call the method without credentials.
+    pub const fn is_anonymous(&self) -> bool {
+        self.anonymous
     }
 }
 
@@ -182,7 +198,7 @@ mod tests {
             .with_idempotent()
             .with_timeout(Duration::from_secs(2))
             .with_bulkhead(16),
-        MethodDescriptor::call("release", "Release"),
+        MethodDescriptor::call("release", "Release").with_anonymous(),
     ];
 
     const INVENTORY: &ComponentDescriptor =
@@ -198,11 +214,13 @@ mod tests {
         assert!(reserve.is_idempotent());
         assert_eq!(reserve.timeout(), Some(Duration::from_secs(2)));
         assert_eq!(reserve.bulkhead(), Some(16));
+        assert!(!reserve.is_anonymous());
 
         let release = METHODS[1];
         assert!(!release.is_idempotent());
         assert_eq!(release.timeout(), None);
         assert_eq!(release.bulkhead(), None);
+        assert!(release.is_anonymous());
         assert_ne!(reserve, release);
     }
 

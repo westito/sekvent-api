@@ -1,4 +1,4 @@
-error: unknown #[call] argument `retry`; expected idempotent, timeout or bulkhead
+error: unknown #[call] argument `retry`; expected idempotent, timeout, bulkhead or anonymous
  --> tests/ui/fail/m4_unknown_call_argument.rs:3:12
   |
 3 |     #[call(retry)]

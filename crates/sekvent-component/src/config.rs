@@ -71,9 +71,52 @@ impl Entry {
 pub(crate) struct Serve {
     /// The `SERVE` key, for error messages.
     pub(crate) key: String,
-    /// Whether callers must present an inbound link token.
-    pub(crate) auth: bool,
+    /// Who may call it.
+    pub(crate) auth: ServeAuth,
 }
+
+/// `SERVE_AUTH`: the ways a served component's callers authenticate.
+/// Neither is `none`: anyone may call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServeAuth {
+    /// A peer service with an inbound link token.
+    pub(crate) link: bool,
+    /// An end user the App's end-user authenticator accepts.
+    pub(crate) bearer: bool,
+}
+
+impl ServeAuth {
+    pub(crate) const NONE: Self = Self {
+        link: false,
+        bearer: false,
+    };
+    pub(crate) const LINK: Self = Self {
+        link: true,
+        bearer: false,
+    };
+    pub(crate) const BEARER: Self = Self {
+        link: false,
+        bearer: true,
+    };
+    pub(crate) const LINK_BEARER: Self = Self {
+        link: true,
+        bearer: true,
+    };
+
+    /// The exact spellings: `link`, `bearer`, `link,bearer` (either order)
+    /// and `none`.
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "link" => Some(Self::LINK),
+            "bearer" => Some(Self::BEARER),
+            "link,bearer" | "bearer,link" => Some(Self::LINK_BEARER),
+            "none" => Some(Self::NONE),
+            _ => None,
+        }
+    }
+}
+
+const SERVE_AUTH_EXPECTED: &str = "one of link, bearer, link,bearer, none";
 
 /// Where a `grpc`-bound component is called.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,16 +170,27 @@ pub(crate) fn key(parts: &[&str]) -> String {
     key
 }
 
+/// [`resolve_with`] for an App without an end-user authenticator.
+#[cfg(test)]
+pub(crate) fn resolve(
+    source: &dyn ConfigSource,
+    entries: &[Entry],
+) -> Result<Settings, BuildError> {
+    resolve_with(source, entries, false)
+}
+
 /// Resolve the binding, exposure, link settings and policies of every
-/// entry, in order.
+/// entry, in order; `end_user` tells whether the App has an end-user
+/// authenticator.
 ///
 /// Every problem is collected: key collisions, unknown keys under
 /// [`CONFIG_PREFIX`] and `SEKVENT_POLICY_`, malformed or invalid values,
 /// bindings that are unavailable or do not fit the component's mode, and
-/// missing endpoints or link tokens.
-pub(crate) fn resolve(
+/// missing endpoints, link tokens or end-user authenticator.
+pub(crate) fn resolve_with(
     source: &dyn ConfigSource,
     entries: &[Entry],
+    end_user: bool,
 ) -> Result<Settings, BuildError> {
     let mut errors = Vec::new();
     let known = known_keys(entries, &mut errors);
@@ -164,6 +218,7 @@ pub(crate) fn resolve(
             source,
             *entry,
             binding.as_ref().map(|(b, _)| *b),
+            end_user,
             &mut errors,
         );
         if let Ok(Some(serve)) = &serve {
@@ -297,10 +352,14 @@ fn warn_unauthenticated(entries: &[Entry], components: &[Resolved]) {
                 "component calls do not present a link token"
             );
         }
-        if resolved.serve.as_ref().is_some_and(|serve| !serve.auth) {
+        if resolved
+            .serve
+            .as_ref()
+            .is_some_and(|serve| serve.auth == ServeAuth::NONE)
+        {
             tracing::warn!(
                 key = %key(&[name, SERVE_AUTH]),
-                "component is served over gRPC without link authentication"
+                "component is served over gRPC without authentication"
             );
         }
     }
@@ -487,20 +546,30 @@ fn available(
 struct Recorded;
 
 /// `SERVE` and `SERVE_AUTH`: `Ok(None)` when not exposed, [`Recorded`]
-/// after recording a problem. `binding` is `None` when it failed to resolve.
+/// after recording a problem. `binding` is `None` when it failed to resolve;
+/// `end_user` tells whether the App has an end-user authenticator.
 fn read_serve(
     source: &dyn ConfigSource,
     entry: Entry,
     binding: Option<Binding>,
+    end_user: bool,
     errors: &mut Vec<BuildError>,
 ) -> Result<Option<Serve>, Recorded> {
     let component = entry.descriptor.name();
     let serve_key = key(&[component, SERVE]);
     let auth_key = key(&[component, SERVE_AUTH]);
     let serve = read_choice(source, &serve_key, "grpc", "none");
-    let auth = read_choice(source, &auth_key, "link", "none");
+    let auth = source
+        .get(&auth_key)
+        .map(|raw| {
+            ServeAuth::parse(&raw).ok_or_else(|| ConfigError::Malformed {
+                key: source.describe(&auth_key),
+                expected: SERVE_AUTH_EXPECTED.to_owned(),
+            })
+        })
+        .transpose();
     let (serve, auth) = match (serve, auth) {
-        (Ok(serve), Ok(auth)) => (serve.unwrap_or(false), auth.unwrap_or(true)),
+        (Ok(serve), Ok(auth)) => (serve.unwrap_or(false), auth.unwrap_or(ServeAuth::LINK)),
         (serve, auth) => {
             errors.extend(serve.err().into_iter().chain(auth.err()).map(Into::into));
             return Err(Recorded);
@@ -516,6 +585,13 @@ fn read_serve(
     } else {
         match binding {
             Some(binding) if binding.is_local() => {
+                if auth.bearer && !end_user {
+                    errors.push(BuildError::EndUserAuthenticatorMissing {
+                        component: component.to_owned(),
+                        key: source.describe(&auth_key),
+                    });
+                    return Err(Recorded);
+                }
                 return Ok(Some(Serve {
                     key: serve_key,
                     auth,
@@ -646,7 +722,7 @@ fn read_links(
     }
     let inbound = components
         .iter()
-        .any(|resolved| resolved.serve.as_ref().is_some_and(|serve| serve.auth));
+        .any(|resolved| resolved.serve.as_ref().is_some_and(|serve| serve.auth.link));
     if outbound.is_empty() && !inbound {
         return None;
     }
@@ -1338,7 +1414,10 @@ mod tests {
             malformed,
             [
                 ("SEKVENT_COMPONENT_INVENTORY_SERVE", "grpc or none"),
-                ("SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH", "link or none"),
+                (
+                    "SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH",
+                    SERVE_AUTH_EXPECTED
+                ),
                 (
                     "SEKVENT_COMPONENT_INVENTORY_LINK",
                     "a link name of letters, digits and underscores"
@@ -1359,7 +1438,7 @@ mod tests {
             resolved.serve,
             Some(Serve {
                 key: "SEKVENT_COMPONENT_INVENTORY_SERVE".to_owned(),
-                auth: true,
+                auth: ServeAuth::LINK,
             })
         );
         let settings = resolve(&source(&pairs), &[entry(INVENTORY)]).unwrap();
@@ -1374,10 +1453,74 @@ mod tests {
             INVENTORY,
         )
         .unwrap();
-        assert_eq!(resolved.serve.map(|serve| serve.auth), Some(false));
+        assert_eq!(
+            resolved.serve.map(|serve| serve.auth),
+            Some(ServeAuth::NONE)
+        );
 
         let resolved = one(&[("SEKVENT_COMPONENT_INVENTORY_SERVE", "none")], INVENTORY).unwrap();
         assert_eq!(resolved.serve, None);
+    }
+
+    #[test]
+    fn end_user_serving_needs_an_authenticator_and_no_link() {
+        let serve = |auth: &'static str| {
+            [
+                ("SEKVENT_COMPONENT_INVENTORY_SERVE", "grpc"),
+                ("SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH", auth),
+            ]
+        };
+        for (value, auth) in [
+            ("bearer", ServeAuth::BEARER),
+            ("link,bearer", ServeAuth::LINK_BEARER),
+            ("bearer,link", ServeAuth::LINK_BEARER),
+        ] {
+            let mut pairs = serve(value).to_vec();
+            pairs.push(("SEKVENT_LINK_INBOUND_SHOP", SHOP_TOKEN));
+            let settings = resolve_with(&source(&pairs), &[entry(INVENTORY)], true).unwrap();
+            assert_eq!(
+                settings.components[0]
+                    .serve
+                    .as_ref()
+                    .map(|serve| serve.auth),
+                Some(auth)
+            );
+
+            let error = resolve(&source(&pairs), &[entry(INVENTORY)]).unwrap_err();
+            assert!(
+                matches!(&error, BuildError::EndUserAuthenticatorMissing { component, key }
+                    if component == "inventory" && key == "SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH"),
+                "{error}"
+            );
+        }
+
+        // Bearer alone reads no link keys; with link it needs an inbound token.
+        let settings = resolve_with(&source(&serve("bearer")), &[entry(INVENTORY)], true).unwrap();
+        assert!(settings.links.is_none());
+        let error =
+            resolve_with(&source(&serve("link,bearer")), &[entry(INVENTORY)], true).unwrap_err();
+        assert!(
+            matches!(&error, BuildError::Config(ConfigError::Missing { key })
+                if key == "SEKVENT_LINK_INBOUND_<CALLER>"),
+            "{error}"
+        );
+
+        // Not served: the mode alone asks for nothing.
+        let settings = resolve(
+            &source(&[("SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH", "bearer")]),
+            &[entry(INVENTORY)],
+        )
+        .unwrap();
+        assert!(settings.components[0].serve.is_none());
+
+        for value in ["Bearer", "link, bearer", "link,bearer,link"] {
+            let error = one(&serve(value), INVENTORY).unwrap_err();
+            assert!(
+                matches!(&error, BuildError::Config(ConfigError::Malformed { key, expected })
+                    if key == "SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH" && expected == SERVE_AUTH_EXPECTED),
+                "{error}"
+            );
+        }
     }
 
     #[test]

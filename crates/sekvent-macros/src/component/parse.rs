@@ -51,6 +51,8 @@ const BAD_METHOD_NAME: &str =
 const MISSING_PROTO: &str = "missing `proto = \"...\"`: the module generated for the component's proto package, such as \"crate::proto::shop::inventory::v1\"; only a local_only component may omit it";
 const PROTO_ON_LOCAL_ONLY: &str = "a local_only component has no contract; remove `proto`";
 const BAD_PROTO: &str = "proto must be a module path such as \"crate::proto::shop::inventory::v1\"";
+pub(crate) const ANONYMOUS_ON_LOCAL_ONLY: &str =
+    "`anonymous` has no effect on a local_only component, which is never served; remove it";
 
 /// Where a component may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,8 @@ pub(crate) struct Method {
     pub(crate) reply: Type,
     pub(crate) error: Type,
     pub(crate) policy: CallPolicy,
+    /// The `anonymous` argument of `#[call]`, if given.
+    pub(crate) anonymous: Option<Span>,
 }
 
 /// Arguments of `#[call(...)]`.
@@ -106,6 +110,8 @@ pub(crate) struct CallPolicy {
     pub(crate) idempotent: bool,
     pub(crate) timeout: Option<Duration>,
     pub(crate) bulkhead: Option<u32>,
+    /// End users may call the method without credentials.
+    pub(crate) anonymous: bool,
 }
 
 /// Parse and validate the attribute arguments.
@@ -370,7 +376,7 @@ fn method(function: TraitItemFn) -> Result<Method> {
             format!("method name `{name}` is reserved on the generated handle"),
         ));
     }
-    let (docs, policy) = method_attrs(&function, &mut errors);
+    let (docs, policy, anonymous) = method_attrs(&function, &mut errors);
     check_modifiers(&function, &mut errors);
     let arguments = arguments(&function, &mut errors);
     let returned = returned(&function, &mut errors);
@@ -389,13 +395,19 @@ fn method(function: TraitItemFn) -> Result<Method> {
         reply,
         error,
         policy,
+        anonymous,
     })
 }
 
-/// Doc comments to keep and the `#[call]` policy.
-fn method_attrs(function: &TraitItemFn, errors: &mut Errors) -> (Vec<Attribute>, CallPolicy) {
+/// Doc comments to keep, the `#[call]` policy and the span of its
+/// `anonymous` argument.
+fn method_attrs(
+    function: &TraitItemFn,
+    errors: &mut Errors,
+) -> (Vec<Attribute>, CallPolicy, Option<Span>) {
     let mut docs = Vec::new();
     let mut policy = CallPolicy::default();
+    let mut anonymous = None;
     let mut kinds = 0_usize;
     for attr in &function.attrs {
         let path = attr.path();
@@ -416,7 +428,7 @@ fn method_attrs(function: &TraitItemFn, errors: &mut Errors) -> (Vec<Attribute>,
         }
         if kind == "call" {
             if kinds == 1 {
-                policy = errors.take(call_policy(attr)).unwrap_or_default();
+                (policy, anonymous) = errors.take(call_policy(attr)).unwrap_or_default();
             }
         } else {
             errors.push(Error::new_spanned(
@@ -434,26 +446,30 @@ fn method_attrs(function: &TraitItemFn, errors: &mut Errors) -> (Vec<Attribute>,
             ),
         ));
     }
-    (docs, policy)
+    (docs, policy, anonymous)
 }
 
-/// `#[call]` or `#[call(idempotent, timeout = "2s", bulkhead = 16)]`.
-pub(crate) fn call_policy(attr: &Attribute) -> Result<CallPolicy> {
+/// `#[call]` or `#[call(idempotent, timeout = "2s", bulkhead = 16, anonymous)]`.
+/// Also returns the span of `anonymous`, when given.
+pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, Option<Span>)> {
     let mut policy = CallPolicy::default();
+    let mut anonymous_span = None;
     if matches!(attr.meta, syn::Meta::Path(_)) {
-        return Ok(policy);
+        return Ok((policy, None));
     }
     let mut errors = Errors::default();
-    let (mut idempotent, mut timeout, mut bulkhead) = (false, false, false);
+    let (mut idempotent, mut timeout, mut bulkhead, mut anonymous) = (false, false, false, false);
     attr.parse_nested_meta(|meta| {
         let key = path_name(&meta.path);
         let seen = match key.as_str() {
             "idempotent" => &mut idempotent,
             "timeout" => &mut timeout,
             "bulkhead" => &mut bulkhead,
+            "anonymous" => &mut anonymous,
             _ => {
                 return Err(meta.error(format!(
-                    "unknown #[call] argument `{key}`; expected idempotent, timeout or bulkhead"
+                    "unknown #[call] argument `{key}`; expected idempotent, timeout, bulkhead \
+                     or anonymous"
                 )));
             }
         };
@@ -463,6 +479,10 @@ pub(crate) fn call_policy(attr: &Attribute) -> Result<CallPolicy> {
         *seen = true;
         match key.as_str() {
             "idempotent" => policy.idempotent = true,
+            "anonymous" => {
+                policy.anonymous = true;
+                anonymous_span = Some(meta.path.span());
+            }
             "timeout" => {
                 let value: Expr = meta.value()?.parse()?;
                 policy.timeout = errors.take(timeout_value(&value));
@@ -475,7 +495,7 @@ pub(crate) fn call_policy(attr: &Attribute) -> Result<CallPolicy> {
         Ok(())
     })?;
     errors.finish()?;
-    Ok(policy)
+    Ok((policy, anonymous_span))
 }
 
 /// A humantime string literal for a positive duration.

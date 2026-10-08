@@ -136,6 +136,12 @@ let server = Server::builder()
   `grpc_routes` counts as a second set. Either mistake fails `bind` with
   `INVALID_ARGUMENT` (`gRPC routes were given more than once; use add_service
   to add more`). Call `add_service` after it for more services.
+- Component routes (`grpc_routes(app.grpc_routes())`) are gRPC routes like
+  any other: they sit behind the gRPC-Web translation, the prefix and CORS.
+  Under `.prefix("/api")` a browser calls a served component at
+  `/api/<service>/<Rpc>` (for example `/api/shop.orders.v1.Orders/PlaceOrder`),
+  and preflights are answered before the component sees anything. See
+  [Components: serve to end users](components.md#how-to-serve-components-to-end-users-browsers-apps).
 - `rest(Router)` merges with `Router::merge`, which **panics on overlapping
   routes**.
 - REST routes get a route recorder, so the access log's `route` field holds
@@ -242,6 +248,16 @@ dropped. It does **not** reject requests by itself: an anonymous request
 still reaches your handlers with `ctx.caller() == None`. Reject in a layer or
 handler where that matters; [Service links](link.md) has the middleware.
 
+Components served through `app.grpc_routes()` ignore this authenticator.
+Its identity only feeds the `CallContext` the server stores in the request
+extensions for REST handlers and hand-written tonic services; component
+calls are authenticated by their own `SEKVENT_COMPONENT_<C>_SERVE_AUTH`
+(link tokens, the App's end-user authenticator, or both). Since it never
+rejects, it cannot block a component call either. The App's end-user
+authenticator receives the request head with its extensions, so it may
+read the context stored there to reuse this authenticator's decision. See
+[Components: serve to end users](components.md#how-to-serve-components-to-end-users-browsers-apps).
+
 For tests, any closure works:
 
 ```rust
@@ -279,10 +295,14 @@ in your logs.
   routing. It never wraps the HTTP or gRPC health endpoints.
 - The bounds are those of `axum::Router::layer`, and the layer must be
   `Clone`. A later `.layer(..)` wraps the earlier ones.
-- Component calls served on this listener pass through the layers too. An
-  end-user authentication layer must let link-authenticated component paths
-  through, or be applied to the REST router or tonic service it protects
-  instead.
+- Component calls served on this listener pass through the layers too. A
+  layer that rejects requests without its own credentials also rejects
+  link callers and anonymous component methods. Apply such a layer to the
+  REST router or tonic service it protects instead, or let the gRPC paths
+  through. To authenticate end users of components, use
+  `SERVE_AUTH=bearer` and the App's end-user authenticator
+  ([Components](components.md#how-to-serve-components-to-end-users-browsers-apps)),
+  not a layer.
 
 ### Limit bodies, messages and connections
 
@@ -578,7 +598,9 @@ layers, `access_log(true)`.
 - **An authenticator is not an authorization check.** Anonymous requests
   still reach handlers; reject them where needed.
 - **Layers see component traffic** on the same listener. Do not put an
-  end-user login check in `.layer(..)` if components are served there.
+  end-user login check in `.layer(..)` if components are served there: it
+  would reject link callers and anonymous methods. Components authenticate
+  end users themselves (`SERVE_AUTH=bearer`).
 - **CORS headers from handlers are discarded** once CORS is configured; set
   extra exposed headers with `expose_headers`.
 - **`Full` health visibility leaks topology** (probe names, version); keep it

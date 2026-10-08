@@ -8,13 +8,16 @@
 #![forbid(unsafe_code)]
 
 mod clock;
+mod end_user;
 pub mod headers;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use end_user::EndUser;
 
 /// Who is calling, as established by service-to-service authentication.
 ///
@@ -47,12 +50,16 @@ impl ServiceIdentity {
 }
 
 /// The context of one logical call.
+///
+/// The direct caller is either a service ([`caller`](Self::caller)) or an
+/// end user ([`end_user`](Self::end_user)), never both.
 #[derive(Debug, Clone)]
 pub struct CallContext {
     request_id: String,
     deadline: Option<Instant>,
     cancel: CancellationToken,
     caller: Option<ServiceIdentity>,
+    end_user: Option<Arc<EndUser>>,
     subject: Option<String>,
     tenant: Option<String>,
     idempotency_key: Option<String>,
@@ -79,6 +86,7 @@ impl CallContext {
             deadline: None,
             cancel: CancellationToken::new(),
             caller: None,
+            end_user: None,
             subject: None,
             tenant: None,
             idempotency_key: None,
@@ -119,10 +127,23 @@ impl CallContext {
         self.cancel = cancel;
         self
     }
-    /// Set the authenticated caller.
+    /// Set the authenticated caller. Clears the end user: a call has one
+    /// direct caller.
     #[must_use]
     pub fn with_caller(mut self, caller: ServiceIdentity) -> Self {
         self.caller = Some(caller);
+        self.end_user = None;
+        self
+    }
+    /// Make an authenticated end user the direct caller: subject and tenant
+    /// become theirs (a tenant the user has none of is cleared) and the
+    /// service caller is cleared.
+    #[must_use]
+    pub fn with_end_user(mut self, user: EndUser) -> Self {
+        self.subject = Some(user.subject().to_owned());
+        self.tenant = user.tenant().map(str::to_owned);
+        self.caller = None;
+        self.end_user = Some(Arc::new(user));
         self
     }
     /// Set the end-user subject.
@@ -201,6 +222,11 @@ impl CallContext {
     pub fn caller(&self) -> Option<&ServiceIdentity> {
         self.caller.as_ref()
     }
+    /// The authenticated end user, when an end user made this call
+    /// directly; `None` for service callers and for calls further down.
+    pub fn end_user(&self) -> Option<&EndUser> {
+        self.end_user.as_deref()
+    }
     /// End-user subject, if any.
     pub fn subject(&self) -> Option<&str> {
         self.subject.as_deref()
@@ -233,8 +259,9 @@ impl CallContext {
     }
 
     /// A child for an outbound call: same identity, deadline and hop count, a
-    /// child cancellation token, and the caller cleared (the callee learns its
-    /// caller from authentication, not from us). The idempotency key is kept
+    /// child cancellation token, and the caller and end user cleared (the
+    /// callee learns its caller from authentication, not from us; subject
+    /// and tenant stay). The idempotency key is kept
     /// only when it was set for this call, not received with it.
     #[must_use]
     pub fn child(&self) -> Self {
@@ -243,6 +270,7 @@ impl CallContext {
             deadline: self.deadline,
             cancel: self.cancel.child_token(),
             caller: None,
+            end_user: None,
             subject: self.subject.clone(),
             tenant: self.tenant.clone(),
             idempotency_key: self.outbound_idempotency_key().map(str::to_owned),
@@ -252,8 +280,9 @@ impl CallContext {
         }
     }
 
-    /// A context for work queued beyond this call's lifetime: identity, trace
-    /// and hop count are kept, deadline and cancellation are not.
+    /// A context for work queued beyond this call's lifetime: subject,
+    /// tenant, trace and hop count are kept; deadline, cancellation, caller
+    /// and end user are not.
     #[must_use]
     pub fn detached(&self) -> Self {
         Self {
@@ -261,6 +290,7 @@ impl CallContext {
             deadline: None,
             cancel: CancellationToken::new(),
             caller: None,
+            end_user: None,
             subject: self.subject.clone(),
             tenant: self.tenant.clone(),
             idempotency_key: self.idempotency_key.clone(),
@@ -270,10 +300,11 @@ impl CallContext {
         }
     }
 
-    /// Drop `subject` and `tenant` unless the caller is a trusted link.
+    /// Drop `subject` and `tenant` unless the caller is a trusted link or an
+    /// authenticated end user.
     #[must_use]
     pub fn sanitize_for_caller(mut self) -> Self {
-        if !self.caller.as_ref().is_some_and(|caller| caller.trusted) {
+        if self.end_user.is_none() && !self.caller.as_ref().is_some_and(|caller| caller.trusted) {
             self.subject = None;
             self.tenant = None;
         }
@@ -496,5 +527,40 @@ mod tests {
             .sanitize_for_caller();
         assert_eq!(anonymous.subject(), None);
         assert_eq!(anonymous.tenant(), None);
+    }
+
+    #[test]
+    fn an_end_user_is_the_direct_caller() {
+        let user = EndUser::new("user-9")
+            .with_tenant("tenant-b")
+            .with_roles(["admin"]);
+        let ctx = populated().with_end_user(user.clone());
+        assert_eq!(ctx.end_user(), Some(&user));
+        assert_eq!(ctx.caller(), None);
+        assert_eq!(ctx.subject(), Some("user-9"));
+        assert_eq!(ctx.tenant(), Some("tenant-b"));
+        let kept = ctx.clone().sanitize_for_caller();
+        assert_eq!(kept.subject(), Some("user-9"));
+        assert_eq!(kept.tenant(), Some("tenant-b"));
+
+        let tenantless = populated().with_end_user(EndUser::new("user-9"));
+        assert_eq!(
+            tenantless.tenant(),
+            None,
+            "the user's tenant, not the header's"
+        );
+
+        let child = ctx.child();
+        assert_eq!(child.end_user(), None);
+        assert_eq!(child.subject(), Some("user-9"));
+        assert_eq!(child.tenant(), Some("tenant-b"));
+        let detached = ctx.detached();
+        assert_eq!(detached.end_user(), None);
+        assert_eq!(detached.subject(), Some("user-9"));
+
+        let service = ctx.with_caller(ServiceIdentity::trusted("billing"));
+        assert_eq!(service.end_user(), None);
+        assert_eq!(service.caller(), Some(&ServiceIdentity::trusted("billing")));
+        assert_eq!(CallContext::new().end_user(), None);
     }
 }

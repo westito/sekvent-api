@@ -233,15 +233,19 @@ Moving inventory into its own service is configuration: the service sets
 `SEKVENT_COMPONENT_INVENTORY_SERVE=grpc` and mounts `app.grpc_routes()` on
 its `sekvent-runtime` server; callers set
 `SEKVENT_COMPONENT_INVENTORY_BINDING=grpc`, `…_ENDPOINT=http://host:port`
-and a link token. `cargo sekvent contract check` keeps the protos
-wire-compatible with committed baselines.
+and a link token. A served component can also face end users directly
+(browsers over gRPC-Web, native apps): `…_SERVE_AUTH=bearer` hands each call
+to an end-user authenticator registered on the App, and
+`#[call(anonymous)]` opens public RPCs such as sign-in. `cargo sekvent
+contract check` keeps the protos wire-compatible with committed baselines.
 
 Enable it with the facade feature `component` (plus `component-grpc` for
 the `grpc` binding and serving, and `runtime` for `App::register`, which
 runs every component as one runtime unit). The design is in
 [docs/component-model.md](docs/component-model.md), the specifications in
 [docs/design/component-c1.md](docs/design/component-c1.md),
-[docs/design/component-c2.md](docs/design/component-c2.md) and, for jobs and
+[docs/design/component-c2.md](docs/design/component-c2.md),
+[docs/design/component-end-user.md](docs/design/component-end-user.md) and, for jobs and
 leases, [docs/design/p8-service-essentials.md](docs/design/p8-service-essentials.md), and
 [examples/shop](examples/shop) is a complete three-component example whose
 tests run under `monolith-local`, `monolith-serialized` and a `split-grpc`

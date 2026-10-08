@@ -3,11 +3,34 @@
 use std::fmt;
 use std::sync::Arc;
 
-use sekvent_context::Clock;
+use sekvent_context::{Clock, EndUser};
 use sekvent_error::AppError;
 use serde::de::DeserializeOwned;
 
-use crate::jwt::{Claims, JwtKeys, TokenRejected, Validation};
+use crate::jwt::{Claims, JwtKeys, NoClaims, TokenRejected, Validation};
+use crate::roles::HasRoles;
+
+/// Custom claims that name an end user's tenant and roles, for
+/// [`BearerAuth::end_user`]. Both default to none.
+pub trait EndUserClaims {
+    /// The tenant the end user acts in.
+    fn tenant(&self) -> Option<&str> {
+        None
+    }
+
+    /// The roles granted to the end user.
+    fn roles(&self) -> &[String] {
+        &[]
+    }
+}
+
+impl EndUserClaims for NoClaims {}
+
+impl HasRoles for EndUser {
+    fn has_role(&self, role: &str) -> bool {
+        EndUser::has_role(self, role)
+    }
+}
 
 /// What a server needs to verify bearer tokens: keys, validation rules and
 /// a clock. Cheap to clone.
@@ -45,6 +68,38 @@ impl BearerAuth {
     pub fn verify<T: DeserializeOwned>(&self, token: &str) -> Result<Claims<T>, TokenRejected> {
         self.keys
             .verify(token, self.now_unix_secs(), &self.validation)
+    }
+
+    /// Verify the bearer token of the `authorization` header in `headers`.
+    /// Every failure (no header, another scheme, a bad token) is
+    /// `UNAUTHENTICATED` with the same caller-safe message; the reason is
+    /// logged at `debug`, the token never.
+    pub fn verify_headers<T: DeserializeOwned>(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> Result<Claims<T>, AppError> {
+        let header = headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        self.authenticate_header(header)
+    }
+
+    /// The end user a valid bearer token in `headers` names: `sub` is the
+    /// subject, tenant and roles come from the custom claims. Fails as
+    /// [`verify_headers`](Self::verify_headers) does.
+    ///
+    /// Made to back a component end-user authenticator:
+    /// `builder.end_user_authenticator(move |request| auth.end_user::<Profile>(&request.headers))`.
+    pub fn end_user<T: DeserializeOwned + EndUserClaims>(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> Result<EndUser, AppError> {
+        let claims = self.verify_headers::<T>(headers)?;
+        let mut user = EndUser::new(claims.sub).with_roles(claims.custom.roles().iter().cloned());
+        if let Some(tenant) = claims.custom.tenant() {
+            user = user.with_tenant(tenant);
+        }
+        Ok(user)
     }
 
     /// Verify the value of an `Authorization` header, if any. Every failure
@@ -139,5 +194,79 @@ mod tests {
         let debug = format!("{auth:?}");
         assert!(debug.contains("k1"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Profile {
+        tenant: Option<String>,
+        roles: Vec<String>,
+    }
+
+    impl EndUserClaims for Profile {
+        fn tenant(&self) -> Option<&str> {
+            self.tenant.as_deref()
+        }
+
+        fn roles(&self) -> &[String] {
+            &self.roles
+        }
+    }
+
+    fn headers(value: &str) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn end_users_come_from_verified_headers() {
+        let keys = JwtKeys::hs256("k1", &Secret::new("0123456789abcdef0123456789abcdef")).unwrap();
+        let profile = Profile {
+            tenant: Some("tenant-a".to_owned()),
+            roles: vec!["admin".to_owned()],
+        };
+        let token = keys
+            .issue(&Claims::new("user-7", 1_000, 60, profile))
+            .unwrap();
+        let plain = keys
+            .issue(&Claims::new("user-8", 1_000, 60, NoClaims {}))
+            .unwrap();
+        let clock = ManualClock::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
+        let auth = BearerAuth::new(keys, Validation::new(), Arc::new(clock));
+
+        let user = auth
+            .end_user::<Profile>(&headers(&format!("Bearer {token}")))
+            .unwrap();
+        assert_eq!(user.subject(), "user-7");
+        assert_eq!(user.tenant(), Some("tenant-a"));
+        assert!(HasRoles::has_role(&user, "admin"));
+        assert!(crate::require_any_role(&user, &["admin"]).is_ok());
+        assert!(crate::require_any_role(&user, &["owner"]).is_err());
+
+        let user = auth
+            .end_user::<NoClaims>(&headers(&format!("bearer {plain}")))
+            .unwrap();
+        assert_eq!(user.subject(), "user-8");
+        assert_eq!(user.tenant(), None);
+        assert!(user.roles().is_empty());
+
+        let claims = auth
+            .verify_headers::<NoClaims>(&headers(&format!("Bearer {plain}")))
+            .unwrap();
+        assert_eq!(claims.sub, "user-8");
+
+        let missing = auth
+            .end_user::<NoClaims>(&http::HeaderMap::new())
+            .unwrap_err();
+        let wrong = auth
+            .end_user::<NoClaims>(&headers("Bearer not-a-token"))
+            .unwrap_err();
+        let basic = auth
+            .end_user::<NoClaims>(&headers("Basic dXNlcjpwYXNz"))
+            .unwrap_err();
+        for error in [&missing, &wrong, &basic] {
+            assert_eq!(error.code(), ErrorCode::Unauthenticated);
+            assert_eq!(error.message(), missing.message());
+        }
     }
 }

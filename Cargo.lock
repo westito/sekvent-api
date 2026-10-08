@@ -4097,6 +4097,7 @@ dependencies = [
  "bytes",
  "http",
  "http-body",
+ "http-body-util",
  "hyper-util",
  "prost",
  "sekvent-component",

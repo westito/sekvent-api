@@ -117,6 +117,21 @@ pub enum BuildError {
         /// Why not.
         reason: &'static str,
     },
+    /// A component is served with end-user authentication but the App has
+    /// no end-user authenticator.
+    #[error(
+        "component {component} is served with end-user authentication ({key}), but no end-user \
+         authenticator is registered; call AppBuilder::end_user_authenticator"
+    )]
+    EndUserAuthenticatorMissing {
+        /// The component name.
+        component: String,
+        /// Its `SERVE_AUTH` key.
+        key: String,
+    },
+    /// A second end-user authenticator was registered.
+    #[error("an end-user authenticator is registered twice")]
+    DuplicateEndUserAuthenticator,
     /// A factory returned an error.
     #[error("component {component} failed to build: {source}")]
     Factory {
@@ -283,6 +298,19 @@ mod tests {
                 },
                 "component notes cannot be served over gRPC (SEKVENT_COMPONENT_NOTES_SERVE): \
                  it is local_only",
+            ),
+            (
+                BuildError::EndUserAuthenticatorMissing {
+                    component: "orders".into(),
+                    key: "SEKVENT_COMPONENT_ORDERS_SERVE_AUTH".into(),
+                },
+                "component orders is served with end-user authentication \
+                 (SEKVENT_COMPONENT_ORDERS_SERVE_AUTH), but no end-user authenticator is \
+                 registered; call AppBuilder::end_user_authenticator",
+            ),
+            (
+                BuildError::DuplicateEndUserAuthenticator,
+                "an end-user authenticator is registered twice",
             ),
             (
                 BuildError::Multiple(vec![duplicate("a"), duplicate("b")]),

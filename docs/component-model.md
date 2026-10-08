@@ -10,7 +10,9 @@
 > authentication, retries, circuit breakers, named policies, bulkhead
 > queues, the call-hop limit, proto-first contracts checked at compile time,
 > and `cargo sekvent contract emit | check`; see
-> [design/component-c2.md](design/component-c2.md). C4: interval, cron
+> [design/component-c2.md](design/component-c2.md). Serving components
+> directly to end users (`SERVE_AUTH=bearer`, `#[call(anonymous)]`); see
+> [design/component-end-user.md](design/component-end-user.md). C4: interval, cron
 > and manual jobs in `sekvent-runtime` (`RuntimeBuilder::job`, facade
 > feature `runtime-cron` for cron) and singleton jobs over a database lease
 > with fencing tokens in `sekvent-db` (`LeaseStore`, `LeaseGuard`, facade
@@ -248,7 +250,7 @@ every topology:
 | `…_<C>_LINK` | link name; the binding presents `SEKVENT_LINK_OUTBOUND_<LINK>` (default: the component name) |
 | `…_<C>_AUTH` | `link` (default) or `none` |
 | `…_<C>_SERVE` | `grpc` exposes a locally bound component through `App::grpc_routes()` |
-| `…_<C>_SERVE_AUTH` | `link` (default: only the process's `SEKVENT_LINK_INBOUND_*` tokens are accepted) or `none` |
+| `…_<C>_SERVE_AUTH` | `link` (default: only the process's `SEKVENT_LINK_INBOUND_*` tokens are accepted), `bearer` (end users accepted by the App's end-user authenticator), `link,bearer` (link tokens first, then end users) or `none` |
 | `SEKVENT_COMPONENT_MAX_HOPS` | deepest chain of component calls, default 16 |
 
 A service mounts `App::grpc_routes()` on its `sekvent-runtime` server next
@@ -257,6 +259,14 @@ the component's lifecycle, and `App::start` fails with `GRPC_NOT_MOUNTED`
 when an exposed component's routes were never taken. On the serving side
 the caller is the authenticated link; end-user subject and tenant survive
 only for a link named in `SEKVENT_LINK_TRUSTED`.
+
+Components can also be served directly to end users (browsers over
+gRPC-Web, native apps): with a bearer mode, an end-user authenticator
+registered on the App identifies the caller from the request head, the
+handler reads it as `cx.end_user()`, and `#[call(anonymous)]` opens the few
+public RPCs such as sign-in. See
+[modules/components.md](modules/components.md#how-to-serve-components-to-end-users-browsers-apps)
+and the design note [component-end-user.md](design/component-end-user.md).
 
 Every call carries a hop count (`x-sekvent-hops` across the wire); a call
 deeper than `SEKVENT_COMPONENT_MAX_HOPS` fails `FAILED_PRECONDITION` /
@@ -292,7 +302,9 @@ let app = builder.build()?;   // every misconfiguration is reported here
   - a remote binding without an endpoint or a link token, unless
     `…_<C>_AUTH=none` says so explicitly;
   - a component exposed over gRPC without any inbound link token, unless
-    `…_<C>_SERVE_AUTH=none`;
+    `…_<C>_SERVE_AUTH` is `none` or `bearer`;
+  - a component exposed with `…_<C>_SERVE_AUTH=bearer` or `link,bearer`
+    while no end-user authenticator is registered;
   - unknown component configuration keys;
   - installing the same component twice;
   - two components sharing one link token;

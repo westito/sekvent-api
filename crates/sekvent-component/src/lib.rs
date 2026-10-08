@@ -40,7 +40,7 @@
 //! | `SEKVENT_COMPONENT_<C>_LINK` | link whose `SEKVENT_LINK_OUTBOUND_<LINK>` token is presented (default `C`) |
 //! | `SEKVENT_COMPONENT_<C>_AUTH` | `link` (default) or `none` |
 //! | `SEKVENT_COMPONENT_<C>_SERVE` | `none` (default) or `grpc`: expose a locally bound `C` |
-//! | `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link` (default) or `none` |
+//! | `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link` (default), `bearer`, `link,bearer` or `none` |
 //! | `SEKVENT_COMPONENT_<C>_POLICY`, `…_<C>_<M>_POLICY` | a named policy, `SEKVENT_POLICY_<N>_*` |
 //! | `SEKVENT_COMPONENT_<C>_<FIELD>` | resilience field for every method of `C` |
 //! | `SEKVENT_COMPONENT_<C>_<M>_<FIELD>` | resilience field of method `M` |
@@ -81,7 +81,10 @@
 //! With the `grpc` feature, `App::grpc_routes` serves every component the
 //! configuration exposes, on paths `/<package>.<Trait>/<Rpc>`, through the
 //! same gate, bulkheads and deadlines as in-process calls, after checking
-//! the caller's link token.
+//! the caller's link token or, with `SERVE_AUTH=bearer` or `link,bearer`,
+//! authenticating an end user through the App's [`EndUserAuthenticator`]
+//! (see [`CallContext::end_user`]). Methods marked `#[call(anonymous)]` skip
+//! end-user authentication, never link authentication.
 
 #![forbid(unsafe_code)]
 
@@ -93,6 +96,7 @@ mod binding;
 mod config;
 mod contract;
 mod descriptor;
+mod end_user;
 mod error;
 #[cfg(feature = "grpc")]
 mod grpc;
@@ -111,9 +115,10 @@ pub mod reasons;
 pub use app::{App, AppBuilder, ComponentState, Deps};
 pub use binding::{Binding, ComponentMode};
 pub use descriptor::{ComponentDescriptor, ComponentHandle, MethodDescriptor, MethodKind};
+pub use end_user::{END_USER_REJECTED_MESSAGE, EndUserAuthenticator};
 pub use error::{BuildError, ComponentError};
 pub use lifecycle::Lifecycle;
-pub use sekvent_context::CallContext;
+pub use sekvent_context::{CallContext, EndUser};
 pub use sekvent_error::{AppError, ErrorCode};
 /// `#[component(...)]` on a trait, and `#[derive(ComponentError)]` on an
 /// error enum.

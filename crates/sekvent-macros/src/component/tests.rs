@@ -110,7 +110,7 @@ fn snapshot_standard() {
                     -> Result<ReserveReply, InventoryError>;
 
                 /// Release a reservation.
-                #[call(timeout = "500ms")]
+                #[call(timeout = "500ms", anonymous)]
                 async fn release(&self, cx: &CallContext, req: ReleaseRequest)
                     -> Result<ReleaseReply, InventoryError>;
             }
@@ -422,6 +422,52 @@ fn undocumented_methods_get_a_handle_doc() {
     assert!(
         out.contains("#[doc=\"Call`ping`onthecomponent.\"]"),
         "{out}"
+    );
+}
+
+#[test]
+fn anonymous_methods() {
+    let item = quote! {
+        trait Echo {
+            #[call(anonymous)]
+            async fn ping(&self, cx: &CallContext, req: PingRequest) -> Result<PingReply, AppError>;
+            #[call(idempotent, anonymous, timeout = "1s")]
+            async fn pong(&self, cx: &CallContext, req: PingRequest) -> Result<PingReply, AppError>;
+            #[call]
+            async fn closed(&self, cx: &CallContext, req: PingRequest) -> Result<PingReply, AppError>;
+        }
+    };
+    let out = expand_ok(standard_args(), item);
+    assert!(
+        out.contains("MethodDescriptor::call(\"ping\",\"Ping\").with_anonymous(),"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "MethodDescriptor::call(\"pong\",\"Pong\").with_idempotent()\
+             .with_timeout(::core::time::Duration::new(1u64,0u32)).with_anonymous(),"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("MethodDescriptor::call(\"closed\",\"Closed\")];"),
+        "{out}"
+    );
+
+    let all = messages(
+        quote!(name = "notes", local_only),
+        quote! {
+            trait Notes {
+                #[call(anonymous)]
+                async fn add(&self, cx: &CallContext, req: String) -> Result<usize, AppError>;
+                #[call]
+                async fn count(&self, cx: &CallContext, req: ()) -> Result<usize, AppError>;
+            }
+        },
+    );
+    assert_eq!(
+        all,
+        ["`anonymous` has no effect on a local_only component, which is never served; remove it"]
     );
 }
 
@@ -861,11 +907,15 @@ fn m1_to_m7_attribute_errors() {
         ),
         (
             quote!(#[call(retry)]),
-            "unknown #[call] argument `retry`; expected idempotent, timeout or bulkhead",
+            "unknown #[call] argument `retry`; expected idempotent, timeout, bulkhead or anonymous",
         ),
         (
             quote!(#[call(idempotent, idempotent)]),
             "duplicate #[call] argument `idempotent`",
+        ),
+        (
+            quote!(#[call(anonymous, anonymous)]),
+            "duplicate #[call] argument `anonymous`",
         ),
         (
             quote!(#[call(timeout = "1s", timeout = "2s")]),

@@ -705,7 +705,8 @@ A component is a trait with a protobuf contract; callers hold its generated
 serialization boundary (`local-serialized`: prost encode, separate task,
 decode) or go to another process (`grpc`). Milestones C1 and C2: `#[call]`
 methods only (no `#[async_call]`/`#[deferred]` yet). Specs:
-`docs/design/component-c1.md`, `docs/design/component-c2.md`; full example
+`docs/design/component-c1.md`, `docs/design/component-c2.md`,
+`docs/design/component-end-user.md` (serving to browsers and apps); full example
 with a split topology: `examples/shop`. Facade features `component`,
 `component-grpc` (the `grpc` binding and `App::grpc_routes`), `runtime`
 (`App::register`).
@@ -836,6 +837,47 @@ bound `grpc`, its factory never runs. The wire is plain gRPC on
 `/<package>.<Trait>/<Rpc>`, so a client generated from the `.proto` by any
 toolchain can call the server with `authorization: Bearer <token>`.
 
+End users (browsers over gRPC-Web, native apps) call a served component
+directly when its `SERVE_AUTH` is `bearer` (end users only) or
+`link,bearer` (link tokens first, then end users). Register the App's one
+end-user authenticator; it sees the request head only, before the body:
+
+```rust
+// facade features: component-grpc, runtime-grpc-web (browsers), auth-axum or auth-tonic (BearerAuth)
+let auth = BearerAuth::new(keys, Validation::new().with_audience("web"), Arc::new(SystemClock));
+builder.end_user_authenticator(move |request: &http::request::Parts| {
+    auth.end_user::<Profile>(&request.headers)         // Profile: Deserialize + EndUserClaims (tenant, roles)
+})?;                                                   // or impl EndUserAuthenticator (async) for I/O-bound checks
+let server = Server::builder()
+    .grpc_routes(app.grpc_routes())
+    .prefix("/api")                                    // browser: POST /api/shop.orders.v1.Orders/PlaceOrder
+    .cors(Cors::origins(["https://shop.example.com"])?)
+    .bind(addr)
+    .await?;
+
+// in a handler: Some for an end user calling directly (then cx.caller() is None)
+if let Some(user) = cx.end_user() {
+    sekvent::auth::require_any_role(user, &["admin"])?;
+}
+```
+
+- No authenticator with a bearer mode fails the build
+  (`BuildError::EndUserAuthenticatorMissing`, naming the `SERVE_AUTH` key);
+  a second one is `DuplicateEndUserAuthenticator`.
+- An authenticator `Err` with `UNAUTHENTICATED` reaches the client as
+  `UNAUTHENTICATED` / `invalid or expired credentials`, no reason, the same
+  for every bad token; any other code passes through unchanged
+  (`UNAVAILABLE` for a down session store).
+- `#[call(anonymous)]` (e.g. `sign_in`) waives end-user authentication only,
+  never link authentication: under `link` it still needs a link token, under
+  local bindings it has no effect, on `local_only` it is a compile error. A
+  token sent to an anonymous method is ignored.
+- Roles stay with the authenticating component: callees down the chain see
+  subject and tenant (`cx.child()` drops the end user), never roles.
+- `ServerBuilder::authenticator` never rejects and component calls ignore
+  it; global `.layer(..)`s wrap component calls, so a layer that demands
+  its own credentials also blocks link callers and anonymous methods.
+
 Configuration keys (all optional unless noted; unknown keys under
 `SEKVENT_COMPONENT_` and `SEKVENT_POLICY_`, malformed values and zeros fail
 the build; every key is accepted under every binding, so one environment
@@ -849,7 +891,7 @@ works for every topology):
 | `SEKVENT_COMPONENT_<C>_LINK` | link name (default: the component name); the binding presents `SEKVENT_LINK_OUTBOUND_<LINK>` (required unless `AUTH=none`) |
 | `SEKVENT_COMPONENT_<C>_AUTH` | `link` (default) or `none` (logged at `warn!`) |
 | `SEKVENT_COMPONENT_<C>_SERVE` | `none` (default) or `grpc`: expose a locally bound component |
-| `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link` (default: needs at least one `SEKVENT_LINK_INBOUND_<CALLER>`) or `none` |
+| `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link` (default: needs at least one `SEKVENT_LINK_INBOUND_<CALLER>`), `bearer` (end users; needs `AppBuilder::end_user_authenticator`, no link keys), `link,bearer` (both requirements) or `none` |
 | `SEKVENT_COMPONENT_MAX_HOPS` | 1–1000, default 16 |
 | `SEKVENT_COMPONENT_<C>_POLICY`, `SEKVENT_COMPONENT_<C>_<M>_POLICY` | a named policy `<N>` |
 | `SEKVENT_POLICY_<N>_<FIELD>` | fields of a named policy |
@@ -959,8 +1001,9 @@ listener) with `await_until!`.
 - **Global layers see component calls.** A `ServerBuilder::layer` wraps
   every REST, gRPC and gRPC-Web request, including component gRPC calls
   served through `app.grpc_routes()`. An end-user auth layer must let
-  link-authenticated component paths through, or go on each service
-  instead.
+  link-authenticated component paths and anonymous methods through, or go
+  on each service instead; for components, use `SERVE_AUTH=bearer` and the
+  App's end-user authenticator rather than a layer.
 - **gRPC limits are per service.** `rest_body_limit` covers REST only; set
   `max_decoding_message_size` / `max_encoding_message_size` on each
   generated tonic server that needs more than 4 MiB.
@@ -985,7 +1028,10 @@ listener) with `await_until!`.
 - **Component links.** Never reuse one token for two links or directions
   (the build refuses it), never set `AUTH=none`/`SERVE_AUTH=none` outside a
   test, and list a caller in `SEKVENT_LINK_TRUSTED` only when it really
-  vouches for the end user.
+  vouches for the end user. Open a component to browsers with
+  `SERVE_AUTH=bearer` and an end-user authenticator, never with `none`, and
+  mark a method `#[call(anonymous)]` only when it is truly public (sign-in
+  and the like): under a bearer mode anyone may call it.
 - **Time and randomness.** Inject `Clock` (`SystemClock` / `ManualClock`)
   and seedable RNGs where behaviour depends on them; JWT and login APIs take
   `now_unix_secs` explicitly.

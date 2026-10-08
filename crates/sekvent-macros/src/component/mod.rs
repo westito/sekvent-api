@@ -24,6 +24,13 @@ pub(crate) fn expand(
     };
     match (args, component) {
         (Ok(args), Ok(component)) => {
+            if args.mode == parse::Mode::LocalOnly {
+                let mut errors = Errors::default();
+                for span in component.methods.iter().filter_map(|m| m.anonymous) {
+                    errors.push(Error::new(span, parse::ANONYMOUS_ON_LOCAL_ONLY));
+                }
+                errors.finish()?;
+            }
             let krate = match &args.krate {
                 Some(path) => path.to_token_stream(),
                 None => runtime(),
