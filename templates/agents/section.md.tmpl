@@ -74,12 +74,17 @@ per package by default) must pass before work is done.
 - Servers in tests bind port 0 and run through the runtime handle
   (`builder.without_signals().build()?.start().await?`).
 - Database tests use `sekvent-testing` containers (one database per test);
-  they are `#[ignore]`d unless `SEKVENT_DOCKER_TESTS=1`, which the gate sets.
+  they are `#[ignore]`d. The gate runs them (exporting
+  `SEKVENT_DOCKER_TESTS=1` and passing `--include-ignored`) only when
+  `sekvent.toml` sets `docker_tests = true` under `[harness]`; by hand, run
+  `SEKVENT_DOCKER_TESTS=1 cargo test -- --include-ignored`.
 - See the `rust-testing` skill for speed and flake work.
 
 ### Updating sekvent
 
-- `cargo sekvent sdk update` moves the locked sekvent revision and the pinned
-  third-party set together. `cargo sekvent deps check` reports drift.
+- `cargo sekvent sdk update` moves the locked sekvent revision in
+  `Cargo.lock` only. The third-party pins come with the CLI: run `cargo
+  sekvent self-update`, then `cargo sekvent deps check` reports drift and
+  `deps sync` aligns it.
 - Do not bump a dependency that sekvent pins on your own; update sekvent.
 <!-- sekvent:end -->

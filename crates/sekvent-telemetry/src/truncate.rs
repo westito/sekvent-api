@@ -4,8 +4,10 @@ use std::borrow::Cow;
 ///
 /// The cut always falls on a character boundary, and a cut string ends with
 /// `…(+N chars)` naming how many characters were dropped. Text that already
-/// fits is returned borrowed. Use it for upstream bodies and other untrusted
-/// text of unbounded length; it does not make secrets safe to log.
+/// fits is returned borrowed. Use it for untrusted, non-secret text of
+/// unbounded length (an upstream error code, a caller-supplied identifier).
+/// It only shortens: short text is kept whole, so it never makes secrets or
+/// raw upstream bodies safe to log.
 pub fn truncate_for_log(s: &str, max_chars: usize) -> Cow<'_, str> {
     match s.char_indices().nth(max_chars) {
         None => Cow::Borrowed(s),

@@ -41,6 +41,18 @@ The `full` feature turns on every module and integration.
 use sekvent::prelude::*; // AppError, ErrorCode, CallContext, Secret, EnvConfig, FromConfig, Runtime, Server, …
 ```
 
+## Documentation
+
+The user guide lives in [`docs/`](docs/README.md):
+
+- [Getting started](docs/getting-started.md): install the CLI, bootstrap a
+  workspace, run and grow a first service.
+- [Facade features](docs/features.md) and the [CLI reference](docs/cli.md)
+  (every command and the full `sekvent.toml` reference).
+- One page per module under [`docs/modules/`](docs/modules/): config, error,
+  context, telemetry, runtime, server, jobs, db, auth, link, client,
+  resilience, components, proto-build and testing.
+
 ## Quick start
 
 Install the CLI (a prebuilt binary checked against its SHA-256, or a source
@@ -127,9 +139,9 @@ every section except `[project]` is optional.
 
 Compiling commands (`gate`, `check`, `clippy`, `test`, `coverage`,
 `harness-clean`) are forwarded to the remote builder when `[remote] mode` is
-`rrb`, and run on the current machine in CI (`CI` set to anything but empty,
-`0`, `false` or `no`), inside the builder, with `SEKVENT_LOCAL=1` or with
-`mode = "local"`.
+`rrb`, and run on the current machine in CI (`CI` set to anything but
+empty, `0`, `false`, `no` or `off`), inside the builder, with
+`SEKVENT_LOCAL=1` or with `mode = "local"`.
 
 The default `[remote]` expects the maintainers' `rrb` remote-build tool at
 `~/.kodein/skills/build-on-rtx/bin/rrb` (change it with `[remote].rrb`). If

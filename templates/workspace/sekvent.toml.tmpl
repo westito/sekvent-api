@@ -77,7 +77,9 @@ post_gate = []
 pre_coverage = []
 post_coverage = []
 # Example:
-# pre_gate = [["cargo", "sekvent", "deps", "check"]]
+# pre_gate = [["bash", "scripts/check-migrations.sh"]]
+# Hooks run programs found on PATH; in CI and on the remote builder the CLI
+# itself is not on PATH, so do not call `cargo sekvent` from a hook.
 
 # Protobuf service contracts. `cargo sekvent contract emit` writes one
 # canonical JSON baseline per `service` found below the roots; `cargo sekvent

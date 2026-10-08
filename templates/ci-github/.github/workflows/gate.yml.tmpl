@@ -24,7 +24,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CI: "true"
-  # The runner has Docker, so the container-backed harness tests run too.
+  # The runner has Docker. The container-backed harness tests run only when
+  # sekvent.toml also sets `docker_tests = true` under [harness]; this
+  # variable alone does not add --include-ignored.
   SEKVENT_DOCKER_TESTS: "1"
 
 jobs:
@@ -34,7 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Must match rust-toolchain.toml.
+      # Must match rust-toolchain.toml. Written with sekvent's toolchain;
+      # edit it (and the coverage job's) if the project uses another one.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "{{rust_version}}"

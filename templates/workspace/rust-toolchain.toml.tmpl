@@ -1,6 +1,8 @@
 # The single source of the Rust version. The Dockerfile's RUST_VERSION, the
-# CI toolchain and the remote builder image tag must all agree with it;
-# `cargo sekvent sdk update` moves them together.
+# CI toolchain and the remote builder image tag must all agree with it.
+# No command moves them: `cargo sekvent sdk update` only changes the sekvent
+# crates in Cargo.lock, and a newer CLI (`cargo sekvent self-update`) only
+# writes its own toolchain into newly generated files. Change them together.
 [toolchain]
 channel = "{{rust_version}}"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]

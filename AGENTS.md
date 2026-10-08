@@ -29,15 +29,18 @@ repository; describe behaviour in your own words and use neutral examples
   `sekvent-api` and write `use sekvent::…`. Internal crates keep their
   `sekvent-*` names; the CLI stays `cargo sekvent`.
 - Projects consume sekvent either as git dependencies on `branch =
-  "master"` (what `cargo sekvent init` and `new` write by default) or as
-  **path dependencies** on a checkout, e.g. a submodule:
+  "master"` (what `cargo sekvent new` writes by default; `init` writes no
+  dependencies, only `sekvent.toml`, `.sekvent/run.sh`, `.remote-build.toml`
+  and the `AGENTS.md` section) or as **path dependencies** on a checkout,
+  e.g. a submodule:
   ```toml
   sekvent-api = { path = "vendor/sekvent-api/crates/sekvent", features = ["…"] }
   sekvent-testing = { path = "vendor/sekvent-api/crates/sekvent-testing" }         # dev
   sekvent-proto-build = { path = "vendor/sekvent-api/crates/sekvent-proto-build" } # build
   ```
-  `cargo sekvent new --sekvent-path <checkout>` writes path deps; `cargo
-  sekvent add` keeps the source an existing workspace already uses.
+  `cargo sekvent new --sekvent-path <checkout>` writes absolute path deps
+  (relative submodule paths are written by hand); `cargo sekvent add` keeps
+  the source an existing workspace already uses.
 - The proc macros locate the facade with proc-macro-crate, which reports the
   dependency *key*. `sekvent-api` (mapped to `sekvent`) and any rename via
   `package = "sekvent-api"` work; the key `sekvent_api` does not.
@@ -192,5 +195,10 @@ If rtx is unreachable, stop and report; there is no local build fallback.
 - Larger changes: a design note under `docs/design/`, then parallel agents
   with disjoint write sets that write code and tests without building, then
   a single verification agent that runs the rrb loop, then review and fix.
+- User docs live in `docs/` (index `docs/README.md`, one page per module
+  under `docs/modules/`, `getting-started.md`, `cli.md`, `features.md`). A
+  change to a public API, feature, config key, CLI flag or default updates
+  the matching page in the same commit; design notes record decisions, the
+  module pages describe current behaviour.
 - Commit only when the gate and coverage are green. Do not push or change
   the repository's visibility without asking.

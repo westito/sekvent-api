@@ -179,7 +179,7 @@ topics are declared and subscribed to is settled in milestone C3.
 |---|---|---|
 | `idempotent` | method | The method may be retried; required for any automatic retry |
 | `timeout = "…"` | method | Default deadline, capped by the caller's own deadline |
-| `bulkhead = N` | method or component | At most `N` concurrent executions; excess is shed with `RESOURCE_EXHAUSTED` |
+| `bulkhead = N` | method | At most `N` concurrent executions; excess is shed with `RESOURCE_EXHAUSTED` |
 | `#[component(proto = "…")]` | component | The module generated for the component's proto package; required unless `local_only` |
 | `#[component(local_only)]` | component | The on-ramp: in-process only, no contract (and no `proto`); the App builder rejects any remote binding |
 | `#[component(remote_only)]` | component | Never runs in this binary; the App builder rejects a local binding |
@@ -266,15 +266,20 @@ cycles.
 ## Wiring: the App builder
 
 Components use constructor injection: an implementation receives the
-handles and pools it needs in its constructor, never through globals.
+handles and resources (pools, clients, a `Clock`) it needs in its
+constructor, never through globals. The practical guide is
+[modules/components.md](modules/components.md).
 
 ```rust
-let mut app = sekvent::App::builder(&config_source)?;
-LedgerHandle::install(&mut app, |deps| Ledger::new(deps.pool("ledger")?))?;
-BillingHandle::install(&mut app, |deps| {
-    Billing::new(deps.handle::<LedgerHandle>()?, deps.pool("billing")?)
+// Resources are keyed by type: wrap two pools of the same type in newtypes.
+let mut builder = sekvent::App::builder(&config_source);
+builder.provide(LedgerDb(ledger_pool))?;
+builder.provide(BillingDb(billing_pool))?;
+LedgerHandle::install(&mut builder, |deps| Ok(Ledger::new(deps.resource::<LedgerDb>()?)))?;
+BillingHandle::install(&mut builder, |deps| {
+    Ok(Billing::new(deps.handle::<LedgerHandle>()?, deps.resource::<BillingDb>()?))
 })?;
-let app = app.build().await?;   // every misconfiguration is reported here
+let app = builder.build()?;   // every misconfiguration is reported here
 ```
 
 - The factory runs only when the component is bound `local` or
@@ -353,9 +358,9 @@ the next tick runs. The rules, specified in
 [design/p8-service-essentials.md](design/p8-service-essentials.md):
 
 - **Schedules.** `JobSpec::interval(period)`, `JobSpec::cron(pattern)`
-  (feature `cron`, parsed with `croner`: five fields, or six with leading
-  seconds) and `JobSpec::manual()` (runs only when triggered through its
-  `JobHandle`). **Cron runs in UTC**; other time zones are not supported.
+  (facade feature `runtime-cron`, parsed with `croner`: five fields, or six
+  with leading seconds) and `JobSpec::manual()` (runs only when triggered
+  through its `JobHandle`). **Cron runs in UTC**; other time zones are not supported.
 - **Fixed cadence.** In-process intervals tick at `start + initial_delay +
   k × period` on tokio's clock, however long the runs take. **Singleton
   intervals are aligned to the Unix epoch** on the wall clock
@@ -386,7 +391,8 @@ the next tick runs. The rules, specified in
   the transaction).
 - Losing the lease cancels the running job (`ABORTED` / `LEASE_LOST`).
 - **On demand.** `JobHandle::trigger` starts a run now, or fails with
-  `JOB_ALREADY_RUNNING`, `JOB_HELD_ELSEWHERE` or `JOB_NOT_RUNNING`. Jobs
+  `JOB_ALREADY_RUNNING`, `JOB_HELD_ELSEWHERE`, `JOB_NOT_RUNNING` or
+  `JOB_GUARD_FAILED` (the lease guard could not answer). Jobs
   and direct `LeaseStore::try_acquire` users that share a lease name
   (`LeaseGuard::with_lease_name`) exclude each other.
 - The application owns the lease table: `LeaseStore::schema_sql` gives
