@@ -40,6 +40,7 @@ example an `-api` crate that only declares a component contract).
 | `runtime` | `sekvent::runtime` (lifecycle, health, server, jobs, downloads) | `sekvent-runtime` | [runtime](modules/runtime.md), [server](modules/server.md), [jobs](modules/jobs.md) |
 | `resilience` | `sekvent::resilience` (retry, breaker, rate gate, TTL cache) | `sekvent-resilience` | [resilience](modules/resilience.md) |
 | `auth` | `sekvent::auth` (passwords, JWT, login) | `sekvent-auth` | [auth](modules/auth.md) |
+| `sso` | `sekvent::sso` (browser single sign-on, Bitbucket Cloud) | `sekvent-sso` | [sso](modules/sso.md) |
 | `link` | `sekvent::link` (service-to-service tokens) | `sekvent-link` | [link](modules/link.md) |
 | `client` | `sekvent::client` (outbound HTTP, OAuth 2.0) | `sekvent-client` | [client](modules/client.md) |
 | `db` | `sekvent::db` (pools, migrations, filters, errors) | `sekvent-db` | [db](modules/db.md) |

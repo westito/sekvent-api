@@ -1,6 +1,6 @@
 ---
 name: sekvent
-description: Write or change code in a Rust backend built on the sekvent framework (a workspace with `sekvent.toml` and a `sekvent-api` dependency). Use when adding a config struct, an error, a gRPC or REST endpoint, CORS or a body limit, a background worker, a periodic or singleton job, a database lease, an outbound HTTP client with retries or a breaker, a small TTL cache, a database pool or its readiness probe, a JWT login or bcrypt-compatible passwords, a file download or upload, service-to-service authentication, a container-backed test, protobuf codegen or a component (a trait that runs in-process now and can move to its own service later) — and before hand-rolling any of those, since sekvent already has them. Gives the crate map, copy-ready recipes with the real API names, and the pitfalls (secrets in logs, fail-open defaults, missing deadlines, retrying non-idempotent calls). For creating a project use `sekvent-new-project`; for moving an existing backend onto sekvent use `sekvent-migrate`.
+description: Write or change code in a Rust backend built on the sekvent framework (a workspace with `sekvent.toml` and a `sekvent-api` dependency). Use when adding a config struct, an error, a gRPC or REST endpoint, CORS or a body limit, a background worker, a periodic or singleton job, a database lease, an outbound HTTP client with retries or a breaker, a small TTL cache, a database pool or its readiness probe, a JWT login or bcrypt-compatible passwords, browser single sign-on (Bitbucket Cloud), a file download or upload, service-to-service authentication, a container-backed test, protobuf codegen or a component (a trait that runs in-process now and can move to its own service later) — and before hand-rolling any of those, since sekvent already has them. Gives the crate map, copy-ready recipes with the real API names, and the pitfalls (secrets in logs, fail-open defaults, missing deadlines, retrying non-idempotent calls). For creating a project use `sekvent-new-project`; for moving an existing backend onto sekvent use `sekvent-migrate`.
 ---
 
 # Building on sekvent
@@ -33,6 +33,7 @@ skill.
 | File downloads (safe headers, type sniffing, filenames) | `runtime` (`Download`) | default |
 | Timeout, retry, rate gate, bulkhead, breaker, backoff, TTL cache | `resilience` | `resilience` |
 | Password hashing (argon2id, bcrypt), JWT, login | `auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` (async hashing) |
+| Browser sign-in with an external account (OAuth 2.0 code flow, Bitbucket Cloud) | `sso` | `sso` |
 | Service-to-service tokens | `link` | `link`; `link-axum`, `link-tonic` |
 | Outbound HTTP, OAuth 2.0 client credentials | `client` | `client` |
 | Pools, migrations, list filters | `db` | `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` |
@@ -596,6 +597,34 @@ rejection for "no such user" and "wrong password". Do not add an early
 return before it. Bearer guards: `auth-axum` (`Bearer`, `RequireRole`),
 `auth-tonic` (`BearerInterceptor`).
 
+### Browser single sign-on
+
+```rust
+use sekvent::config::{EnvSource, FromConfig, Prefixed};
+use sekvent::sso::{BitbucketProvider, Sso, SsoConfig, SsoIdentity};
+
+let sso = Sso::from_config(SsoConfig::from_config(&Prefixed::new(&EnvSource, "SSO_"))?) // SSO_APP_URL, SSO_STATE_KEY
+    .provider(BitbucketProvider::from_config(&EnvSource, "SSO_BITBUCKET_")?)        // CLIENT_ID, CLIENT_SECRET, CALLBACK_URL, WORKSPACE
+    .on_login(move |ctx: CallContext, identity: SsoIdentity| {
+        let users = users.clone();
+        async move { users.find_or_create(&ctx, &identity).await }            // -> Result<O, AppError>
+    })
+    .build()?;
+let server = Server::builder().prefix("/api").rest(sso.router()); // GET /api/sso/bitbucket/{login,callback}
+
+// In the app's anonymous exchange RPC (#[call(anonymous)]):
+let user = sso.redeem(&request.code).ok_or_else(|| AppError::unauthenticated("invalid code"))?;
+// … mint the session with JwtKeys::issue.
+```
+
+The browser navigates to `…/login?redirect=/path`, comes back to
+`<APP_URL>/path#sso_code=<code>` (or `#sso_error=access_denied`, …) and
+posts the code to the exchange RPC. Codes are single use, 60 s, in process
+memory. Link users on `(identity.provider, identity.subject)`, never on the
+email (which is set only when verified). Bitbucket admits only members of
+`WORKSPACE`; the consumer needs Account: Read and Account: Email. Details:
+`docs/modules/sso.md`.
+
 ### bcrypt-compatible passwords
 
 A service sharing a password store with applications that read bcrypt
@@ -1032,6 +1061,11 @@ listener) with `await_until!`.
   `SERVE_AUTH=bearer` and an end-user authenticator, never with `none`, and
   mark a method `#[call(anonymous)]` only when it is truly public (sign-in
   and the like): under a bearer mode anyone may call it.
+- **SSO.** Never put a token in a URL or hand-roll `returnTo`: use
+  `sekvent::sso`, whose return paths are relative only and whose handoff
+  code travels in the fragment. Keep `secure_cookies` on outside
+  `http://localhost`, give the state key its own secret, and run one
+  instance (or sticky routing) because handoff codes live in memory.
 - **Time and randomness.** Inject `Clock` (`SystemClock` / `ManualClock`)
   and seedable RNGs where behaviour depends on them; JWT and login APIs take
   `now_unix_secs` explicitly.

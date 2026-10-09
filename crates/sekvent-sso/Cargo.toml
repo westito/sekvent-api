@@ -1,0 +1,37 @@
+[package]
+name = "sekvent-sso"
+description = "Browser single sign-on: OAuth 2.0 authorization code flow, identity providers, one-time handoff codes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+sekvent-client = { workspace = true }
+sekvent-config = { workspace = true }
+sekvent-context = { workspace = true }
+sekvent-error = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+form_urlencoded = { workspace = true }
+futures = { workspace = true }
+getrandom = { workspace = true }
+hmac = { workspace = true }
+http = { workspace = true }
+percent-encoding = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+sekvent-runtime = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true

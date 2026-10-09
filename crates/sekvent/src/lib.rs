@@ -17,6 +17,7 @@
 //! | [`client`] | `sekvent-client` | `client` | outbound HTTP with policy, context propagation, OAuth 2.0 |
 //! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, list filters, readiness probes, leases |
 //! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local, serialized and gRPC bindings |
+//! | [`sso`] | `sekvent-sso` | `sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), one-time handoff codes |
 //!
 //! # Sub-features
 //!
@@ -124,6 +125,10 @@ pub use sekvent_db as db;
 /// of the generated handles.
 #[cfg(feature = "component")]
 pub use sekvent_component as component;
+
+/// Browser single sign-on with OAuth 2.0 identity providers.
+#[cfg(feature = "sso")]
+pub use sekvent_sso as sso;
 
 /// `#[component(...)]` on a trait; the `App`; the `ComponentError` trait and
 /// its derive.

@@ -3,7 +3,7 @@
 sekvent is a Rust backend framework. It gives a service the pieces every
 backend ends up writing by hand — configuration, an error model, a per-call
 context, a staged lifecycle with health checks, resilience policies, password
-and JWT auth, service-to-service tokens, an outbound HTTP client, database
+and JWT auth, browser single sign-on, service-to-service tokens, an outbound HTTP client, database
 pools and migrations, a container-backed test harness and protobuf codegen
 helpers — plus `cargo sekvent`, a CLI that scaffolds workspaces and runs the
 quality gate.
@@ -29,6 +29,7 @@ sqlx 0.9 and sea-orm 2.0.
 | `sekvent-link` | `link`; `link-axum`, `link-tonic` | Service-to-service tokens, middleware, interceptors |
 | `sekvent-client` | `client` | Outbound HTTP (reqwest, rustls) with policies, context propagation, OAuth 2.0 client credentials |
 | `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate`, `db-lease` | Named pools, migrations, distinct-target check, list filters, readiness probes per pool, leases with fencing tokens for singleton jobs |
+| `sekvent-sso` | `sso` | Browser single sign-on: OAuth 2.0 authorization code flow with a signed state cookie, a Bitbucket Cloud provider (workspace members only), one-time handoff codes |
 | `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |
 | `sekvent-testing` | not re-exported (`[dev-dependencies]`) | Postgres and MySQL test containers, a reaper, `await_until!` |
 | `sekvent-proto-build` | not re-exported (`[build-dependencies]`) | `build.rs` protobuf codegen on top of `tonic-prost-build`; protos compile in-process with protox, so no `protoc` is needed |
@@ -50,7 +51,7 @@ The user guide lives in [`docs/`](docs/README.md):
 - [Facade features](docs/features.md) and the [CLI reference](docs/cli.md)
   (every command and the full `sekvent.toml` reference).
 - One page per module under [`docs/modules/`](docs/modules/): config, error,
-  context, telemetry, runtime, server, jobs, db, auth, link, client,
+  context, telemetry, runtime, server, jobs, db, auth, sso, link, client,
   resilience, components, proto-build and testing.
 
 ## Quick start

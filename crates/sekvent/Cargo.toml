@@ -30,6 +30,8 @@ db = ["dep:sekvent-db"]
 component = ["dep:sekvent-component", "config", "error", "context"]
 # The component `grpc` binding and serving components over gRPC.
 component-grpc = ["component", "sekvent-component/grpc"]
+# Browser single sign-on (OAuth 2.0 code flow, Bitbucket Cloud provider).
+sso = ["dep:sekvent-sso"]
 
 # sekvent-error wire mappings.
 error-http = ["error", "sekvent-error/http"]
@@ -73,6 +75,7 @@ full = [
     "db",
     "component",
     "component-grpc",
+    "sso",
     "error-http",
     "error-grpc",
     "runtime-grpc-web",
@@ -106,6 +109,7 @@ sekvent-link = { workspace = true, optional = true }
 sekvent-client = { workspace = true, optional = true }
 sekvent-db = { workspace = true, optional = true }
 sekvent-component = { workspace = true, optional = true }
+sekvent-sso = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

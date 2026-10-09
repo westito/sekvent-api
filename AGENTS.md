@@ -63,6 +63,7 @@ repository; describe behaviour in your own words and use neutral examples
 | `sekvent-auth` | argon2id and bcrypt schemes, JWT with the time passed in; runtime-free, wasm-compatible core | error, config, context (optional) |
 | `sekvent-link` | service tokens, `TokenMap`, middleware, interceptor | config, context, error |
 | `sekvent-client` | reqwest builder, resilience, context propagation, OAuth2 cache | config, context, error, resilience, telemetry |
+| `sekvent-sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), state cookie, handoff codes | config, error, context, client |
 | `sekvent-db` | named pools, migrations, distinct-target check, sea-orm filters, probes, leases | config, error, runtime (optional) |
 | `sekvent-component` | components, App builder, local, serialized and gRPC bindings | config, error, context, resilience, link (optional), macros, runtime (optional) |
 | `sekvent-testing` | Postgres/MySQL containers, reaper, `await_until!` | — |

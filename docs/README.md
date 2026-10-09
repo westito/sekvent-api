@@ -4,7 +4,7 @@ sekvent is a Rust backend framework. A service depends on one facade
 package, `sekvent-api` (library name `sekvent`), and turns on the modules it
 needs: configuration, an error model, a per-call context, logging, a staged
 lifecycle with one server for gRPC, gRPC-Web and REST, jobs, resilience
-policies, auth, service-to-service tokens, an outbound HTTP client, databases
+policies, auth, browser single sign-on, service-to-service tokens, an outbound HTTP client, databases
 with leases, and a component model. The `cargo sekvent` CLI scaffolds
 workspaces and runs the quality gate.
 
@@ -29,6 +29,7 @@ workspaces and runs the quality gate.
 | `sekvent::runtime` | `runtime` | [jobs](modules/jobs.md) | Interval, cron and manual jobs; overlap, misfire, triggers, singletons |
 | `sekvent::db` | `db-*` | [db](modules/db.md) | Named pools, migrations, error classification, list filters, probes, leases |
 | `sekvent::auth` | `auth` | [auth](modules/auth.md) | argon2id and bcrypt passwords, login helper, JWT with injected time |
+| `sekvent::sso` | `sso` | [sso](modules/sso.md) | Browser single sign-on (OAuth 2.0 code flow), Bitbucket Cloud provider, one-time handoff codes |
 | `sekvent::link` | `link` | [link](modules/link.md) | Service-to-service tokens, inbound checks, outbound attachment |
 | `sekvent::client` | `client` | [client](modules/client.md) | Outbound HTTP with policies, context propagation, OAuth 2.0 |
 | `sekvent::resilience` | `resilience` | [resilience](modules/resilience.md) | Backoff, retries with budgets, rate gate, bulkhead, breaker, TTL cache |
@@ -79,6 +80,7 @@ A typical service:
 | [design/component-c1.md](design/component-c1.md) | Specification of local bindings and the lifecycle (C1) |
 | [design/component-c2.md](design/component-c2.md) | Specification of the gRPC binding, link auth and contracts (C2) |
 | [design/component-end-user.md](design/component-end-user.md) | Specification of serving components to end users: `SERVE_AUTH=bearer`, the end-user authenticator, `#[call(anonymous)]`, gRPC-Web |
+| [design/sso.md](design/sso.md) | Specification of browser single sign-on: providers, state cookie, handoff codes, Bitbucket Cloud |
 | [design/p8-service-essentials.md](design/p8-service-essentials.md) | Specification of server essentials, probes, password schemes, jobs, leases, HTTP helpers |
 | [examples/shop](../examples/shop/README.md) | Three components (orders, inventory, notifications) in monolith and split topologies |
 
