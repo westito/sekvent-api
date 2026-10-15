@@ -14,7 +14,7 @@ exclude = []
 # The r2 revision carries cargo-llvm-cov and the docker client, both needed by
 # the coverage gate and the testcontainers harness tests. The Rust version in
 # the tag must agree with rust-toolchain.toml.
-base = "remote-builder:rust1.98.1-flutter3.47.2-r2"
+base = "remote-builder:rust1.98.1-flutter3.47.7-r4"
 
 [run]
 workdir = "/work"
