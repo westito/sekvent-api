@@ -1,0 +1,5 @@
+error: `anonymous` and `optional_end_user` exclude each other: an anonymous method never sees an end user; keep one
+ --> tests/ui/fail/m23_anonymous_and_optional_end_user.rs:3:23
+  |
+3 |     #[call(anonymous, optional_end_user)]
+  |                       ^^^^^^^^^^^^^^^^^

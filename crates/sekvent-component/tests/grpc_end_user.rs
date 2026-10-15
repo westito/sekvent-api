@@ -1,7 +1,7 @@
 //! Components served to end users: gRPC-Web over HTTP/1.1 through the
 //! runtime server under a path prefix with CORS, bearer tokens checked by
-//! the App's end-user authenticator, anonymous methods, and link callers
-//! next to end users.
+//! the App's end-user authenticator, anonymous and optional-end-user
+//! methods, and link callers next to end users.
 
 mod support;
 
@@ -25,10 +25,72 @@ use support::inventory::{
     Inventory, InventoryError, InventoryHandle, ReleaseReply, ReleaseRequest, ReserveReply,
     ReserveRequest,
 };
+use tracking::{TrackReply, TrackRequest, Tracker, TrackerHandle};
 
 const ORIGIN_URL: &str = "https://shop.example";
 const RESERVE: &str = "/api/shop.inventory.v1.Inventory/Reserve";
 const RELEASE: &str = "/api/shop.inventory.v1.Inventory/Release";
+const TRACK: &str = "/api/shop.tracking.v1.Tracker/Track";
+
+/// A one-method component declared with `#[component]`, for the method kind
+/// the hand-expanded inventory does not carry: `#[call(optional_end_user)]`.
+#[allow(dead_code, missing_docs, unreachable_pub)]
+mod tracking {
+    use sekvent_component::{AppError, CallContext};
+
+    /// The contract sekvent-proto-build would generate for
+    /// `shop.tracking.v1.Tracker`.
+    pub mod proto {
+        #[allow(non_upper_case_globals)]
+        pub const __sekvent_service_Tracker: (&str, &[(&str, &str, &str, bool)]) = (
+            "shop.tracking.v1.Tracker",
+            &[(
+                "Track",
+                "shop.tracking.v1.TrackRequest",
+                "shop.tracking.v1.TrackReply",
+                false,
+            )],
+        );
+        #[allow(non_camel_case_types)]
+        pub type __sekvent_rpc_Tracker__Track = (super::TrackRequest, super::TrackReply);
+    }
+
+    /// Track an order by its public code.
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct TrackRequest {
+        #[prost(string, tag = "1")]
+        pub code: String,
+    }
+
+    impl prost::Name for TrackRequest {
+        const NAME: &'static str = "TrackRequest";
+        const PACKAGE: &'static str = "shop.tracking.v1";
+    }
+
+    /// Whether the viewer was signed in.
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct TrackReply {
+        #[prost(bool, tag = "1")]
+        pub signed_in: bool,
+    }
+
+    impl prost::Name for TrackReply {
+        const NAME: &'static str = "TrackReply";
+        const PACKAGE: &'static str = "shop.tracking.v1";
+    }
+
+    /// Order tracking, open to everyone and personal for signed-in buyers.
+    #[sekvent_component::component(
+        name = "tracker",
+        package = "shop.tracking.v1",
+        proto = "crate::tracking::proto"
+    )]
+    pub trait Tracker: Send + Sync + 'static {
+        /// The order's state, as the viewer may see it.
+        #[call(optional_end_user)]
+        async fn track(&self, cx: &CallContext, req: TrackRequest) -> Result<TrackReply, AppError>;
+    }
+}
 
 /// What the implementation saw of one call.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +149,15 @@ impl Inventory for Storefront {
     }
 }
 
+impl Tracker for Storefront {
+    async fn track(&self, cx: &CallContext, _req: TrackRequest) -> Result<TrackReply, AppError> {
+        self.record(cx);
+        Ok(TrackReply {
+            signed_in: cx.end_user().is_some(),
+        })
+    }
+}
+
 /// Accepts `Bearer user-<n>` session tokens.
 fn sessions(request: &http::request::Parts) -> Result<EndUser, AppError> {
     request
@@ -99,7 +170,8 @@ fn sessions(request: &http::request::Parts) -> Result<EndUser, AppError> {
         .ok_or_else(|| AppError::unauthenticated("unknown session token"))
 }
 
-/// A started runtime serving the storefront under `/api` with CORS.
+/// A started runtime serving the storefront (inventory and tracker) under
+/// `/api` with CORS.
 struct Shop {
     runtime: RuntimeHandle,
     addr: SocketAddr,
@@ -120,6 +192,8 @@ async fn serve(serve_auth: &str, storefront: Storefront) -> Shop {
     let keys: MapSource = [
         ("SEKVENT_COMPONENT_INVENTORY_SERVE", "grpc"),
         ("SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH", serve_auth),
+        ("SEKVENT_COMPONENT_TRACKER_SERVE", "grpc"),
+        ("SEKVENT_COMPONENT_TRACKER_SERVE_AUTH", serve_auth),
         ("SEKVENT_LINK_INBOUND_SHOP", TOKEN),
         ("SEKVENT_LINK_TRUSTED", "shop"),
     ]
@@ -127,6 +201,8 @@ async fn serve(serve_auth: &str, storefront: Storefront) -> Shop {
     .collect();
     let app = build_with(&keys, move |builder| {
         builder.end_user_authenticator(sessions)?;
+        let tracker = storefront.clone();
+        TrackerHandle::install(builder, move |_| Ok(tracker))?;
         InventoryHandle::install(builder, move |_| Ok(storefront))
     })
     .unwrap();
@@ -341,6 +417,117 @@ async fn end_users_reach_components_over_grpc_web() {
         assert_eq!(peer.tenant.as_deref(), Some("t-9"));
         app.stop(Duration::ZERO).await.unwrap();
 
+        shop.stop().await;
+    })
+    .await;
+}
+
+/// One `Track` call over gRPC-Web.
+async fn track(shop: &Shop, authorization: Option<&str>) -> WebReply {
+    let request = TrackRequest { code: "o1".into() };
+    grpc_web(shop.addr, TRACK, authorization, &request).await
+}
+
+/// Whether a successful `Track` reply saw a signed-in viewer.
+fn signed_in(reply: WebReply) -> bool {
+    assert_eq!(reply.grpc.code(), tonic::Code::Ok, "{:?}", reply.grpc);
+    TrackReply::decode(reply.message.unwrap())
+        .unwrap()
+        .signed_in
+}
+
+fn buyer(subject: &str) -> Seen {
+    Seen {
+        end_user: Some(
+            EndUser::new(subject)
+                .with_tenant("t-1")
+                .with_roles(["buyer"]),
+        ),
+        caller: None,
+        subject: Some(subject.into()),
+        tenant: Some("t-1".into()),
+    }
+}
+
+const NOBODY: Seen = Seen {
+    end_user: None,
+    caller: None,
+    subject: None,
+    tenant: None,
+};
+
+#[tokio::test]
+async fn optional_end_users_are_authenticated_only_when_they_send_a_credential() {
+    guarded(async {
+        let storefront = Storefront::default();
+        let shop = serve("bearer", storefront.clone()).await;
+
+        // No credential: served, without an end user.
+        assert!(!signed_in(track(&shop, None).await));
+        assert_eq!(storefront.seen().pop(), Some(NOBODY));
+
+        // A valid credential: the end user, as for any other method.
+        assert!(signed_in(track(&shop, Some("Bearer user-5")).await));
+        assert_eq!(storefront.seen().pop(), Some(buyer("user-5")));
+
+        // A rejected credential is refused, never served as nobody; the
+        // handler does not run.
+        for authorization in ["Bearer forged", "Basic dXNlcg==", ""] {
+            let reply = track(&shop, Some(authorization)).await;
+            assert_eq!(reply.grpc.code(), tonic::Code::Unauthenticated);
+            assert_eq!(reply.grpc.message(), END_USER_REJECTED_MESSAGE);
+            assert!(reply.message.is_none());
+        }
+        assert_eq!(storefront.seen().len(), 2);
+
+        shop.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn optional_end_users_next_to_links() {
+    guarded(async {
+        let link_token = format!("Bearer {TOKEN}");
+
+        // link,bearer: a link, an end user, or nobody.
+        let storefront = Storefront::default();
+        let shop = serve("link,bearer", storefront.clone()).await;
+        assert!(!signed_in(track(&shop, Some(link_token.as_str())).await));
+        let link = storefront.seen().pop().unwrap();
+        assert_eq!(link.caller, Some(ServiceIdentity::trusted("shop")));
+        assert_eq!(link.end_user, None);
+        assert!(signed_in(track(&shop, Some("Bearer user-6")).await));
+        assert_eq!(storefront.seen().pop(), Some(buyer("user-6")));
+        assert!(!signed_in(track(&shop, None).await));
+        assert_eq!(storefront.seen().pop(), Some(NOBODY));
+        let reply = track(&shop, Some("Bearer forged")).await;
+        assert_eq!(reply.grpc.message(), END_USER_REJECTED_MESSAGE);
+        shop.stop().await;
+
+        // link: the attribute never waives the link.
+        let storefront = Storefront::default();
+        let shop = serve("link", storefront.clone()).await;
+        for authorization in [None, Some("Bearer user-6")] {
+            let reply = track(&shop, authorization).await;
+            assert_eq!(reply.grpc.code(), tonic::Code::Unauthenticated);
+            assert_ne!(reply.grpc.message(), END_USER_REJECTED_MESSAGE);
+        }
+        assert!(storefront.seen().is_empty());
+        assert!(!signed_in(track(&shop, Some(link_token.as_str())).await));
+        assert_eq!(
+            storefront.seen().pop().unwrap().caller,
+            Some(ServiceIdentity::trusted("shop"))
+        );
+        shop.stop().await;
+
+        // none: anyone, and the authenticator never runs.
+        let storefront = Storefront::default();
+        let shop = serve("none", storefront.clone()).await;
+        for authorization in [None, Some("Bearer user-6"), Some("Bearer forged")] {
+            assert!(!signed_in(track(&shop, authorization).await));
+            assert_eq!(storefront.seen().pop(), Some(NOBODY));
+        }
         shop.stop().await;
     })
     .await;

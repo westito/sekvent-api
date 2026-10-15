@@ -31,6 +31,8 @@ configuration, with a per-method opt-out for the few public RPCs (sign-in).
 - `EndUser` (in `sekvent-context`) and `CallContext::end_user`: handlers
   tell an end user from a peer service and read subject, tenant and roles.
 - `#[call(anonymous)]` and `MethodDescriptor::with_anonymous`.
+- `#[call(optional_end_user)]` and `MethodDescriptor::with_optional_end_user`
+  (added later, section 5.1).
 - A ready-made JWT adapter on `sekvent-auth`'s `BearerAuth`
   (`verify_headers`, `end_user`, `EndUserClaims`) and `HasRoles` for
   `EndUser`.
@@ -43,7 +45,7 @@ configuration, with a per-method opt-out for the few public RPCs (sign-in).
 | Item | Note |
 |---|---|
 | Per-component authenticators | one authenticator per App; it can look at the request path if components need different rules |
-| Optional authentication on anonymous methods | an anonymous method never sees an end user, even when the request carries a valid token (decision 4) |
+| Optional authentication on anonymous methods | an anonymous method never sees an end user, even when the request carries a valid token (decision 4); `optional_end_user` is the separate attribute for that (section 5.1) |
 | Propagating roles to further components | roles stay with the component that authenticated the end user (decision 3) |
 | `SEKVENT_COMPONENT_<C>_MAX_MESSAGE_SIZE` | the 4 MiB request cap stays fixed |
 | Cookies, CSRF | an authenticator may read cookies from the request head; CSRF protection is the application's (gRPC-Web requests need a custom content type, which a plain form cannot send) |
@@ -120,6 +122,9 @@ impl AppBuilder<'_> {
 impl MethodDescriptor {
     #[must_use] pub const fn with_anonymous(self) -> Self;
     pub const fn is_anonymous(&self) -> bool;
+    /// Each of the two clears the other.
+    #[must_use] pub const fn with_optional_end_user(self) -> Self;
+    pub const fn is_optional_end_user(&self) -> bool;
 }
 
 // BuildError gains:
@@ -188,6 +193,11 @@ the method descriptor, and is a compile error on a `local_only` component
 (which is never served): `` `anonymous` has no effect on a local_only
 component, which is never served; remove it``.
 
+`#[call(optional_end_user)]` expands to `.with_optional_end_user()`, has
+the parallel `local_only` error, and given together with `anonymous` is
+`` `anonymous` and `optional_end_user` exclude each other: an anonymous
+method never sees an end user; keep one``.
+
 ## 4. Configuration
 
 | `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | Who may call a non-anonymous method | Anonymous methods |
@@ -246,6 +256,23 @@ bindings it has no effect. A component that must stay closed to the public
 therefore cannot be opened by the attribute alone; the operator has to
 choose a bearer mode too.
 
+### 5.1 `optional_end_user`
+
+An `optional_end_user` method waives step 5 only when the request carries
+no `Authorization` header; the call then runs with no end user. With the
+header, whatever its value, step 5 runs unchanged: success sets the end
+user, `UNAUTHENTICATED` is answered with `END_USER_REJECTED_MESSAGE`, any
+other error passes through, and the deadline bounds the authenticator. A
+rejected credential is never downgraded to "no end user", so a stale token
+is noticed instead of silently getting the signed-out answer. Steps 1 and 2
+are untouched: under `link` a link token is still required, and under
+`link,bearer` a matching link token makes the caller that link. Under
+`none` and the local bindings it has no effect.
+
+The header's presence, not a successful parse, is the signal, so the rule
+does not depend on the authenticator's token format. Contract baselines
+record neither attribute: both are serving policy, not wire contract.
+
 ## 6. Composition with the runtime server
 
 - **gRPC-Web.** `ServerBuilder::grpc_routes(app.grpc_routes())` puts the
@@ -285,7 +312,7 @@ choose a bearer mode too.
    would let any trusted link assert roles.
 4. **Anonymous means anonymous.** A token sent to an anonymous method is
    ignored instead of being verified optionally; a method that personalises
-   for signed-in users is not anonymous.
+   for signed-in users is not anonymous but `optional_end_user` (5.1).
 5. **Non-`UNAUTHENTICATED` errors pass through** the authenticator
    boundary unchanged, so infrastructure failures stay retryable.
 6. **Combined mode tries the link first.** Link tokens and end-user tokens
@@ -301,12 +328,17 @@ choose a bearer mode too.
 - `sekvent-component` unit tests: `SERVE_AUTH` grammar and build rules;
   the serving decisions of section 5 for every mode, anonymous methods,
   error normalisation and the authenticator deadline; the duplicate
-  registration error; `MethodDescriptor` anonymous.
+  registration error; `MethodDescriptor` anonymous and optional end user;
+  optional-end-user methods with and without a header, under every mode.
 - Loopback (`tests/grpc_end_user.rs`, 127.0.0.1:0, 30 s guard, real clock):
   a gRPC-Web request over HTTP/1.1 under `.prefix("/api")` with a bearer
   token reaching the handler with the end user; a missing and a wrong
   token answered identically before the handler runs; an anonymous method
   without a token; a link caller next to an end user under `link,bearer`;
-  a CORS preflight.
+  a CORS preflight; an `optional_end_user` method (a macro-declared
+  `Tracker`) without a header, with a valid and with a rejected token, under
+  `bearer`, `link,bearer`, `link` and `none`.
 - `sekvent-macros`: snapshot (`release` is anonymous in the standard
-  case), parse tests, the trybuild fail case `m22_anonymous_on_local_only`.
+  case), parse tests, the trybuild fail cases `m22_anonymous_on_local_only`,
+  `m23_anonymous_and_optional_end_user` and
+  `m24_optional_end_user_on_local_only`.

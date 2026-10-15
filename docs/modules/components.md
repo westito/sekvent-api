@@ -250,11 +250,12 @@ C3 and are rejected for now.
 | `timeout = "2s"` | A humantime string literal, positive. It bounds the **whole call**, retries included, and never extends the caller's deadline. |
 | `bulkhead = 16` | An integer literal from 1 to `u32::MAX`: the most concurrent executions where the component runs. Calls beyond it fail with `RESOURCE_EXHAUSTED` / `BULKHEAD_FULL`. |
 | `anonymous` | End users may call the method without credentials when the component is served with `SERVE_AUTH=bearer` or `link,bearer`. It waives end-user authentication only, never link authentication. A compile error on a `local_only` component, which is never served. See [How to serve components to end users](#how-to-serve-components-to-end-users-browsers-apps). |
+| `optional_end_user` | End users may call the method with or without credentials under `SERVE_AUTH=bearer` or `link,bearer`: a request without an `Authorization` header runs with no end user, one with it is authenticated as for any other method, and a rejected credential is refused. Never waives link authentication. Excludes `anonymous`; a compile error on a `local_only` component. See [Methods for everyone that personalise](#methods-for-everyone-that-personalise-calloptional_end_user). |
 
 `timeout` and `bulkhead` are defaults. Configuration can override each of
 them, as described in
 [How to tune resilience per component and method](#how-to-tune-resilience-per-component-and-method).
-`anonymous` cannot be changed by configuration.
+`anonymous` and `optional_end_user` cannot be changed by configuration.
 Unknown or duplicated options are compile errors. The trybuild cases under
 `crates/sekvent-macros/tests/ui/fail/` list every message.
 
@@ -370,7 +371,8 @@ Inside a handler, `cx` is the **callee's** context:
   component directly and the App's end-user authenticator accepted them
   (`SERVE_AUTH=bearer` or `link,bearer`). `caller()` is then `None`: the
   direct caller is either a service or an end user, never both. It is
-  `None` for service calls, in-process calls and anonymous calls.
+  `None` for service calls, in-process calls, anonymous calls and
+  `optional_end_user` calls made without credentials.
 - `cx.tenant()` and the subject come from the caller. Over gRPC they
   survive only from a link listed in `SEKVENT_LINK_TRUSTED`, or from the
   authenticated end user. Roles stay with the end user: the components
@@ -663,12 +665,12 @@ SEKVENT_COMPONENT_ORDERS_SERVE_AUTH=bearer          # end users only
 # SEKVENT_COMPONENT_ORDERS_SERVE_AUTH=link,bearer   # peer services with link tokens, and end users
 ```
 
-| `SERVE_AUTH` | Who may call a method | Who may call an `anonymous` method |
-|---|---|---|
-| `link` (default) | a peer with an inbound link token | the same: a link token is required |
-| `bearer` | an end user the authenticator accepts | anyone, with no identity |
-| `link,bearer` (or `bearer,link`) | a peer with an inbound link token, else an end user the authenticator accepts | a peer with a valid link token keeps its identity; anyone else is served without one |
-| `none` | anyone (logged once at `warn`) | anyone |
+| `SERVE_AUTH` | Who may call a method | Who may call an `anonymous` method | Who may call an `optional_end_user` method |
+|---|---|---|---|
+| `link` (default) | a peer with an inbound link token | the same: a link token is required | the same: a link token is required |
+| `bearer` | an end user the authenticator accepts | anyone, with no identity | anyone without an `Authorization` header, with no identity; with the header, an end user the authenticator accepts |
+| `link,bearer` (or `bearer,link`) | a peer with an inbound link token, else an end user the authenticator accepts | a peer with a valid link token keeps its identity; anyone else is served without one | a peer with an inbound link token; else as under `bearer` |
+| `none` | anyone (logged once at `warn`) | anyone | anyone, with no identity; the authenticator never runs |
 
 Spellings are exact; anything else is a malformed key. `SERVE_AUTH=bearer`
 alone needs no `SEKVENT_LINK_*` key. A mode that includes `link` still
@@ -815,6 +817,55 @@ pub trait Accounts: Send + Sync + 'static {
   and sets `MethodDescriptor::with_anonymous()` (read back with
   `is_anonymous()`).
 
+### Methods for everyone that personalise: `#[call(optional_end_user)]`
+
+Some public RPCs answer everyone but do more for a signed-in caller:
+submitting a report that is bound to its author when there is one, tracking
+an order by code and saying whether the viewer placed it, voting once per
+account. Mark them `optional_end_user` instead of splitting each into a
+public and a signed-in RPC:
+
+```rust
+#[sekvent::component(name = "orders", package = "shop.orders.v1", proto = "crate::proto::shop::orders::v1")]
+pub trait Orders: Send + Sync + 'static {
+    /// Track an order by its public code; the buyer sees more.
+    #[call(optional_end_user, timeout = "1s")]
+    async fn track(&self, cx: &CallContext, req: TrackRequest) -> Result<TrackReply, OrdersError>;
+}
+
+async fn track(&self, cx: &CallContext, req: TrackRequest) -> Result<TrackReply, OrdersError> {
+    let order = self.find_by_code(&req.code).await?;
+    let is_buyer = cx.end_user().is_some_and(|user| user.subject() == order.buyer_id);
+    // …
+}
+```
+
+- The signal is the `Authorization` header. Without it the call runs with
+  `cx.end_user() == None`, exactly like an anonymous call. With it, whatever
+  its value, the end-user authenticator runs exactly as for any other
+  method: on success the context carries the end user (subject and tenant
+  set from it), an `UNAUTHENTICATED` answer is
+  [rejected](#what-a-rejected-end-user-sees) with
+  `END_USER_REJECTED_MESSAGE`, any other error passes unchanged, and the
+  call's deadline bounds it.
+- A rejected credential is **never downgraded** to "no end user". A client
+  holding an expired token learns that it is expired instead of silently
+  getting the signed-out answer; it signs in again or retries without the
+  header.
+- Like `anonymous`, it never waives link authentication (under
+  `SERVE_AUTH=link` a link token is still required), and under `link,bearer`
+  a matching link token makes the caller that link. Under `SERVE_AUTH=none`
+  and the local bindings it has no effect: the authenticator does not run.
+- `anonymous` and `optional_end_user` exclude each other (a compile error
+  when both are given). On a `local_only` component it is a compile error
+  (`` `optional_end_user` has no effect on a local_only component, which is
+  never served; remove it``).
+- It combines with the other options and sets
+  `MethodDescriptor::with_optional_end_user()` (read back with
+  `is_optional_end_user()`). Contract baselines do not record it, as they do
+  not record `anonymous`: it is serving policy, not part of the wire
+  contract.
+
 ### What a rejected end user sees
 
 | The authenticator returns | The caller gets |
@@ -825,7 +876,9 @@ pub trait Accounts: Send + Sync + 'static {
 | nothing before the call's deadline | `DEADLINE_EXCEEDED` |
 
 In every rejected case the request body is never read and the handler
-never runs.
+never runs. The same table applies to an `optional_end_user` method called
+with an `Authorization` header; without one the authenticator is not
+consulted.
 
 ### Serving order for end users
 
@@ -841,8 +894,10 @@ Everything is still decided from the request head before the body is read:
 3. **Context.** It is decoded from the headers and the deadline narrowed by
    the method's timeout.
 4. **End user.** When the mode includes `bearer`, no link matched and the
-   method is not anonymous, the authenticator runs. On success the context
-   carries the end user.
+   method is not anonymous, the authenticator runs, except for an
+   `optional_end_user` method called without an `Authorization` header,
+   which runs with no end user. On success the context carries the end
+   user.
 5. **Hop limit**, gate, bulkhead, method timeout and handler, exactly as
    for a link caller.
 
@@ -1134,9 +1189,13 @@ key }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
   the network can call an anonymous method, and any token they send is
   ignored. Use it for sign-in and similar, never for a method that reads
   or changes a user's data.
+- **`optional_end_user` trusts only the end user it authenticated.**
+  Anyone may call such a method, so `cx.end_user() == None` means "not
+  signed in", never "trusted". Decide everything personal from
+  `cx.end_user()`, never from a user id in the request message.
 - **Global layers see component calls.** A `ServerBuilder::layer` that
   rejects requests without its own credentials also rejects link callers
-  and anonymous methods served on that listener. Put such a layer on the
+  and anonymous or `optional_end_user` methods served on that listener. Put such a layer on the
   REST router instead, or let the gRPC paths through.
 - **The server's authenticator is not component auth.**
   `ServerBuilder::authenticator` never rejects, and component calls ignore

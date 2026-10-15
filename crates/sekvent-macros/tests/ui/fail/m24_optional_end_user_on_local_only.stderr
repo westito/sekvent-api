@@ -1,0 +1,5 @@
+error: `optional_end_user` has no effect on a local_only component, which is never served; remove it
+ --> tests/ui/fail/m24_optional_end_user_on_local_only.rs:3:12
+  |
+3 |     #[call(optional_end_user, idempotent)]
+  |            ^^^^^^^^^^^^^^^^^

@@ -263,8 +263,9 @@ only for a link named in `SEKVENT_LINK_TRUSTED`.
 Components can also be served directly to end users (browsers over
 gRPC-Web, native apps): with a bearer mode, an end-user authenticator
 registered on the App identifies the caller from the request head, the
-handler reads it as `cx.end_user()`, and `#[call(anonymous)]` opens the few
-public RPCs such as sign-in. See
+handler reads it as `cx.end_user()`, `#[call(anonymous)]` opens the few
+public RPCs such as sign-in, and `#[call(optional_end_user)]` opens public
+RPCs that still authenticate a caller who sends credentials. See
 [modules/components.md](modules/components.md#how-to-serve-components-to-end-users-browsers-apps)
 and the design note [component-end-user.md](design/component-end-user.md).
 

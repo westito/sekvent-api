@@ -11,7 +11,8 @@
 //! App's end-user authenticator, which sees the request head only), or
 //! either, by the component's `SERVE_AUTH`. A link token is checked first;
 //! an anonymous method skips the end-user authenticator but never the link
-//! check.
+//! check, and an optional-end-user method skips it only for a request
+//! without an `Authorization` header.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -141,12 +142,12 @@ impl Served {
             .with_reason(reasons::UNKNOWN_METHOD)
             .with_metadata("component", descriptor.name()));
         };
+        let declared = &descriptor.methods()[method];
         let end_user = caller.is_none()
             && self.end_user.is_some()
-            && !descriptor
-                .methods()
-                .get(method)
-                .is_some_and(crate::MethodDescriptor::is_anonymous);
+            && !declared.is_anonymous()
+            && (!declared.is_optional_end_user()
+                || wire_headers.contains_key(http::header::AUTHORIZATION));
         let mut cx = headers::from_headers(wire_headers, caller);
         if let Some(deadline) = self
             .server
@@ -427,10 +428,12 @@ mod tests {
     const METHODS: &[MethodDescriptor] = &[
         MethodDescriptor::call("reserve", "Reserve"),
         MethodDescriptor::call("release", "Release").with_anonymous(),
+        MethodDescriptor::call("track", "Track").with_optional_end_user(),
     ];
     const INVENTORY: &ComponentDescriptor =
         &ComponentDescriptor::new("inventory", "Inventory", METHODS).with_package("shop.v1");
     const RESERVE: &str = "/shop.v1.Inventory/Reserve";
+    const TRACK: &str = "/shop.v1.Inventory/Track";
     const TOKEN: &str = "shop-link-token-0123456789abcdefghijklmn";
 
     /// Echoes the body; `panic` panics in the future, `panic-now` before
@@ -462,7 +465,11 @@ mod tests {
             timeout,
             ..MethodPolicy::default()
         };
-        let server = Arc::new(Server::new(INVENTORY, &[policy.clone(), policy], false));
+        let server = Arc::new(Server::new(
+            INVENTORY,
+            &[policy.clone(), policy.clone(), policy],
+            false,
+        ));
         assert!(server.open());
         server
     }
@@ -519,6 +526,13 @@ mod tests {
             .prepare("/shop.v1.Inventory/Release", &http::HeaderMap::new())
             .unwrap_err();
         assert_eq!(error.message(), sekvent_link::REJECTED_MESSAGE);
+        // So do optional-end-user methods, with or without a credential.
+        for wire in [http::HeaderMap::new(), bearer("user-1")] {
+            let error = served.prepare(TRACK, &wire).unwrap_err();
+            assert_eq!(error.message(), sekvent_link::REJECTED_MESSAGE);
+        }
+        let prepared = served.prepare(TRACK, &bearer(TOKEN)).unwrap();
+        assert!(!prepared.end_user);
         let prepared = served.prepare(RESERVE, &bearer(TOKEN)).unwrap();
         assert_eq!(prepared.method, 0);
         assert!(!prepared.end_user);
@@ -726,6 +740,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_end_users_are_authenticated_only_when_they_send_a_credential() {
+        let served = end_user_served(false, None);
+        // No header: served without identity, the authenticator not run.
+        let mut wire = http::HeaderMap::new();
+        wire.insert(headers::SUBJECT, "someone-else".parse().unwrap());
+        let prepared = admit(&served, TRACK, wire).await.unwrap();
+        assert!(!prepared.end_user);
+        assert_eq!(prepared.cx.end_user(), None);
+        assert_eq!(prepared.cx.subject(), None, "never the header's");
+        assert_eq!(prepared.cx.caller(), None);
+
+        // A header: authenticated exactly as for any other method.
+        let prepared = admit(&served, TRACK, bearer("user-4")).await.unwrap();
+        assert!(prepared.end_user);
+        assert_eq!(prepared.cx.end_user().map(EndUser::subject), Some("user-4"));
+        assert_eq!(prepared.cx.subject(), Some("user-4"));
+        assert_eq!(prepared.cx.tenant(), Some("t-1"));
+
+        // A rejected credential is refused, never downgraded to no end user,
+        // and an empty header still counts as one.
+        let mut empty = http::HeaderMap::new();
+        empty.insert(http::header::AUTHORIZATION, "".parse().unwrap());
+        for wire in [bearer("forged"), empty] {
+            let error = admit(&served, TRACK, wire).await.unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unauthenticated);
+            assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+        }
+        // Other failures pass through unchanged.
+        let error = admit(&served, TRACK, bearer("down")).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_optional_end_user_is_authenticated_within_the_deadline() {
+        let served = end_user_served(false, Some(Duration::from_millis(50)));
+        let error = admit(&served, TRACK, bearer("hang")).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(error.metadata()["method"], "track");
+    }
+
+    #[tokio::test]
     async fn links_come_first_when_both_are_served() {
         let served = end_user_served(true, None);
         let mut wire = bearer(TOKEN);
@@ -757,6 +812,21 @@ mod tests {
             prepared.cx.caller(),
             Some(&ServiceIdentity::trusted("shop"))
         );
+
+        // An optional-end-user method: the link, an end user, or nobody.
+        let prepared = admit(&served, TRACK, bearer(TOKEN)).await.unwrap();
+        assert!(!prepared.end_user);
+        assert_eq!(
+            prepared.cx.caller(),
+            Some(&ServiceIdentity::trusted("shop"))
+        );
+        let prepared = admit(&served, TRACK, bearer("user-2")).await.unwrap();
+        assert_eq!(prepared.cx.end_user().map(EndUser::subject), Some("user-2"));
+        let prepared = admit(&served, TRACK, http::HeaderMap::new()).await.unwrap();
+        assert_eq!(prepared.cx.end_user(), None);
+        assert_eq!(prepared.cx.caller(), None);
+        let error = admit(&served, TRACK, bearer("forged")).await.unwrap_err();
+        assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
     }
 
     #[tokio::test(start_paused = true)]

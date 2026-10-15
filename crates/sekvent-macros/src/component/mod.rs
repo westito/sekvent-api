@@ -26,8 +26,13 @@ pub(crate) fn expand(
         (Ok(args), Ok(component)) => {
             if args.mode == parse::Mode::LocalOnly {
                 let mut errors = Errors::default();
-                for span in component.methods.iter().filter_map(|m| m.anonymous) {
-                    errors.push(Error::new(span, parse::ANONYMOUS_ON_LOCAL_ONLY));
+                for served in component.methods.iter().map(|m| m.served) {
+                    if let Some(span) = served.anonymous {
+                        errors.push(Error::new(span, parse::ANONYMOUS_ON_LOCAL_ONLY));
+                    }
+                    if let Some(span) = served.optional_end_user {
+                        errors.push(Error::new(span, parse::OPTIONAL_END_USER_ON_LOCAL_ONLY));
+                    }
                 }
                 errors.finish()?;
             }

@@ -26,6 +26,12 @@ pub const END_USER_REJECTED_MESSAGE: &str = "invalid or expired credentials";
 /// `UNAUTHENTICATED` with [`END_USER_REJECTED_MESSAGE`] and nothing else;
 /// any other error (a session store that is down) reaches it unchanged.
 /// The authenticator runs within the call's deadline.
+///
+/// It is not run for a link caller, for a method marked
+/// `#[call(anonymous)]`, or for a method marked `#[call(optional_end_user)]`
+/// when the request carries no `Authorization` header; such a call has no
+/// end user. When an optional-end-user request does carry the header, the
+/// authenticator runs and its errors are answered exactly as above.
 pub trait EndUserAuthenticator: Send + Sync + 'static {
     /// The end user `request` was made by.
     fn authenticate<'a>(

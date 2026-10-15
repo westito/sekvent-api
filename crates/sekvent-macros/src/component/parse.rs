@@ -53,6 +53,10 @@ const PROTO_ON_LOCAL_ONLY: &str = "a local_only component has no contract; remov
 const BAD_PROTO: &str = "proto must be a module path such as \"crate::proto::shop::inventory::v1\"";
 pub(crate) const ANONYMOUS_ON_LOCAL_ONLY: &str =
     "`anonymous` has no effect on a local_only component, which is never served; remove it";
+pub(crate) const OPTIONAL_END_USER_ON_LOCAL_ONLY: &str = "`optional_end_user` has no effect on a \
+     local_only component, which is never served; remove it";
+const ANONYMOUS_AND_OPTIONAL_END_USER: &str = "`anonymous` and `optional_end_user` exclude each \
+     other: an anonymous method never sees an end user; keep one";
 
 /// Where a component may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +104,16 @@ pub(crate) struct Method {
     pub(crate) reply: Type,
     pub(crate) error: Type,
     pub(crate) policy: CallPolicy,
-    /// The `anonymous` argument of `#[call]`, if given.
+    /// Where the `#[call]` arguments that only matter when serving were given.
+    pub(crate) served: ServedArgs,
+}
+
+/// Spans of the `#[call]` arguments that only matter when the component is
+/// served, for errors on a `local_only` component.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ServedArgs {
     pub(crate) anonymous: Option<Span>,
+    pub(crate) optional_end_user: Option<Span>,
 }
 
 /// Arguments of `#[call(...)]`.
@@ -112,6 +124,9 @@ pub(crate) struct CallPolicy {
     pub(crate) bulkhead: Option<u32>,
     /// End users may call the method without credentials.
     pub(crate) anonymous: bool,
+    /// End users may call the method with or without credentials; a
+    /// credential, when sent, is authenticated.
+    pub(crate) optional_end_user: bool,
 }
 
 /// Parse and validate the attribute arguments.
@@ -376,7 +391,7 @@ fn method(function: TraitItemFn) -> Result<Method> {
             format!("method name `{name}` is reserved on the generated handle"),
         ));
     }
-    let (docs, policy, anonymous) = method_attrs(&function, &mut errors);
+    let (docs, policy, served) = method_attrs(&function, &mut errors);
     check_modifiers(&function, &mut errors);
     let arguments = arguments(&function, &mut errors);
     let returned = returned(&function, &mut errors);
@@ -395,19 +410,19 @@ fn method(function: TraitItemFn) -> Result<Method> {
         reply,
         error,
         policy,
-        anonymous,
+        served,
     })
 }
 
-/// Doc comments to keep, the `#[call]` policy and the span of its
-/// `anonymous` argument.
+/// Doc comments to keep, the `#[call]` policy and the spans of its
+/// serving-only arguments.
 fn method_attrs(
     function: &TraitItemFn,
     errors: &mut Errors,
-) -> (Vec<Attribute>, CallPolicy, Option<Span>) {
+) -> (Vec<Attribute>, CallPolicy, ServedArgs) {
     let mut docs = Vec::new();
     let mut policy = CallPolicy::default();
-    let mut anonymous = None;
+    let mut served = ServedArgs::default();
     let mut kinds = 0_usize;
     for attr in &function.attrs {
         let path = attr.path();
@@ -428,7 +443,7 @@ fn method_attrs(
         }
         if kind == "call" {
             if kinds == 1 {
-                (policy, anonymous) = errors.take(call_policy(attr)).unwrap_or_default();
+                (policy, served) = errors.take(call_policy(attr)).unwrap_or_default();
             }
         } else {
             errors.push(Error::new_spanned(
@@ -446,19 +461,21 @@ fn method_attrs(
             ),
         ));
     }
-    (docs, policy, anonymous)
+    (docs, policy, served)
 }
 
-/// `#[call]` or `#[call(idempotent, timeout = "2s", bulkhead = 16, anonymous)]`.
-/// Also returns the span of `anonymous`, when given.
-pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, Option<Span>)> {
+/// `#[call]` or `#[call(idempotent, timeout = "2s", bulkhead = 16, anonymous)]`
+/// (or `optional_end_user` in place of `anonymous`). Also returns the spans
+/// of the serving-only arguments.
+pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, ServedArgs)> {
     let mut policy = CallPolicy::default();
-    let mut anonymous_span = None;
+    let mut served = ServedArgs::default();
     if matches!(attr.meta, syn::Meta::Path(_)) {
-        return Ok((policy, None));
+        return Ok((policy, served));
     }
     let mut errors = Errors::default();
-    let (mut idempotent, mut timeout, mut bulkhead, mut anonymous) = (false, false, false, false);
+    let (mut idempotent, mut timeout, mut bulkhead, mut anonymous, mut optional_end_user) =
+        (false, false, false, false, false);
     attr.parse_nested_meta(|meta| {
         let key = path_name(&meta.path);
         let seen = match key.as_str() {
@@ -466,10 +483,11 @@ pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, Option<Span>)
             "timeout" => &mut timeout,
             "bulkhead" => &mut bulkhead,
             "anonymous" => &mut anonymous,
+            "optional_end_user" => &mut optional_end_user,
             _ => {
                 return Err(meta.error(format!(
-                    "unknown #[call] argument `{key}`; expected idempotent, timeout, bulkhead \
-                     or anonymous"
+                    "unknown #[call] argument `{key}`; expected idempotent, timeout, bulkhead, \
+                     anonymous or optional_end_user"
                 )));
             }
         };
@@ -481,7 +499,11 @@ pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, Option<Span>)
             "idempotent" => policy.idempotent = true,
             "anonymous" => {
                 policy.anonymous = true;
-                anonymous_span = Some(meta.path.span());
+                served.anonymous = Some(meta.path.span());
+            }
+            "optional_end_user" => {
+                policy.optional_end_user = true;
+                served.optional_end_user = Some(meta.path.span());
             }
             "timeout" => {
                 let value: Expr = meta.value()?.parse()?;
@@ -494,8 +516,11 @@ pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, Option<Span>)
         }
         Ok(())
     })?;
+    if let (Some(_), Some(second)) = (served.anonymous, served.optional_end_user) {
+        errors.push(Error::new(second, ANONYMOUS_AND_OPTIONAL_END_USER));
+    }
     errors.finish()?;
-    Ok((policy, anonymous_span))
+    Ok((policy, served))
 }
 
 /// A humantime string literal for a positive duration.

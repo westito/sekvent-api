@@ -472,6 +472,51 @@ fn anonymous_methods() {
 }
 
 #[test]
+fn optional_end_user_methods() {
+    let item = quote! {
+        trait Echo {
+            #[call(optional_end_user)]
+            async fn ping(&self, cx: &CallContext, req: PingRequest) -> Result<PingReply, AppError>;
+            #[call(idempotent, optional_end_user, bulkhead = 2)]
+            async fn pong(&self, cx: &CallContext, req: PingRequest) -> Result<PingReply, AppError>;
+        }
+    };
+    let out = expand_ok(standard_args(), item);
+    assert!(
+        out.contains("MethodDescriptor::call(\"ping\",\"Ping\").with_optional_end_user(),"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "MethodDescriptor::call(\"pong\",\"Pong\").with_idempotent().with_bulkhead(2u32)\
+             .with_optional_end_user()];"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("with_anonymous"), "{out}");
+
+    let all = messages(
+        quote!(name = "notes", local_only),
+        quote! {
+            trait Notes {
+                #[call(optional_end_user)]
+                async fn add(&self, cx: &CallContext, req: String) -> Result<usize, AppError>;
+                #[call(anonymous)]
+                async fn count(&self, cx: &CallContext, req: ()) -> Result<usize, AppError>;
+            }
+        },
+    );
+    assert_eq!(
+        all,
+        [
+            "`optional_end_user` has no effect on a local_only component, which is never served; \
+             remove it",
+            "`anonymous` has no effect on a local_only component, which is never served; remove it",
+        ]
+    );
+}
+
+#[test]
 fn local_only_descriptors() {
     let item = quote! {
         trait Notes {
@@ -907,7 +952,8 @@ fn m1_to_m7_attribute_errors() {
         ),
         (
             quote!(#[call(retry)]),
-            "unknown #[call] argument `retry`; expected idempotent, timeout, bulkhead or anonymous",
+            "unknown #[call] argument `retry`; expected idempotent, timeout, bulkhead, anonymous \
+             or optional_end_user",
         ),
         (
             quote!(#[call(idempotent, idempotent)]),
@@ -916,6 +962,20 @@ fn m1_to_m7_attribute_errors() {
         (
             quote!(#[call(anonymous, anonymous)]),
             "duplicate #[call] argument `anonymous`",
+        ),
+        (
+            quote!(#[call(optional_end_user, optional_end_user)]),
+            "duplicate #[call] argument `optional_end_user`",
+        ),
+        (
+            quote!(#[call(anonymous, idempotent, optional_end_user)]),
+            "`anonymous` and `optional_end_user` exclude each other: an anonymous method never \
+             sees an end user; keep one",
+        ),
+        (
+            quote!(#[call(optional_end_user, anonymous)]),
+            "`anonymous` and `optional_end_user` exclude each other: an anonymous method never \
+             sees an end user; keep one",
         ),
         (
             quote!(#[call(timeout = "1s", timeout = "2s")]),

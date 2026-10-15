@@ -24,6 +24,7 @@ pub struct MethodDescriptor {
     timeout: Option<Duration>,
     bulkhead: Option<u32>,
     anonymous: bool,
+    optional_end_user: bool,
 }
 
 impl MethodDescriptor {
@@ -39,6 +40,7 @@ impl MethodDescriptor {
             timeout: None,
             bulkhead: None,
             anonymous: false,
+            optional_end_user: false,
         }
     }
 
@@ -65,10 +67,24 @@ impl MethodDescriptor {
 
     /// Let end users call the method without credentials when the component
     /// is served with end-user authentication; link authentication still
-    /// applies.
+    /// applies. Replaces [`with_optional_end_user`](Self::with_optional_end_user).
     #[must_use]
     pub const fn with_anonymous(mut self) -> Self {
         self.anonymous = true;
+        self.optional_end_user = false;
+        self
+    }
+
+    /// Let end users call the method with or without credentials when the
+    /// component is served with end-user authentication: a request without
+    /// an `Authorization` header runs without an end user, one with it is
+    /// authenticated as for any other method, and a rejected credential is
+    /// refused rather than treated as absent. Link authentication still
+    /// applies. Replaces [`with_anonymous`](Self::with_anonymous).
+    #[must_use]
+    pub const fn with_optional_end_user(mut self) -> Self {
+        self.optional_end_user = true;
+        self.anonymous = false;
         self
     }
 
@@ -105,6 +121,12 @@ impl MethodDescriptor {
     /// Whether end users may call the method without credentials.
     pub const fn is_anonymous(&self) -> bool {
         self.anonymous
+    }
+
+    /// Whether end users may call the method with or without credentials,
+    /// credentials that are sent being authenticated.
+    pub const fn is_optional_end_user(&self) -> bool {
+        self.optional_end_user
     }
 }
 
@@ -199,6 +221,7 @@ mod tests {
             .with_timeout(Duration::from_secs(2))
             .with_bulkhead(16),
         MethodDescriptor::call("release", "Release").with_anonymous(),
+        MethodDescriptor::call("track", "Track").with_optional_end_user(),
     ];
 
     const INVENTORY: &ComponentDescriptor =
@@ -215,13 +238,24 @@ mod tests {
         assert_eq!(reserve.timeout(), Some(Duration::from_secs(2)));
         assert_eq!(reserve.bulkhead(), Some(16));
         assert!(!reserve.is_anonymous());
+        assert!(!reserve.is_optional_end_user());
 
         let release = METHODS[1];
         assert!(!release.is_idempotent());
         assert_eq!(release.timeout(), None);
         assert_eq!(release.bulkhead(), None);
         assert!(release.is_anonymous());
+        assert!(!release.is_optional_end_user());
         assert_ne!(reserve, release);
+
+        let track = METHODS[2];
+        assert!(track.is_optional_end_user());
+        assert!(!track.is_anonymous());
+        // The two exclude each other: the later builder wins.
+        let anonymous = track.with_anonymous();
+        assert!(anonymous.is_anonymous() && !anonymous.is_optional_end_user());
+        let optional = release.with_optional_end_user();
+        assert!(optional.is_optional_end_user() && !optional.is_anonymous());
     }
 
     #[test]
@@ -230,7 +264,7 @@ mod tests {
         assert_eq!(INVENTORY.service(), "Inventory");
         assert_eq!(INVENTORY.package(), Some("shop.inventory.v1"));
         assert_eq!(INVENTORY.mode(), ComponentMode::Standard);
-        assert_eq!(INVENTORY.methods().len(), 2);
+        assert_eq!(INVENTORY.methods().len(), 3);
         assert_eq!(
             INVENTORY.full_service_name().as_deref(),
             Some("shop.inventory.v1.Inventory")

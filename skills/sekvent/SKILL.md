@@ -901,6 +901,11 @@ if let Some(user) = cx.end_user() {
   never link authentication: under `link` it still needs a link token, under
   local bindings it has no effect, on `local_only` it is a compile error. A
   token sent to an anonymous method is ignored.
+- `#[call(optional_end_user)]` (excludes `anonymous`) is for public RPCs that
+  personalise: no `Authorization` header runs with `cx.end_user() == None`;
+  with the header the authenticator runs as for any method and a rejected
+  token is `UNAUTHENTICATED`, never downgraded to anonymous. Same link and
+  `local_only` rules as `anonymous`.
 - Roles stay with the authenticating component: callees down the chain see
   subject and tenant (`cx.child()` drops the end user), never roles.
 - `ServerBuilder::authenticator` never rejects and component calls ignore
@@ -1059,8 +1064,9 @@ listener) with `await_until!`.
   test, and list a caller in `SEKVENT_LINK_TRUSTED` only when it really
   vouches for the end user. Open a component to browsers with
   `SERVE_AUTH=bearer` and an end-user authenticator, never with `none`, and
-  mark a method `#[call(anonymous)]` only when it is truly public (sign-in
-  and the like): under a bearer mode anyone may call it.
+  mark a method `#[call(anonymous)]` or `#[call(optional_end_user)]` only
+  when it is truly public (sign-in and the like): under a bearer mode anyone
+  may call it, so decide personal data from `cx.end_user()` alone.
 - **SSO.** Never put a token in a URL or hand-roll `returnTo`: use
   `sekvent::sso`, whose return paths are relative only and whose handoff
   code travels in the fragment. Keep `secure_cookies` on outside

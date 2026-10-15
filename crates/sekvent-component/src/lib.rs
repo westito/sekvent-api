@@ -84,7 +84,9 @@
 //! the caller's link token or, with `SERVE_AUTH=bearer` or `link,bearer`,
 //! authenticating an end user through the App's [`EndUserAuthenticator`]
 //! (see [`CallContext::end_user`]). Methods marked `#[call(anonymous)]` skip
-//! end-user authentication, never link authentication.
+//! end-user authentication, never link authentication; methods marked
+//! `#[call(optional_end_user)]` skip it only for a request without an
+//! `Authorization` header and otherwise authenticate the end user as usual.
 
 #![forbid(unsafe_code)]
 

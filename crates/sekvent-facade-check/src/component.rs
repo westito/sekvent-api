@@ -71,8 +71,9 @@ pub enum EchoError {
     proto = "crate::component::proto"
 )]
 pub trait Echo: Send + Sync + 'static {
-    /// The request's text, unchanged.
-    #[call(timeout = "1s")]
+    /// The request's text, unchanged; open to end users with or without
+    /// credentials when served to them.
+    #[call(timeout = "1s", optional_end_user)]
     async fn ping(&self, cx: &CallContext, req: PingRequest) -> Result<PingReply, EchoError>;
 }
 
@@ -166,6 +167,16 @@ mod tests {
 
             built.stop(Duration::from_secs(1)).await.unwrap();
         }
+    }
+
+    #[test]
+    fn the_call_options_reach_the_descriptor() {
+        use sekvent::component::ComponentHandle;
+
+        let ping = EchoHandle::DESCRIPTOR.methods()[0];
+        assert_eq!(ping.timeout(), Some(Duration::from_secs(1)));
+        assert!(ping.is_optional_end_user());
+        assert!(!ping.is_anonymous());
     }
 
     #[test]
