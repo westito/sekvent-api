@@ -8,17 +8,19 @@
 name = "{{project_name}}"
 
 [remote]
-# "rrb": compiling commands (check, clippy, test, gate, coverage) run on the
-# remote builder through rrb. "local": run them on this machine. CI and the
-# builder container itself always run locally.
+# Where compiling commands (check, clippy, test, gate, coverage) run.
+# "auto" (the default): on the remote builder named by the BUILD_CMD
+# environment variable when it is set on the machine, locally otherwise.
+# "local": always on this machine. "rrb": always on the remote builder,
+# through `rrb` below or else BUILD_CMD (an error when neither is set).
+# CI, SEKVENT_LOCAL=1 and the builder container itself always run locally.
 #
-# Without a remote builder, set mode = "local" here (or export
-# SEKVENT_LOCAL=1 for one shell); a missing rrb is otherwise an error, never
-# a silent local build.
-mode = "rrb"
-# Path of the rrb executable (`~` is expanded) or a bare name looked up on
-# PATH.
-rrb = "~/.kodein/skills/build-on-rtx/bin/rrb"
+# Keep "auto" in a shared repository: the choice then belongs to each
+# machine's environment, not to this file.
+mode = "auto"
+# Path of the rrb executable for mode = "rrb" (`~` is expanded; a bare name
+# is looked up on PATH).
+# rrb = "rrb"
 
 [gate]
 # Workspace packages left out of fmt, clippy, test and coverage.

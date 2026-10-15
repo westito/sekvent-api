@@ -129,7 +129,8 @@ orders/
   ignored) and takes its own keys, listed below, from their defaults. Copy it
   to `.env` (git-ignored) for local runs.
 - `.remote-build.toml` and `.sekvent/run.sh` — configuration of the `rrb`
-  remote builder and the script it (and CI) runs. `run.sh` reads the sekvent
+  remote builder (used only where `BUILD_CMD` is set) and the script it
+  (and CI) runs. `run.sh` reads the sekvent
   revision from `Cargo.lock`, installs `cargo-sekvent` at that revision into
   `$CARGO_HOME/sekvent-cli/<rev>` once, and runs it. You can ignore both if
   you build locally.
@@ -261,24 +262,20 @@ Press Ctrl-C to stop: health turns not-serving, the runtime waits
 
 ### Run the tests and the gate
 
-`cargo sekvent` forwards everything that compiles (`gate`, `check`,
-`clippy`, `test`, `coverage`, `harness-clean`) to a remote builder through
-`rrb`, unless the current machine is the place to compile. If you do not use
-a remote builder, opt out once in `sekvent.toml`:
-
-```toml
-[remote]
-mode = "local"
-```
-
-or for a single shell:
+Everything that compiles (`gate`, `check`, `clippy`, `test`, `coverage`,
+`harness-clean`) runs on this machine unless the `BUILD_CMD` environment
+variable names an `rrb` remote builder; then `cargo sekvent` forwards it
+there. Nothing in the project has to change for either: the default
+`[remote].mode = "auto"` follows the environment. To build locally for one
+shell even where `BUILD_CMD` is set:
 
 ```sh
 export SEKVENT_LOCAL=1
 ```
 
-CI (`CI` set) always runs locally. A missing `rrb` is an error that says
-exactly this; it never turns into a silent local build.
+CI (`CI` set) always runs locally. When forwarding is selected and `rrb` is
+missing or fails, the command fails; it never turns into a silent local
+build.
 
 ```sh
 cargo fmt --all            # formatting writes files, so it always runs here
@@ -708,8 +705,9 @@ cargo sekvent skills install --dest DIR
 cargo sekvent agents                    # refresh the managed section of AGENTS.md
 ```
 
-The skills are `sekvent` (writing code in a sekvent project),
-`sekvent-new-project` and `sekvent-migrate`. Only skill directories whose
+The skills are `sekvent-api` (orientation: features, service anatomy,
+which docs page answers what), `sekvent` (writing code in a sekvent
+project), `sekvent-new-project` and `sekvent-migrate`. Only skill directories whose
 name starts with `sekvent` are written or replaced. `agents` rewrites only
 the text between the `sekvent:begin` and `sekvent:end` markers (appending
 the section when there is none) and refuses a file with an opening marker

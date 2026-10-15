@@ -26,10 +26,13 @@ Installation is covered in [Getting started](getting-started.md#install-the-cli)
 
 ## Where commands run
 
-Commands that compile Rust are **compiling commands**. By default they are
-not run on your machine but forwarded to a remote builder:
-`cargo sekvent gate` becomes `rrb run sekvent gate`, executed in the project
-root. `rrb` syncs the project's git file set to the builder and runs the
+Commands that compile Rust are **compiling commands**. By default
+(`[remote].mode = "auto"`) they run on your machine, unless the
+`BUILD_CMD` environment variable names an `rrb` remote builder; then they
+are forwarded to it: `cargo sekvent gate` becomes
+`$BUILD_CMD run sekvent gate`, executed in the project root. The project
+configuration never names a builder, so the same repository builds locally
+for one developer and remotely for another. `rrb` syncs the project's git file set to the builder and runs the
 `[run.commands].sekvent` entry of `.remote-build.toml`, which is
 `.sekvent/run.sh`. That script installs `cargo-sekvent` at exactly the
 sekvent revision `Cargo.lock` pins (once per revision, into
@@ -37,20 +40,23 @@ sekvent revision `Cargo.lock` pins (once per revision, into
 executes locally. The exit code of `rrb` becomes the exit code of the
 command.
 
-A compiling command runs on the current machine instead when any of these
-holds, checked in this order:
+The decision is checked in this order:
 
-1. `RRB_CONTAINER` is set (the builder's containers set it);
-2. `CI` is set;
-3. `SEKVENT_LOCAL` is set;
-4. `[remote].mode = "local"` in `sekvent.toml`.
+1. `RRB_CONTAINER` is set (the builder's containers set it): local;
+2. `CI` is set: local;
+3. `SEKVENT_LOCAL` is set: local;
+4. `[remote].mode = "local"`: local;
+5. `mode = "auto"` (the default): forwarded through `$BUILD_CMD` when it
+   is set and non-empty, local otherwise;
+6. `mode = "rrb"`: forwarded through `[remote].rrb`, else `$BUILD_CMD`;
+   with neither, the command fails.
 
-For the three variables, any value except empty, `0`, `false`, `no` and
-`off` (case-insensitive, surrounding whitespace ignored) counts as set, so
-`CI=false` does not switch to local mode.
+For `RRB_CONTAINER`, `CI` and `SEKVENT_LOCAL`, any value except empty, `0`,
+`false`, `no` and `off` (case-insensitive, surrounding whitespace ignored)
+counts as set, so `CI=false` does not switch to local mode.
 
-There is no automatic fallback: when forwarding is selected and `rrb` is
-missing or fails, the command fails and says how to opt into local builds.
+Once forwarding is selected, a missing or failing `rrb` fails the command
+(with a hint on how to build locally); it never turns into a local build.
 
 | Runs | Commands |
 |---|---|
@@ -387,7 +393,7 @@ marker but no closing one is left alone and reported with its line number.
 cargo sekvent skills install [--dest DIR]
 ```
 
-Copies the agent skills shipped with this CLI (`sekvent`,
+Copies the agent skills shipped with this CLI (`sekvent-api`, `sekvent`,
 `sekvent-new-project`, `sekvent-migrate`) into `~/.kodein/skills`, plus
 `~/.claude/skills` when that directory exists, or only into `--dest DIR`.
 Only directories whose names start with `sekvent` are written or replaced.
@@ -440,13 +446,14 @@ Read by the CLI:
 
 | Variable | Effect |
 |---|---|
+| `BUILD_CMD` | Path of the `rrb` remote builder; when set and non-empty, compiling commands are forwarded to it (`mode = "auto"`), and it is the fallback path for `mode = "rrb"` |
 | `CI` | Enabled: compiling commands run locally |
 | `SEKVENT_LOCAL` | Enabled: compiling commands run locally |
 | `RRB_CONTAINER` | Enabled: already inside the builder, run locally |
 | `SEKVENT_NO_UPDATE_CHECK` | Any non-empty value skips the gate's "sekvent moved on" hint |
 | `SEKVENT_DOCKER_TESTS` | With `[harness].docker_tests`: left as is when set; a value other than `1`/`true` turns the container tests and `--include-ignored` off for one run |
 | `RUST_TEST_THREADS` | Left as is when set; otherwise set from `[gate].test_threads` |
-| `HOME` | Expands `~` in `[remote].rrb`; base of the default skill directories |
+| `HOME` | Expands `~` in `[remote].rrb` and `BUILD_CMD`; base of the default skill directories |
 
 Set by the CLI for the commands it runs:
 
@@ -485,8 +492,8 @@ tasks run there.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `mode` | `"rrb"` \| `"local"` | `"rrb"` | `"rrb"` forwards compiling commands to the remote builder; `"local"` runs them on this machine |
-| `rrb` | string | `"~/.kodein/skills/build-on-rtx/bin/rrb"` | Path of the `rrb` executable; a leading `~` is the home directory, a bare name (no `/`) is looked up on `PATH`. Must not be empty |
+| `mode` | `"auto"` \| `"rrb"` \| `"local"` | `"auto"` | `"auto"` forwards compiling commands to the remote builder named by `BUILD_CMD` when that is set and runs them locally otherwise; `"rrb"` always forwards; `"local"` always runs them on this machine |
+| `rrb` | string | none | Path of the `rrb` executable for `mode = "rrb"` (falls back to `BUILD_CMD`); a leading `~` is the home directory, a bare name (no `/`) is looked up on `PATH`. Must not be empty when given; ignored by `"auto"` |
 
 ### `[gate]`
 
@@ -576,8 +583,9 @@ contain whitespace.
 name = "orders"                     # required
 
 [remote]
-mode = "local"                      # no remote builder: compile here
-# rrb = "rrb"                       # or: forward through an rrb found on PATH
+mode = "local"                      # always compile here, even with BUILD_CMD set
+# mode = "rrb"                      # or: always forward ...
+# rrb = "rrb"                       # ... through an rrb found on PATH
 
 [gate]
 exclude = ["vendored-sdk"]          # left out of every step

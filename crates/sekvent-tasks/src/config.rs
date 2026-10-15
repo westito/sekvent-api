@@ -13,9 +13,6 @@ use serde::{Deserialize, Serialize};
 /// File name of the project configuration.
 pub const CONFIG_FILE: &str = "sekvent.toml";
 
-/// Default location of the `rrb` remote builder front end.
-pub const DEFAULT_RRB: &str = "~/.kodein/skills/build-on-rtx/bin/rrb";
-
 /// Default per-package line coverage floor, in percent.
 pub const DEFAULT_FAIL_UNDER_LINES: f64 = 95.0;
 
@@ -109,39 +106,36 @@ pub struct ProjectConfig {
 }
 
 /// `[remote]`: how compiling commands reach the builder.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+///
+/// Nothing here names a machine-specific path by default: whether and through
+/// which `rrb` a command is forwarded comes from the environment
+/// (`BUILD_CMD`) unless the project pins it with `mode = "rrb"`. See
+/// [`crate::location::decide_location`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteConfig {
-    /// `"rrb"` forwards compiling commands to the remote builder; `"local"`
-    /// runs them in place.
+    /// `"auto"` forwards compiling commands to the remote builder named by
+    /// `BUILD_CMD` when that is set and runs them in place otherwise;
+    /// `"rrb"` always forwards; `"local"` always runs in place.
     pub mode: RemoteMode,
-    /// Path of the `rrb` executable; a leading `~` is the home directory and
-    /// a bare name is looked up on `PATH`.
-    pub rrb: String,
-}
-
-impl Default for RemoteConfig {
-    fn default() -> Self {
-        Self {
-            mode: RemoteMode::Rrb,
-            rrb: DEFAULT_RRB.to_owned(),
-        }
-    }
-}
-
-impl RemoteConfig {
-    /// The `rrb` path with a leading `~` replaced by `home`.
-    pub fn rrb_path(&self, home: Option<&Path>) -> PathBuf {
-        expand_tilde(&self.rrb, home)
-    }
+    /// Path of the `rrb` executable for `mode = "rrb"`; without it,
+    /// `BUILD_CMD` names the executable. A leading `~` is the home
+    /// directory and a bare name is looked up on `PATH`. `mode = "auto"`
+    /// ignores it and uses `BUILD_CMD`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rrb: Option<String>,
 }
 
 /// `[remote].mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RemoteMode {
-    /// Forward compiling commands to the remote builder through `rrb`.
+    /// Forward compiling commands through the `rrb` named by `BUILD_CMD`
+    /// when that variable is set; run them on this machine otherwise.
     #[default]
+    Auto,
+    /// Always forward compiling commands to the remote builder through
+    /// `rrb` (`[remote].rrb`, else `BUILD_CMD`).
     Rrb,
     /// Run compiling commands on this machine.
     Local,
@@ -406,7 +400,12 @@ impl Config {
         if self.project.name.trim().is_empty() {
             return Err(invalid("project.name", "must not be empty".into()));
         }
-        if self.remote.rrb.trim().is_empty() {
+        if self
+            .remote
+            .rrb
+            .as_deref()
+            .is_some_and(|rrb| rrb.trim().is_empty())
+        {
             return Err(invalid("remote.rrb", "must not be empty".into()));
         }
         if self.gate.test_threads == 0 {
@@ -626,7 +625,7 @@ description = "Seed the dev database"
         let config = parse(FULL).unwrap();
         assert_eq!(config.project.name, "orders");
         assert_eq!(config.remote.mode, RemoteMode::Local);
-        assert_eq!(config.remote.rrb, "/opt/rrb");
+        assert_eq!(config.remote.rrb.as_deref(), Some("/opt/rrb"));
         assert_eq!(config.gate.exclude, ["vendored"]);
         assert_eq!(
             config.gate.features,
@@ -676,8 +675,8 @@ description = "Seed the dev database"
     fn defaults_fill_everything_but_the_name() {
         let config = parse("[project]\nname = \"orders\"\n").unwrap();
         assert_eq!(config, Config::with_name("orders"));
-        assert_eq!(config.remote.mode, RemoteMode::Rrb);
-        assert_eq!(config.remote.rrb, DEFAULT_RRB);
+        assert_eq!(config.remote.mode, RemoteMode::Auto);
+        assert_eq!(config.remote.rrb, None);
         assert_eq!(config.gate.features, Features::Set(FeatureSet::All));
         assert_eq!(config.gate.test_threads, 8);
         assert!(config.gate.fmt);
@@ -695,6 +694,49 @@ description = "Seed the dev database"
         assert_eq!(config.contract.baseline, PathBuf::from("contracts"));
         assert!(config.contract.gate);
         assert!(!config.contract.in_gate());
+    }
+
+    #[test]
+    fn remote_modes_parse() {
+        for (value, mode) in [
+            ("auto", RemoteMode::Auto),
+            ("rrb", RemoteMode::Rrb),
+            ("local", RemoteMode::Local),
+        ] {
+            let config = parse(&format!(
+                "[project]\nname = \"x\"\n[remote]\nmode = \"{value}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.remote.mode, mode, "{value}");
+            assert_eq!(config.remote.rrb, None, "{value}");
+        }
+        for value in ["remote", "RRB", ""] {
+            let text = format!("[project]\nname = \"x\"\n[remote]\nmode = \"{value}\"\n");
+            assert!(
+                matches!(parse(&text), Err(ConfigError::Parse { .. })),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn older_remote_tables_still_load() {
+        let config =
+            parse("[project]\nname = \"x\"\n[remote]\nmode = \"rrb\"\nrrb = \"~/bin/rrb\"\n")
+                .unwrap();
+        assert_eq!(config.remote.mode, RemoteMode::Rrb);
+        assert_eq!(config.remote.rrb.as_deref(), Some("~/bin/rrb"));
+
+        let config = parse("[project]\nname = \"x\"\n[remote]\nrrb = \"/opt/rrb\"\n").unwrap();
+        assert_eq!(config.remote.mode, RemoteMode::Auto);
+        assert_eq!(config.remote.rrb.as_deref(), Some("/opt/rrb"));
+    }
+
+    #[test]
+    fn rrb_mode_without_a_path_loads_and_is_resolved_from_the_environment() {
+        let config = parse("[project]\nname = \"x\"\n[remote]\nmode = \"rrb\"\n").unwrap();
+        assert_eq!(config.remote.mode, RemoteMode::Rrb);
+        assert_eq!(config.remote.rrb, None);
     }
 
     #[test]
@@ -788,6 +830,9 @@ description = "Seed the dev database"
         let defaults = Config::with_name("orders").to_toml().unwrap();
         assert!(defaults.contains("stale_after = \"6h\""), "{defaults}");
         assert!(defaults.contains("docker_tests = false"), "{defaults}");
+        assert!(defaults.contains("mode = \"auto\""), "{defaults}");
+        assert!(!defaults.contains("rrb ="), "{defaults}");
+        assert_eq!(parse(&defaults).unwrap(), Config::with_name("orders"));
     }
 
     #[test]
@@ -801,10 +846,6 @@ description = "Seed the dev database"
         assert_eq!(expand_tilde("~other", Some(home)), PathBuf::from("~other"));
         assert_eq!(expand_tilde("/a/~/b", Some(home)), PathBuf::from("/a/~/b"));
         assert_eq!(expand_tilde("~/x", None), PathBuf::from("~/x"));
-        assert_eq!(
-            RemoteConfig::default().rrb_path(Some(home)),
-            PathBuf::from("/home/dev/.kodein/skills/build-on-rtx/bin/rrb")
-        );
     }
 
     #[test]

@@ -79,7 +79,7 @@ mod tests {
     use super::*;
     use crate::config::RemoteMode;
     use crate::harness::fake::FakeSweeper;
-    use crate::location::{LocalReason, RRB_CONTAINER_ENV};
+    use crate::location::{LocalReason, RRB_CONTAINER_ENV, RrbSource};
     use crate::process::fake::FakeRunner;
 
     #[test]
@@ -89,6 +89,7 @@ mod tests {
         let interrupted = Arc::new(AtomicBool::new(false));
         let mut config = Config::with_name("orders");
         config.remote.mode = RemoteMode::Rrb;
+        config.remote.rrb = Some("/opt/rrb".into());
         let project = Project {
             root: "/work".into(),
             config,
@@ -101,7 +102,10 @@ mod tests {
             Arc::clone(&interrupted),
         );
         assert_eq!(ctx.root, PathBuf::from("/work"));
-        assert_eq!(ctx.location(), Location::Remote);
+        assert_eq!(
+            ctx.location(),
+            Location::Remote(RrbSource::Config("/opt/rrb".into()))
+        );
         ctx.env.insert(RRB_CONTAINER_ENV.into(), "1".into());
         assert_eq!(ctx.location(), Location::Local(LocalReason::InsideBuilder));
 

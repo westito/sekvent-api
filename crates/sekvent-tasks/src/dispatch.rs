@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 
-use crate::config::{RemoteConfig, TaskConfig};
+use crate::config::{TaskConfig, expand_tilde};
 use crate::context::Context;
-use crate::location::Location;
+use crate::location::{BUILD_CMD_ENV, Location, RrbSource};
 use crate::metadata::Metadata;
 use crate::process::Cmd;
 
@@ -100,24 +100,31 @@ pub fn normalize_args(mut argv: Vec<String>) -> Vec<String> {
 
 /// How to build without a remote builder, appended to every "rrb is
 /// missing" error.
-pub const LOCAL_HINT: &str = "to compile on this machine instead, set `[remote].mode = \"local\"` \
-     in sekvent.toml or export SEKVENT_LOCAL=1; there is no automatic local fallback";
+pub const LOCAL_HINT: &str = "to compile on this machine instead, export SEKVENT_LOCAL=1 or set \
+     `[remote].mode = \"local\"` in sekvent.toml (with the default `mode = \"auto\"`, \
+     unsetting BUILD_CMD does the same); a missing builder never falls back to a local build";
 
-/// The `rrb` executable: the configured path (with `~` expanded) or, for a
-/// bare name, a `PATH` lookup.
-pub fn resolve_rrb(remote: &RemoteConfig, home: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let path = remote.rrb_path(home);
-    if path.components().count() == 1 && !remote.rrb.contains('/') {
+/// The `rrb` executable of a remote location: the configured or
+/// environment path (with `~` expanded) or, for a bare name, a `PATH`
+/// lookup.
+pub fn resolve_rrb(source: &RrbSource, home: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let (rrb, origin) = match source {
+        RrbSource::Config(rrb) => (rrb, "[remote].rrb"),
+        RrbSource::Env(rrb) => (rrb, BUILD_CMD_ENV),
+        RrbSource::Missing => bail!(
+            "`[remote].mode = \"rrb\"` needs the rrb executable: set [remote].rrb in \
+             sekvent.toml or export {BUILD_CMD_ENV}; {LOCAL_HINT}"
+        ),
+    };
+    let path = expand_tilde(rrb, home);
+    if path.components().count() == 1 && !rrb.contains('/') {
         return which::which(&path).with_context(|| {
-            format!(
-                "`{}` is not on PATH; remote builds need rrb (set [remote].rrb); {LOCAL_HINT}",
-                remote.rrb
-            )
+            format!("`{rrb}` (from {origin}) is not on PATH; remote builds need rrb; {LOCAL_HINT}")
         });
     }
     if !path.is_file() {
         bail!(
-            "rrb not found at {}; remote builds need it (set [remote].rrb); {LOCAL_HINT}",
+            "rrb not found at {} (from {origin}); remote builds need it; {LOCAL_HINT}",
             path.display()
         );
     }
@@ -132,10 +139,15 @@ pub fn remote_command(rrb: &Path, root: &Path, args: &[String]) -> Cmd {
         .cwd(root)
 }
 
-/// Hand `args` to the remote builder. On Unix this replaces the process, so
-/// rrb's exit code (and its `RTX NOT AVAILABLE` failure) is the result.
-pub fn forward_remote(ctx: &Context<'_>, args: &[String]) -> anyhow::Result<i32> {
-    let rrb = resolve_rrb(&ctx.config.remote, dirs::home_dir().as_deref())?;
+/// Hand `args` to the remote builder through the `rrb` that `source` names.
+/// On Unix this replaces the process, so rrb's exit code (including its
+/// failure when the builder is unreachable) is the result.
+pub fn forward_remote(
+    ctx: &Context<'_>,
+    source: &RrbSource,
+    args: &[String],
+) -> anyhow::Result<i32> {
+    let rrb = resolve_rrb(source, dirs::home_dir().as_deref())?;
     let cmd = remote_command(&rrb, &ctx.root, args);
     ctx.runner
         .exec(&cmd)
@@ -150,7 +162,7 @@ pub fn compile_or_forward(
     local: impl FnOnce(&Context<'_>) -> anyhow::Result<i32>,
 ) -> anyhow::Result<i32> {
     match ctx.location() {
-        Location::Remote => forward_remote(ctx, args),
+        Location::Remote(source) => forward_remote(ctx, &source, args),
         Location::Local(_) => local(ctx),
     }
 }
@@ -218,11 +230,16 @@ mod tests {
         )
     }
 
-    fn with_rrb(dir: &Path) -> Config {
+    fn fake_rrb(dir: &Path) -> String {
         let rrb = dir.join("rrb");
         std::fs::write(&rrb, "#!/bin/sh\n").unwrap();
+        rrb.display().to_string()
+    }
+
+    fn with_rrb(dir: &Path) -> Config {
         let mut config = Config::with_name("orders");
-        config.remote.rrb = rrb.display().to_string();
+        config.remote.mode = RemoteMode::Rrb;
+        config.remote.rrb = Some(fake_rrb(dir));
         config
     }
 
@@ -288,6 +305,46 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_forwards_through_remote_build_only_when_it_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let rrb = fake_rrb(dir.path());
+        let runner = FakeRunner::default();
+        let sweeper = FakeSweeper::default();
+        let ctx = context(
+            Config::with_name("orders"),
+            &[("BUILD_CMD", rrb.as_str())],
+            &runner,
+            &sweeper,
+        );
+        compile_or_forward(&ctx, &args(&["gate"]), |_| panic!("must not run locally")).unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, rrb);
+        assert_eq!(calls[0].args, ["run", "sekvent", "gate"]);
+
+        let runner = FakeRunner::default();
+        let ctx = context(Config::with_name("orders"), &[], &runner, &sweeper);
+        assert_eq!(
+            compile_or_forward(&ctx, &args(&["gate"]), |_| Ok(5)).unwrap(),
+            5
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn rrb_mode_falls_back_to_remote_build_for_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let rrb = fake_rrb(dir.path());
+        let mut config = Config::with_name("orders");
+        config.remote.mode = RemoteMode::Rrb;
+        let runner = FakeRunner::default();
+        let sweeper = FakeSweeper::default();
+        let ctx = context(config, &[("BUILD_CMD", rrb.as_str())], &runner, &sweeper);
+        compile_or_forward(&ctx, &args(&["test"]), |_| panic!("must not run locally")).unwrap();
+        assert_eq!(runner.calls()[0].program, rrb);
+    }
+
+    #[test]
     fn local_locations_run_in_place() {
         let dir = tempfile::tempdir().unwrap();
         for env in [
@@ -318,7 +375,8 @@ mod tests {
     #[test]
     fn a_missing_rrb_is_an_error_never_a_local_build() {
         let mut config = Config::with_name("orders");
-        config.remote.rrb = "/nonexistent/rrb".into();
+        config.remote.mode = RemoteMode::Rrb;
+        config.remote.rrb = Some("/nonexistent/rrb".into());
         let runner = FakeRunner::default();
         let sweeper = FakeSweeper::default();
         let ctx = context(config, &[], &runner, &sweeper);
@@ -331,13 +389,41 @@ mod tests {
         );
         assert!(message.contains("mode = \"local\""), "{message}");
         assert!(message.contains("SEKVENT_LOCAL=1"), "{message}");
+        assert!(message.contains("from [remote].rrb"), "{message}");
         assert!(runner.calls().is_empty());
 
-        let bare = RemoteConfig {
-            rrb: "sekvent-no-such-rrb-binary".into(),
-            ..RemoteConfig::default()
-        };
+        let runner = FakeRunner::default();
+        let ctx = context(
+            Config::with_name("orders"),
+            &[("BUILD_CMD", "/nonexistent/env-rrb")],
+            &runner,
+            &sweeper,
+        );
+        let message = compile_or_forward(&ctx, &args(&["gate"]), |_| panic!("no fallback"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("rrb not found at /nonexistent/env-rrb (from BUILD_CMD)"),
+            "{message}"
+        );
+        assert!(runner.calls().is_empty());
+
+        let mut unpinned = Config::with_name("orders");
+        unpinned.remote.mode = RemoteMode::Rrb;
+        let runner = FakeRunner::default();
+        let ctx = context(unpinned, &[], &runner, &sweeper);
+        let message = compile_or_forward(&ctx, &args(&["gate"]), |_| panic!("no fallback"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("needs the rrb executable"), "{message}");
+        assert!(message.contains("[remote].rrb"), "{message}");
+        assert!(message.contains("BUILD_CMD"), "{message}");
+        assert!(runner.calls().is_empty());
+
+        let bare = RrbSource::Config("sekvent-no-such-rrb-binary".into());
         let error = resolve_rrb(&bare, None).unwrap_err();
+        assert!(format!("{error:#}").contains(LOCAL_HINT), "{error:#}");
+        let error = resolve_rrb(&RrbSource::Missing, None).unwrap_err();
         assert!(format!("{error:#}").contains(LOCAL_HINT), "{error:#}");
     }
 

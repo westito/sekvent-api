@@ -426,6 +426,7 @@ mod tests {
         let config = rendered(&files, CONFIG_FILE).unwrap().text();
         let config = Config::parse(&config, Path::new(CONFIG_FILE)).unwrap();
         assert_eq!(config.project.name, "orders");
+        assert_eq!(config.remote, crate::config::RemoteConfig::default());
         let bootstrap = rendered(&files, BOOTSTRAP).unwrap();
         assert!(bootstrap.executable);
         let script = bootstrap.text();

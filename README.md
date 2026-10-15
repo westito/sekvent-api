@@ -116,7 +116,7 @@ every section except `[project]` is optional.
 | Section | Holds |
 |---|---|
 | `[project]` | The project name |
-| `[remote]` | Where compiling commands run: `mode = "rrb"` forwards them to a remote builder, `"local"` runs them here; CI always runs locally |
+| `[remote]` | Where compiling commands run: the default `mode = "auto"` forwards them to the remote builder named by `BUILD_CMD` when that is set and runs them here otherwise; `"rrb"` and `"local"` pin the choice; CI always runs locally |
 | `[gate]` | Excluded packages, features, test threads, extra clippy arguments, `fmt`, `doc`, and `[[gate.boundaries]]` dependency rules |
 | `[coverage]` | `fail_under_lines` (default 95), ignored file patterns, excluded packages, per-package `[coverage.thresholds]` |
 | `[harness]` | Label namespace of test containers and when they count as stale |
@@ -139,22 +139,18 @@ every section except `[project]` is optional.
 | `cargo sekvent agents [--file PATH]` | Insert or refresh the sekvent section of `AGENTS.md` |
 
 Compiling commands (`gate`, `check`, `clippy`, `test`, `coverage`,
-`harness-clean`) are forwarded to the remote builder when `[remote] mode` is
-`rrb`, and run on the current machine in CI (`CI` set to anything but
-empty, `0`, `false`, `no` or `off`), inside the builder, with
-`SEKVENT_LOCAL=1` or with `mode = "local"`.
+`harness-clean`) run on the current machine by default. When the
+`BUILD_CMD` environment variable is set to the path of an `rrb` remote
+builder, they are forwarded to it instead (`[remote].mode = "auto"`, the
+default). They always run locally in CI (`CI` set to anything but empty,
+`0`, `false`, `no` or `off`), inside the builder, with `SEKVENT_LOCAL=1` or
+with `mode = "local"`; `mode = "rrb"` always forwards, through
+`[remote].rrb` or else `BUILD_CMD`.
 
-The default `[remote]` expects the maintainers' `rrb` remote-build tool at
-`~/.kodein/skills/build-on-rtx/bin/rrb` (change it with `[remote].rrb`). If
-you do not use a remote builder, set this in `sekvent.toml`:
-
-```toml
-[remote]
-mode = "local"
-```
-
-or export `SEKVENT_LOCAL=1` for a single shell. A missing `rrb` is an error
-that says so; it never silently turns into a local build.
+No project file names a builder, so a repository needs no change to build
+locally on one machine and remotely on another. Once forwarding is
+selected, a missing or failing `rrb` is an error; it never silently turns
+into a local build.
 
 Inside the builder and in CI, `.sekvent/run.sh` runs the CLI at the exact
 sekvent revision `Cargo.lock` pins. Each revision is built once into its own
@@ -175,6 +171,7 @@ sekvent ships skills for coding agents in [`skills/`](skills/):
 
 | Skill | Use it to |
 |---|---|
+| `sekvent-api` | Learn how sekvent fits together, pick features, find the docs page for a task |
 | `sekvent` | Write code in a sekvent project: crate map, recipes, pitfalls |
 | `sekvent-new-project` | Create a workspace or add a service crate |
 | `sekvent-migrate` | Move an existing Rust backend onto sekvent |

@@ -2,9 +2,10 @@
 # Run `cargo sekvent <args>` with the CLI built from the exact sekvent
 # revision this project is locked to.
 #
-# Used inside the remote builder container (`rrb run sekvent <args>`) and in
-# CI, where cargo-sekvent runs its commands locally. The revision comes from
-# Cargo.lock, so the CLI and the libraries can never disagree.
+# Used inside a remote builder container (`cargo sekvent` forwards there as
+# `run sekvent <args>`) and in CI, where cargo-sekvent runs its commands
+# locally. The revision comes from Cargo.lock, so the CLI and the libraries
+# can never disagree.
 #
 # Each revision is installed into its own root,
 # $CARGO_HOME/sekvent-cli/<rev>, and that binary is executed directly, never

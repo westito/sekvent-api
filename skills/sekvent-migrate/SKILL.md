@@ -10,13 +10,13 @@ the workspace onto sekvent's toolchain and dependency set with nothing else
 changed, then swap hand-rolled pieces for sekvent modules one at a time.
 The service must behave the same on the wire when you are done.
 
-Where commands run is the `build-on-rtx` skill's business: everything that
-compiles (`cargo sekvent check|clippy|test|gate|coverage`) goes to the remote
-builder; `cargo fmt`, `cargo update` and edits stay local. If the builder is
-unreachable, stop and report — never fall back to a local build. (A project
-without a remote builder opts out explicitly with `[remote].mode = "local"`
-in `sekvent.toml`; that is a configuration choice, not a fallback.) For a test
-suite that is slow or flaky once it compiles, use the `rust-testing` skill.
+Everything that compiles goes through `cargo sekvent
+check|clippy|test|gate|coverage`, which forwards it to the remote builder
+named by `BUILD_CMD` when that is set on the machine and runs it locally
+otherwise (`SEKVENT_LOCAL=1` forces local); `cargo fmt`, `cargo update` and
+edits always stay local. Leave `[remote].mode` at its default `"auto"` so
+the project does not depend on any one machine's builder. For a test suite
+that is slow or flaky once it compiles, use the `rust-testing` skill.
 
 ## 0. Work on a branch in a worktree
 

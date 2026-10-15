@@ -15,7 +15,7 @@ over this one for their directory.
 | `crates/` | workspace members; each has its own `AGENTS.md` |
 | `proto/` | protobuf contracts (if any); code is generated in `build.rs` |
 | `sekvent.toml` | gate, coverage, harness and task configuration |
-| `.remote-build.toml` | remote builder (rrb) configuration |
+| `.remote-build.toml` | remote builder configuration, used when `BUILD_CMD` is set |
 | `.sekvent/run.sh` | installs the locked cargo-sekvent in containers and CI |
 | `Dockerfile` | release image build (no deploy tooling here) |
 
@@ -38,28 +38,26 @@ managed by `cargo sekvent agents`; edit outside it.
 
 ### Where things run
 
-- Everything that compiles (check, clippy, tests, coverage) runs on the
-  remote builder: `cargo sekvent <command>` forwards to rrb, which syncs the
-  tree and runs the command in a container with Docker access for the test
-  harness. See the `build-on-rtx` skill.
-- `cargo fmt` (the writing form) and in-tree code generation run locally.
-- There is no local fallback. If the builder is unreachable, stop and report;
-  do not "just run cargo test here". CI runs the same commands locally
-  (`CI=true`).
-- A project or machine without a remote builder opts out explicitly with
-  `[remote].mode = "local"` in `sekvent.toml` (or `SEKVENT_LOCAL=1` for one
-  shell); compiling commands then run on this machine. That is a
-  configuration choice, not a fallback for an unreachable builder.
+- Everything that compiles (check, clippy, tests, coverage) goes through
+  `cargo sekvent <command>`. When `BUILD_CMD` is set on the machine, the
+  CLI forwards the command to the remote builder that variable names;
+  otherwise the command runs locally.
+- `SEKVENT_LOCAL=1` forces local execution (for one shell, say), and CI
+  (`CI=true`) always runs locally. `[remote].mode` in `sekvent.toml` is
+  `"auto"` by default, which follows `BUILD_CMD`; leave it there so the
+  project builds the same way on every machine.
+- `cargo fmt` (the writing form) and in-tree code generation always run
+  locally.
 
 ### Commands
 
 ```sh
 cargo fmt --all                 # local, writes
-cargo sekvent check             # remote: cargo check, all targets
-cargo sekvent clippy            # remote: clippy -D warnings
-cargo sekvent test              # remote: the test suite
-cargo sekvent gate              # remote: fmt --check + clippy + tests + boundaries
-cargo sekvent coverage          # remote: llvm-cov, per-package line floors
+cargo sekvent check             # cargo check, all targets
+cargo sekvent clippy            # clippy -D warnings
+cargo sekvent test              # the test suite
+cargo sekvent gate              # fmt --check + clippy + tests + boundaries
+cargo sekvent coverage          # llvm-cov, per-package line floors
 cargo sekvent harness-clean     # remove leftover test containers
 ```
 

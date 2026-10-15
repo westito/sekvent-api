@@ -1,9 +1,11 @@
-# rrb (build-on-rtx) — {{project_name}}.
+# Remote builder (rrb) configuration — {{project_name}}.
 #
-# The directory holding this file is the sync root and the Cargo workspace
-# root. Everything that compiles runs on the remote builder; `cargo fmt` (the
-# writing form) and in-tree codegen stay on this machine. You rarely call rrb
-# directly: `cargo sekvent <command>` forwards to it.
+# Read only on machines where BUILD_CMD names an rrb executable; without
+# it, compiling commands run locally and this file is unused. The directory
+# holding this file is the sync root and the Cargo workspace root. When a
+# remote builder is in use, everything that compiles runs there; `cargo fmt`
+# (the writing form) and in-tree codegen stay on this machine. You rarely
+# call rrb directly: `cargo sekvent <command>` forwards to it.
 
 [project]
 # Remote directory, volume names and container label. [A-Za-z0-9._-]+ only.

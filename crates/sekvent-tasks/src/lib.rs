@@ -8,12 +8,14 @@
 //!
 //! # Where commands run
 //!
-//! A developer machine never compiles. Compiling commands (`gate`, `check`,
-//! `clippy`, `test`, `coverage`, `harness-clean`, remote custom tasks and the
-//! `xtask` fallback) are forwarded to the remote builder as
-//! `rrb run sekvent <args>` unless [`location::decide_location`] says the
-//! current machine is the place to compile: inside the builder, in CI, with
-//! `SEKVENT_LOCAL=1` or with `[remote].mode = "local"`. A missing or failing
+//! Compiling commands (`gate`, `check`, `clippy`, `test`, `coverage`,
+//! `harness-clean`, remote custom tasks and the `xtask` fallback) are
+//! forwarded to a remote builder as `rrb run sekvent <args>` when
+//! [`location::decide_location`] selects one: with the default
+//! `[remote].mode = "auto"` that is whenever `BUILD_CMD` names an `rrb`
+//! executable, with `mode = "rrb"` always. Otherwise, and always inside the
+//! builder, in CI, with `SEKVENT_LOCAL=1` or with `mode = "local"`, they run
+//! on the current machine. Once forwarding is selected, a missing or failing
 //! `rrb` is an error, never a reason to compile locally.
 //!
 //! Commands that write into the source tree (`new`, `init`, `add`, `deps
@@ -49,7 +51,7 @@ pub mod template;
 
 pub use config::{Config, ConfigError, Project};
 pub use context::{Context, install_interrupt_handler};
-pub use location::{EnvMap, Location, decide_location, process_env};
+pub use location::{EnvMap, Location, RrbSource, decide_location, process_env};
 pub use process::{Cmd, Runner, SystemRunner};
 
 #[cfg(test)]

@@ -91,6 +91,6 @@ module pages win.
 ## Agent skills
 
 The [`skills/`](../skills/) directory holds instructions for coding agents
-(`sekvent`, `sekvent-new-project`, `sekvent-migrate`); install them with
+(`sekvent-api`, `sekvent`, `sekvent-new-project`, `sekvent-migrate`); install them with
 `cargo sekvent skills install`. They summarise the same material as these
 pages.

@@ -14,11 +14,11 @@ code needs `use sekvent::prelude::*;` (`AppError`, `ErrorCode`, `CallContext`,
 `UnitContext`, `Ctx`, `ShutdownTrigger`, `JobSpec`, `JobContext`; with the `component` feature also
 `App`, `ComponentError`, `Lifecycle`).
 
-Where commands run is the `build-on-rtx` skill's business: compile, lint and
-test through `cargo sekvent check|clippy|test|gate|coverage` (forwarded to the
-remote builder, or run here when `sekvent.toml` sets `[remote].mode =
-"local"`), `cargo fmt` locally. Test speed and flakes: the `rust-testing`
-skill.
+Compile, lint and test through `cargo sekvent
+check|clippy|test|gate|coverage`: forwarded to the remote builder named by
+`BUILD_CMD` when that is set on the machine, run here otherwise
+(`SEKVENT_LOCAL=1` forces local); `cargo fmt` always runs locally. Test
+speed and flakes: the `rust-testing` skill.
 
 ## Crate map — which one to reach for
 
