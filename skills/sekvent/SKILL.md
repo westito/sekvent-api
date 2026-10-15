@@ -180,9 +180,11 @@ let server = builder.bind(config.listen_addr).await?;
   preflight never reaches the authenticator or a handler; health (HTTP and
   `grpc.health.v1`) never sees your layers or the authenticator.
 - CORS covers REST and gRPC-Web. Origins are `http(s)://host[:port]`,
-  normalized (IPv6 hosts included, e.g. `http://[::1]:8080`); a path, `*`
-  inside a list, `null` or an empty list is `INVALID_ARGUMENT` naming the
-  key and the entry's index, never its text. Credentials with
+  normalized (IPv6 hosts included, e.g. `http://[::1]:8080`); the port `*`
+  (`http://localhost:*`) allows that exact host on any port, for dev
+  servers with a fresh port per run, and works with credentials. A path,
+  `*` inside a list or in a host, `null` or an empty list is
+  `INVALID_ARGUMENT` naming the key and the entry's index, never its text. Credentials with
   `Cors::any_origin()` fail `bind`.
   Defaults allow `authorization`, `content-type`, `grpc-timeout`,
   `idempotency-key`, `traceparent`, `x-grpc-web`, `x-request-id`,

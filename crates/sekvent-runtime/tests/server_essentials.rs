@@ -406,6 +406,30 @@ async fn credentials_need_a_list_and_vary_by_origin() {
     );
 }
 
+#[tokio::test]
+async fn an_any_port_origin_is_an_explicit_list() {
+    let router = router(
+        Server::builder().rest(rest()).cors(
+            Cors::origins(["http://localhost:*"])
+                .unwrap()
+                .allow_credentials(true),
+        ),
+    )
+    .await;
+    for origin in ["http://localhost:61234", "http://localhost"] {
+        let answer = send(&router, with_origin("/echo", origin)).await;
+        assert_eq!(answer.header("access-control-allow-origin"), Some(origin));
+        assert_eq!(
+            answer.header("access-control-allow-credentials"),
+            Some("true")
+        );
+        assert_eq!(answer.header("vary"), Some("origin"));
+    }
+    let refused = send(&router, with_origin("/echo", "http://127.0.0.1:61234")).await;
+    assert!(!refused.has_cors_headers(), "{:?}", refused.headers);
+    assert_eq!(refused.header("vary"), Some("origin"));
+}
+
 async fn router_with_any_origin() -> Router {
     router(Server::builder().rest(rest()).cors(Cors::any_origin())).await
 }

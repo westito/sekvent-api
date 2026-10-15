@@ -325,7 +325,7 @@ use sekvent::config::EnvSource;
 use sekvent::runtime::Cors;
 
 // In code:
-let cors = Cors::origins(["https://app.example.com", "http://localhost:5173"])?
+let cors = Cors::origins(["https://app.example.com", "http://localhost:*"])?
     .allow_credentials(true)
     .allow_headers(&["x-tenant"])
     .expose_headers(&["x-total-count"])
@@ -342,7 +342,7 @@ if let Some(cors) = Cors::from_config(&EnvSource, "ORDERS_CORS_")? {
 | Method | Effect |
 |---|---|
 | `Cors::any_origin()` | `Access-Control-Allow-Origin: *` |
-| `Cors::origins(iter)?` | exactly these origins, normalized; `INVALID_ARGUMENT` on a bad entry or an empty list |
+| `Cors::origins(iter)?` | exactly these origins, normalized; an entry `scheme://host:*` allows that scheme and host on any port; `INVALID_ARGUMENT` on a bad entry or an empty list |
 | `Cors::from_config(source, prefix)?` | `Ok(None)` when `<prefix>ORIGINS` is unset or blank |
 | `Cors::config_keys(prefix)` | every key `from_config` reads, e.g. for an env template |
 | `.allow_credentials(bool)` | cookies and `Authorization` from the browser; needs an origin list |
@@ -366,7 +366,7 @@ Configuration keys (`<prefix>` is yours, e.g. `ORDERS_CORS_`):
 
 | Key | Value | Default |
 |---|---|---|
-| `<prefix>ORIGINS` | `*` or a comma-separated origin list | unset: CORS off |
+| `<prefix>ORIGINS` | `*` or a comma-separated origin list; an entry may end in `:*` for any port (`http://localhost:*`) | unset: CORS off |
 | `<prefix>CREDENTIALS` | bool | `false` |
 | `<prefix>MAX_AGE` | duration (`10m`, `3600`) | `1h` |
 | `<prefix>ALLOW_HEADERS` | comma-separated header names, added to the defaults | — |
@@ -383,7 +383,18 @@ The rules:
   `OPTIONS` request reaches your routes.
 - **Allowed or nothing.** A request without `Origin`, or from an origin not in
   the list, gets no `access-control-*` headers at all, so the browser blocks
-  it. With an origin list every response also carries `Vary: origin`.
+  it. With an origin list an allowed request gets its own `Origin` back in
+  `Access-Control-Allow-Origin` (never `*`), and every response carries
+  `Vary: origin`.
+- **Any port, exact host.** An entry whose port is `*` (`http://localhost:*`,
+  `http://127.0.0.1:*`, `http://[::1]:*`) matches that scheme and host on
+  every port, the scheme's default included (an `Origin` with no port), for
+  a development server such as `flutter run -d chrome` or Vite that picks a
+  fresh port. The host is still exact (`http://localhost.evil.example`
+  does not match), and only the port can be a wildcard. Such an entry is an
+  explicit list entry, so it works with `allow_credentials(true)`. Keep
+  these entries out of production configuration: any program on that host
+  can then answer from some port.
 - **Authoritative.** `access-control-*` headers set by your layers or handlers
   are removed before the server adds its own, so inner code can never widen
   the policy.
@@ -395,7 +406,9 @@ The rules:
   addresses in hex, `[::ffff:102:304]`). Duplicates collapse.
 - **Rejected entries** (`INVALID_ARGUMENT`): anything but `http://` or
   `https://`, a path, query, fragment or user info, `*` inside a list (use
-  `any_origin`), `null`, a malformed host or port, and an empty list. The
+  `any_origin`), `null`, a malformed host or port (a `*` in the host as in
+  `http://*:80` or `https://*.example.com`, a port such as `*x`, or anything
+  after `:*`), and an empty list. The
   error names the entry by position (`origin #2`, counting from 1; blank
   entries in configuration count too), never by its text, which may hold a
   credential.

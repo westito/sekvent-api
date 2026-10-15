@@ -37,7 +37,7 @@ JWT stays as it is (strict, `kid` required).
 | Cron time zones other than UTC | fixed offsets mishandle DST and IANA zones need `chrono-tz`; later |
 | `cargo sekvent schedule` | the subcommand stays reserved (exit 2) |
 | Range requests, `ETag`, `Last-Modified` on downloads | later |
-| Wildcard origins (`https://*.example.com`) | explicit lists or any origin only |
+| Wildcard origins (`https://*.example.com`) | explicit lists or any origin only; an exact host may leave its port open (`http://localhost:*`, added later) |
 | Metrics, OpenTelemetry export | spans and events only, as in C2 |
 | Queue-backed jobs, retries of failed runs | C3 (bus); a failed run waits for the next tick |
 

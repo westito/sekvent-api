@@ -59,7 +59,8 @@ const MAX_QUOTED: usize = 200;
 /// Cross-origin rules for browsers calling the server (REST and gRPC-Web).
 ///
 /// Built with [`any_origin`](Self::any_origin) or a validated, normalized
-/// origin list ([`origins`](Self::origins)), or read from configuration
+/// origin list ([`origins`](Self::origins), whose entries may leave the port
+/// open with `:*`), or read from configuration
 /// ([`from_config`](Self::from_config)), then handed to
 /// [`ServerBuilder::cors`](crate::ServerBuilder::cors).
 ///
@@ -75,8 +76,9 @@ const MAX_QUOTED: usize = 200;
 /// is answered by the server itself with `200`, before authentication and
 /// handlers; any other `OPTIONS` request reaches the application. A request
 /// without `Origin`, or from an origin outside the list, gets no
-/// `access-control-*` headers at all, so the browser blocks it; a list also
-/// adds `Vary: Origin` to every response.
+/// `access-control-*` headers at all, so the browser blocks it. A list
+/// answers a listed origin with that origin (never `*`) and adds
+/// `Vary: Origin` to every response.
 ///
 /// These rules are authoritative: `access-control-*` headers set by
 /// application layers or handlers are removed before the server adds its
@@ -110,11 +112,17 @@ impl Cors {
     /// written in hex, `[::ffff:102:304]`, as browsers do).
     ///
     /// Each entry is `http://` or `https://`, a host and an optional port.
+    /// The port `*` (`http://localhost:*`) matches that scheme and host on
+    /// any port, the default one (no port in `Origin`) included; for a
+    /// development server that picks a fresh port on every run. The host is
+    /// always exact: there are no host wildcards.
+    ///
     /// `INVALID_ARGUMENT` for a path, query, fragment or user info, `*` (use
     /// [`any_origin`](Self::any_origin)), `null`, another scheme, a
-    /// malformed host or port, and for an empty list. The error names the
-    /// entry by its position, counting from 1 (`origin #2`), never by its
-    /// text, which may hold a credential.
+    /// malformed host or port (a `*` in the host, or a port such as `*x`),
+    /// and for an empty list. The error names the entry by its position,
+    /// counting from 1 (`origin #2`), never by its text, which may hold a
+    /// credential.
     pub fn origins<I, S>(origins: I) -> Result<Self, AppError>
     where
         I: IntoIterator<Item = S>,
@@ -132,7 +140,8 @@ impl Cors {
     }
 
     /// Read the rules from `<prefix>ORIGINS` (`*` or a comma-separated
-    /// list), `<prefix>CREDENTIALS` (bool, default false), `<prefix>MAX_AGE`
+    /// list, entries as in [`origins`](Self::origins), `:*` ports included),
+    /// `<prefix>CREDENTIALS` (bool, default false), `<prefix>MAX_AGE`
     /// (duration, default `1h`), `<prefix>ALLOW_HEADERS` and
     /// `<prefix>EXPOSE_HEADERS` (comma-separated, added to the defaults).
     ///
@@ -342,11 +351,14 @@ fn push_origin(list: &mut Vec<String>, position: usize, raw: &str) -> Result<(),
     Ok(())
 }
 
+/// Port of a normalized origin entry that matches every port.
+const ANY_PORT: &str = ":*";
+
 /// The rules of a validated [`Cors`] as ready-made header values.
 #[derive(Debug)]
 struct Policy {
     /// `None` for every origin, else the normalized list.
-    origins: Option<Vec<HeaderValue>>,
+    origins: Option<OriginList>,
     credentials: bool,
     methods: Option<HeaderValue>,
     allow_headers: Option<HeaderValue>,
@@ -354,15 +366,54 @@ struct Policy {
     max_age: HeaderValue,
 }
 
+/// A normalized origin list, split for matching.
+#[derive(Debug, Default)]
+struct OriginList {
+    /// Origins matched byte for byte.
+    exact: Vec<HeaderValue>,
+    /// `scheme://host` of the entries with the port `*`.
+    any_port: Vec<String>,
+}
+
+impl OriginList {
+    fn new(list: &[String]) -> Self {
+        let mut split = Self::default();
+        for origin in list {
+            if let Some(base) = origin.strip_suffix(ANY_PORT) {
+                split.any_port.push(base.to_owned());
+            } else if let Ok(value) = HeaderValue::from_str(origin) {
+                split.exact.push(value);
+            }
+        }
+        split
+    }
+
+    /// Whether a request's `Origin` is listed.
+    fn matches(&self, origin: &HeaderValue) -> bool {
+        let origin = origin.as_bytes();
+        self.exact.iter().any(|listed| listed.as_bytes() == origin)
+            || self.any_port.iter().any(|base| on_any_port(base, origin))
+    }
+}
+
+/// Whether `origin` is `base` itself (the default port) or `base:<port>`
+/// with a port written as browsers write it.
+fn on_any_port(base: &str, origin: &[u8]) -> bool {
+    match origin.strip_prefix(base.as_bytes()) {
+        Some([]) => true,
+        Some([b':', port @ ..]) => std::str::from_utf8(port)
+            .ok()
+            .and_then(|port| parse_port(port).ok().map(|parsed| (port, parsed)))
+            .is_some_and(|(port, parsed)| parsed.to_string() == port),
+        _ => false,
+    }
+}
+
 impl Policy {
     fn new(cors: &Cors) -> Self {
         let origins = match &cors.origins {
             Origins::Any => None,
-            Origins::List(list) => Some(
-                list.iter()
-                    .filter_map(|origin| HeaderValue::from_str(origin).ok())
-                    .collect(),
-            ),
+            Origins::List(list) => Some(OriginList::new(list)),
         };
         Self {
             origins,
@@ -380,10 +431,7 @@ impl Policy {
         let origin = origin?;
         match &self.origins {
             None => Some(HeaderValue::from_static("*")),
-            Some(list) => list
-                .iter()
-                .any(|listed| listed.as_bytes() == origin.as_bytes())
-                .then(|| origin.clone()),
+            Some(list) => list.matches(origin).then(|| origin.clone()),
         }
     }
 
@@ -526,6 +574,9 @@ fn normalize_origin(raw: &str) -> Result<String, &'static str> {
         return Err("an origin has no user info");
     }
     let (host, port) = split_host_port(authority)?;
+    if port == Some("*") {
+        return Ok(format!("{scheme}://{host}{ANY_PORT}"));
+    }
     let port = port.map(parse_port).transpose()?;
     Ok(match port.filter(|&port| port != default_port) {
         Some(port) => format!("{scheme}://{host}:{port}"),
@@ -556,6 +607,9 @@ fn split_host_port(authority: &str) -> Result<(String, Option<&str>), &'static s
     };
     if host.is_empty() {
         return Err("an origin needs a host");
+    }
+    if host.contains('*') {
+        return Err("the host must be exact; only the port may be *");
     }
     let valid = host.split('.').all(|label| {
         !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
@@ -620,13 +674,15 @@ fn ipv6_host(address: Ipv6Addr) -> String {
     host
 }
 
+const BAD_PORT: &str = "the port must be a number from 1 to 65535, or * for any port";
+
 fn parse_port(port: &str) -> Result<u16, &'static str> {
     if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("the port must be a number from 1 to 65535");
+        return Err(BAD_PORT);
     }
     match port.parse::<u16>() {
         Ok(port) if port > 0 => Ok(port),
-        _ => Err("the port must be a number from 1 to 65535"),
+        _ => Err(BAD_PORT),
     }
 }
 
@@ -740,6 +796,10 @@ mod tests {
             "http://[1:2:3:4:5:6:7:8]",
             "http://[1:0:2:3:4:5:6:7]",
             "http://LOCALHOST",
+            "HTTP://LocalHost:*",
+            "http://localhost:*/",
+            "http://127.0.0.1:*",
+            "https://[0:0::1]:*",
         ])
         .unwrap();
         assert_eq!(
@@ -761,6 +821,9 @@ mod tests {
                 "http://[1:2:3:4:5:6:7:8]",
                 "http://[1:0:2:3:4:5:6:7]",
                 "http://localhost",
+                "http://localhost:*",
+                "http://127.0.0.1:*",
+                "https://[::1]:*",
             ]
         );
     }
@@ -801,6 +864,19 @@ mod tests {
             "http://256.0.0.1",
             "http://0x7f.0.0.1",
             "http://a.0x1f",
+            "http://*:80",
+            "http://*",
+            "http://*:*",
+            "https://*.example.com",
+            "https://*.example.com:*",
+            "http://localhost:*x",
+            "http://localhost:**",
+            "http://localhost:x*",
+            "http://localhost:*/path",
+            "http://localhost:*?x=1",
+            "http://localhost:*#top",
+            "http://[::1]*",
+            "*:*",
         ] {
             let error = Cors::origins(["https://ok.example.com", bad]).unwrap_err();
             assert_eq!(error.code(), ErrorCode::InvalidArgument, "{bad}");
@@ -816,6 +892,75 @@ mod tests {
         assert_eq!(error.message(), "CORS needs at least one origin");
         assert!(Cors::origins(["https://ok.example.com", "*"]).is_err());
         assert!(Cors::origins(["http://1.2.3.4", "http://a.b4"]).is_ok());
+    }
+
+    #[test]
+    fn wildcard_ports_are_reported_precisely() {
+        let reason = |raw: &str| normalize_origin(raw).unwrap_err();
+        assert_eq!(
+            reason("http://*:80"),
+            "the host must be exact; only the port may be *"
+        );
+        assert_eq!(
+            reason("https://*.example.com"),
+            "the host must be exact; only the port may be *"
+        );
+        assert_eq!(reason("http://localhost:*x"), BAD_PORT);
+        assert_eq!(
+            reason("http://localhost:*/path"),
+            "an origin has no path, query or fragment"
+        );
+        assert_eq!(
+            normalize_origin("http://localhost:*").unwrap(),
+            "http://localhost:*"
+        );
+    }
+
+    #[test]
+    fn any_port_entries_match_that_scheme_and_host_only() {
+        let list = OriginList::new(&[
+            "http://localhost:*".to_owned(),
+            "https://[::1]:*".to_owned(),
+            "https://app.example.com".to_owned(),
+        ]);
+        assert_eq!(list.exact.len(), 1);
+        assert_eq!(list.any_port, ["http://localhost", "https://[::1]"]);
+        let matches = |origin: &str| list.matches(&HeaderValue::from_str(origin).unwrap());
+        for allowed in [
+            "http://localhost",
+            "http://localhost:1",
+            "http://localhost:80",
+            "http://localhost:5173",
+            "http://localhost:65535",
+            "https://[::1]",
+            "https://[::1]:8443",
+            "https://app.example.com",
+        ] {
+            assert!(matches(allowed), "{allowed}");
+        }
+        for refused in [
+            "https://localhost:5173",
+            "http://localhost:",
+            "http://localhost:0",
+            "http://localhost:05173",
+            "http://localhost:65536",
+            "http://localhost:123456",
+            "http://localhost:+80",
+            "http://localhost:*",
+            "http://localhost:5173/",
+            "http://localhost.evil.example",
+            "http://localhost.:5173",
+            "http://localhostx:5173",
+            "http://localhost:5173@evil.example",
+            "http://127.0.0.1:5173",
+            "http://[::1]:8443",
+            "https://app.example.com:8443",
+            "null",
+        ] {
+            assert!(!matches(refused), "{refused}");
+        }
+        let invalid = HeaderValue::from_bytes(b"http://localhost:\xff").unwrap();
+        assert!(!list.matches(&invalid));
     }
 
     #[test]
@@ -990,6 +1135,23 @@ mod tests {
             "{error:?}"
         );
         assert!(read(&[("CORS_ORIGINS", ",,")]).is_err());
+
+        let error = read(&[("CORS_ORIGINS", "https://a.example.com, http://*:80")]).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("CORS_ORIGINS"), "{text}");
+        assert!(text.contains("origin #2 is invalid"), "{text}");
+    }
+
+    #[test]
+    fn any_port_entries_are_read_from_config_with_credentials() {
+        let cors = read(&[
+            ("CORS_ORIGINS", "http://localhost:*, http://127.0.0.1:*"),
+            ("CORS_CREDENTIALS", "true"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(list(&cors), ["http://localhost:*", "http://127.0.0.1:*"]);
+        assert!(cors.validate().is_ok(), "a pattern is an explicit list");
     }
 
     /// A handler that sets its own, wider CORS headers.
@@ -1078,6 +1240,44 @@ mod tests {
             let response = call(&cors, request.body(Body::empty()).unwrap()).await;
             assert_eq!(response.status(), StatusCode::OK);
             assert!(cors_names(&response).is_empty(), "{:?}", response.headers());
+            assert_eq!(response.headers()["vary"], "origin");
+        }
+    }
+
+    #[tokio::test]
+    async fn any_port_entries_reflect_the_origin() {
+        let cors = Cors::origins(["http://localhost:*"])
+            .unwrap()
+            .allow_credentials(true);
+        assert!(cors.validate().is_ok());
+        for origin in ["http://localhost:5173", "http://localhost"] {
+            let request = Request::get("/reflect")
+                .header("origin", origin)
+                .body(Body::empty())
+                .unwrap();
+            let response = call(&cors, request).await;
+            let headers = response.headers();
+            assert_eq!(headers["access-control-allow-origin"], origin);
+            assert_eq!(headers["access-control-allow-credentials"], "true");
+            let vary: Vec<&str> = headers
+                .get_all(VARY)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            assert_eq!(vary, ["Accept-Encoding", "origin"]);
+
+            let response = call(&cors, options("/echo", Some(origin), true)).await;
+            let headers = response.headers();
+            assert_eq!(headers["access-control-allow-origin"], origin);
+            assert_eq!(headers["access-control-max-age"], "3600");
+            assert_eq!(headers["vary"], "origin");
+        }
+        for origin in [
+            "https://localhost:5173",
+            "http://localhost.evil.example:5173",
+        ] {
+            let response = call(&cors, options("/echo", Some(origin), true)).await;
+            assert!(cors_names(&response).is_empty(), "{origin}");
             assert_eq!(response.headers()["vary"], "origin");
         }
     }
