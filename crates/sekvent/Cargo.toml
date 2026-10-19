@@ -41,6 +41,11 @@ error-grpc = ["error", "sekvent-error/grpc"]
 runtime-grpc-web = ["runtime", "sekvent-runtime/grpc-web"]
 # sekvent-runtime: cron schedules for jobs (UTC).
 runtime-cron = ["runtime", "sekvent-runtime/cron"]
+# sekvent-runtime: static files (`Vfs`, `Directory`) and `StaticSite` to serve
+# a built frontend from the API's server.
+runtime-vfs = ["runtime", "sekvent-runtime/vfs"]
+# sekvent-runtime: `Embedded`, static files compiled in with rust-embed.
+runtime-vfs-embed = ["runtime-vfs", "sekvent-runtime/vfs-embed"]
 
 # sekvent-auth adapters.
 auth-axum = ["auth", "sekvent-auth/axum"]
@@ -80,6 +85,8 @@ full = [
     "error-grpc",
     "runtime-grpc-web",
     "runtime-cron",
+    "runtime-vfs",
+    "runtime-vfs-embed",
     "auth-axum",
     "auth-tonic",
     "auth-tokio",

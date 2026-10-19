@@ -33,6 +33,9 @@
 //! extractor. The server applies validated [`Cors`], a REST body limit,
 //! application tower layers ([`ServerBuilder::layer`]) and a per-request
 //! access log with request ids; [`Download`] builds file responses.
+//! With feature `vfs`, `vfs::StaticSite` serves a built frontend from a
+//! virtual filesystem (a folder, or files embedded with `vfs-embed`) next
+//! to the API (`ServerBuilder::site`).
 //!
 //! # Jobs
 //!
@@ -57,6 +60,8 @@ mod server;
 mod signal;
 mod stage;
 mod unit;
+#[cfg(feature = "vfs")]
+pub mod vfs;
 
 pub use cors::Cors;
 pub use download::{

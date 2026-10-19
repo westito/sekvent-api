@@ -16,7 +16,7 @@ scheduler; they have their own pages: [Server](server.md) and
 | | |
 |---|---|
 | Facade feature | `runtime` (on by default) |
-| Optional features | `runtime-grpc-web` (gRPC-Web on the listener, see [Server](server.md)), `runtime-cron` (cron jobs, see [Jobs](jobs.md)) |
+| Optional features | `runtime-grpc-web` (gRPC-Web on the listener, see [Server](server.md)), `runtime-cron` (cron jobs, see [Jobs](jobs.md)), `runtime-vfs` and `runtime-vfs-embed` (a bundled frontend, see [Server](server.md#serve-a-bundled-frontend)) |
 | Module | `use sekvent::runtime::{Runtime, RuntimeBuilder, RuntimeHandle, Stage, UnitContext, UnitPolicy, RestartPolicy};` |
 | Prelude | `Runtime`, `RuntimeBuilder`, `RuntimeHandle`, `ShutdownTrigger`, `Stage`, `UnitContext`, `UnitPolicy` (plus `Server`, `ServerBuilder`, `Ctx`, `JobSpec`, `JobContext`) |
 | Internal crate | `sekvent-runtime` |

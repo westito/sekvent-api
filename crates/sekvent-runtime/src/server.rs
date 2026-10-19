@@ -108,6 +108,7 @@ pub struct ServerBuilder {
     rest_body_limit: usize,
     layers: Vec<ServerLayer>,
     access_log: bool,
+    site: Option<Router>,
     problems: Vec<String>,
 }
 
@@ -126,6 +127,7 @@ impl fmt::Debug for ServerBuilder {
             .field("rest_body_limit", &self.rest_body_limit)
             .field("layers", &self.layers.len())
             .field("access_log", &self.access_log)
+            .field("site", &self.site.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -288,10 +290,15 @@ impl ServerBuilder {
         self
     }
 
-    /// Wrap every REST, gRPC and gRPC-Web request (inside the call context,
-    /// outside routing; never the HTTP or gRPC health endpoints). Same
-    /// bounds as [`Router::layer`]; the layer must be `Clone`. A later call
-    /// wraps the earlier ones.
+    /// Wrap every REST, gRPC and gRPC-Web request and the static site
+    /// (inside the call context, outside routing; never the HTTP or gRPC
+    /// health endpoints). Same bounds as [`Router::layer`]; the layer must
+    /// be `Clone`. A later call wraps the earlier ones.
+    ///
+    /// A layer that rejects requests without credentials therefore also
+    /// rejects the static site (`site`, feature `vfs`), including the page
+    /// that asks for them. Put such a layer on the API router instead
+    /// (`api_routes().layer(..)` before [`rest`](Self::rest)).
     ///
     /// Component calls served on this listener pass through the layer too,
     /// so a layer that rejects requests without its own credentials also
@@ -317,6 +324,28 @@ impl ServerBuilder {
     #[must_use]
     pub fn access_log(mut self, enabled: bool) -> Self {
         self.access_log = enabled;
+        self
+    }
+
+    /// Serve a built frontend for every path outside the prefix that is
+    /// not a health endpoint (feature `vfs`). Can be given once.
+    ///
+    /// Needs a [`prefix`](Self::prefix): the API lives under it, so the
+    /// site's SPA fallback can never shadow an API route, and an unknown
+    /// path under the prefix stays the API's `404`. Native gRPC at the root
+    /// keeps working: gRPC content types still go to gRPC. The site is
+    /// public: it passes CORS, the request id, the access log and the
+    /// application layers, and the [`authenticator`](Self::authenticator)
+    /// only shapes its call context, never rejects it.
+    #[cfg(feature = "vfs")]
+    #[must_use]
+    pub fn site(mut self, site: crate::vfs::StaticSite) -> Self {
+        if self.site.is_some() {
+            self.problems
+                .push("a static site was given more than once".into());
+        } else {
+            self.site = Some(Router::new().fallback_service(site));
+        }
         self
     }
 
@@ -355,6 +384,7 @@ impl ServerBuilder {
                     rest_body_limit: self.rest_body_limit,
                     layers: self.layers,
                     access_log: self.access_log,
+                    site: self.site,
                 },
             }),
         })
@@ -380,6 +410,12 @@ impl ServerBuilder {
                 "the connection limit must be between 1 and {}",
                 Semaphore::MAX_PERMITS
             )));
+        }
+        if self.site.is_some() && self.prefix.is_none() {
+            return Err(AppError::invalid_argument(
+                "a static site needs a path prefix such as /api for the API, \
+                 so the site's fallback cannot shadow API routes",
+            ));
         }
         if let Some(prefix) = &self.prefix {
             if !is_valid_prefix(prefix) {
@@ -449,6 +485,7 @@ struct ServerConfig {
     rest_body_limit: usize,
     layers: Vec<ServerLayer>,
     access_log: bool,
+    site: Option<Router>,
 }
 
 impl ServerConfig {
@@ -505,7 +542,7 @@ impl ServerConfig {
             return Router::new();
         }
         let service = Dispatch {
-            grpc: self.with_grpc_web(Routes::new(health.grpc_service()).into_axum_router()),
+            grpc: Some(self.with_grpc_web(Routes::new(health.grpc_service()).into_axum_router())),
             rest: None,
         };
         let routes = Router::new().route_service(GRPC_HEALTH_ROUTE, service);
@@ -542,7 +579,7 @@ struct ServerInner {
 }
 
 /// One listener serving native gRPC, gRPC-Web and REST, plus the health
-/// endpoints.
+/// endpoints and, with feature `vfs`, a built frontend (`ServerBuilder::site`).
 ///
 /// Every request carries an `x-request-id` (echoed on the response) and is
 /// logged once at completion (target `sekvent::access`, health traffic at
@@ -583,6 +620,7 @@ impl Server {
             rest_body_limit: DEFAULT_REST_BODY_LIMIT,
             layers: Vec::new(),
             access_log: true,
+            site: None,
             problems: Vec::new(),
         }
     }
@@ -602,7 +640,12 @@ impl Server {
     ///    `grpc.health.v1.Health`, also under the prefix), or else
     /// 4. the call context (its request id is the one above), the
     ///    application layers, then the prefix strip and the split between
-    ///    gRPC (by content type) and the REST routes with their body limit.
+    ///    gRPC (by content type) and the REST routes with their body limit;
+    ///    outside the prefix, native gRPC at the root (by content type) and
+    ///    the static site (`ServerBuilder::site`) for everything
+    ///    else. The site therefore sees CORS, the request id, the access
+    ///    log and the application layers like the API, and nothing that
+    ///    the prefix or a health endpoint matched.
     pub fn router(&self, health: &HealthRegistry) -> Router {
         let config = &self.inner.config;
         let grpc = self.grpc_router();
@@ -612,18 +655,22 @@ impl Server {
                 let nested = Router::new().nest_service(
                     prefix,
                     Dispatch {
-                        grpc: grpc.clone(),
+                        grpc: Some(grpc.clone()),
                         rest: Some(rest),
                     },
                 );
-                if config.grpc_at_root {
-                    nested.fallback_service(Dispatch { grpc, rest: None })
+                let root = Dispatch {
+                    grpc: config.grpc_at_root.then_some(grpc),
+                    rest: config.site.clone(),
+                };
+                if root.grpc.is_some() || root.rest.is_some() {
+                    nested.fallback_service(root)
                 } else {
                     nested
                 }
             }
             None => Router::new().fallback_service(Dispatch {
-                grpc,
+                grpc: Some(grpc),
                 rest: Some(rest),
             }),
         };
@@ -940,10 +987,10 @@ fn is_grpc(headers: &HeaderMap) -> bool {
 }
 
 /// Sends gRPC (by content type) to the tonic routes and everything else to
-/// the REST routes, or to a 404 when there are none.
+/// the REST routes (or the static site); a missing side answers 404.
 #[derive(Clone)]
 struct Dispatch {
-    grpc: Router,
+    grpc: Option<Router>,
     rest: Option<Router>,
 }
 
@@ -958,7 +1005,7 @@ impl tower::Service<Request<Body>> for Dispatch {
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let target = if is_grpc(request.headers()) {
-            Some(self.grpc.clone())
+            self.grpc.clone()
         } else {
             self.rest.clone()
         };

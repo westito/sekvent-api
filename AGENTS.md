@@ -58,7 +58,7 @@ repository; describe behaviour in your own words and use neutral examples
 | `sekvent-telemetry` | tracing init, log ring buffer, request-id and access-log layers, `truncate_for_log` | — |
 | `sekvent-error` | `ErrorCode`, `AppError`, `WireError`, HTTP + gRPC mappings | — |
 | `sekvent-context` | `CallContext`, `ServiceIdentity`, `Clock`, header codec (peer vs external propagation) | — |
-| `sekvent-runtime` | staged lifecycle, supervision, health, combined server (CORS, limits, layers, access log), jobs, downloads | config, error, context, telemetry |
+| `sekvent-runtime` | staged lifecycle, supervision, health, combined server (CORS, limits, layers, access log), jobs, downloads, static sites (`vfs`) | config, error, context, telemetry |
 | `sekvent-resilience` | backoff, retry budget, rate gate, timeout, bulkhead, circuit breaker, TTL cache | config, error, context |
 | `sekvent-auth` | argon2id and bcrypt schemes, JWT with the time passed in; runtime-free, wasm-compatible core | error, config, context (optional) |
 | `sekvent-link` | service tokens, `TokenMap`, middleware, interceptor | config, context, error |

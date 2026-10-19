@@ -10,7 +10,7 @@
 //! | [`error`] | `sekvent-error` | `error` (default) | `ErrorCode`, `AppError`, `WireError`; HTTP and gRPC mappings |
 //! | [`context`] | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
 //! | [`telemetry`] | `sekvent-telemetry` | `telemetry` (default) | tracing init, log buffer, request ids, access log, `truncate_for_log` |
-//! | [`runtime`] | `sekvent-runtime` | `runtime` (default) | staged lifecycle, supervision, health, the combined server (CORS, limits, layers, access log), jobs, downloads |
+//! | [`runtime`] | `sekvent-runtime` | `runtime` (default) | staged lifecycle, supervision, health, the combined server (CORS, limits, layers, access log), jobs, downloads, static sites |
 //! | [`resilience`] | `sekvent-resilience` | `resilience` | backoff, retry budget, rate gate, timeout, bulkhead, breaker, TTL cache |
 //! | [`auth`] | `sekvent-auth` | `auth` | argon2id and bcrypt password hashing, JWT with injected time, login helper |
 //! | [`link`] | `sekvent-link` | `link` | service-to-service tokens, middleware, interceptors |
@@ -29,6 +29,11 @@
 //! - `runtime-grpc-web`: serve gRPC-Web on the same listener as native gRPC.
 //!   Off in the facade's defaults, unlike the `sekvent-runtime` crate's.
 //! - `runtime-cron`: cron schedules for jobs (`JobSpec::cron`, UTC).
+//! - `runtime-vfs`: static files (`runtime::vfs::{Vfs, Directory}`) and
+//!   `StaticSite`, a built frontend served next to the API
+//!   (`ServerBuilder::site`).
+//! - `runtime-vfs-embed`: `runtime::vfs::Embedded`, files compiled into the
+//!   binary with the re-exported `rust-embed`.
 //! - `auth-axum`, `auth-tonic`: bearer extractors, interceptors, role guards.
 //! - `auth-tokio`: password hashing and verification on tokio's blocking
 //!   pool (`hash_async`, `verify_async`, `authenticate_async`).

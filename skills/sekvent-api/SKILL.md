@@ -41,6 +41,7 @@ can describe APIs the project does not have yet.
 | Set up logging, JSON logs, the access log, request ids | `docs/modules/telemetry.md` |
 | Structure `main.rs`, stages, units, shutdown, health, probes | `docs/modules/runtime.md` |
 | Serve gRPC, gRPC-Web and REST; CORS; body limits; layers; downloads | `docs/modules/server.md` |
+| Serve a bundled SPA/frontend (Vite `dist`) from the binary next to the API; the dev proxy setup | `docs/modules/server.md` ("Serve a bundled frontend") |
 | Run interval, cron, manual or singleton jobs | `docs/modules/jobs.md` |
 | Pools, migrations, DB error mapping, list filters, probes, leases | `docs/modules/db.md` |
 | Passwords (argon2id, bcrypt), login, JWT, roles | `docs/modules/auth.md` |
@@ -125,6 +126,7 @@ this shape; read it before restructuring.
 |---|---|
 | gRPC-Web next to gRPC (browser clients) | `runtime-grpc-web` (without it `grpc_web(true)` does nothing) |
 | Cron schedules | `runtime-cron` |
+| Serve a built frontend (SPA) next to the API | `runtime-vfs` (`StaticSite`, `Directory`); `runtime-vfs-embed` to compile `web/dist` into the binary (`Embedded`, `rust-embed` re-exported) |
 | Postgres / MySQL with sqlx | `db-sqlx-postgres` / `db-sqlx-mysql` (+ `db-migrate`) |
 | sea-orm | `db-sea-orm-postgres` / `db-sea-orm-mysql` (+ `db-sea-orm-migrate`) |
 | Singleton jobs, leases with fencing | `db-lease` (with `runtime`: `LeaseGuard`) |
@@ -134,6 +136,16 @@ this shape; read it before restructuring.
 | Retry, breaker, TTL cache | `resilience` |
 | Service-to-service tokens | `link` (+ `link-axum` / `link-tonic`) |
 | Components | `component` (+ `component-grpc` for the gRPC binding) |
+
+A browser frontend: in development run Vite's dev server with
+`server.proxy` sending `/api` to the backend (one origin, no CORS); in
+production embed the `vite build` output with `runtime-vfs-embed` behind a
+feature of the service's own (`embed-ui`, so `cargo check` works without a
+built frontend; the feature itself needs `web/dist` to exist) and pass
+`StaticSite` to `ServerBuilder::site`. The API must then live under a
+prefix (`.prefix("/api")`); browser navigations to unknown paths get
+`index.html`, missing files below `assets/` a `404`. Auth layers go on the
+API router, not `ServerBuilder::layer`, which also wraps the site.
 
 `sekvent-testing` is a dev-dependency and `sekvent-proto-build` a
 build-dependency; neither is re-exported. The dependency key must be

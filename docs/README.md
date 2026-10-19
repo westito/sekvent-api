@@ -25,7 +25,7 @@ workspaces and runs the quality gate.
 | `sekvent::context` | `context` | [context](modules/context.md) | `CallContext`, deadlines, idempotency keys, `Clock`, header propagation |
 | `sekvent::telemetry` | `telemetry` | [telemetry](modules/telemetry.md) | Logging init, formats, access log, request ids, `truncate_for_log` |
 | `sekvent::runtime` | `runtime` | [runtime](modules/runtime.md) | Stages, units, supervision, shutdown, health and dependency probes |
-| `sekvent::runtime` | `runtime` | [server](modules/server.md) | One listener for gRPC, gRPC-Web and REST; CORS, limits, layers, downloads |
+| `sekvent::runtime` | `runtime` | [server](modules/server.md) | One listener for gRPC, gRPC-Web and REST; CORS, limits, layers, downloads, a bundled frontend (`runtime-vfs`) |
 | `sekvent::runtime` | `runtime` | [jobs](modules/jobs.md) | Interval, cron and manual jobs; overlap, misfire, triggers, singletons |
 | `sekvent::db` | `db-*` | [db](modules/db.md) | Named pools, migrations, error classification, list filters, probes, leases |
 | `sekvent::auth` | `auth` | [auth](modules/auth.md) | argon2id and bcrypt passwords, login helper, JWT with injected time |
@@ -82,6 +82,7 @@ A typical service:
 | [design/component-end-user.md](design/component-end-user.md) | Specification of serving components to end users: `SERVE_AUTH=bearer`, the end-user authenticator, `#[call(anonymous)]`, `#[call(optional_end_user)]`, gRPC-Web |
 | [design/sso.md](design/sso.md) | Specification of browser single sign-on: providers, state cookie, handoff codes, Bitbucket Cloud |
 | [design/p8-service-essentials.md](design/p8-service-essentials.md) | Specification of server essentials, probes, password schemes, jobs, leases, HTTP helpers |
+| [design/static-site.md](design/static-site.md) | Specification of serving a built frontend: the virtual filesystem, path normalization, `StaticSite`, server routing |
 | [examples/shop](../examples/shop/README.md) | Three components (orders, inventory, notifications) in monolith and split topologies |
 
 The pages under `modules/` describe how to use the current code; the design

@@ -14,6 +14,11 @@ default = ["grpc-web"]
 grpc-web = ["dep:tonic-web"]
 # Cron schedules for jobs (UTC).
 cron = ["dep:croner", "dep:chrono"]
+# Static files from a virtual filesystem and `StaticSite` to serve a built
+# frontend; `Directory` reads a folder on disk.
+vfs = ["dep:mime_guess", "dep:sha2", "dep:percent-encoding", "dep:httpdate"]
+# `Embedded`: static files compiled into the binary with rust-embed.
+vfs-embed = ["vfs", "dep:rust-embed"]
 
 [dependencies]
 sekvent-error = { workspace = true, features = ["http", "grpc"] }
@@ -36,6 +41,11 @@ rand = { workspace = true }
 bytes = { workspace = true }
 croner = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
+mime_guess = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+httpdate = { workspace = true, optional = true }
+rust-embed = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -43,6 +53,7 @@ tracing-subscriber = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 prost = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -23,7 +23,7 @@ sqlx 0.9 and sea-orm 2.0.
 | `sekvent-error` | `error` (default); `error-http`, `error-grpc` | `ErrorCode`, `AppError`, `WireError`; HTTP and gRPC mappings |
 | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
 | `sekvent-telemetry` | `telemetry` (default) | Tracing init, log ring buffer, request ids, access log, `truncate_for_log` |
-| `sekvent-runtime` | `runtime` (default); `runtime-grpc-web`, `runtime-cron` | Staged lifecycle, supervision, health, one listener for gRPC, gRPC-Web and REST with CORS, body limits, global layers and an access log; interval, cron and manual jobs; file downloads |
+| `sekvent-runtime` | `runtime` (default); `runtime-grpc-web`, `runtime-cron`, `runtime-vfs`, `runtime-vfs-embed` | Staged lifecycle, supervision, health, one listener for gRPC, gRPC-Web and REST with CORS, body limits, global layers and an access log; interval, cron and manual jobs; file downloads; a bundled frontend served next to the API |
 | `sekvent-resilience` | `resilience` | Backoff, retry budget, rate gate, timeout, bulkhead, circuit breaker, a TTL cache with single flight |
 | `sekvent-auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` | argon2id and bcrypt password schemes, JWT with injected time, login helper, async hashing helpers |
 | `sekvent-link` | `link`; `link-axum`, `link-tonic` | Service-to-service tokens, middleware, interceptors |

@@ -151,6 +151,7 @@ line. The `sekvent` skill has the recipes with real API names.
 | `tokio::time::interval` loops, cron crates, admin "run now" flags | `RuntimeBuilder::job` with `JobSpec::interval`, `JobSpec::cron` (`runtime-cron`) or `JobSpec::manual`; `JobHandle::trigger` for run-now |
 | lease or lock rows with heartbeats, "only one replica runs this" | `sekvent::db::LeaseStore` (`try_acquire`, `keep_alive`, fencing tokens) and `JobSpec::singleton(LeaseGuard::new(store))` (`db-lease`) |
 | download handlers setting `Content-Disposition` and content types by hand | `sekvent::runtime::Download` (`sanitize_filename`, `sniff_content_type` for uploads) |
+| tower-http `ServeDir`/`ServeFile` with an `index.html` fallback, `rust-embed`/`include_dir` handlers serving a frontend | `ServerBuilder::site(StaticSite::new(..))` over `Embedded::<Ui>` (`runtime-vfs-embed`, derive with `#[crate_path = "sekvent::runtime::vfs::rust_embed"]`) or `Directory::new(dist)` (`runtime-vfs`); the API moves under `.prefix("/api")`. Keep the same URL layout so bookmarks and the dev proxy keep working |
 | hand-made caches (a `Mutex<HashMap>` with timestamps, `moka` for a few keys) | `sekvent::resilience::TtlCache` (single flight, stale on transient errors) |
 | database health checks in a readiness handler | `PoolRegistry::probes()` registered with `RuntimeBuilder::probe` |
 | list endpoints building filters and pagination by hand | `sekvent::db::list` (`ListParams`, column filters) with sea-orm; pools via `PoolSpec` / `PoolRegistry` |

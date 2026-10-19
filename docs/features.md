@@ -56,6 +56,8 @@ example an `-api` crate that only declares a component contract).
 | `error-grpc` | `error` | `From<AppError> for tonic::Status` and back, gRPC error details |
 | `runtime-grpc-web` | `runtime` | gRPC-Web on the server's listener, next to native gRPC and REST |
 | `runtime-cron` | `runtime` | `JobSpec::cron` schedules (UTC) |
+| `runtime-vfs` | `runtime` | `sekvent::runtime::vfs`: `Vfs`, `Directory`, `StaticSite` and `ServerBuilder::site`, a built frontend served next to the API ([server](modules/server.md#serve-a-bundled-frontend)) |
+| `runtime-vfs-embed` | `runtime-vfs` | `Embedded`, files compiled into the binary with `rust-embed` (re-exported, so no dependency of your own) |
 | `auth-axum` | `auth` | Bearer-token extractor for axum |
 | `auth-tonic` | `auth` | Bearer-token interceptor for tonic |
 | `auth-tokio` | `auth` | `hash_async`, `verify_async`, `authenticate_async` on tokio's blocking pool |

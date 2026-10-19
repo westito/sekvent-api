@@ -8,7 +8,8 @@ endpoints and CORS preflights also gets a [`CallContext`](context.md) decoded
 from its headers. The server applies validated CORS rules, connection and
 body limits and your own tower layers, and drains gracefully as a
 [runtime](runtime.md) unit. `Download` builds file responses with safe
-headers.
+headers, and with `runtime-vfs` the same listener can serve a built frontend
+(a single-page app) next to the API.
 
 ## Enable it
 
@@ -16,6 +17,7 @@ headers.
 |---|---|
 | Facade feature | `runtime` (on by default) |
 | gRPC-Web | `runtime-grpc-web`. **Off in the facade's defaults** (the internal crate's `grpc-web` feature is on by default, the facade turns it off). Without it, `ServerBuilder::grpc_web(true)` has no effect. |
+| Static frontend | `runtime-vfs` (`Vfs`, `Directory`, `StaticSite`, `ServerBuilder::site`); `runtime-vfs-embed` adds `Embedded` and re-exports `rust-embed`. See [Serve a bundled frontend](#serve-a-bundled-frontend). |
 | Module | `use sekvent::runtime::{Server, ServerBuilder, Ctx, Cors, Download, Disposition, CacheControl, HealthVisibility};` |
 | Prelude | `Server`, `ServerBuilder`, `Ctx` |
 | Your manifest | `axum` (0.8) for REST routes and `tonic` (0.14) for gRPC services, at the versions the workspace pins |
@@ -76,6 +78,8 @@ HTTP/1.1 or HTTP/2, detected per connection.
 | `/livez`, `/readyz`, `/healthz` | health | health | health |
 | `/api/readyz` | — | 404 | 404 |
 | `grpc.health.v1.Health` | at the root | at the root and under `/api` | under `/api` only |
+| `/settings`, `/assets/app.js` with a `site(..)` | — (a site needs a prefix) | the site | the site |
+| `/api/unknown` with a `site(..)` | — | 404 (never the site) | 404 (never the site) |
 
 The prefix is stripped before routing, so tonic still sees
 `/pkg.Service/Method` and REST routes are written without it. Native gRPC
@@ -109,7 +113,9 @@ anything below it (while gRPC health is on). Anything else fails `bind` with
    2. your **application layers** (`ServerBuilder::layer`), the last one
       added outermost;
    3. the **prefix strip** and the split between gRPC (by content type) and
-      the REST routes with their body limit.
+      the REST routes with their body limit; outside the prefix, native gRPC
+      at the root (by content type) and the static site, when one is set,
+      for everything else.
 
 The authenticator runs on the request **head** before any body is read.
 
@@ -290,9 +296,14 @@ request logging. Its default span records the full URI, query included, so
 credentials passed as query parameters (`?code=…`, `?token=…`) would end up
 in your logs.
 
-- A layer wraps every REST, gRPC and gRPC-Web request, inside the call
-  context (so it can read `CallContext` from the extensions) and outside
-  routing. It never wraps the HTTP or gRPC health endpoints.
+- A layer wraps every REST, gRPC and gRPC-Web request and the
+  [static site](#serve-a-bundled-frontend), inside the call context (so it
+  can read `CallContext` from the extensions) and outside routing. It never
+  wraps the HTTP or gRPC health endpoints.
+- A layer that rejects requests without credentials (a token check, say)
+  rejects the site too, including the login page that would ask for them.
+  Put such a layer on the API router instead, before handing it over:
+  `.rest(api_routes().layer(require_token))`.
 - The bounds are those of `axum::Router::layer`, and the layer must be
   `Clone`. A later `.layer(..)` wraps the earlier ones.
 - Component calls served on this listener pass through the layers too. A
@@ -530,6 +541,228 @@ filename's extension only refines ZIP (`docx`, `xlsx`, `pptx`, `odt`, `ods`,
 type from the first bytes, never from the client's `Content-Type`, and store
 under a name the server chooses.
 
+### Serve a bundled frontend
+
+A React, Vue or Svelte app built with Vite can ship inside the service
+binary and be served by the same `Server` as the API. In development Vite
+runs on its own and proxies the API; in production the built `web/dist`
+is embedded and served by `StaticSite`.
+
+**Development: Vite's dev server proxies `/api`.** The browser only talks to
+Vite, so the API needs no CORS, and hot reload keeps working.
+
+```ts
+// web/vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    proxy: {
+      "^/api([/?]|$)": { target: "http://127.0.0.1:8080", changeOrigin: false },
+    },
+  },
+  build: { outDir: "dist", assetsDir: "assets", emptyOutDir: true },
+});
+```
+
+A proxy key is a path prefix unless it starts with `^`, in which case Vite
+reads it as a regular expression. A plain `"/api"` would also proxy a client
+route such as `/api-keys`; `"^/api([/?]|$)"` matches `/api` and paths below
+it only, like the server's prefix. Vite tests the expression against the
+request URL including its query string, hence `?` next to `/`.
+
+**Production: `vite build`, then embed `web/dist`.** Put the embedding
+behind a feature of your own (here `embed-ui`) so `cargo check`, clippy and
+the backend tests work without a built frontend:
+
+```toml
+# crates/console/Cargo.toml
+[features]
+embed-ui = ["sekvent-api/runtime-vfs-embed"]
+
+[dependencies]
+sekvent-api = { workspace = true, features = ["runtime-vfs"] }
+```
+
+```rust
+#[cfg(feature = "embed-ui")]
+#[derive(sekvent::runtime::vfs::RustEmbed)]
+#[crate_path = "sekvent::runtime::vfs::rust_embed"]
+#[folder = "../../web/dist"] // relative to this crate's Cargo.toml
+struct Ui;
+
+#[cfg(feature = "embed-ui")]
+fn site() -> Option<sekvent::runtime::vfs::StaticSite> {
+    use std::sync::Arc;
+
+    use sekvent::runtime::vfs::{Embedded, StaticSite};
+
+    Some(StaticSite::new(Arc::new(Embedded::<Ui>::new())))
+}
+
+#[cfg(not(feature = "embed-ui"))]
+fn site() -> Option<sekvent::runtime::vfs::StaticSite> {
+    None // `cargo run` without the feature: use the Vite dev server
+}
+
+let builder = Server::builder().prefix("/api").rest(api_routes());
+let builder = match site() {
+    Some(site) => builder.site(site),
+    None => builder,
+};
+let server = builder.bind(addr).await?;
+```
+
+Every import sits inside the feature-gated function, so the file compiles
+without warnings with the feature on and off.
+
+Build the release with `npm --prefix web ci && npm --prefix web run build`
+followed by `cargo build --release --features embed-ui`. The
+`#[crate_path]` line lets the derive use the `rust-embed` that sekvent
+re-exports, so the service needs no `rust-embed` dependency of its own;
+`#[folder]` is relative to the crate's `Cargo.toml` (`$VAR` expansion is
+not enabled). Debug builds read the folder from disk at runtime, release
+builds compile the files in.
+
+**The `embed-ui` feature needs a built frontend.** The derive fails to
+compile when `web/dist` does not exist, so build the frontend before any
+cargo command that turns the feature on. That includes workspace-wide
+`--all-features` runs (clippy, tests, coverage): build `web/dist` first, or
+list features explicitly instead of `--all-features`. rust-embed's
+`#[allow_missing = true]` would silence the error, but a release built
+without `web/dist` would then ship an empty UI that only fails at runtime
+(every page a `404`); do not use it for the production embed.
+
+To serve a `dist` folder from disk instead (a container image that copies
+the build next to the binary, say), use `Directory`:
+
+```rust
+use std::sync::Arc;
+
+use sekvent::runtime::vfs::{Directory, StaticSite};
+
+let dist = Directory::new("/srv/web/dist")?; // INVALID_ARGUMENT unless a directory
+let site = StaticSite::new(Arc::new(dist.max_file_size(16 * 1024 * 1024)));
+```
+
+`Directory` reads the whole file and hashes it (SHA-256, for the `ETag`)
+on **every request**, on tokio's blocking pool. That is fine for a small
+build behind a CDN, but `Embedded` is the production path: its bytes are in
+the binary and its hashes are computed at build time. A file above
+`max_file_size` (default 64 MiB) is not served: it counts as missing, and
+the first one is logged at `warn` with its normalized path.
+
+`StaticSite::builder(vfs)` changes the defaults:
+
+| Builder | Default | Notes |
+|---|---|---|
+| `.index(name)` | `index.html` | one file name; served for `/`, paths ending in `/`, and by the SPA fallback |
+| `.spa_fallback(bool)` | on | a navigation (`Accept` lists `text/html`) to a missing path serves the root index with `200` |
+| `.immutable_prefix(dir)` | `assets` | files below it get `public, max-age=31536000, immutable`; a missing path below it is always `404` |
+| `.no_immutable_prefix()` | — | nothing is cached as immutable |
+| `.header(name, value)` | `X-Frame-Options: DENY` | sent on every site response, replacing a header of that name the site would set; typed `HeaderName` and `HeaderValue`, so it cannot fail |
+| `.without_header(&name)` | — | drops a header given with `.header` or the default `X-Frame-Options`; the site's own headers stay |
+| `.build()?` | — | `INVALID_ARGUMENT` for an index that is not one file name, or an empty or invalid prefix |
+
+For example, a site that may be framed by its own origin and sends a
+content security policy:
+
+```rust
+use axum::http::HeaderValue;
+use axum::http::header::{CONTENT_SECURITY_POLICY, X_FRAME_OPTIONS};
+
+let site = StaticSite::builder(Arc::new(Embedded::<Ui>::new()))
+    .header(X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"))
+    .header(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'self'; frame-ancestors 'self'"),
+    )
+    .build()?;
+```
+
+No `Content-Security-Policy` is sent by default: a generic one would
+either break real apps or clobber the one you set.
+
+How the site answers:
+
+- **Routing.** `ServerBuilder::site(site)` serves every path outside the
+  prefix that is not a health endpoint. It **needs a prefix**: without one
+  `bind` fails with `INVALID_ARGUMENT` (`a static site needs a path prefix
+  such as /api …`), so the SPA fallback can never shadow an API route. An
+  unknown path under the prefix stays the API's `404`. Native gRPC at the
+  root keeps working: gRPC content types go to gRPC, everything else to the
+  site. A second `site(..)` fails `bind`.
+- **Public.** The site gets CORS, the request id, the access log and your
+  application layers like the API. The authenticator only shapes its call
+  context; it never rejects, so anonymous browsers load the app. A layer
+  that rejects anonymous requests rejects the site too: apply such a layer
+  to the API router instead (`.rest(api_routes().layer(..))`).
+- **Methods.** `GET` and `HEAD` only; anything else is `405` with `Allow:
+  GET, HEAD`. `HEAD` announces the `Content-Length` of the `GET`.
+- **Paths.** The URL path is percent-decoded once and normalized:
+  empty segments collapse; `.` and `..`, hidden files (a segment starting
+  with `.`, except `.well-known`), segments over 255 bytes, control
+  characters, `\`, `:` and an encoded `/` (`%2F`) are rejected. `Directory`
+  also refuses symbolic links that lead outside its folder or to a hidden
+  file inside it.
+- **Directories.** `/` and paths ending in `/` serve that directory's
+  index. A path that is not a file but a directory with an index (`/docs`
+  with `docs/index.html`) answers `308` to `/docs/`, query string kept, so
+  relative links in that page resolve against the directory.
+- **SPA fallback.** A **navigation**, a request whose `Accept` lists
+  `text/html` itself (browsers do; `*/*` and `text/*` do not count), to a
+  missing path serves the root `index.html` with `200`, so client-side
+  routes survive a reload. Dots do not matter: `/nodes/10.0.0.1`,
+  `/instances/ocid1.instance.oc1…` and `/releases/v1.2.3` all fall back.
+  A path the normalizer rejects (`/nodes/fe80::1`) falls back too; the
+  index is safe to serve for any URL. Always `404`, never the index: a
+  missing path below the immutable prefix (`/assets/app-1234.js`, so a stale
+  tab gets a real error for an old chunk instead of HTML), and any missing
+  path requested without `text/html` (a `fetch` with `Accept: */*`).
+- **Caching.** HTML and the index are `no-cache`; files under `assets/`
+  (where Vite writes content-hashed names) are `public, max-age=31536000,
+  immutable`; everything else is `no-cache`. Every file has a strong `ETag`
+  from a SHA-256 of its bytes; `If-None-Match` (a list, `W/` tags, or `*`)
+  answers `304` without a body and without `Content-Length`.
+- **Precompressed files.** When `app.js` exists and `app.js.br` or
+  `app.js.gz` next to it (for example from `vite-plugin-compression`), and
+  `Accept-Encoding` allows it (`q=0` refuses), the variant is sent with
+  `Content-Encoding`, the content type of `app.js` (including a
+  `VfsFile::with_content_type` override) and its own `ETag`; `br` wins a
+  tie. A variant without its original is never served, and one that cannot
+  be read is skipped. Nothing is compressed at runtime.
+- **Headers.** Always `X-Content-Type-Options: nosniff`, `Vary:
+  Accept-Encoding` (plus `Accept` when the SPA fallback decided the answer,
+  and on a `500` while the fallback is on) and the builder's extra headers
+  (`X-Frame-Options: DENY` by default); files carry `Content-Type` (by
+  extension, `charset=utf-8` for text), `Content-Length` and, when known,
+  `Last-Modified`.
+- **Errors.** A file that cannot be read is `500`, logged server-side.
+  `Debug` of every site, file and file system type never prints contents.
+
+Two build pitfalls:
+
+- **Vite's `public/` folder is copied as is.** A file at
+  `web/public/assets/logo.svg` lands in `dist/assets/logo.svg` without a
+  content hash, and then gets the immutable one-year cache: a changed logo
+  never reaches returning browsers. Keep public files out of
+  `public/assets/`, or set a different `build.assetsDir` and the matching
+  `.immutable_prefix(..)`.
+- **Stale variants win.** A leftover `app.js.br` from an earlier build next
+  to a newer `app.js` is served to every client that accepts `br`. Build
+  with `emptyOutDir: true` (Vite's default when `outDir` is inside the
+  project root) and generate the `.br`/`.gz` files in the same build.
+
+`StaticSite` is also a plain tower service:
+`Router::new().fallback_service(site)` mounts it on any axum router, and
+`site.respond(&method, &uri, &headers).await` answers one request (the URI
+supplies the path and, for a directory redirect, the query). A custom
+source implements `Vfs` (`get(&VfsPath) -> BoxFuture<Result<Option<VfsFile>,
+AppError>>`); `VfsPath` can only be built by the shared normalizer, so an
+implementation never sees an unsafe path.
+
 ### Serve the router elsewhere
 
 `server.router(&health)` returns the complete `axum::Router` (every layer
@@ -543,6 +776,7 @@ the lifecycle.
 |---|---|
 | invalid prefix, zero header timeout, connection limit 0 or too large, zero body limit, invalid CORS | `bind`/`from_listener`: `INVALID_ARGUMENT` |
 | `grpc_routes` twice, or after `add_service` | `bind`/`from_listener`: `INVALID_ARGUMENT`, `gRPC routes were given more than once; use add_service to add more` |
+| `site(..)` without a prefix, or twice | `bind`/`from_listener`: `INVALID_ARGUMENT` |
 | address in use | `bind`: `UNAVAILABLE`, `could not listen on <addr>` |
 | listener broke while serving | unit fails: `UNAVAILABLE`, `the listener on <addr> failed` |
 | `Ctx` without a call context | `INTERNAL`, `the request has no call context` |
@@ -605,7 +839,11 @@ layers, `access_log(true)`.
   without it browsers get no translation even though `grpc_web` defaults to
   `true`.
 - **REST at the root with a prefix**: once `prefix` is set, REST routes are
-  served only under it; the root answers only gRPC and health.
+  served only under it; the root answers only gRPC, health and, when set,
+  the static site.
+- **A missing frontend build** fails the `rust-embed` derive at compile
+  time. Keep the derive behind a feature of your own (`embed-ui`) and turn
+  it on only where `web/dist` has been built.
 - **Overlapping `rest(..)` routers panic** at build time, like
   `Router::merge`.
 - **An authenticator is not an authorization check.** Anonymous requests

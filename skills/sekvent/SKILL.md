@@ -31,6 +31,7 @@ speed and flakes: the `rust-testing` skill.
 | Lifecycle, health, one listener for gRPC + gRPC-Web + REST, CORS, body limits, global layers | `runtime` | default; `runtime-grpc-web` |
 | Interval, cron and manual jobs | `runtime` (`JobSpec`, `RuntimeBuilder::job`) | default; `runtime-cron` for cron |
 | File downloads (safe headers, type sniffing, filenames) | `runtime` (`Download`) | default |
+| A built frontend (SPA) served from the binary next to the API | `runtime::vfs` (`StaticSite`, `Directory`, `Embedded`; `ServerBuilder::site`) | `runtime-vfs`; `runtime-vfs-embed` for files compiled in |
 | Timeout, retry, rate gate, bulkhead, breaker, backoff, TTL cache | `resilience` | `resilience` |
 | Password hashing (argon2id, bcrypt), JWT, login | `auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` (async hashing) |
 | Browser sign-in with an external account (OAuth 2.0 code flow, Bitbucket Cloud) | `sso` | `sso` |
@@ -271,6 +272,86 @@ async fn upload(Ctx(cx): Ctx, mut multipart: Multipart) -> Result<Json<Stored>, 
     …
 }
 ```
+
+### A bundled frontend (SPA) next to the API
+
+Development: Vite's dev server proxies the API (`web/vite.config.ts`:
+`server: { proxy: { "^/api([/?]|$)": "http://127.0.0.1:8080" } }`; a key
+starting with `^` is a regex, a plain `"/api"` would also proxy
+`/api-keys`), so there is one origin and no CORS. Production: `vite build`
+writes `web/dist`, the binary embeds it behind a feature of the service's
+own and serves it:
+
+```toml
+[features]
+embed-ui = ["sekvent-api/runtime-vfs-embed"]     # cargo build --release --features embed-ui
+[dependencies]
+sekvent-api = { workspace = true, features = ["runtime-vfs"] }
+```
+
+```rust
+#[cfg(feature = "embed-ui")]
+#[derive(sekvent::runtime::vfs::RustEmbed)]
+#[crate_path = "sekvent::runtime::vfs::rust_embed"]   // the re-export: no rust-embed dependency
+#[folder = "../../web/dist"]                          // relative to this crate's Cargo.toml
+struct Ui;
+
+#[cfg(feature = "embed-ui")]
+fn site() -> Option<sekvent::runtime::vfs::StaticSite> {
+    use std::sync::Arc;
+    use sekvent::runtime::vfs::{Embedded, StaticSite};
+    Some(StaticSite::new(Arc::new(Embedded::<Ui>::new())))
+}
+
+#[cfg(not(feature = "embed-ui"))]
+fn site() -> Option<sekvent::runtime::vfs::StaticSite> {
+    None                                              // dev: the Vite dev server serves the UI
+}
+
+let builder = Server::builder().prefix("/api").rest(api_routes()); // a site needs a prefix
+let builder = match site() {
+    Some(site) => builder.site(site),
+    None => builder,
+};
+// Or from disk: StaticSite::new(Arc::new(Directory::new("/srv/web/dist")?)) — reads and hashes per request
+// Tuning: StaticSite::builder(vfs).index("index.html").spa_fallback(true).immutable_prefix("assets")
+//     .header(CONTENT_SECURITY_POLICY, HeaderValue::from_static("…")).build()?
+```
+
+- All imports live inside the gated function, so the crate is warning-free
+  with the feature on and off. The derive fails to compile without
+  `web/dist`: build the frontend before `--features embed-ui` (and before
+  workspace `--all-features` clippy/test runs, or list features). Do not
+  use rust-embed's `#[allow_missing = true]` for this: a release would ship
+  an empty UI.
+- Everything outside `/api` that is not `/livez`, `/readyz`, `/healthz` or
+  gRPC (by content type) goes to the site; `/api/unknown` stays a `404`.
+  `site(..)` without a prefix fails `bind`.
+- SPA fallback: a navigation (`Accept` lists `text/html`; `*/*` does not
+  count) to a missing path serves `index.html`, dots or not
+  (`/nodes/10.0.0.1`), also for paths the normalizer rejects. A missing
+  path below `assets/` is always `404`, and so is anything requested
+  without `text/html`.
+- `/docs` where `docs/index.html` exists answers `308` to `/docs/` (query
+  kept); `/` and `…/` serve the directory index.
+- `index.html` and other HTML are `no-cache`; `assets/` (Vite's hashed
+  files) is `public, max-age=31536000, immutable` (keep Vite `public/`
+  files out of `public/assets/`); strong `ETag`, `304` on `If-None-Match`
+  (no `Content-Length`); `app.js.br` / `.gz` served when `app.js` exists
+  and `Accept-Encoding` allows, with `app.js`'s content type (build with
+  `emptyOutDir` so stale variants cannot win); `GET`/`HEAD` only (`405`
+  otherwise); `nosniff` and `X-Frame-Options: DENY` always
+  (`.header(..)` / `.without_header(&..)` change the extras).
+- The site is public: CORS, request id, access log and
+  `ServerBuilder::layer` layers apply, the authenticator never rejects. A
+  layer that rejects anonymous callers belongs on the API router
+  (`.rest(api_routes().layer(..))`), or the login page cannot load.
+- Paths are percent-decoded once and normalized (`VfsPath`): `..`, hidden
+  files (except `.well-known`), segments over 255 bytes, `\`, `:`, `%2F`
+  and control characters are rejected; `Directory` refuses symlinks leading
+  outside its root or to hidden files, and files above
+  `.max_file_size(..)` (64 MiB). `Embedded` is the production path.
+
 ### Worker unit
 
 ```rust
