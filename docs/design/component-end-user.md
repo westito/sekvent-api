@@ -55,8 +55,10 @@ configuration, with a per-method opt-out for the few public RPCs (sign-in).
 ### 3.1 `sekvent-context`
 
 ```rust
-/// An end user authenticated at a serving boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An end user authenticated at a serving boundary. `Debug`, `PartialEq`
+/// and `Eq` are written by hand since typed extensions were added
+/// (end-user-extensions.md).
+#[derive(Clone)]
 pub struct EndUser { /* private */ }
 
 impl EndUser {
@@ -68,6 +70,8 @@ impl EndUser {
     pub fn tenant(&self) -> Option<&str>;
     pub fn roles(&self) -> &[String];
     pub fn has_role(&self, role: &str) -> bool;
+    #[must_use] pub fn with_extension<T: Clone + Send + Sync + 'static>(self, value: T) -> Self;
+    pub fn extension<T: Send + Sync + 'static>(&self) -> Option<&T>;
 }
 
 impl CallContext {

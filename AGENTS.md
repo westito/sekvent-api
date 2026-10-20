@@ -106,7 +106,8 @@ cycle, and keep `sekvent-error` and `sekvent-context` dependency-light.
 
 Specs: `docs/component-model.md` (overview), `docs/design/component-c1.md`
 (local bindings, lifecycle), `docs/design/component-c2.md` (gRPC, contracts),
-`docs/design/component-end-user.md` (serving to end users),
+`docs/design/component-end-user.md` (serving to end users;
+`docs/design/end-user-extensions.md` for typed `EndUser` extensions),
 `docs/design/component-streaming.md` (server-streaming methods),
 `docs/design/p8-service-essentials.md` (jobs, leases).
 Milestones C1, C2 and C4 are done (C4: jobs in `sekvent-runtime`, leases in

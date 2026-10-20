@@ -89,6 +89,35 @@ The direct caller is either a service (`caller()`) or an end user
 (`end_user()`), never both. Roles travel with the end user only: they are
 never encoded in headers and never reach the components a handler calls.
 
+An authenticator can attach whatever else it learned and handlers need as
+typed **extensions**, one value per type (the scope of an API token, a
+session id):
+
+```rust
+use sekvent::context::EndUser;
+
+#[derive(Clone)]
+struct TokenScope { permissions: Vec<String> }   // a type of your own, not String
+
+let user = EndUser::new("agent-3")
+    .with_roles(["developer"])
+    .with_extension(TokenScope { permissions: vec!["issues.edit".into()] });
+
+// in the handler
+let scope: Option<&TokenScope> = cx.end_user().and_then(EndUser::extension::<TokenScope>);
+```
+
+- `with_extension::<T: Clone + Send + Sync + 'static>(value)` replaces an
+  earlier value of the same type; `extension::<T>()` is `None` when no value
+  of `T` was attached.
+- Extensions follow the roles' rule: they stay with the end user in this
+  process, are never encoded in headers and never reach the components a
+  handler calls (`child()` and `detached()` drop the end user).
+- `Debug` prints only their number (`extensions: 2`), never values or type
+  names.
+- Equality (`PartialEq`, `Eq`) compares subject, tenant and roles and
+  ignores extensions.
+
 ## How to build and derive contexts
 
 Builders (all `#[must_use]`, consuming `self`):
@@ -349,7 +378,8 @@ rejected. Handlers map an expired deadline or cancellation to
   end-user authenticator check a credential and the component serving
   boundary call `with_end_user`.
 - `CallContext` derives `Debug`, which includes subject, tenant and the end
-  user; avoid logging the whole context where those are sensitive.
+  user (its extensions as a count only); avoid logging the whole context
+  where those are sensitive.
 
 ## See also
 

@@ -388,12 +388,24 @@ missing subdirectory fails with [`ProtoBuildError::Io`](#errors).
 sekvent_proto_build::ProtoBuild::new("proto")
     .messages_only()
     .bytes(["."])                                                 // every `bytes` field as Bytes
+    .btree_map(["."])                                             // every `map<…>` field as BTreeMap
     .type_attribute(".common.v1.Money", "#[derive(serde::Serialize)]")
     .field_attribute(".billing.v1.Invoice.note", "#[doc = \"Free text.\"]")
 ```
 
 - `bytes(paths)` maps `bytes` fields under these proto paths to
   `bytes::Bytes` (`["."]` for all); repeated calls add paths.
+- `btree_map(paths)` maps `map<…>` fields under these proto paths
+  (`["."]` for all, `".billing.v1.Invoice"` for one message,
+  `".billing.v1.Invoice.labels"` for one field) to
+  `::prost::alloc::collections::BTreeMap` instead of
+  `std::collections::HashMap`; repeated calls add paths. A `HashMap`
+  encodes its entries in a random order, so the same message encodes to
+  different bytes from one value to the next; a `BTreeMap` encodes them in
+  key order. Use it when encoded bytes are compared or hashed (a request
+  fingerprint for idempotency, a cache key, a signature). Set it where the
+  messages are generated; services-only mode generates no messages, so it
+  has no effect there.
 - `type_attribute(path, attribute)` and `field_attribute(path, attribute)`
   pass straight to prost's options of the same name; each call adds one
   rule. Paths are fully qualified protobuf paths with a leading dot.
@@ -550,6 +562,7 @@ path). A failure before code generation leaves no wrapper behind.
 | `.server` / `.client` | `fn server(self, enable: bool) -> Self` / `fn client(self, enable: bool) -> Self` |
 | `.file_descriptor_set` | `fn file_descriptor_set(self, file_name: impl Into<String>) -> Self` |
 | `.bytes` | `fn bytes<S: Into<String>>(self, paths: impl IntoIterator<Item = S>) -> Self` |
+| `.btree_map` | `fn btree_map<S: Into<String>>(self, paths: impl IntoIterator<Item = S>) -> Self` |
 | `.type_attribute` / `.field_attribute` | `fn type_attribute(self, path: impl Into<String>, attribute: impl Into<String>) -> Self` (same shape for fields) |
 | `.service_generator_hook` | `fn service_generator_hook(self, generator: Box<dyn ServiceGenerator>) -> Self` |
 | `.service_contracts` | `fn service_contracts(self, enable: bool) -> Self` |

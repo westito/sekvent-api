@@ -877,6 +877,9 @@ generated `.rs`. The package `sekvent.v1` and the names `__sekvent_*` are
 reserved. `messages_only()` and `both()` also emit one
 `__sekvent_service_<Service>` constant per proto `service`, which
 `#[component(proto = …)]` checks (`.service_contracts(false)` turns it off).
+`.btree_map(["."])` generates `map<…>` fields as `BTreeMap` (key-ordered,
+deterministic encoding) instead of `HashMap`; use it on the messages build
+when encoded bytes are hashed or compared (idempotency fingerprints).
 Protos are compiled in-process with protox: no `protoc` is needed anywhere
 (machine, CI, Docker), and the `google/protobuf/*` well-known types are
 bundled.
@@ -1044,9 +1047,16 @@ let server = Server::builder()
 // in a handler: Some for an end user calling directly (then cx.caller() is None)
 if let Some(user) = cx.end_user() {
     sekvent::auth::require_any_role(user, &["admin"])?;
+    let scope = user.extension::<TokenScope>();          // typed data the authenticator attached
 }
 ```
 
+- An authenticator that loads more than identity (an API token's scope)
+  attaches it with `EndUser::with_extension(value)` (`T: Clone + Send +
+  Sync + 'static`, one value per type, use a newtype); handlers read
+  `user.extension::<T>()`. Extensions are never logged (`Debug` shows the
+  count), never put in headers, never reach callees, and are ignored by
+  `EndUser` equality.
 - No authenticator with a bearer mode fails the build
   (`BuildError::EndUserAuthenticatorMissing`, naming the `SERVE_AUTH` key);
   a second one is `DuplicateEndUserAuthenticator`.

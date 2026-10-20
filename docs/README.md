@@ -81,6 +81,7 @@ A typical service:
 | [design/component-c1.md](design/component-c1.md) | Specification of local bindings and the lifecycle (C1) |
 | [design/component-c2.md](design/component-c2.md) | Specification of the gRPC binding, link auth and contracts (C2) |
 | [design/component-end-user.md](design/component-end-user.md) | Specification of serving components to end users: `SERVE_AUTH=bearer`, the end-user authenticator, `#[call(anonymous)]`, `#[call(optional_end_user)]`, gRPC-Web |
+| [design/end-user-extensions.md](design/end-user-extensions.md) | Specification of typed extensions on `EndUser`: storage, equality, never logged or propagated |
 | [design/sso.md](design/sso.md) | Specification of browser single sign-on: providers, state cookie, handoff codes, Bitbucket Cloud |
 | [design/p8-service-essentials.md](design/p8-service-essentials.md) | Specification of server essentials, probes, password schemes, jobs, leases, HTTP helpers |
 | [design/storage.md](design/storage.md) | Specification of object storage: own SigV4 signer on rustls/ring, presigned uploads and downloads, two endpoints, the MinIO test image |

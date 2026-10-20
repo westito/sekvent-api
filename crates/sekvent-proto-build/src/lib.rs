@@ -234,6 +234,7 @@ pub struct ProtoBuild {
     client: bool,
     descriptor_set: Option<String>,
     bytes: Vec<String>,
+    btree_maps: Vec<String>,
     type_attributes: Vec<(String, String)>,
     field_attributes: Vec<(String, String)>,
     hooks: Vec<Box<dyn ServiceGenerator>>,
@@ -257,6 +258,7 @@ impl ProtoBuild {
             client: true,
             descriptor_set: None,
             bytes: Vec::new(),
+            btree_maps: Vec::new(),
             type_attributes: Vec::new(),
             field_attributes: Vec::new(),
             hooks: Vec::new(),
@@ -336,6 +338,15 @@ impl ProtoBuild {
     #[must_use]
     pub fn bytes<S: Into<String>>(mut self, paths: impl IntoIterator<Item = S>) -> Self {
         self.bytes.extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Map `map<…>` fields under these proto paths to `BTreeMap` instead of
+    /// `HashMap` (`["."]` for all), so their encoding is ordered by key and
+    /// equal maps encode to equal bytes.
+    #[must_use]
+    pub fn btree_map<S: Into<String>>(mut self, paths: impl IntoIterator<Item = S>) -> Self {
+        self.btree_maps.extend(paths.into_iter().map(Into::into));
         self
     }
 
@@ -499,6 +510,9 @@ impl ProtoBuild {
         }
         if !self.bytes.is_empty() {
             config.bytes(&self.bytes);
+        }
+        if !self.btree_maps.is_empty() {
+            config.btree_map(&self.btree_maps);
         }
         for (path, attribute) in &self.type_attributes {
             config.type_attribute(path, attribute);
@@ -807,6 +821,7 @@ mod tests {
             .client(false)
             .file_descriptor_set("fds.bin")
             .bytes(["."])
+            .btree_map([".a.v1"])
             .type_attribute(".a", "#[derive(Eq)]")
             .field_attribute(".a.A.b", "#[doc = \"b\"]")
             .out_dir("/tmp/out")
@@ -819,6 +834,7 @@ mod tests {
         assert!(!build.server && !build.client);
         assert_eq!(build.descriptor_set.as_deref(), Some("fds.bin"));
         assert_eq!(build.bytes, ["."]);
+        assert_eq!(build.btree_maps, [".a.v1"]);
         assert_eq!(build.type_attributes.len(), 1);
         assert_eq!(build.field_attributes.len(), 1);
         assert_eq!(build.out_dir.as_deref(), Some(Path::new("/tmp/out")));

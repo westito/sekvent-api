@@ -817,14 +817,19 @@ mod tests {
                     Some("down") => Err(AppError::unavailable("sessions are down")),
                     Some("panic") => panic!("secret token"),
                     Some("hang") => std::future::pending().await,
-                    Some(user) if user.starts_with("user-") => {
-                        Ok(EndUser::new(user).with_tenant("t-1").with_roles(["buyer"]))
-                    }
+                    Some(user) if user.starts_with("user-") => Ok(EndUser::new(user)
+                        .with_tenant("t-1")
+                        .with_roles(["buyer"])
+                        .with_extension(SessionScope("orders:read"))),
                     _ => Err(AppError::unauthenticated("token signature mismatch")),
                 }
             })
         }
     }
+
+    /// What `Sessions` learned about a session besides its user.
+    #[derive(Debug, Clone, PartialEq)]
+    struct SessionScope(&'static str);
 
     fn end_user_served(link: bool, timeout: Option<Duration>) -> Served {
         let inbound = link.then(|| {
@@ -869,6 +874,11 @@ mod tests {
         let user = prepared.cx.end_user().unwrap();
         assert_eq!(user.subject(), "user-7");
         assert!(user.has_role("buyer"));
+        assert_eq!(
+            user.extension::<SessionScope>(),
+            Some(&SessionScope("orders:read")),
+            "the authenticator's extensions reach the handler"
+        );
         assert_eq!(prepared.cx.subject(), Some("user-7"), "never the header's");
         assert_eq!(prepared.cx.tenant(), Some("t-1"));
         assert_eq!(prepared.cx.caller(), None);

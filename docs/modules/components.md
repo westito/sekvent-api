@@ -813,12 +813,34 @@ async fn get_order(&self, cx: &CallContext, req: GetOrderRequest) -> Result<Orde
 }
 ```
 
-`EndUser` has `subject()`, `tenant()`, `roles()` and `has_role(..)`. The
+`EndUser` has `subject()`, `tenant()`, `roles()`, `has_role(..)` and
+`extension::<T>()`. The
 context's subject and tenant are set from it, so `cx.tenant()` works the
 same for an end user as behind a trusted link. Subject and tenant headers
 the client sent itself are dropped before the authenticator runs, so an end
 user cannot assert another identity. The components this handler calls see
-subject and tenant only; the end user and its roles stay here.
+subject and tenant only; the end user, its roles and its extensions stay
+here.
+
+When the authenticator loads a record anyway (an API token row, to check
+revocation), it can hand the rest of it to the handlers as a typed
+extension instead of having them read it again:
+
+```rust
+#[derive(Clone)]
+struct TokenScope { permissions: Vec<String> }
+
+// in the authenticator
+Ok(EndUser::new(token.owner).with_roles(token.roles).with_extension(TokenScope { permissions: token.permissions }))
+
+// in the handler
+if let Some(scope) = cx.end_user().and_then(EndUser::extension::<TokenScope>) {
+    // narrow what the roles allow
+}
+```
+
+One value per type (use a type of your own); `Debug` shows only how many
+there are. See [context](context.md#concepts).
 
 ### Public methods: `#[call(anonymous)]`
 

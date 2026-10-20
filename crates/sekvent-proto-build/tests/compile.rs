@@ -201,7 +201,10 @@ fn both_runs_tonic_and_the_hook() {
 /// the same whether or not prost formatted it.
 fn compact(text: &str) -> String {
     let dense: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    dense.replace(",]", "]").replace(",)", ")")
+    dense
+        .replace(",]", "]")
+        .replace(",)", ")")
+        .replace(",>", ">")
 }
 
 /// A package with two services, streaming RPCs of every kind, a type from another
@@ -505,4 +508,124 @@ fn an_import_missing_from_every_include_names_it() {
     let message = error.to_string();
     assert!(message.contains("svc.proto"), "{message}");
     assert!(message.contains("vendor/v1/thing.proto"), "{message}");
+}
+
+/// A package with map fields in two messages and a service.
+fn maps_fixture(dir: &Path) {
+    fs::create_dir_all(dir.join("tags/v1")).unwrap();
+    fs::write(
+        dir.join("tags/v1/tags.proto"),
+        "syntax = \"proto3\";\n\
+         package tags.v1;\n\
+         message Tagged {\n\
+           map<string, string> labels = 1;\n\
+           map<string, int64> counts = 2;\n\
+         }\n\
+         message Plain { map<string, string> labels = 1; }\n\
+         service Tags { rpc Get(Tagged) returns (Plain); }\n",
+    )
+    .unwrap();
+}
+
+/// Defines `Tagged` from the given fields and keeps their source text, so
+/// a test can check that prost generated exactly these fields and then
+/// encode the type.
+macro_rules! mirrored {
+    ($($fields:tt)*) => {
+        const TAGGED_FIELDS: &str = stringify!($($fields)*);
+
+        #[allow(unreachable_pub)]
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        struct Tagged {
+            $($fields)*
+        }
+    };
+}
+
+mirrored! {
+    #[prost(btree_map = "string, string", tag = "1")]
+    pub labels: ::prost::alloc::collections::BTreeMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+    #[prost(btree_map = "string, int64", tag = "2")]
+    pub counts: ::prost::alloc::collections::BTreeMap<::prost::alloc::string::String, i64>,
+}
+
+#[test]
+fn maps_are_hash_maps_unless_btree_map_names_them() {
+    let src = tempfile::tempdir().unwrap();
+    maps_fixture(src.path());
+    let out = tempfile::tempdir().unwrap();
+    ProtoBuild::new(src.path())
+        .messages_only()
+        .out_dir(out.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+    let tags = read(&out.path().join("tags.v1.rs"));
+    assert!(tags.contains("prost(map = \"string, string\""), "{tags}");
+    assert!(!tags.contains("BTreeMap"), "{tags}");
+}
+
+#[test]
+fn btree_map_applies_to_every_matching_map_field() {
+    let src = tempfile::tempdir().unwrap();
+    maps_fixture(src.path());
+    let out = tempfile::tempdir().unwrap();
+    ProtoBuild::new(src.path())
+        .messages_only()
+        .btree_map(["."])
+        .out_dir(out.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+    let tags = read(&out.path().join("tags.v1.rs"));
+    assert!(compact(&tags).contains(&compact(TAGGED_FIELDS)), "{tags}");
+    assert!(!tags.contains("HashMap"), "{tags}");
+    assert!(!tags.contains("prost(map"), "{tags}");
+}
+
+#[test]
+fn btree_map_paths_select_fields_in_combined_mode() {
+    let src = tempfile::tempdir().unwrap();
+    maps_fixture(src.path());
+    let out = tempfile::tempdir().unwrap();
+    ProtoBuild::new(src.path())
+        .both()
+        .btree_map([".tags.v1.Tagged"])
+        .out_dir(out.path())
+        .emit_rerun_if_changed(false)
+        .compile()
+        .unwrap();
+    let tags = read(&out.path().join("tags.v1.rs"));
+    assert!(compact(&tags).contains(&compact(TAGGED_FIELDS)), "{tags}");
+    assert!(
+        tags.contains("prost(map = \"string, string\""),
+        "`Plain` keeps its HashMap: {tags}"
+    );
+    assert!(tags.contains("tags_server"), "{tags}");
+}
+
+#[test]
+fn btree_maps_encode_the_same_whatever_the_insertion_order() {
+    let mut forward = Tagged::default();
+    let mut backward = Tagged::default();
+    let keys = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+    let entries: Vec<(i64, &str)> = (0_i64..).zip(keys).collect();
+    for &(value, key) in &entries {
+        forward.labels.insert(key.to_owned(), key.to_uppercase());
+        forward.counts.insert(key.to_owned(), value);
+    }
+    for &(value, key) in entries.iter().rev() {
+        backward.labels.insert(key.to_owned(), key.to_uppercase());
+        backward.counts.insert(key.to_owned(), value);
+    }
+    let bytes = forward.encode_to_vec();
+    assert_eq!(bytes, backward.encode_to_vec());
+
+    // Entries go out in key order: the first is `alpha`'s label.
+    assert_eq!(bytes[0], 0x0a, "field 1, length-delimited");
+    assert_eq!(&bytes[2..9], b"\x0a\x05alpha");
+    assert_eq!(Tagged::decode(bytes.as_slice()).unwrap(), forward);
 }
