@@ -1,0 +1,38 @@
+[package]
+name = "sekvent-storage"
+description = "S3-compatible object storage: presigned uploads and downloads, server-side head, delete and copy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# `StorageProbe`: a readiness probe for `sekvent-runtime`.
+runtime = ["dep:sekvent-runtime", "dep:futures"]
+
+[dependencies]
+sekvent-client = { workspace = true }
+sekvent-config = { workspace = true }
+sekvent-context = { workspace = true }
+sekvent-error = { workspace = true }
+sekvent-resilience = { workspace = true }
+# Path, not workspace: keeps sekvent-runtime's default grpc-web feature off.
+sekvent-runtime = { path = "../sekvent-runtime", default-features = false, optional = true }
+futures = { workspace = true, optional = true }
+hmac = { workspace = true }
+httpdate = { workspace = true }
+percent-encoding = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+sekvent-testing = { workspace = true, features = ["minio"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

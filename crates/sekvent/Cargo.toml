@@ -20,7 +20,12 @@ config = ["dep:sekvent-config"]
 error = ["dep:sekvent-error"]
 context = ["dep:sekvent-context"]
 telemetry = ["dep:sekvent-telemetry"]
-runtime = ["dep:sekvent-runtime", "sekvent-component?/runtime", "sekvent-db?/runtime"]
+runtime = [
+    "dep:sekvent-runtime",
+    "sekvent-component?/runtime",
+    "sekvent-db?/runtime",
+    "sekvent-storage?/runtime",
+]
 resilience = ["dep:sekvent-resilience"]
 auth = ["dep:sekvent-auth"]
 link = ["dep:sekvent-link"]
@@ -32,6 +37,8 @@ component = ["dep:sekvent-component", "config", "error", "context"]
 component-grpc = ["component", "sekvent-component/grpc"]
 # Browser single sign-on (OAuth 2.0 code flow, Bitbucket Cloud provider).
 sso = ["dep:sekvent-sso"]
+# S3-compatible object storage: presigned uploads and downloads.
+storage = ["dep:sekvent-storage"]
 
 # sekvent-error wire mappings.
 error-http = ["error", "sekvent-error/http"]
@@ -81,6 +88,7 @@ full = [
     "component",
     "component-grpc",
     "sso",
+    "storage",
     "error-http",
     "error-grpc",
     "runtime-grpc-web",
@@ -117,6 +125,7 @@ sekvent-client = { workspace = true, optional = true }
 sekvent-db = { workspace = true, optional = true }
 sekvent-component = { workspace = true, optional = true }
 sekvent-sso = { workspace = true, optional = true }
+sekvent-storage = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

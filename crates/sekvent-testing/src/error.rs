@@ -24,6 +24,10 @@ pub enum HarnessError {
     /// The database never accepted a connection within the startup budget.
     #[error("database server did not become ready: {0}")]
     NotReady(String),
+    /// A command run inside a container failed.
+    #[cfg(feature = "minio")]
+    #[error("command in the container failed: {0}")]
+    Exec(String),
     /// A database statement failed.
     #[cfg(any(feature = "postgres", feature = "mysql"))]
     #[error("database statement failed: {0}")]

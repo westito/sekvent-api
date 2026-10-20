@@ -240,3 +240,64 @@ async fn mysql_databases_are_separate_and_reachable() {
     assert!(!my.admin_url().contains(":sekvent@"));
     assert!(!format!("{my:?}").contains("mysql://"));
 }
+
+#[cfg(feature = "minio")]
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn minio_buckets_are_separate_and_described_without_secrets() {
+    use sekvent_testing::MinioHarness;
+
+    if skip() {
+        return;
+    }
+    let minio = MinioHarness::shared().await;
+    assert!(std::ptr::eq(minio, MinioHarness::shared().await));
+    let first = minio.create_bucket().await.unwrap();
+    let second = minio.create_bucket().await.unwrap();
+    assert_ne!(first.name, second.name);
+    assert_eq!(first.endpoint, minio.endpoint());
+    assert_eq!(
+        minio.endpoint(),
+        format!("http://{}:{}", minio.host(), minio.port())
+    );
+    assert_eq!(first.region, minio.region());
+    assert_eq!(first.access_key_id, minio.access_key_id());
+    assert_eq!(first.secret_access_key, minio.secret_access_key());
+    assert_eq!(minio.secret_access_key().len(), 32);
+    assert!(!format!("{minio:?}").contains(minio.secret_access_key()));
+    assert!(!format!("{first:?}").contains(minio.secret_access_key()));
+
+    let reachable = tokio::net::TcpStream::connect((minio.host(), minio.port())).await;
+    assert!(reachable.is_ok(), "the published port answers");
+}
+
+#[cfg(feature = "minio")]
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_dedicated_minio_container_carries_the_harness_labels() {
+    use sekvent_testing::MinioHarness;
+
+    if skip() {
+        return;
+    }
+    let harness = Harness::with_run_id(
+        "io.sekvent.harness.selftest",
+        Some(&format!("minio-labels-{}", std::process::id())),
+    )
+    .unwrap();
+    let minio = MinioHarness::start(&harness, MinioHarness::default_image())
+        .await
+        .unwrap();
+    let listed = Command::new("docker")
+        .args([
+            "ps",
+            "--quiet",
+            "--filter",
+            &harness.run_filter(harness.run_id()),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&listed.stdout).lines().count(), 1);
+    drop(minio);
+    harness.sweep_run(harness.run_id()).unwrap();
+}

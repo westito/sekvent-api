@@ -5,7 +5,7 @@ package, `sekvent-api` (library name `sekvent`), and turns on the modules it
 needs: configuration, an error model, a per-call context, logging, a staged
 lifecycle with one server for gRPC, gRPC-Web and REST, jobs, resilience
 policies, auth, browser single sign-on, service-to-service tokens, an outbound HTTP client, databases
-with leases, and a component model. The `cargo sekvent` CLI scaffolds
+with leases, S3-compatible object storage, and a component model. The `cargo sekvent` CLI scaffolds
 workspaces and runs the quality gate.
 
 ## Start here
@@ -30,12 +30,13 @@ workspaces and runs the quality gate.
 | `sekvent::db` | `db-*` | [db](modules/db.md) | Named pools, migrations, error classification, list filters, probes, leases |
 | `sekvent::auth` | `auth` | [auth](modules/auth.md) | argon2id and bcrypt passwords, login helper, JWT with injected time |
 | `sekvent::sso` | `sso` | [sso](modules/sso.md) | Browser single sign-on (OAuth 2.0 code flow), Bitbucket Cloud provider, one-time handoff codes |
+| `sekvent::storage` | `storage` | [storage](modules/storage.md) | S3-compatible object storage: presigned browser uploads and downloads, head, delete, copy, bucket probe |
 | `sekvent::link` | `link` | [link](modules/link.md) | Service-to-service tokens, inbound checks, outbound attachment |
 | `sekvent::client` | `client` | [client](modules/client.md) | Outbound HTTP with policies, context propagation, OAuth 2.0 |
 | `sekvent::resilience` | `resilience` | [resilience](modules/resilience.md) | Backoff, retries with budgets, rate gate, bulkhead, breaker, TTL cache |
 | `sekvent::component` | `component` | [components](modules/components.md) | Components with proto contracts, the `App` builder, bindings, gRPC serving |
 | `sekvent-proto-build` | build-dependency | [proto-build](modules/proto-build.md) | `build.rs` codegen with protox (no `protoc`), contract constants |
-| `sekvent-testing` | dev-dependency | [testing](modules/testing.md) | Postgres and MySQL containers, `await_until!`, deterministic test rules |
+| `sekvent-testing` | dev-dependency | [testing](modules/testing.md) | Postgres, MySQL and MinIO containers, `await_until!`, deterministic test rules |
 
 ## How the pieces fit
 
@@ -82,6 +83,7 @@ A typical service:
 | [design/component-end-user.md](design/component-end-user.md) | Specification of serving components to end users: `SERVE_AUTH=bearer`, the end-user authenticator, `#[call(anonymous)]`, `#[call(optional_end_user)]`, gRPC-Web |
 | [design/sso.md](design/sso.md) | Specification of browser single sign-on: providers, state cookie, handoff codes, Bitbucket Cloud |
 | [design/p8-service-essentials.md](design/p8-service-essentials.md) | Specification of server essentials, probes, password schemes, jobs, leases, HTTP helpers |
+| [design/storage.md](design/storage.md) | Specification of object storage: own SigV4 signer on rustls/ring, presigned uploads and downloads, two endpoints, the MinIO test image |
 | [design/static-site.md](design/static-site.md) | Specification of serving a built frontend: the virtual filesystem, path normalization, `StaticSite`, server routing |
 | [examples/shop](../examples/shop/README.md) | Three components (orders, inventory, notifications) in monolith and split topologies |
 

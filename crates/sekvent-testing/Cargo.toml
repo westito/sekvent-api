@@ -1,6 +1,6 @@
 [package]
 name = "sekvent-testing"
-description = "Testcontainers harness for Postgres and MySQL with crash-safe cleanup."
+description = "Testcontainers harness for Postgres, MySQL and MinIO with crash-safe cleanup."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,8 @@ default = []
 postgres = ["dep:sqlx", "sqlx/postgres"]
 # `MySqlHarness`: a shared MySQL container with one database per test.
 mysql = ["dep:sqlx", "sqlx/mysql"]
+# `MinioHarness`: a shared S3-compatible MinIO container with one bucket per test.
+minio = []
 
 [dependencies]
 testcontainers = { workspace = true }

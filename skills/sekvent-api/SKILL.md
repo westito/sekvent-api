@@ -46,12 +46,13 @@ can describe APIs the project does not have yet.
 | Pools, migrations, DB error mapping, list filters, probes, leases | `docs/modules/db.md` |
 | Passwords (argon2id, bcrypt), login, JWT, roles | `docs/modules/auth.md` |
 | Browser single sign-on (OAuth 2.0 code flow, Bitbucket Cloud) | `docs/modules/sso.md` |
+| Browser uploads/downloads via S3-compatible storage (presigned URLs), keys, MinIO tests | `docs/modules/storage.md` |
 | Service-to-service tokens | `docs/modules/link.md` |
 | Call an upstream HTTP API (retries, OAuth 2.0, context propagation) | `docs/modules/client.md` |
 | Retry, breaker, bulkhead, rate gate, timeout, TTL cache | `docs/modules/resilience.md` |
 | Components (trait + proto contract, App builder, bindings, split topology) | `docs/modules/components.md`, concepts in `docs/component-model.md` |
 | `build.rs` protobuf codegen without `protoc` | `docs/modules/proto-build.md` |
-| Container-backed DB tests, deterministic tests, coverage | `docs/modules/testing.md` |
+| Container-backed DB and MinIO tests, deterministic tests, coverage | `docs/modules/testing.md` |
 | Why something is designed the way it is | `docs/design/*.md` (decisions; the module pages describe current behaviour) |
 | A complete multi-component example | `examples/shop/` |
 
@@ -133,6 +134,7 @@ this shape; read it before restructuring.
 | Passwords, JWT | `auth` (+ `auth-tokio` for hashing off the async threads, `auth-axum` / `auth-tonic` adapters) |
 | Browser single sign-on | `sso` |
 | Outbound HTTP | `client` |
+| File uploads/downloads (S3, MinIO, presigned URLs) | `storage` |
 | Retry, breaker, TTL cache | `resilience` |
 | Service-to-service tokens | `link` (+ `link-axum` / `link-tonic`) |
 | Components | `component` (+ `component-grpc` for the gRPC binding) |

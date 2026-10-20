@@ -44,6 +44,7 @@ example an `-api` crate that only declares a component contract).
 | `link` | `sekvent::link` (service-to-service tokens) | `sekvent-link` | [link](modules/link.md) |
 | `client` | `sekvent::client` (outbound HTTP, OAuth 2.0) | `sekvent-client` | [client](modules/client.md) |
 | `db` | `sekvent::db` (pools, migrations, filters, errors) | `sekvent-db` | [db](modules/db.md) |
+| `storage` | `sekvent::storage` (S3-compatible object storage, presigned uploads and downloads) | `sekvent-storage` | [storage](modules/storage.md) |
 | `component` | `sekvent::component` plus `sekvent::{App, ComponentError, component}` | `sekvent-component` | [components](modules/components.md) |
 
 `component` also turns on `config`, `error` and `context`.
@@ -81,6 +82,7 @@ Some APIs need two features at once. The facade wires them for you:
 |---|---|---|
 | `db-*` (a backend) | `runtime` (default) | `PoolProbe` and `PoolRegistry::probes()` for readiness |
 | `db-lease` + a backend | `runtime` (default) | `LeaseGuard`, a `JobGuard` that makes a job run on one instance |
+| `storage` | `runtime` (default) | `StorageProbe`, a bucket readiness probe |
 | `component` | `runtime` (default) | `App::register`, which runs the components as one runtime unit |
 
 ## Things that surprise people

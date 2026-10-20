@@ -2,7 +2,8 @@
 
 `sekvent-testing` runs database-backed tests against real Postgres and
 MySQL servers in Docker containers: one server per test binary, started on
-first use, and a fresh, uniquely named database per test. Containers carry
+first use, and a fresh, uniquely named database per test. Object storage
+tests get a MinIO server the same way, with a fresh bucket per test. Containers carry
 labels and a watchdog that removes them when the test process ends, even
 after `SIGKILL`, and `cargo sekvent harness-clean` sweeps any leftovers. The
 crate also provides `await_until!`, a bounded poll for side effects that have
@@ -22,6 +23,7 @@ state, tracing capture and the coverage gate.
 | (none) | `Harness`, `Reaper`, `await_until!`, `docker_tests_enabled`, address helpers, sweeps |
 | `postgres` | `PostgresHarness` (pulls sqlx with Postgres) |
 | `mysql` | `MySqlHarness` (pulls sqlx with MySQL) |
+| `minio` | `MinioHarness`, `TestBucket`: an S3-compatible MinIO server for [storage](storage.md) tests (no extra dependencies) |
 
 ```toml
 [dev-dependencies]
@@ -130,6 +132,39 @@ admin user `root` and admin database `mysql`. Postgres connects as user
   MySQL: `--skip-log-bin`, `--innodb-flush-log-at-trx-commit=0`,
   `--max-connections=500`). Startup waits for the server's readiness log and
   a successful connection (Postgres up to 120 s, MySQL 180 s).
+
+### Start an object storage server
+
+```rust
+impl MinioHarness {
+    pub async fn shared() -> &'static Self;                                        // panics if it cannot start
+    pub async fn start(harness: &Harness, image: ServerImage) -> Result<Self, HarnessError>;
+    pub fn default_image() -> ServerImage;          // pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    pub async fn create_bucket(&self) -> Result<TestBucket, HarnessError>;
+    pub fn endpoint(&self) -> String;               // http://host:port
+    pub fn host(&self) -> &str;
+    pub fn port(&self) -> u16;
+    pub fn region(&self) -> &str;                   // us-east-1
+    pub fn access_key_id(&self) -> &str;            // the root user
+    pub fn secret_access_key(&self) -> &str;        // the random root password
+}
+```
+
+- `create_bucket()` returns `TestBucket { name, endpoint, region,
+  access_key_id, secret_access_key }`; the name is `t-` plus 32 hex digits.
+  `bucket.config("FILES_")` yields `FILES_ENDPOINT`, `FILES_REGION`,
+  `FILES_BUCKET`, `FILES_ACCESS_KEY_ID`, `FILES_SECRET_ACCESS_KEY` and
+  `FILES_PATH_STYLE=true` for `sekvent::storage::StorageConfig`; collect
+  them into a `MapSource`. `TestBucket`'s `Debug` omits the secret.
+- Buckets are created with `mc mb` run inside the container, so a custom
+  image (`SEKVENT_TEST_MINIO_IMAGE`) must run `server <dir>` and carry
+  `mc`. A failed command is `HarnessError::Exec` with the password
+  redacted from its output.
+- The default image: MinIO stopped publishing community images in
+  October 2025 and `minio/minio` no longer serves new tags. `pgsty/minio`
+  is a maintained community build of the same server (with `mc`), pinned to
+  a release tag. Startup waits for the `API:` log line and a successful
+  `mc ls` (up to 120 s).
 
 `ServerImage { name, tag }`: `ServerImage::new("postgres", "16")` or
 `ServerImage::parse("registry.example:5000/db/postgres:16")` (a reference
@@ -440,6 +475,7 @@ hold lives in a measured library.
 ## See also
 
 - [Databases](db.md) — pools, leases and their Docker tests
+- [Storage](storage.md) — presigned uploads tested against `MinioHarness`
 - [Context](context.md) — `Clock`, `ManualClock`, `CallContext` deadlines
 - [Telemetry](telemetry.md) — `LogBuffer`
 - [Components](components.md) — fakes and binding profiles

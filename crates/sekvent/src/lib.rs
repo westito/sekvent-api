@@ -18,6 +18,7 @@
 //! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, list filters, readiness probes, leases |
 //! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local, serialized and gRPC bindings |
 //! | [`sso`] | `sekvent-sso` | `sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), one-time handoff codes |
+//! | [`storage`] | `sekvent-storage` | `storage` | S3-compatible object storage: presigned uploads and downloads, head, delete, copy |
 //!
 //! # Sub-features
 //!
@@ -45,6 +46,8 @@
 //!   sqlx backend; with `runtime` also `LeaseGuard` for singleton jobs.
 //! - `db` and `runtime` together give pool readiness probes
 //!   (`PoolRegistry::probes`) on a sqlx backend.
+//! - `storage` and `runtime` together give the bucket readiness probe
+//!   (`storage::StorageProbe`).
 //! - `component` also turns on `config`, `error` and `context`; with
 //!   `runtime` on as well, `App::register` runs the App as a runtime unit.
 //! - `component-grpc`: the component `grpc` binding and serving components
@@ -56,7 +59,7 @@
 //! Two crates are deliberately left out, because they belong in other
 //! dependency sections:
 //!
-//! - `sekvent-testing` (Postgres and MySQL containers, the reaper,
+//! - `sekvent-testing` (Postgres, MySQL and `MinIO` containers, the reaper,
 //!   `await_until!`) goes under `[dev-dependencies]`.
 //! - `sekvent-proto-build` (protobuf code generation) goes under
 //!   `[build-dependencies]` and is driven from `build.rs`.
@@ -134,6 +137,10 @@ pub use sekvent_component as component;
 /// Browser single sign-on with OAuth 2.0 identity providers.
 #[cfg(feature = "sso")]
 pub use sekvent_sso as sso;
+
+/// S3-compatible object storage with presigned URLs.
+#[cfg(feature = "storage")]
+pub use sekvent_storage as storage;
 
 /// `#[component(...)]` on a trait; the `App`; the `ComponentError` trait and
 /// its derive.

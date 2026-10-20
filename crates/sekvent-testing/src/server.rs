@@ -1,4 +1,7 @@
-#![cfg_attr(not(any(feature = "postgres", feature = "mysql")), allow(dead_code))]
+#![cfg_attr(
+    not(any(feature = "postgres", feature = "mysql", feature = "minio")),
+    allow(dead_code)
+)]
 
 use std::future::Future;
 use std::time::Duration;

@@ -1,4 +1,4 @@
-//! Testcontainers harness for Postgres and MySQL with crash-safe cleanup.
+//! Testcontainers harness for Postgres, MySQL and `MinIO` with crash-safe cleanup.
 //!
 //! This crate is for tests only: add it under `[dev-dependencies]`.
 //!
@@ -11,6 +11,9 @@
 //!   `mysql`): one database server per test binary, started lazily and
 //!   shared by every test in it, with a fresh, uniquely named database per
 //!   test via `create_database()`.
+//! - `MinioHarness` (feature `minio`): one S3-compatible `MinIO` server per
+//!   test binary with a fresh bucket per test via `create_bucket()`, whose
+//!   `TestBucket::config` feeds `sekvent-storage`.
 //! - [`Reaper`]: a detached watchdog process that removes a container once the
 //!   test process is gone, even when it was killed with `SIGKILL`.
 //! - [`container_addr`]: the address a container is reachable on, honouring
@@ -63,6 +66,8 @@ mod reaper;
 mod server;
 mod sweep;
 
+#[cfg(feature = "minio")]
+mod minio;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "postgres")]
@@ -76,6 +81,8 @@ pub use reaper::Reaper;
 pub use server::{DOCKER_TESTS_ENV, ServerImage, TestDatabase, docker_tests_enabled};
 pub use sweep::SweepReport;
 
+#[cfg(feature = "minio")]
+pub use minio::{MinioHarness, TestBucket};
 #[cfg(feature = "mysql")]
 pub use mysql::MySqlHarness;
 #[cfg(feature = "postgres")]

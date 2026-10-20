@@ -37,11 +37,12 @@ speed and flakes: the `rust-testing` skill.
 | Browser sign-in with an external account (OAuth 2.0 code flow, Bitbucket Cloud) | `sso` | `sso` |
 | Service-to-service tokens | `link` | `link`; `link-axum`, `link-tonic` |
 | Outbound HTTP, OAuth 2.0 client credentials | `client` | `client` |
+| File uploads/downloads via S3-compatible storage (presigned URLs), head, delete, copy | `storage` | `storage`; with `runtime` also `StorageProbe` |
 | Pools, migrations, list filters | `db` | `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` |
 | Readiness probes per pool | `db` (`PoolRegistry::probes`) | `db` + `runtime` + a sqlx backend |
 | Leases with fencing tokens, singleton jobs | `db` (`LeaseStore`, `LeaseGuard`) | `db-lease` + a sqlx backend; `runtime` for `LeaseGuard` |
 | A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; `component-grpc` for the `grpc` binding and serving; `runtime` for `App::register` |
-| Postgres/MySQL test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` |
+| Postgres/MySQL/MinIO test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` (features `postgres`, `mysql`, `minio`) |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
 
 Enable features on the crate's own `sekvent-api = { workspace = true, features = [...] }`
@@ -708,6 +709,31 @@ email (which is set only when verified). Bitbucket admits only members of
 `WORKSPACE`; the consumer needs Account: Read and Account: Email. Details:
 `docs/modules/sso.md`.
 
+### File uploads with presigned URLs
+
+```rust
+use sekvent::config::EnvSource;
+use sekvent::storage::{ObjectKey, PresignGet, PresignPut, Storage};
+
+let storage = Storage::from_config(&EnvSource, "STORAGE_")?;
+// STORAGE_ENDPOINT, STORAGE_PUBLIC_ENDPOINT (optional), STORAGE_REGION, STORAGE_BUCKET,
+// STORAGE_ACCESS_KEY_ID, STORAGE_SECRET_ACCESS_KEY, STORAGE_PATH_STYLE (MinIO: true)
+
+let key = ObjectKey::new(format!("attachments/{issue_id}/{}", uuid::Uuid::now_v7()))?; // server-chosen
+let upload = storage.presign_put(&key, PresignPut::new("image/png").content_length(size))?;
+// → browser: fetch(upload.url, { method: "PUT", headers: upload.headers, body: file })
+let info = storage.head(&ctx, &key).await?;          // Option<ObjectInfo { size, content_type, etag, .. }>
+// check size/type, delete mismatches, then store key + original file name in the DB
+let download = storage.presign_get(&key, PresignGet::new().attachment(&file_name))?;
+```
+
+Authorize before presigning; keep URLs short-lived and out of logs. S3
+cannot cap a presigned `PUT` by size, so sign the exact length or `head`
+after upload. Tests: `sekvent_testing::MinioHarness::shared().await
+.create_bucket()` (feature `minio`), `bucket.config("FILES_")` into a
+`MapSource`; presign with a past `ManualClock` to test expiry. Details:
+`docs/modules/storage.md`.
+
 ### bcrypt-compatible passwords
 
 A service sharing a password store with applications that read bcrypt
@@ -1155,6 +1181,10 @@ listener) with `await_until!`.
   code travels in the fragment. Keep `secure_cookies` on outside
   `http://localhost`, give the state key its own secret, and run one
   instance (or sticky routing) because handoff codes live in memory.
+- **Object storage.** Never derive object keys from user file names, never
+  log a presigned URL, and do not trust what the browser says about an
+  upload: `head` it and compare with what you allowed. Serve user files as
+  `attachment` or with a safe `response_content_type`.
 - **Time and randomness.** Inject `Clock` (`SystemClock` / `ManualClock`)
   and seedable RNGs where behaviour depends on them; JWT and login APIs take
   `now_unix_secs` explicitly.

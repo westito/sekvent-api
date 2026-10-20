@@ -64,9 +64,10 @@ repository; describe behaviour in your own words and use neutral examples
 | `sekvent-link` | service tokens, `TokenMap`, middleware, interceptor | config, context, error |
 | `sekvent-client` | reqwest builder, resilience, context propagation, OAuth2 cache | config, context, error, resilience, telemetry |
 | `sekvent-sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), state cookie, handoff codes | config, error, context, client |
+| `sekvent-storage` | S3-compatible object storage: SigV4 presigned uploads and downloads, head, delete, copy, bucket probe | config, error, context, client, resilience, runtime (optional) |
 | `sekvent-db` | named pools, migrations, distinct-target check, sea-orm filters, probes, leases | config, error, runtime (optional) |
 | `sekvent-component` | components, App builder, local, serialized and gRPC bindings | config, error, context, resilience, link (optional), macros, runtime (optional) |
-| `sekvent-testing` | Postgres/MySQL containers, reaper, `await_until!` | — |
+| `sekvent-testing` | Postgres/MySQL/MinIO containers, reaper, `await_until!` | — |
 | `sekvent-proto-build` | build.rs codegen helpers, component service-contract constants and RPC type aliases | — |
 | `sekvent-api` (lib `sekvent`) | facade re-exporting the above behind features | all |
 | `sekvent-facade-check` | compiles and tests a component through the facade alone | facade |
