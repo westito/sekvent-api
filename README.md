@@ -161,10 +161,9 @@ CLI a project runs. CI caches that directory.
 Unknown subcommands are passed to the workspace's `xtask` package when there
 is one.
 
-sekvent's own repository runs the same checks in
-[`.github/workflows/gate.yml`](.github/workflows/gate.yml): format check,
-clippy with `-D warnings`, the test suite, and a 95 % line coverage floor
-through `cargo llvm-cov`.
+sekvent's own repository runs the same checks through `cargo sekvent gate`
+and `cargo sekvent coverage`: format check, clippy with `-D warnings`, the
+test suite, and a 95 % line coverage floor through `cargo llvm-cov`.
 
 ## Agent skills
 

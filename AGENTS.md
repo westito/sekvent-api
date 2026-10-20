@@ -19,8 +19,10 @@ repository; describe behaviour in your own words and use neutral examples
 - Remote: `git@github.com:westito/sekvent-api.git` (public; anonymous
   `https://github.com/westito/sekvent-api` works for clones, git
   dependencies, the install script and `self-update`), branch `master`.
-  Projects track `master`; the only tag is the rolling `cli-latest`
-  prerelease that `cli-release.yml` moves on every push.
+  Projects track `master`; the only tag is the `cli-latest` prerelease
+  holding prebuilt CLI binaries. The repository has no GitHub workflows, so
+  nothing refreshes that release automatically; the gate runs on the remote
+  builder.
 - The repository is public: no client names, client paths, hosts or
   session notes in any committed file, history included. Handoff state
   lives outside the repo.
