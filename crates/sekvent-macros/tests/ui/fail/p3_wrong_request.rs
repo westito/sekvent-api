@@ -37,12 +37,13 @@ impl prost::Name for ShoutRequest {
 }
 
 mod proto {
-    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.echo.v1.Echo",
         &[(
             "Ping",
             "check.echo.v1.ShoutRequest",
             "check.echo.v1.PingReply",
+            false,
             false,
         )],
     );

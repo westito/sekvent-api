@@ -6,7 +6,8 @@ use crate::{RPC_TYPES_PREFIX, SERVICE_CONTRACT_PREFIX};
 
 /// Appends `__sekvent_service_<Service>` after every service's position in
 /// its package's generated file: the service's full name and, per RPC, its
-/// name, request and reply full names and whether it streams. Each RPC also
+/// name, request and reply full names, whether it streams requests and
+/// whether it streams replies. Each RPC also
 /// gets `__sekvent_rpc_<Service>__<Rpc>`, an alias of its Rust
 /// `(Request, Reply)` types. The `#[component(proto = …)]` macro checks a
 /// component trait against both.
@@ -27,10 +28,10 @@ pub(crate) fn render(service: &Service) -> String {
         "/// Contract of `{full_name}`, checked by `#[component(proto = …)]`."
     );
     out.push_str("#[doc(hidden)]\n");
-    out.push_str("#[allow(non_upper_case_globals, dead_code)]\n");
+    out.push_str("#[allow(non_upper_case_globals, dead_code, clippy::type_complexity)]\n");
     let _ = writeln!(
         out,
-        "pub const {SERVICE_CONTRACT_PREFIX}{}: (&str, &[(&str, &str, &str, bool)]) = (",
+        "pub const {SERVICE_CONTRACT_PREFIX}{}: (&str, &[(&str, &str, &str, bool, bool)]) = (",
         service.proto_name
     );
     let _ = writeln!(out, "    {full_name:?},");
@@ -41,11 +42,12 @@ pub(crate) fn render(service: &Service) -> String {
         for method in &service.methods {
             let _ = writeln!(
                 out,
-                "        ({:?}, {:?}, {:?}, {}),",
+                "        ({:?}, {:?}, {:?}, {}, {}),",
                 method.proto_name,
                 type_name(&method.input_proto_type),
                 type_name(&method.output_proto_type),
-                method.client_streaming || method.server_streaming,
+                method.client_streaming,
+                method.server_streaming,
             );
         }
         out.push_str("    ],\n");
@@ -169,14 +171,14 @@ mod tests {
             render(&invoices),
             "/// Contract of `billing.v1.Invoices`, checked by `#[component(proto = …)]`.\n\
              #[doc(hidden)]\n\
-             #[allow(non_upper_case_globals, dead_code)]\n\
-             pub const __sekvent_service_Invoices: (&str, &[(&str, &str, &str, bool)]) = (\n\
+             #[allow(non_upper_case_globals, dead_code, clippy::type_complexity)]\n\
+             pub const __sekvent_service_Invoices: (&str, &[(&str, &str, &str, bool, bool)]) = (\n\
              \x20   \"billing.v1.Invoices\",\n\
              \x20   &[\n\
-             \x20       (\"GetInvoice\", \"billing.v1.GetInvoiceRequest\", \"billing.v1.Invoice\", false),\n\
-             \x20       (\"Total\", \"billing.v1.GetInvoiceRequest\", \"common.v1.Money\", false),\n\
-             \x20       (\"Watch\", \"billing.v1.GetInvoiceRequest\", \"billing.v1.Invoice.Line\", true),\n\
-             \x20       (\"Upload\", \"google.protobuf.BytesValue\", \"google.protobuf.Empty\", true),\n\
+             \x20       (\"GetInvoice\", \"billing.v1.GetInvoiceRequest\", \"billing.v1.Invoice\", false, false),\n\
+             \x20       (\"Total\", \"billing.v1.GetInvoiceRequest\", \"common.v1.Money\", false, false),\n\
+             \x20       (\"Watch\", \"billing.v1.GetInvoiceRequest\", \"billing.v1.Invoice.Line\", false, true),\n\
+             \x20       (\"Upload\", \"google.protobuf.BytesValue\", \"google.protobuf.Empty\", true, false),\n\
              \x20   ],\n\
              );\n\
              /// Request and reply of `billing.v1.Invoices.GetInvoice`, checked by `#[component(proto = …)]`.\n\
@@ -216,12 +218,19 @@ mod tests {
                     (".other.v1.Line", "super::super::other::v1::Line"),
                     (false, false),
                 ),
+                method(
+                    "Chat",
+                    (".shop.v1.Line", "Line"),
+                    (".shop.v1.Line", "Line"),
+                    (true, true),
+                ),
             ],
         );
         let rendered = render(&orders);
         for needle in [
-            "(\"Nested\", \"shop.v1.Order.Line\", \"shop.v1.Line\", false),",
-            "(\"Deep\", \"shop.v1.Order.Line.Tax\", \"other.v1.Line\", false),",
+            "(\"Nested\", \"shop.v1.Order.Line\", \"shop.v1.Line\", false, false),",
+            "(\"Deep\", \"shop.v1.Order.Line.Tax\", \"other.v1.Line\", false, false),",
+            "(\"Chat\", \"shop.v1.Line\", \"shop.v1.Line\", true, true),",
             "pub type __sekvent_rpc_Orders__Nested = (order::Line, Line);",
             "pub type __sekvent_rpc_Orders__Deep = (order::line::Tax, super::super::other::v1::Line);",
         ] {
@@ -238,8 +247,8 @@ mod tests {
             render(&service("", "Idle", Vec::new())),
             "/// Contract of `Idle`, checked by `#[component(proto = …)]`.\n\
              #[doc(hidden)]\n\
-             #[allow(non_upper_case_globals, dead_code)]\n\
-             pub const __sekvent_service_Idle: (&str, &[(&str, &str, &str, bool)]) = (\n\
+             #[allow(non_upper_case_globals, dead_code, clippy::type_complexity)]\n\
+             pub const __sekvent_service_Idle: (&str, &[(&str, &str, &str, bool, bool)]) = (\n\
              \x20   \"Idle\",\n\
              \x20   &[],\n\
              );\n"
@@ -256,7 +265,7 @@ mod tests {
         );
         let rendered = render(&loose);
         assert!(
-            rendered.contains("(\"Get\", \"Req\", \"Rep\", false),"),
+            rendered.contains("(\"Get\", \"Req\", \"Rep\", false, false),"),
             "{rendered}"
         );
         assert!(

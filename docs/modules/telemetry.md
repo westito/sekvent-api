@@ -241,7 +241,8 @@ Event fields:
 | `protocol` | `http`, `grpc` or `grpc-web`, by the request's content type |
 | `status` | HTTP status |
 | `grpc_status` | gRPC only: from the trailers, a trailers-only answer's headers, or the trailer frame of a gRPC-Web body (binary or base64 text) |
-| `latency_ms` | to the end of the body |
+| `latency_ms` | to the end of the body; for a stream, its duration |
+| `messages` | only when the response carries a `MessageCount`: the messages a streaming response sent, read when the request completes (component streams count one per item) |
 | `aborted` | the response did not reach its end |
 
 Levels:
@@ -260,7 +261,27 @@ unset.
 
 `RouteTemplate(pub String)` is the response extension your router sets to
 report the matched template; the combined server does this for its REST
-routes. Other public types: `AccessLogService<S>`, `AccessLogBody<B>` (the
+routes.
+
+`MessageCount` (`sekvent::telemetry::access_log::MessageCount`) is the
+response extension a streaming service sets to have its messages counted.
+It is a cheaply cloneable shared counter: put a clone in the response's
+extensions and call `increment()` as each message goes out; the access log
+keeps a clone and logs `get()` when the request completes, not when the
+headers were sent. The component gRPC service does this for every served
+stream; a tonic streaming service of your own can do the same:
+
+```rust
+use sekvent::telemetry::access_log::MessageCount;
+
+let count = MessageCount::new();
+let counted = count.clone();
+let items = items.inspect(move |_| counted.increment());   // e.g. tokio_stream::StreamExt::inspect
+let mut response = tonic::Response::new(Box::pin(items) as Self::FollowStream);
+response.extensions_mut().insert(count);
+```
+
+Other public types: `AccessLogService<S>`, `AccessLogBody<B>` (the
 wrapped response body) and `ResponseFuture<F>`.
 
 ## How to log untrusted text (`truncate_for_log`)

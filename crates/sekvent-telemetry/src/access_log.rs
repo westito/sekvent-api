@@ -23,7 +23,9 @@
 //!   `grpc-web`, by the request's content type), `status`, `grpc_status`
 //!   (gRPC only: from the trailers, the headers of a trailers-only answer,
 //!   or the trailer frame of a gRPC-Web body, binary or base64 text as the
-//!   response's content type says), `latency_ms` (to the end of the body)
+//!   response's content type says), `latency_ms` (to the end of the body),
+//!   `messages` (only when the response carries a [`MessageCount`]: the
+//!   messages a streaming response sent, read when the request completes)
 //!   and `aborted` (the response did not reach its end).
 //!
 //! Headers, query strings, bodies, peer addresses and user agents are never
@@ -40,6 +42,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
@@ -78,6 +81,29 @@ pub struct RouteTemplate(
     /// The template.
     pub String,
 );
+
+/// Counts the messages of a streaming response. Put a clone in the
+/// response's extensions and count as messages go out; the access log's
+/// completion event then has `messages`, read when the request completes.
+#[derive(Debug, Clone, Default)]
+pub struct MessageCount(Arc<AtomicU64>);
+
+impl MessageCount {
+    /// A counter at zero; also `Default`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Count one more message.
+    pub fn increment(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Messages counted so far.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 /// Request ids, the per-request span and one completion event; see the
 /// [module docs](self).
@@ -193,6 +219,7 @@ where
                     protocol,
                     status: None,
                     grpc_status: None,
+                    messages: None,
                     scanner: None,
                     started,
                     quiet,
@@ -259,7 +286,7 @@ impl Protocol {
 
 /// The completion event at a level known at compile time.
 macro_rules! completed {
-    ($level:expr, $completion:expr, $latency_ms:expr, $aborted:expr) => {
+    ($level:expr, $completion:expr, $latency_ms:expr, $messages:expr, $aborted:expr) => {
         tracing::event!(
             target: "sekvent::access",
             $level,
@@ -271,6 +298,7 @@ macro_rules! completed {
             status = $completion.status,
             grpc_status = $completion.grpc_status,
             latency_ms = $latency_ms,
+            messages = $messages,
             aborted = $aborted,
             "request completed"
         )
@@ -287,6 +315,8 @@ struct Completion {
     protocol: Protocol,
     status: Option<u16>,
     grpc_status: Option<i32>,
+    /// The response's message counter, read at completion.
+    messages: Option<MessageCount>,
     /// Reads a gRPC-Web response body for its trailer frame.
     scanner: Option<TrailerScanner>,
     started: Instant,
@@ -295,8 +325,15 @@ struct Completion {
 }
 
 impl Completion {
-    fn respond(&mut self, status: u16, headers: &HeaderMap, route: Option<&RouteTemplate>) {
+    fn respond(
+        &mut self,
+        status: u16,
+        headers: &HeaderMap,
+        route: Option<&RouteTemplate>,
+        messages: Option<&MessageCount>,
+    ) {
         self.status = Some(status);
+        self.messages = messages.cloned();
         if self.protocol.is_grpc() {
             self.grpc_status = grpc_status(headers);
             self.scanner = match Protocol::of(headers) {
@@ -370,11 +407,12 @@ impl Completion {
             return;
         }
         let level = self.level();
+        let messages = self.messages.as_ref().map(MessageCount::get);
         let _entered = self.span.enter();
         match level {
-            Level::DEBUG => completed!(Level::DEBUG, self, latency_ms, aborted),
-            Level::WARN => completed!(Level::WARN, self, latency_ms, aborted),
-            _ => completed!(Level::INFO, self, latency_ms, aborted),
+            Level::DEBUG => completed!(Level::DEBUG, self, latency_ms, messages, aborted),
+            Level::WARN => completed!(Level::WARN, self, latency_ms, messages, aborted),
+            _ => completed!(Level::INFO, self, latency_ms, messages, aborted),
         }
     }
 }
@@ -605,6 +643,7 @@ where
                     response.status().as_u16(),
                     response.headers(),
                     response.extensions().get::<RouteTemplate>(),
+                    response.extensions().get::<MessageCount>(),
                 );
                 Poll::Ready(Ok(response.map(|body| AccessLogBody::new(body, completion))))
             }
@@ -760,7 +799,12 @@ mod tests {
             .expect("valid request")
     }
 
-    async fn answer<B>(layer: &AccessLogLayer, request: Request<()>, response: Response<B>)
+    /// `response` through the layer, its body not read yet.
+    async fn respond<B>(
+        layer: &AccessLogLayer,
+        request: Request<()>,
+        response: Response<B>,
+    ) -> Response<AccessLogBody<B>>
     where
         B: Body + Send + 'static,
         B::Data: Send,
@@ -771,11 +815,20 @@ mod tests {
             let response = slot.lock().expect("not poisoned").take().expect("one call");
             async move { Ok::<_, Infallible>(response) }
         });
-        let response = layer
+        layer
             .layer(service)
             .oneshot(request)
             .await
-            .expect("infallible");
+            .expect("infallible")
+    }
+
+    async fn answer<B>(layer: &AccessLogLayer, request: Request<()>, response: Response<B>)
+    where
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: std::fmt::Debug,
+    {
+        let response = respond(layer, request, response).await;
         let _ = response.into_body().collect().await;
     }
 
@@ -942,6 +995,53 @@ mod tests {
         for record in buffer.snapshot() {
             assert!(!format!("{record:?}").contains("s3cret"));
         }
+    }
+
+    #[tokio::test]
+    async fn messages_are_read_when_the_request_completes() {
+        let (buffer, _guard) = capture();
+        let count = MessageCount::new();
+        let mut response = Response::new(script([
+            Ok(Frame::data(Bytes::from_static(b"\0\0\0\0\0"))),
+            Ok(trailers(&[("grpc-status", "0")])),
+        ]));
+        response.extensions_mut().insert(count.clone());
+        count.increment();
+        let response = respond(
+            &AccessLogLayer::new(),
+            with_type("/pkg.Svc/Watch", "application/grpc"),
+            response,
+        )
+        .await;
+        // Counted after the headers, before the body ends.
+        count.increment();
+        count.increment();
+        assert!(access(&buffer).is_empty(), "not ended yet");
+        let _ = response.into_body().collect().await;
+        assert_eq!(count.get(), 3);
+        let record = only(&buffer);
+        assert_eq!(record.fields["messages"], "3");
+        assert_eq!(record.fields["grpc_status"], "0");
+        assert_eq!(record.fields["aborted"], "false");
+
+        buffer.clear();
+        answer(&AccessLogLayer::new(), get("/orders"), ok_text()).await;
+        assert!(!only(&buffer).fields.contains_key("messages"), "no counter");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_logs_the_messages_sent() {
+        let (buffer, _guard) = capture();
+        let count = MessageCount::default();
+        let mut response = ok_text();
+        response.extensions_mut().insert(count.clone());
+        let response = respond(&AccessLogLayer::new(), get("/stream"), response).await;
+        count.increment();
+        drop(response);
+        let record = only(&buffer);
+        assert_eq!(record.fields["messages"], "1");
+        assert_eq!(record.fields["aborted"], "true");
+        assert!(format!("{count:?}").contains("MessageCount"));
     }
 
     #[tokio::test]

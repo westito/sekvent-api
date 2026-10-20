@@ -41,13 +41,14 @@ mod tracking {
     /// The contract sekvent-proto-build would generate for
     /// `shop.tracking.v1.Tracker`.
     pub mod proto {
-        #[allow(non_upper_case_globals)]
-        pub const __sekvent_service_Tracker: (&str, &[(&str, &str, &str, bool)]) = (
+        #[allow(non_upper_case_globals, clippy::type_complexity)]
+        pub const __sekvent_service_Tracker: (&str, &[(&str, &str, &str, bool, bool)]) = (
             "shop.tracking.v1.Tracker",
             &[(
                 "Track",
                 "shop.tracking.v1.TrackRequest",
                 "shop.tracking.v1.TrackReply",
+                false,
                 false,
             )],
         );

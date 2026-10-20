@@ -42,7 +42,7 @@ pub mod proto {
                 /// Contract of `check.billing.v1.Billing`, checked by `#[component(proto = …)]`.
                 #[doc(hidden)]
                 #[allow(non_upper_case_globals, dead_code)]
-                pub const __sekvent_service_Billing: (&str, &[(&str, &str, &str, bool)]) = (
+                pub const __sekvent_service_Billing: (&str, &[(&str, &str, &str, bool, bool)]) = (
                     "check.billing.v1.Billing",
                     &[
                         (
@@ -50,22 +50,35 @@ pub mod proto {
                             "check.billing.v1.TotalRequest",
                             "common.v1.Money",
                             false,
+                            false,
                         ),
                         (
                             "Describe",
                             "google.protobuf.StringValue",
                             "google.protobuf.StringValue",
                             false,
+                            false,
                         ),
-                        ("Tag", "Loose", "check.billing.v1.TotalRequest", false),
+                        (
+                            "Tag",
+                            "Loose",
+                            "check.billing.v1.TotalRequest",
+                            false,
+                            false,
+                        ),
                     ],
                 );
                 #[allow(non_camel_case_types, dead_code)]
-                pub type __sekvent_rpc_Billing__Total = (TotalRequest, super::super::super::common::v1::Money);
+                pub type __sekvent_rpc_Billing__Total =
+                    (TotalRequest, super::super::super::common::v1::Money);
                 #[allow(non_camel_case_types, dead_code)]
-                pub type __sekvent_rpc_Billing__Describe = (::prost::alloc::string::String, ::prost::alloc::string::String);
+                pub type __sekvent_rpc_Billing__Describe = (
+                    ::prost::alloc::string::String,
+                    ::prost::alloc::string::String,
+                );
                 #[allow(non_camel_case_types, dead_code)]
-                pub type __sekvent_rpc_Billing__Tag = (super::super::super::super::Loose, TotalRequest);
+                pub type __sekvent_rpc_Billing__Tag =
+                    (super::super::super::super::Loose, TotalRequest);
             }
         }
     }

@@ -4,17 +4,19 @@ A small shop built from three sekvent components — inventory, notifications
 and orders. It shows milestones C1 and C2 of the
 [component model](../../docs/component-model.md) (specs:
 [component-c1.md](../../docs/design/component-c1.md),
-[component-c2.md](../../docs/design/component-c2.md)): declaring a
-component against its proto contract, implementing it, wiring components
-together by constructor injection, and moving calls behind a serialization
-boundary or into another process by configuration alone.
+[component-c2.md](../../docs/design/component-c2.md),
+[component-streaming.md](../../docs/design/component-streaming.md)):
+declaring a component against its proto contract, implementing it, wiring
+components together by constructor injection, moving calls behind a
+serialization boundary or into another process by configuration alone, and
+a server-streaming method that follows stock levels live.
 
 ## Crates
 
 | Crate | What it holds |
 |---|---|
-| `inventory-api` | `shop.inventory.v1`: the `Inventory` service and messages, the `Inventory` trait (`reserve`, `release`, `stock`), `InventoryError` |
-| `inventory` | `InventoryService`: in-memory stock and reservations |
+| `inventory-api` | `shop.inventory.v1`: the `Inventory` service and messages, the `Inventory` trait (`reserve`, `release`, `stock`, the stream `watch_stock`), `InventoryError` |
+| `inventory` | `InventoryService`: in-memory stock and reservations, one `watch` channel per SKU for `watch_stock` |
 | `inventory-svc` | Inventory as its own service: the component served over gRPC, plus a thin `main.rs` |
 | `notifications-api` | `shop.notifications.v1`: the `Notifications` service and messages, the trait (`notify`, `sent`), `NotificationsError` |
 | `notifications` | `NotificationsService`: in-memory outbox with a blocklist; opens and closes through `Lifecycle` |
@@ -56,6 +58,45 @@ reservation and returns `OrdersError::CustomerBlocked`. Inventory's
 `OutOfStock` and `UnknownSku` are mapped to the orders variants of the same
 name; anything else becomes `OrdersError::Other`.
 
+## Watching stock: a server-streaming method
+
+`Inventory.WatchStock` is declared `rpc WatchStock(StockRequest) returns
+(stream StockReply)` and implemented as
+`#[call(stream, idempotent, timeout = "500ms")] async fn watch_stock(…) ->
+Result<CallStream<StockReply, InventoryError>, InventoryError>`:
+
+```rust
+let mut levels = inventory.watch_stock(&cx, StockRequest { sku }).await?;   // UnknownSku fails here
+while let Some(level) = levels.next().await {
+    let level = level?;                // the error that ended the stream
+    println!("{} left", level.available);
+}
+```
+
+- The first item is the SKU's level now; after that, the latest level after
+  every reserve and release. `InventoryService` keeps a
+  `tokio::sync::watch` channel per SKU, so a slow watcher skips levels in
+  between and always ends on the latest one; it never falls behind.
+- An unknown SKU fails the **open** with `InventoryError::UnknownSku`, before
+  any item. The `500ms` timeout bounds the open only.
+- Dropping the stream ends it: the subscription is released where inventory
+  runs (`InventoryService::watchers` drops back), in the same task under
+  `local`, by aborting the serving task under `local-serialized`, and by
+  resetting the HTTP/2 stream under `grpc`.
+- A stream lives at most 15 minutes (90–100 % of it, jittered), then ends
+  with `UNAVAILABLE` / `STREAM_EXPIRED`; set
+  `SEKVENT_COMPONENT_INVENTORY_WATCH_STOCK_STREAM_MAX_LIFETIME` to change
+  that. Stopping inventory, or shutting `inventory-svc` down, ends every
+  open stream at once with `UNAVAILABLE` / `COMPONENT_DRAINING`. After
+  either, a watcher opens a new stream right away; the first item brings it
+  up to date, so no cursor is needed.
+
+Per topology: in the monolith the stream is polled in the consumer's task
+(`local`) or crosses a channel of 16 items (`local-serialized`); in the
+split topology it is a server-streaming gRPC call to `inventory-svc`. The open is retried
+like `stock` (it is `idempotent`); a stream that ended is never reopened by
+the framework.
+
 ## Bindings
 
 Nothing in the code picks a binding. The App builder reads it:
@@ -68,6 +109,7 @@ Nothing in the code picks a binding. The App builder reads it:
 | `SEKVENT_COMPONENT_INVENTORY_RESERVE_TIMEOUT=250ms` | override `reserve`'s `2s` timeout |
 | `SEKVENT_COMPONENT_INVENTORY_RESERVE_BULKHEAD_MAX_CONCURRENT=4` | override `reserve`'s bulkhead of 16 (where inventory runs) |
 | `SEKVENT_COMPONENT_MAX_HOPS=8` | refuse call chains deeper than 8 components (default 16) |
+| `SEKVENT_COMPONENT_INVENTORY_WATCH_STOCK_STREAM_MAX_LIFETIME=5m` | end `watch_stock` streams after 5 minutes instead of 15 (where inventory runs) |
 
 An unknown `SEKVENT_COMPONENT_*` key or a malformed value fails the build
 with a message that names the key. Every key is accepted under every
@@ -99,7 +141,7 @@ lets the shop forward its callers' subject and tenant; without it the
 service drops them.
 
 On the remote binding the shop retries `idempotent` methods (`reserve`,
-`stock`) up to three times within the caller's deadline, never `release`,
+`stock`, and the open of `watch_stock`) up to three times within the caller's deadline, never `release`,
 and opens a circuit breaker for inventory when it keeps failing with
 `UNAVAILABLE`, `DEADLINE_EXCEEDED` or `RESOURCE_EXHAUSTED`. Tune it with
 `SEKVENT_COMPONENT_INVENTORY_RETRY_*` and `…_BREAKER_*`, or share settings
@@ -109,7 +151,9 @@ through a named policy (`SEKVENT_COMPONENT_INVENTORY_POLICY=remote` plus
 Both binaries serve `grpc.health.v1` and the HTTP health endpoints. In
 `inventory-svc`, `shop.inventory.v1.Inventory` reports `SERVING` while the
 component runs and `NOT_SERVING` from the moment shutdown begins; in-flight
-calls finish before the listener closes.
+calls finish before the listener closes, while open `watch_stock` streams
+end with `COMPONENT_DRAINING` as soon as shutdown begins, so they never hold
+it up.
 
 ## Running
 
@@ -149,6 +193,7 @@ The shared suite runs under three profiles through `rstest` cases:
 | `tests/flows.rs` | placing and reading orders, out-of-stock, unknown SKU, zero quantity, a blocked customer (reservation released), an unknown order, the caller's tenant reaching notifications |
 | `tests/faults.rs` | method, caller and configured deadlines; a full bulkhead; cancelled and expired contexts; typed errors and an unknown reason; dropping the caller; draining on stop; the hop limit |
 | `tests/runtime.rs` | the App wired as the binary wires it: start, one order, shutdown, every component stopped |
+| `tests/streams.rs` | `watch_stock` under every profile: the current level, then the level after an order; an unknown SKU failing the open; dropping the stream releasing the subscription; stopping the App (or shutting the service down) ending an open stream with `COMPONENT_DRAINING`; the lifetime ending it with `STREAM_EXPIRED` |
 | `tests/remote.rs` | `split-grpc` only: the breaker opening (and business errors never opening it), retries of idempotent methods only, the `Retry-After` cap, the deadline across the hop, wrong and missing tokens, trusted versus untrusted links, graceful shutdown, unmounted routes |
 
 Fault tests swap the real inventory for a fake installed through

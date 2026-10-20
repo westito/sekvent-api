@@ -842,9 +842,11 @@ A component is a trait with a protobuf contract; callers hold its generated
 `XHandle` and never know whether calls stay in-process (`local`), cross a
 serialization boundary (`local-serialized`: prost encode, separate task,
 decode) or go to another process (`grpc`). Milestones C1 and C2: `#[call]`
-methods only (no `#[async_call]`/`#[deferred]` yet). Specs:
+methods only, unary or server-streaming (`#[call(stream)]`; no
+`#[async_call]`/`#[deferred]` yet). Specs:
 `docs/design/component-c1.md`, `docs/design/component-c2.md`,
-`docs/design/component-end-user.md` (serving to browsers and apps); full example
+`docs/design/component-end-user.md` (serving to browsers and apps),
+`docs/design/component-streaming.md` (streams); full example
 with a split topology: `examples/shop`. Facade features `component`,
 `component-grpc` (the `grpc` binding and `App::grpc_routes`), `runtime`
 (`App::register`).
@@ -892,7 +894,8 @@ pub trait Inventory: Send + Sync + 'static {
 // generates InventoryHandle (Clone): .reserve(&cx, req), ::install, ::install_with_lifecycle, .binding()
 ```
 
-- Every method: `async fn m(&self, cx: &CallContext, req: Req) -> Result<Rep, E>`;
+- Every method: `async fn m(&self, cx: &CallContext, req: Req) -> Result<Rep, E>`
+  (a `#[call(stream)]` method returns `Result<CallStream<Item, E>, E>`, below);
   `Req`/`Rep` are prost messages, `E` implements `ComponentError` (or is
   `AppError`). `local_only` components take plain Rust types and need no
   `package` or `proto` (and must not have `proto`); `remote_only` ones have
@@ -1021,6 +1024,94 @@ if let Some(user) = cx.end_user() {
   it; global `.layer(..)`s wrap component calls, so a layer that demands
   its own credentials also blocks link callers and anonymous methods.
 
+Server-streaming methods (`#[call(stream)]`): one request, a stream of
+replies, for live updates to a browser (gRPC-Web) or another service. Spec:
+`docs/design/component-streaming.md`; example: `Inventory.WatchStock` in
+`examples/shop`.
+
+```proto
+service Inventory {
+  rpc WatchStock(StockRequest) returns (stream StockReply);  // `stream` on the reply only
+}
+```
+
+```rust
+// trait (in the -api crate)
+#[call(stream, idempotent, timeout = "500ms")]           // timeout bounds the open; optional max_lifetime = "1h"
+async fn watch_stock(&self, cx: &CallContext, req: StockRequest)
+    -> Result<CallStream<StockReply, InventoryError>, InventoryError>;   // open error, item error
+
+// implementation: check and subscribe in the body, then hand back a stream
+async fn watch_stock(&self, _cx: &CallContext, req: StockRequest)
+    -> Result<CallStream<StockReply, InventoryError>, InventoryError>
+{
+    let Some(level) = self.levels.get(&req.sku) else {
+        return Err(InventoryError::UnknownSku { sku: req.sku });   // fails the open, before any item
+    };
+    let sku = req.sku;
+    let items = WatchStream::new(level.subscribe())            // tokio-stream, feature "sync"
+        .map(move |available| Ok(StockReply { sku: sku.clone(), available }));
+    Ok(CallStream::new(items))      // or from_receiver(mpsc::Receiver<Result<T, E>>), iter(..), empty()
+}
+
+// consumer: reopen after the end; at once after STREAM_EXPIRED / COMPONENT_DRAINING
+loop {
+    let mut stock = match inventory.watch_stock(&cx, StockRequest { sku: sku.clone() }).await {
+        Ok(stock) => stock,
+        Err(error) => { backoff().await; continue; }         // open errors are unary errors
+    };
+    while let Some(item) = stock.next().await {               // inherent next(), no extension trait
+        match item {
+            Ok(level) => render(level),
+            Err(InventoryError::Other(e)) if e.code() == ErrorCode::Unavailable
+                && matches!(e.reason(), Some(reasons::STREAM_EXPIRED | reasons::DRAINING)) => break,
+            Err(error) => { backoff().await; break; }
+        }
+    }
+}
+```
+
+- `stream` and the `CallStream` return type go together (either alone is a
+  compile error); `#[call(stream)]` on a unary RPC, `#[call]` on a
+  streaming RPC, and any client-streaming or bidirectional RPC fail the
+  contract check. The service constant is a 5-tuple
+  `(rpc, request, reply, client_streaming, server_streaming)`.
+- The open is a call: auth, hop limit, gate, bulkhead, `TIMEOUT`, open
+  retries (when `idempotent`) and the breaker under `grpc`. It completes
+  when the method returns, not at the first item. Nothing after it reaches
+  the breaker; the framework never reopens a stream.
+- A stream ends at its first `Err` (then `None` forever), when the consumer
+  drops it, at the caller's deadline (`DEADLINE_EXCEEDED`), at its lifetime
+  (`UNAVAILABLE`/`STREAM_EXPIRED`, metadata `max_lifetime_ms`), and with
+  `UNAVAILABLE`/`COMPONENT_DRAINING` when its component drains, on
+  `app.close_streams()`, or as soon as the runtime begins shutting down
+  (under `App::register`). Item errors are never turned into
+  `DOWNSTREAM_FAILURE`.
+- The handler's `cx` is the stream's context: deadline = end of the stream,
+  token cancelled when it ends. A producer task stops on `cx.cancelled()` or
+  `Sender::closed()`; capture `cx.caller()` / `cx.end_user()` during the
+  open.
+- An open stream holds its admission and bulkhead permit for its whole life
+  (size stream bulkheads for concurrent subscribers). An unpolled stream
+  holds a drain until the grace.
+- Keys: `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME`,
+  `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` (humantime or seconds,
+  above zero; default 15 min, `DEFAULT_STREAM_MAX_LIFETIME`; each stream draws
+  90–100 %; not in named policies; known only for streaming methods).
+  Credentials are checked at the open only, so keep the lifetime no longer
+  than tokens should be trusted.
+- Browsers: over HTTP/1.1 each stream holds a connection (six per origin,
+  and one of `max_connections`); proxies cut quiet responses (send
+  heartbeat items, a `oneof` in the item). Servers that serve streams set
+  `.http2_keep_alive(Some(Http2KeepAlive { interval: Duration::from_secs(30),
+  timeout: Duration::from_secs(20) }))` (`sekvent::runtime::Http2KeepAlive`;
+  off by default).
+- Without the runtime: `app.close_streams()` before draining your own
+  server, then `app.stop(grace)`.
+- Tests: on the paused clock a stream that never ends auto-advances into
+  its lifetime; set a long lifetime or expect `STREAM_EXPIRED` (between
+  90 % and 100 %). See `examples/shop/shop/tests/streams.rs`.
+
 Configuration keys (all optional unless noted; unknown keys under
 `SEKVENT_COMPONENT_` and `SEKVENT_POLICY_`, malformed values and zeros fail
 the build; every key is accepted under every binding, so one environment
@@ -1037,6 +1128,7 @@ works for every topology):
 | `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link` (default: needs at least one `SEKVENT_LINK_INBOUND_<CALLER>`), `bearer` (end users; needs `AppBuilder::end_user_authenticator`, no link keys), `link,bearer` (both requirements) or `none` |
 | `SEKVENT_COMPONENT_MAX_HOPS` | 1–1000, default 16 |
 | `SEKVENT_COMPONENT_<C>_POLICY`, `SEKVENT_COMPONENT_<C>_<M>_POLICY` | a named policy `<N>` |
+| `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME`, `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` | stream lifetime, streaming methods only (default 15 min) |
 | `SEKVENT_POLICY_<N>_<FIELD>` | fields of a named policy |
 | `SEKVENT_COMPONENT_<C>_<FIELD>`, `SEKVENT_COMPONENT_<C>_<M>_<FIELD>` | component defaults, one method |
 
@@ -1074,7 +1166,8 @@ whose own component call failed transiently answers `INTERNAL`/
 above neither retry nor trip on it; a panicking handler answers
 `INTERNAL`/`HANDLER_PANICKED`. The server authenticates, routes (exact
 `/<service>/<Rpc>` path) and checks hops from headers before reading the
-body, never trusts request trailers, and caps requests at 4 MiB.
+body, never trusts request trailers, and caps requests (and served stream
+items) at 4 MiB.
 
 Contracts: `[contract]` in `sekvent.toml` lists the proto roots
 (`roots = ["crates/billing-api/proto"]`, `baseline = "contracts"`,

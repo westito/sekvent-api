@@ -79,6 +79,6 @@ pub use runtime::{
     PROBE_UNIT, RunReport, Runtime, RuntimeBuilder, RuntimeHandle, ShutdownReason, ShutdownTrigger,
     UnitExit, UnitReport,
 };
-pub use server::{Authenticator, Ctx, Server, ServerBuilder};
+pub use server::{Authenticator, Ctx, Http2KeepAlive, Server, ServerBuilder};
 pub use stage::{RestartPolicy, Stage, UnitPolicy};
 pub use unit::UnitContext;

@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use sekvent_component::__private::{BoxFuture, Bytes, Dispatch};
-use sekvent_component::{App, AppBuilder, AppError, Binding, BuildError, CallContext, Lifecycle};
+use sekvent_component::{
+    App, AppBuilder, AppError, Binding, BuildError, CallContext, CallStream, Lifecycle,
+};
 use sekvent_config::MapSource;
 use tokio::sync::{Semaphore, mpsc};
 
@@ -15,6 +17,7 @@ use super::inventory::{
     Inventory, InventoryError, InventoryHandle, ReleaseReply, ReleaseRequest, ReserveReply,
     ReserveRequest,
 };
+use super::ticker::{LatestRequest, Tick, Ticker, TickerError, TicksRequest};
 
 /// What the implementation saw of one call's context.
 #[derive(Debug, Clone)]
@@ -677,6 +680,189 @@ impl Lifecycle for SlowStart {
 
     async fn on_stop(&self) -> Result<(), AppError> {
         self.recorder.push("stop notes");
+        Ok(())
+    }
+}
+
+/// One item a test feeds to a [`ScriptedTicker`] stream.
+pub type Fed = Result<Tick, TickerError>;
+
+/// A tick of series `series`.
+pub fn tick(series: &str, seq: u64) -> Tick {
+    Tick {
+        series: series.to_owned(),
+        seq,
+    }
+}
+
+/// What a [`ScriptedTicker`] tells the test.
+pub struct TickerEvents {
+    /// Every open's context, as the handler saw it, in open order.
+    pub opened: mpsc::UnboundedReceiver<CallContext>,
+    /// One message per producer dropped (or open future dropped, for
+    /// `hang`).
+    pub dropped: mpsc::UnboundedReceiver<()>,
+    /// How many items the `count` producers produced.
+    pub produced: Arc<std::sync::atomic::AtomicU64>,
+    /// One message per `on_stop`.
+    pub stopped: mpsc::UnboundedReceiver<()>,
+}
+
+/// A [`Ticker`] scripted by the series it is asked for:
+///
+/// - `unknown`: the open fails with `UnknownSeries`;
+/// - `other`: the open fails with an `Other` error of unknown reason;
+/// - `hang`: the open never completes (and signals `dropped` when its
+///   future is dropped);
+/// - `gated`: the open waits for a permit of `gate`, then is `feed`;
+/// - `panic-open`: the open panics;
+/// - `panic`: one item, then the producer panics;
+/// - `count`: endless items `from`, `from + 1`, …, counted in `produced`;
+/// - `big`: one item of 5 MiB;
+/// - anything else (`feed`): items fed by the test through the sender
+///   [`ScriptedTicker::feed`] returned, in feed order; without one queued,
+///   a producer that never yields.
+///
+/// Every producer signals `dropped` when it is dropped; every open reports
+/// its context on `opened`. `latest` answers the series with `seq` 7.
+pub struct ScriptedTicker {
+    opened: mpsc::UnboundedSender<CallContext>,
+    dropped: mpsc::UnboundedSender<()>,
+    stopped: mpsc::UnboundedSender<()>,
+    produced: Arc<std::sync::atomic::AtomicU64>,
+    feeds: Arc<Mutex<std::collections::VecDeque<mpsc::Receiver<Fed>>>>,
+    pub gate: Arc<Semaphore>,
+}
+
+impl ScriptedTicker {
+    pub fn new() -> (Self, TickerEvents) {
+        let (opened, opened_rx) = mpsc::unbounded_channel();
+        let (dropped, dropped_rx) = mpsc::unbounded_channel();
+        let (stopped, stopped_rx) = mpsc::unbounded_channel();
+        let produced = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ticker = Self {
+            opened,
+            dropped,
+            stopped,
+            produced: Arc::clone(&produced),
+            feeds: Arc::default(),
+            gate: Arc::new(Semaphore::new(0)),
+        };
+        let events = TickerEvents {
+            opened: opened_rx,
+            dropped: dropped_rx,
+            produced,
+            stopped: stopped_rx,
+        };
+        (ticker, events)
+    }
+
+    /// Queue a feed for the next `feed` open; its sender.
+    pub fn feed(&self) -> mpsc::Sender<Fed> {
+        let (sender, receiver) = mpsc::channel(64);
+        self.feeds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(receiver);
+        sender
+    }
+
+    /// A handle on the same feeds and gate, for a factory.
+    pub fn share(&self) -> Self {
+        Self {
+            opened: self.opened.clone(),
+            dropped: self.dropped.clone(),
+            stopped: self.stopped.clone(),
+            produced: Arc::clone(&self.produced),
+            feeds: Arc::clone(&self.feeds),
+            gate: Arc::clone(&self.gate),
+        }
+    }
+
+    /// A stream that yields `stream`'s items and signals `dropped` when
+    /// dropped.
+    fn signalled(
+        &self,
+        stream: impl futures::Stream<Item = Fed> + Send + 'static,
+    ) -> CallStream<Tick, TickerError> {
+        let signal = DropSignal(self.dropped.clone());
+        let mut stream = Box::pin(stream);
+        CallStream::new(futures::stream::poll_fn(move |cx| {
+            let _keep = &signal;
+            stream.as_mut().poll_next(cx)
+        }))
+    }
+
+    fn fed(&self) -> CallStream<Tick, TickerError> {
+        let next = self
+            .feeds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        match next {
+            Some(mut receiver) => {
+                self.signalled(futures::stream::poll_fn(move |cx| receiver.poll_recv(cx)))
+            }
+            None => self.signalled(futures::stream::pending()),
+        }
+    }
+}
+
+impl Ticker for ScriptedTicker {
+    async fn ticks(
+        &self,
+        cx: &CallContext,
+        req: TicksRequest,
+    ) -> Result<CallStream<Tick, TickerError>, TickerError> {
+        let _ = self.opened.send(cx.clone());
+        let series = req.series.clone();
+        match series.as_str() {
+            "unknown" => Err(TickerError::UnknownSeries { series }),
+            "other" => Err(TickerError::Other(
+                AppError::failed_precondition("the series is paused").with_reason("PAUSED"),
+            )),
+            "hang" => {
+                let _signal = DropSignal(self.dropped.clone());
+                std::future::pending().await
+            }
+            "gated" => {
+                self.gate.acquire().await.unwrap().forget();
+                Ok(self.fed())
+            }
+            "panic-open" => panic!("the scripted ticker panicked on purpose"),
+            "panic" => {
+                let mut sent = false;
+                Ok(self.signalled(futures::stream::poll_fn(move |_| {
+                    assert!(!sent, "the scripted producer panicked on purpose");
+                    sent = true;
+                    std::task::Poll::Ready(Some(Ok(tick("panic", 1))))
+                })))
+            }
+            "count" => {
+                let produced = Arc::clone(&self.produced);
+                let mut seq = req.from;
+                Ok(self.signalled(futures::stream::poll_fn(move |_| {
+                    produced.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    seq += 1;
+                    std::task::Poll::Ready(Some(Ok(tick("count", seq - 1))))
+                })))
+            }
+            "big" => Ok(self.signalled(futures::stream::iter([Ok(Tick {
+                series: "x".repeat(5 * 1024 * 1024),
+                seq: 1,
+            })]))),
+            _ => Ok(self.fed()),
+        }
+    }
+
+    async fn latest(&self, _cx: &CallContext, req: LatestRequest) -> Result<Tick, TickerError> {
+        Ok(tick(&req.series, 7))
+    }
+}
+
+impl Lifecycle for ScriptedTicker {
+    async fn on_stop(&self) -> Result<(), AppError> {
+        let _ = self.stopped.send(());
         Ok(())
     }
 }

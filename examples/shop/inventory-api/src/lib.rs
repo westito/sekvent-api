@@ -4,6 +4,10 @@
 //! [`InventoryHandle`] they call it through, its messages and its typed
 //! [`InventoryError`]. Where the implementation runs is decided when the App
 //! is built, never here.
+//!
+//! [`Inventory::watch_stock`] is a server-streaming method: its handle
+//! method resolves once the stream is open and returns a
+//! [`CallStream`](sekvent::component::CallStream) of stock levels.
 
 #![forbid(unsafe_code)]
 
@@ -83,4 +87,18 @@ pub trait Inventory: Send + Sync + 'static {
         cx: &CallContext,
         req: StockRequest,
     ) -> Result<StockReply, InventoryError>;
+
+    /// Stock of one SKU now, then again after every change.
+    ///
+    /// An unknown SKU fails the open with [`InventoryError::UnknownSku`].
+    /// The `timeout` bounds the open only; the stream lasts until the
+    /// caller drops it, the caller's deadline or the stream's lifetime
+    /// (`SEKVENT_COMPONENT_INVENTORY_WATCH_STOCK_STREAM_MAX_LIFETIME`,
+    /// 15 minutes by default) passes, or inventory drains.
+    #[call(stream, idempotent, timeout = "500ms")]
+    async fn watch_stock(
+        &self,
+        cx: &CallContext,
+        req: StockRequest,
+    ) -> Result<CallStream<StockReply, InventoryError>, InventoryError>;
 }

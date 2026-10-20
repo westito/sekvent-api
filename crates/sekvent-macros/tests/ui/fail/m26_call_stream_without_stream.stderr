@@ -1,0 +1,5 @@
+error: a method that returns a CallStream needs #[call(stream)]
+  --> tests/ui/fail/m26_call_stream_without_stream.rs:11:9
+   |
+11 |         sekvent_component::CallStream<String, sekvent_component::AppError>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

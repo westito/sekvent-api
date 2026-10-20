@@ -268,22 +268,24 @@ package's module:
 
 - a constant `__sekvent_service_<Service>` (prefix
   [`SERVICE_CONTRACT_PREFIX`](#reference)) of type
-  `(&str, &[(&str, &str, &str, bool)])`: the service's full name, then per
-  RPC its name, the request's full protobuf name, the reply's full protobuf
-  name, and whether it streams in either direction;
+  `(&str, &[(&str, &str, &str, bool, bool)])`: the service's full name, then
+  per RPC its name, the request's full protobuf name, the reply's full
+  protobuf name, whether it streams requests and whether it streams
+  replies;
 - per RPC, a type alias `__sekvent_rpc_<Service>__<Rpc>` (prefix
   [`RPC_TYPES_PREFIX`](#reference); service and RPC separated by a double
-  underscore) of the Rust `(Request, Reply)` types.
+  underscore) of the Rust `(Request, Reply)` types; for a server-streaming
+  RPC the second type is the item.
 
 For `service Entries { rpc GetEntry(GetEntryRequest) returns (Entry); rpc Follow(GetEntryRequest) returns (stream Entry); }`
 in package `ledger.v1`:
 
 ```rust
-pub const __sekvent_service_Entries: (&str, &[(&str, &str, &str, bool)]) = (
+pub const __sekvent_service_Entries: (&str, &[(&str, &str, &str, bool, bool)]) = (
     "ledger.v1.Entries",
     &[
-        ("GetEntry", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", false),
-        ("Follow", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", true),
+        ("GetEntry", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", false, false),
+        ("Follow", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", false, true),
     ],
 );
 pub type __sekvent_rpc_Entries__GetEntry = (GetEntryRequest, Entry);
@@ -300,10 +302,15 @@ crate, so the messages crate needs no sekvent dependency to compile them.
 
 `#[component(proto = "…")]` reads `<proto>::__sekvent_service_<Trait>` and
 `<proto>::__sekvent_rpc_<Trait>__<Rpc>` and fails the build unless the
-service is `<package>.<Trait>`, each method maps to exactly one unary RPC
+service is `<package>.<Trait>`, each method maps to exactly one RPC
 (`place_order` → `PlaceOrder`) and no RPC is left over, and the method's
-request and reply types are the alias's types. You never reference these
-items yourself.
+request and reply types are the alias's types. A `#[call]` method needs a
+unary RPC and a `#[call(stream)]` method an RPC that streams its replies
+(`Follow` above); an RPC that streams requests is rejected for every
+method. You never reference these items yourself.
+
+Tests that declare a component against a hand-written `proto` module
+write the constant in the same five-field shape.
 
 Turn them off with `.service_contracts(false)`, for example in a plain gRPC
 messages crate that no component uses (they are harmless if left on).

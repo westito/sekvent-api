@@ -5,8 +5,8 @@ use quote::quote;
 use syn::{DeriveInput, parse_quote};
 
 use super::parse::{
-    borrows_or_impl, bulkhead_value, is_component_name, is_package, is_snake_name, proto_path,
-    rpc_name, timeout_value,
+    borrows_or_impl, bulkhead_value, is_component_name, is_package, is_snake_name,
+    max_lifetime_value, proto_path, rpc_name, timeout_value,
 };
 
 fn runtime() -> TokenStream {
@@ -153,6 +153,45 @@ fn snapshot_remote_only() {
                 #[call(idempotent, timeout = "1m 30s")]
                 async fn record(&self, cx: &CallContext, req: RecordRequest)
                     -> Result<RecordReply, LedgerError>;
+            }
+        },
+    );
+}
+
+#[test]
+fn snapshot_stream() {
+    component_snapshot(
+        "component__stream",
+        quote!(
+            name = "ticker",
+            package = "shop.ticker.v1",
+            proto = "crate::proto::shop::ticker::v1"
+        ),
+        quote! {
+            pub trait Ticker: Send + Sync + 'static {
+                /// Ticks of a series, from `from` on, as they happen.
+                #[call(stream, idempotent, timeout = "1s", bulkhead = 8, max_lifetime = "10m")]
+                async fn ticks(&self, cx: &CallContext, req: TicksRequest)
+                    -> Result<CallStream<Tick, TickerError>, TickerError>;
+
+                /// The latest tick of a series.
+                #[call(idempotent, timeout = "500ms")]
+                async fn latest(&self, cx: &CallContext, req: LatestRequest) -> Result<Tick, TickerError>;
+            }
+        },
+    );
+}
+
+#[test]
+fn snapshot_local_only_stream() {
+    component_snapshot(
+        "component__local_only_stream",
+        quote!(name = "feed", local_only),
+        quote! {
+            pub trait Feed {
+                #[call(stream)]
+                async fn lines(&self, cx: &CallContext, req: String)
+                    -> Result<CallStream<String, AppError>, AppError>;
             }
         },
     );
@@ -952,8 +991,8 @@ fn m1_to_m7_attribute_errors() {
         ),
         (
             quote!(#[call(retry)]),
-            "unknown #[call] argument `retry`; expected idempotent, timeout, bulkhead, anonymous \
-             or optional_end_user",
+            "unknown #[call] argument `retry`; expected idempotent, timeout, bulkhead, anonymous, \
+             optional_end_user, stream or max_lifetime",
         ),
         (
             quote!(#[call(idempotent, idempotent)]),
@@ -1351,4 +1390,388 @@ fn generated_generics_do_not_capture_user_types() {
     }
     assert!(!out.contains("<T:"), "{out}");
     assert!(!out.contains("install<T,F>"), "{out}");
+}
+
+// --- streaming methods (#[call(stream)]) -----------------------------------
+
+fn watch(attrs: &TokenStream, output: &TokenStream) -> TokenStream {
+    quote! {
+        #attrs
+        async fn watch(&self, cx: &CallContext, req: PingRequest) #output;
+    }
+}
+
+fn stream_method() -> TokenStream {
+    watch(
+        &quote!(#[call(stream)]),
+        &quote!(-> Result<CallStream<PingReply, ItemError>, OpenError>),
+    )
+}
+
+#[test]
+fn max_lifetimes_parse_with_humantime() {
+    let parse = |value: syn::Expr| max_lifetime_value(&value).map_err(|error| error.to_string());
+    assert_eq!(
+        parse(parse_quote!("10m")),
+        Ok(std::time::Duration::from_secs(600))
+    );
+    assert_eq!(
+        parse(parse_quote!("1h 1ms")),
+        Ok(std::time::Duration::new(3600, 1_000_000))
+    );
+    let bad: [syn::Expr; 5] = [
+        parse_quote!("0s"),
+        parse_quote!("forever"),
+        parse_quote!(""),
+        parse_quote!(600),
+        parse_quote!(ten_minutes),
+    ];
+    for bad in bad {
+        assert_eq!(
+            parse(bad),
+            Err("max_lifetime must be a positive duration such as \"15m\" or \"1h\"".to_owned())
+        );
+    }
+}
+
+#[test]
+fn stream_descriptors_follow_the_builder_order() {
+    let all = watch(
+        &quote!(#[call(optional_end_user, max_lifetime = "1m 30s", bulkhead = 2, timeout = "250ms", idempotent, stream)]),
+        &quote!(-> Result<CallStream<PingReply, AppError>, AppError>),
+    );
+    let anonymous = watch(
+        &quote!(#[call(anonymous, stream)]),
+        &quote!(-> Result<CallStream<PingReply, AppError>, AppError>),
+    );
+    let out = expand_ok(standard_args(), quote!(pub trait Echo { #all }));
+    assert!(
+        out.contains(
+            "MethodDescriptor::call(\"watch\",\"Watch\").with_stream().with_idempotent()\
+             .with_timeout(::core::time::Duration::new(0u64,250000000u32)).with_bulkhead(2u32)\
+             .with_max_lifetime(::core::time::Duration::new(90u64,0u32))\
+             .with_optional_end_user()];"
+        ),
+        "{out}"
+    );
+    let out = expand_ok(standard_args(), quote!(pub trait Echo { #anonymous }));
+    assert!(
+        out.contains(
+            "MethodDescriptor::call(\"watch\",\"Watch\").with_stream().with_anonymous()];"
+        ),
+        "{out}"
+    );
+    // A stream without `max_lifetime` leaves the default to the runtime.
+    let stream = stream_method();
+    let out = expand_ok(standard_args(), quote!(pub trait Echo { #stream }));
+    assert!(
+        out.contains("MethodDescriptor::call(\"watch\",\"Watch\").with_stream()];"),
+        "{out}"
+    );
+    assert!(!out.contains("with_max_lifetime"), "{out}");
+}
+
+#[test]
+fn a_stream_method_keeps_its_signature_and_opens_through_call_stream() {
+    let stream = stream_method();
+    let out = expand_ok(standard_args(), quote!(pub trait Echo { #stream }));
+    for needle in [
+        // The trait, the object twin and the handle use the return type as written.
+        "fnwatch(&self,cx:&CallContext,req:PingRequest)->impl::core::future::Future<\
+         Output=Result<CallStream<PingReply,ItemError>,OpenError>>+::core::marker::Send;",
+        "fn__watch<'a>(&'aself,cx:&'aCallContext,req:PingRequest)->::sekvent_component::\
+         __private::BoxFuture<'a,Result<CallStream<PingReply,ItemError>,OpenError>>",
+        "pubfnwatch<'a>(&'aself,cx:&'aCallContext,req:PingRequest)->impl::core::future::\
+         Future<Output=Result<CallStream<PingReply,ItemError>,OpenError>>+::core::marker::Send+'a",
+        "self.0.call_stream(0usize,cx,req,",
+        // Assertions: request, item, open error, item error.
+        "::sekvent_component::__private::assert_wire::<PingRequest>();\
+         ::sekvent_component::__private::assert_wire::<PingReply>();\
+         ::sekvent_component::__private::assert_error::<OpenError>();\
+         ::sekvent_component::__private::assert_error::<ItemError>();",
+        "const_:()=::sekvent_component::__private::assert_stream_rpc::<PingRequest,PingReply>(\
+         crate::proto::__sekvent_service_Echo,\"Watch\",);",
+        "const_:()=::sekvent_component::__private::assert_rpc_types::<PingRequest,PingReply,\
+         crate::proto::__sekvent_rpc_Echo__Watch>();",
+    ] {
+        assert!(out.contains(needle), "missing `{needle}` in {out}");
+    }
+    assert!(!out.contains("assert_rpc::<"), "{out}");
+}
+
+#[test]
+fn dispatch_holds_unary_methods_and_dispatch_stream_streaming_ones() {
+    let ping = ping();
+    let stream = stream_method();
+
+    // Streaming only: no `dispatch`, the trait default answers.
+    let out = expand_ok(standard_args(), quote!(pub trait Echo { #stream }));
+    assert!(!out.contains("fndispatch("), "{out}");
+    assert!(
+        out.contains(
+            "fndispatch_stream(&self,method:usize,cx:::sekvent_component::CallContext,\
+             body:::sekvent_component::__private::Bytes)->::sekvent_component::__private::\
+             BoxFuture<'static,::core::result::Result<::sekvent_component::CallStream<\
+             ::sekvent_component::__private::Bytes,::sekvent_component::AppError>,\
+             ::sekvent_component::AppError>>{letimp=::std::sync::Arc::clone(&self.0);\
+             matchmethod{0usize=>::sekvent_component::__private::serve_stream(cx,body,\
+             move|cx:::sekvent_component::CallContext,req:PingRequest|asyncmove{\
+             __EchoDyn::__watch(&*imp,&cx,req).await}),\
+             _=>::sekvent_component::__private::unknown_stream_method(\
+             <EchoHandleas::sekvent_component::ComponentHandle>::DESCRIPTOR,method),}}"
+        ),
+        "{out}"
+    );
+
+    // Unary only: no `dispatch_stream`, exactly as before streams existed.
+    let out = expand_ok(standard_args(), quote!(pub trait Echo { #ping }));
+    assert!(out.contains("fndispatch("), "{out}");
+    assert!(!out.contains("dispatch_stream"), "{out}");
+    assert!(!out.contains("serve_stream"), "{out}");
+    assert!(!out.contains("with_stream"), "{out}");
+
+    // Mixed: each function keeps the declaration index of its methods.
+    let out = expand_ok(standard_args(), quote!(pub trait Echo { #stream #ping }));
+    assert!(
+        out.contains("matchmethod{1usize=>::sekvent_component::__private::serve(cx,body,"),
+        "{out}"
+    );
+    assert!(
+        out.contains("matchmethod{0usize=>::sekvent_component::__private::serve_stream(cx,body,"),
+        "{out}"
+    );
+    assert!(out.contains("self.0.call_stream(0usize,cx,req,"), "{out}");
+    assert!(out.contains("self.0.call(1usize,cx,req,"), "{out}");
+    assert!(
+        out.contains("assert_service(crate::proto::__sekvent_service_Echo,\"check.echo.v1.Echo\",&[\"Watch\",\"Ping\"],);"),
+        "{out}"
+    );
+}
+
+#[test]
+fn local_only_streams_use_call_stream_local_and_local_types() {
+    let out = expand_ok(
+        quote!(name = "feed", local_only),
+        quote! {
+            pub trait Feed {
+                #[call(stream, max_lifetime = "1h")]
+                async fn lines(&self, cx: &CallContext, req: String)
+                    -> Result<CallStream<String, LineError>, AppError>;
+                #[call]
+                async fn count(&self, cx: &CallContext, req: ()) -> Result<usize, AppError>;
+            }
+        },
+    );
+    for needle in [
+        "self.0.call_stream_local(0usize,cx,req,",
+        "self.0.call_local(1usize,cx,req,",
+        "::sekvent_component::__private::assert_local::<String>();\
+         ::sekvent_component::__private::assert_local::<String>();\
+         ::sekvent_component::__private::assert_error::<AppError>();\
+         ::sekvent_component::__private::assert_error::<LineError>();",
+        ".with_stream().with_max_lifetime(::core::time::Duration::new(3600u64,0u32)),",
+    ] {
+        assert!(out.contains(needle), "missing `{needle}` in {out}");
+    }
+    assert!(!out.contains("Dispatch"), "{out}");
+    assert!(!out.contains("assert_stream_rpc"), "{out}");
+}
+
+#[test]
+fn remote_only_streams_are_served_and_installed_remotely() {
+    let stream = stream_method();
+    let out = expand_ok(
+        quote!(
+            name = "echo",
+            package = "check.echo.v1",
+            proto = "crate::proto",
+            remote_only
+        ),
+        quote!(pub trait Echo { #stream }),
+    );
+    assert!(out.contains("self.0.call_stream(0usize,cx,req,"), "{out}");
+    assert!(out.contains("fndispatch_stream("), "{out}");
+    assert!(out.contains("install_remote(app,EchoHandle)"), "{out}");
+    assert!(
+        out.contains("assert_stream_rpc::<PingRequest,PingReply>("),
+        "{out}"
+    );
+}
+
+#[test]
+fn m25_a_stream_method_returns_result_of_call_stream() {
+    let shape = "a #[call(stream)] method returns Result<CallStream<Item, Error>, Error>";
+    let stream = quote!(#[call(stream)]);
+    for output in [
+        quote!(),
+        quote!(-> CallStream<PingReply, AppError>),
+        quote!(-> Result<CallStream<PingReply, AppError>>),
+        quote!(-> Option<CallStream<PingReply, AppError>>),
+        quote!(-> Result<PingReply, AppError>),
+        quote!(-> Result<(), AppError>),
+        quote!(-> Result<CallStream<PingReply>, AppError>),
+        quote!(-> Result<CallStream<PingReply, AppError, u8>, AppError>),
+        quote!(-> Result<CallStream<'static, PingReply, AppError>, AppError>),
+        quote!(-> Result< <T as Trait>::CallStream<PingReply, AppError>, AppError>),
+        quote!(-> Result<my<u8>::CallStream<PingReply, AppError>, AppError>),
+        quote!(-> Result<Stream<PingReply, AppError>, AppError>),
+    ] {
+        let method = watch(&stream, &output);
+        let all = messages(standard_args(), quote!(pub trait Echo { #method }));
+        assert_eq!(all, [shape], "{output}");
+    }
+    // Any path to `CallStream` is accepted, as for `Result`.
+    let method = watch(
+        &stream,
+        &quote!(-> ::core::result::Result<::sekvent_component::CallStream<PingReply, AppError>, AppError>),
+    );
+    expand_ok(standard_args(), quote!(pub trait Echo { #method }));
+}
+
+#[test]
+fn m26_a_call_stream_reply_needs_stream() {
+    let without = "a method that returns a CallStream needs #[call(stream)]";
+    for (attrs, output) in [
+        (
+            quote!(#[call]),
+            quote!(-> Result<CallStream<PingReply, AppError>, AppError>),
+        ),
+        (
+            quote!(#[call(idempotent)]),
+            quote!(-> Result<sekvent::CallStream<PingReply, AppError>, AppError>),
+        ),
+        (
+            quote!(#[call]),
+            quote!(-> Result<CallStream<PingReply>, AppError>),
+        ),
+    ] {
+        let method = watch(&attrs, &output);
+        let all = messages(standard_args(), quote!(pub trait Echo { #method }));
+        assert_eq!(all, [without], "{output}");
+    }
+    // Without a valid kind attribute only that attribute is reported.
+    let returns = quote!(-> Result<CallStream<PingReply, AppError>, AppError>);
+    for (attrs, expected) in [
+        (quote!(), "method `watch` needs a kind attribute: #[call]"),
+        (
+            quote!(#[async_call(stream)]),
+            "#[async_call] is planned for milestone C3 and not available yet",
+        ),
+        (
+            quote!(#[deferred(stream)]),
+            "#[deferred] is planned for milestone C3 and not available yet",
+        ),
+        (
+            quote!(#[call(stream, retry)]),
+            "unknown #[call] argument `retry`; expected idempotent, timeout, bulkhead, anonymous, \
+             optional_end_user, stream or max_lifetime",
+        ),
+    ] {
+        let method = watch(&attrs, &returns);
+        let all = messages(standard_args(), quote!(pub trait Echo { #method }));
+        assert_eq!(all, [expected], "{attrs}");
+    }
+}
+
+#[test]
+fn m27_m28_max_lifetime_errors() {
+    let without = "`max_lifetime` applies to #[call(stream)] methods only";
+    let bad = "max_lifetime must be a positive duration such as \"15m\" or \"1h\"";
+    let unary = quote!(-> Result<PingReply, AppError>);
+    let streaming = quote!(-> Result<CallStream<PingReply, AppError>, AppError>);
+    for (attrs, output, expected) in [
+        (quote!(#[call(max_lifetime = "10m")]), &unary, vec![without]),
+        (
+            quote!(#[call(idempotent, max_lifetime = "10m")]),
+            &unary,
+            vec![without],
+        ),
+        (
+            quote!(#[call(max_lifetime = "0s")]),
+            &unary,
+            vec![bad, without],
+        ),
+        (
+            quote!(#[call(stream, max_lifetime = "0s")]),
+            &streaming,
+            vec![bad],
+        ),
+        (
+            quote!(#[call(max_lifetime = "never", stream)]),
+            &streaming,
+            vec![bad],
+        ),
+        (
+            quote!(#[call(stream, max_lifetime = 600)]),
+            &streaming,
+            vec![bad],
+        ),
+        (
+            quote!(#[call(stream, stream)]),
+            &streaming,
+            vec!["duplicate #[call] argument `stream`"],
+        ),
+        (
+            quote!(#[call(stream, max_lifetime = "1m", max_lifetime = "2m")]),
+            &streaming,
+            vec!["duplicate #[call] argument `max_lifetime`"],
+        ),
+    ] {
+        let method = watch(&attrs, output);
+        let all = messages(standard_args(), quote!(pub trait Echo { #method }));
+        assert_eq!(all, expected, "{attrs}");
+    }
+    // `max_lifetime` after `stream` and before it are the same.
+    let method = watch(&quote!(#[call(max_lifetime = "5m", stream)]), &streaming);
+    let out = expand_ok(standard_args(), quote!(pub trait Echo { #method }));
+    assert!(
+        out.contains(".with_stream().with_max_lifetime(::core::time::Duration::new(300u64,0u32))"),
+        "{out}"
+    );
+}
+
+#[test]
+fn stream_items_and_errors_follow_the_reply_rules() {
+    let borrowed = "reply and error types cannot contain lifetimes or `impl Trait`";
+    let stream = quote!(#[call(stream)]);
+    for (output, count) in [
+        (
+            quote!(-> Result<CallStream<&'static str, AppError>, AppError>),
+            1,
+        ),
+        (
+            quote!(-> Result<CallStream<PingReply, impl Error>, AppError>),
+            1,
+        ),
+        (
+            quote!(-> Result<CallStream<PingReply, AppError>, Box<dyn Error + 'static>>),
+            1,
+        ),
+        (
+            quote!(-> Result<CallStream<&'static str, &'static str>, &'static str>),
+            3,
+        ),
+    ] {
+        let method = watch(&stream, &output);
+        let all = messages(standard_args(), quote!(pub trait Echo { #method }));
+        assert_eq!(all, vec![borrowed; count], "{output}");
+    }
+}
+
+#[test]
+fn local_only_streams_still_reject_serving_arguments() {
+    let all = messages(
+        quote!(name = "feed", local_only),
+        quote! {
+            trait Feed {
+                #[call(stream, anonymous)]
+                async fn lines(&self, cx: &CallContext, req: String)
+                    -> Result<CallStream<String, AppError>, AppError>;
+            }
+        },
+    );
+    assert_eq!(
+        all,
+        ["`anonymous` has no effect on a local_only component, which is never served; remove it"]
+    );
 }

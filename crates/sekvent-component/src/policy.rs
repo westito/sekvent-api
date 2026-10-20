@@ -3,16 +3,25 @@
 //! [`PolicySpec`], per method and per component.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use sekvent_config::__private::opt_duration_value;
 use sekvent_config::{ConfigError, ConfigSource};
 use sekvent_resilience::{PolicyError, PolicySpec, RetryBudget, RetryPolicy};
 
 use crate::config::{self, key};
 use crate::server::MethodPolicy;
-use crate::{BuildError, ComponentDescriptor, MethodDescriptor, POLICY_PREFIX};
+use crate::{
+    BuildError, ComponentDescriptor, DEFAULT_STREAM_MAX_LIFETIME, MethodDescriptor, POLICY_PREFIX,
+};
 
 /// Suffix of the keys that reference a named policy.
 pub(crate) const POLICY: &str = "POLICY";
+
+/// Suffix of the stream lifetime keys: known at component level when the
+/// component has a streaming method, and at method level for streaming
+/// methods. Not a policy field: named policies do not carry it.
+pub(crate) const STREAM_MAX_LIFETIME: &str = "STREAM_MAX_LIFETIME";
 
 /// Fields accepted at method level (and at every other level).
 pub(crate) const METHOD_FIELDS: &[&str] = &[
@@ -232,8 +241,22 @@ pub(crate) fn resolve(
         }
     };
 
+    let streams = descriptor.methods().iter().any(MethodDescriptor::is_stream);
+    let component_lifetime = read_lifetime(
+        source,
+        &key(&[component, STREAM_MAX_LIFETIME]),
+        streams,
+        errors,
+    );
+
     let mut methods = Vec::with_capacity(descriptor.methods().len());
     for method in descriptor.methods() {
+        let lifetime = read_lifetime(
+            source,
+            &key(&[component, method.name(), STREAM_MAX_LIFETIME]),
+            method.is_stream(),
+            errors,
+        );
         let prefix = format!("{}_", key(&[component, method.name()]));
         let own_method = from_config(source, &prefix, errors).map(|mut spec| {
             strip_rate_limit(&mut spec);
@@ -264,14 +287,25 @@ pub(crate) fn resolve(
                 None
             }
         };
-        if let (Some(own), Some(named_layer), Some(own_method)) = (&own, &method_named, &own_method)
-        {
+        if let (Some(own), Some(named_layer), Some(own_method), Ok(lifetime), Ok(inherited)) = (
+            &own,
+            &method_named,
+            &own_method,
+            lifetime,
+            component_lifetime,
+        ) {
             let spec =
                 PolicySpec::resolve([&framework, &attribute(method), named_layer, own, own_method]);
             check(source, &prefix, method_checks(&spec), errors);
             methods.push(MethodPolicy {
                 timeout: spec.timeout,
                 spec,
+                max_lifetime: method.is_stream().then(|| {
+                    lifetime
+                        .or(inherited)
+                        .or(method.max_lifetime())
+                        .unwrap_or(DEFAULT_STREAM_MAX_LIFETIME)
+                }),
             });
         }
     }
@@ -290,6 +324,41 @@ pub(crate) fn resolve(
         methods,
         component: spec,
     })
+}
+
+/// A problem already recorded in the build errors.
+#[derive(Debug, Clone, Copy)]
+struct Recorded;
+
+/// A `STREAM_MAX_LIFETIME` key that `applies` (else not read): `Ok(None)`
+/// when unset or not read, `Err` after recording a malformed or zero value
+/// (naming the key, never the value).
+fn read_lifetime(
+    source: &dyn ConfigSource,
+    key: &str,
+    applies: bool,
+    errors: &mut Vec<BuildError>,
+) -> Result<Option<Duration>, Recorded> {
+    if !applies {
+        return Ok(None);
+    }
+    match opt_duration_value(source, key) {
+        Ok(Some(lifetime)) if lifetime.is_zero() => {
+            errors.push(
+                ConfigError::Invalid {
+                    key: source.describe(key),
+                    reason: "must be longer than zero".to_owned(),
+                }
+                .into(),
+            );
+            Err(Recorded)
+        }
+        Ok(lifetime) => Ok(lifetime),
+        Err(error) => {
+            errors.push(error.into());
+            Err(Recorded)
+        }
+    }
 }
 
 fn from_config(
@@ -668,6 +737,113 @@ mod tests {
         assert_eq!(
             invalid_keys(&errors),
             ["SEKVENT_COMPONENT_INVENTORY_RESERVE_*"]
+        );
+    }
+
+    const STREAMING: &[MethodDescriptor] = &[
+        MethodDescriptor::call("watch", "Watch")
+            .with_stream()
+            .with_max_lifetime(Duration::from_secs(600)),
+        MethodDescriptor::call("follow", "Follow").with_stream(),
+        MethodDescriptor::call("stock", "Stock"),
+    ];
+    const FEED: &ComponentDescriptor = &ComponentDescriptor::new("feed", "Feed", STREAMING);
+
+    fn resolve_feed(pairs: &[(&str, &str)]) -> Result<ComponentPolicies, Vec<BuildError>> {
+        let source: MapSource = pairs.iter().copied().collect();
+        let mut named = NamedPolicies::default();
+        let mut errors = Vec::new();
+        let resolved = resolve(&source, FEED, &mut named, &mut errors);
+        match resolved {
+            Some(resolved) if errors.is_empty() => Ok(resolved),
+            _ => Err(errors),
+        }
+    }
+
+    fn lifetimes(resolved: &ComponentPolicies) -> Vec<Option<Duration>> {
+        resolved
+            .methods
+            .iter()
+            .map(|method| method.max_lifetime)
+            .collect()
+    }
+
+    #[test]
+    fn stream_lifetimes_default_then_attribute_then_component_then_method() {
+        let resolved = resolve_feed(&[]).unwrap();
+        assert_eq!(
+            lifetimes(&resolved),
+            [
+                Some(Duration::from_secs(600)),
+                Some(DEFAULT_STREAM_MAX_LIFETIME),
+                None
+            ]
+        );
+        let resolved =
+            resolve_feed(&[("SEKVENT_COMPONENT_FEED_STREAM_MAX_LIFETIME", "2h")]).unwrap();
+        assert_eq!(
+            lifetimes(&resolved),
+            [
+                Some(Duration::from_secs(7200)),
+                Some(Duration::from_secs(7200)),
+                None
+            ]
+        );
+        let resolved = resolve_feed(&[
+            ("SEKVENT_COMPONENT_FEED_STREAM_MAX_LIFETIME", "2h"),
+            ("SEKVENT_COMPONENT_FEED_WATCH_STREAM_MAX_LIFETIME", "30"),
+        ])
+        .unwrap();
+        assert_eq!(
+            lifetimes(&resolved),
+            [
+                Some(Duration::from_secs(30)),
+                Some(Duration::from_secs(7200)),
+                None
+            ]
+        );
+        // A unary method ignores a key it does not know (the unknown-key
+        // check reports it).
+        let resolved =
+            resolve_feed(&[("SEKVENT_COMPONENT_FEED_STOCK_STREAM_MAX_LIFETIME", "1s")]).unwrap();
+        assert_eq!(resolved.methods[2].max_lifetime, None);
+    }
+
+    #[test]
+    fn malformed_and_zero_lifetimes_name_the_key_only() {
+        let errors = resolve_feed(&[
+            ("SEKVENT_COMPONENT_FEED_STREAM_MAX_LIFETIME", "forever"),
+            ("SEKVENT_COMPONENT_FEED_FOLLOW_STREAM_MAX_LIFETIME", "0s"),
+        ])
+        .unwrap_err();
+        let text: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        let text = text.join("; ");
+        assert_eq!(errors.len(), 2, "{text}");
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                BuildError::Config(ConfigError::Malformed { key, .. })
+                    if key == "SEKVENT_COMPONENT_FEED_STREAM_MAX_LIFETIME"
+            )),
+            "{text}"
+        );
+        assert_eq!(
+            invalid_keys(&errors),
+            ["SEKVENT_COMPONENT_FEED_FOLLOW_STREAM_MAX_LIFETIME"]
+        );
+        assert!(text.contains("must be longer than zero"), "{text}");
+        assert!(!text.contains("forever"), "{text}");
+    }
+
+    #[test]
+    fn a_component_without_streams_reads_no_lifetime() {
+        let resolved =
+            resolve_pairs(&[("SEKVENT_COMPONENT_INVENTORY_STREAM_MAX_LIFETIME", "x")]).unwrap();
+        assert!(
+            resolved
+                .methods
+                .iter()
+                .all(|method| method.max_lifetime.is_none())
         );
     }
 

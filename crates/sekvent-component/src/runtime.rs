@@ -35,15 +35,23 @@ impl App {
     /// Every service of [`App::grpc_services`] reports `NotServing` in the
     /// runtime's health until the App has started, `Serving` while it runs,
     /// and `NotServing` again before it stops.
+    ///
+    /// As soon as the runtime begins shutting down, for any reason, the
+    /// running App closes its streams ([`App::close_streams`]): they end
+    /// with `UNAVAILABLE` / `COMPONENT_DRAINING` and new ones are refused,
+    /// so ingress drains without waiting on them. Unary calls continue
+    /// until the components drain.
     #[must_use]
     pub fn register(&self, runtime: RuntimeBuilder) -> RuntimeBuilder {
         let app = self.clone();
+        let trigger = runtime.shutdown_trigger();
         runtime.unit(
             UNIT,
             Stage::Components,
             UnitPolicy::Critical,
             move |ctx: UnitContext| {
                 let app = app.clone();
+                let trigger = trigger.clone();
                 async move {
                     let services = app.grpc_services();
                     let health = ctx.health();
@@ -58,6 +66,11 @@ impl App {
                         outcome?;
                         set_all(health, &services, ServiceStatus::Serving).await;
                         ctx.ready();
+                        tokio::select! {
+                            biased;
+                            () = trigger.triggered() => app.close_streams(),
+                            () = shutdown.cancelled() => app.close_streams(),
+                        }
                         shutdown.cancelled().await;
                         set_all(health, &services, ServiceStatus::NotServing).await;
                     }

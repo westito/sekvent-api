@@ -3,23 +3,33 @@
 
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::{Stream, StreamExt as _};
 use http::HeaderMap;
 use sekvent_context::{CallContext, ServiceIdentity, headers};
 use sekvent_error::{AppError, ErrorCode};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
+use tokio_util::sync::WaitForCancellationFutureOwned;
 use tracing::Instrument as _;
 
 use crate::__private::{Dispatch, LocalMessage, WireMessage};
 #[cfg(feature = "grpc")]
 use crate::grpc::client::RemoteClient;
 use crate::server::Server;
+use crate::stream::CallStream;
 use crate::wire::{self, AbortOnDrop};
 use crate::{Binding, ComponentError, LOCAL_CALLER, reasons};
+
+/// How many encoded items a `local-serialized` producer runs ahead of its
+/// consumer.
+const SERIALIZED_STREAM_BUFFER: usize = 16;
 
 /// Metadata key naming the component whose transient failure a call made
 /// from inside a handler returned. The gRPC serving side turns an error
@@ -218,6 +228,113 @@ impl<D: ?Sized + Send + Sync + 'static> Endpoint<D> {
             outcome.map_err(E::from_app_error)
         }
     }
+
+    /// Open streaming method `method` of a standard or `remote_only`
+    /// component: directly under `local`, encoded and on a task of its own
+    /// under `local-serialized`, over gRPC under `grpc`. Resolves once the
+    /// stream is open; the open fails with `E`, the stream ends with `EI`.
+    #[allow(clippy::manual_async_fn)]
+    pub fn call_stream<'a, Req, Item, E, EI, L, Fut>(
+        &'a self,
+        method: usize,
+        cx: &'a CallContext,
+        req: Req,
+        local: L,
+    ) -> impl Future<Output = Result<CallStream<Item, EI>, E>> + Send + 'a
+    where
+        Req: WireMessage,
+        Item: WireMessage,
+        E: ComponentError,
+        EI: ComponentError,
+        L: FnOnce(Arc<D>, CallContext, Req) -> Fut + Send + 'a,
+        Fut: Future<Output = Result<CallStream<Item, EI>, E>> + Send + 'a,
+    {
+        async move {
+            let link = &*self.link;
+            let server = &link.server;
+            let outcome = match &self.route {
+                Route::Local(imp) => {
+                    let imp = Arc::clone(imp);
+                    invoke_stream(link, method, cx, MethodTimeout::Here, move |callee| {
+                        open_local(link, method, callee, imp, req, local)
+                    })
+                    .await
+                }
+                Route::Serialized(dispatch) => {
+                    let dispatch = Arc::clone(dispatch);
+                    invoke_stream(link, method, cx, MethodTimeout::Here, move |callee| {
+                        open_serialized::<Req, Item>(server, dispatch, method, callee, req)
+                    })
+                    .await
+                }
+                #[cfg(feature = "grpc")]
+                Route::Remote(client) => {
+                    let client = Arc::clone(client);
+                    invoke_stream(link, method, cx, MethodTimeout::Transport, move |callee| {
+                        open_remote::<Req, Item>(server, client, method, callee, req)
+                    })
+                    .await
+                }
+            };
+            typed_stream(outcome)
+        }
+    }
+
+    /// Open streaming method `method` of a `local_only` component: always
+    /// the local pipeline. Another route cannot exist after a successful
+    /// build; it would yield `INTERNAL`, never a panic.
+    #[allow(clippy::manual_async_fn)]
+    pub fn call_stream_local<'a, Req, Item, E, EI, L, Fut>(
+        &'a self,
+        method: usize,
+        cx: &'a CallContext,
+        req: Req,
+        local: L,
+    ) -> impl Future<Output = Result<CallStream<Item, EI>, E>> + Send + 'a
+    where
+        Req: LocalMessage,
+        Item: LocalMessage,
+        E: ComponentError,
+        EI: ComponentError,
+        L: FnOnce(Arc<D>, CallContext, Req) -> Fut + Send + 'a,
+        Fut: Future<Output = Result<CallStream<Item, EI>, E>> + Send + 'a,
+    {
+        async move {
+            let link = &*self.link;
+            let server = &link.server;
+            let outcome = match &self.route {
+                Route::Local(imp) => {
+                    let imp = Arc::clone(imp);
+                    invoke_stream(link, method, cx, MethodTimeout::Here, move |callee| {
+                        open_local(link, method, callee, imp, req, local)
+                    })
+                    .await
+                }
+                Route::Serialized(_) => Err(not_serializable(server, method)),
+                #[cfg(feature = "grpc")]
+                Route::Remote(_) => Err(not_serializable(server, method)),
+            };
+            typed_stream(outcome)
+        }
+    }
+}
+
+/// The handle's view of an opened stream: open errors decode into `E`,
+/// item errors into `EI`.
+fn typed_stream<Item, E, EI>(
+    outcome: Result<CallStream<Item, AppError>, AppError>,
+) -> Result<CallStream<Item, EI>, E>
+where
+    Item: Send + 'static,
+    E: ComponentError,
+    EI: ComponentError,
+{
+    match outcome {
+        Ok(stream) => Ok(CallStream::new(
+            stream.map(|item| item.map_err(EI::from_app_error)),
+        )),
+        Err(error) => Err(E::from_app_error(error)),
+    }
 }
 
 /// Who enforces the method's `TIMEOUT` for one call.
@@ -254,15 +371,7 @@ where
 {
     let server = &*link.server;
     let descriptor = server.descriptor();
-    let span = tracing::debug_span!(
-        "component_call",
-        component = descriptor.name(),
-        method = descriptor
-            .methods()
-            .get(method)
-            .map_or("?", |method| method.name()),
-        binding = link.binding.as_str(),
-    );
+    let span = call_span(link, method);
     async move {
         let timeout = match enforce {
             MethodTimeout::Here => server.timeout(method),
@@ -298,6 +407,150 @@ where
     }
     .instrument(span)
     .await
+}
+
+/// The caller's span of one call or stream.
+fn call_span(link: &Link, method: usize) -> tracing::Span {
+    let descriptor = link.server.descriptor();
+    tracing::debug_span!(
+        "component_call",
+        component = descriptor.name(),
+        method = descriptor
+            .methods()
+            .get(method)
+            .map_or("?", |method| method.name()),
+        binding = link.binding.as_str(),
+    )
+}
+
+/// [`invoke`] for the open of a stream: the hop limit, the callee's context
+/// (with the caller's deadline, never narrowed by the method's `TIMEOUT`),
+/// and `transport` within the open bound — the method's `TIMEOUT` when
+/// this side enforces it, and the caller's deadline — until the caller
+/// cancels.
+///
+/// The open stream is wrapped in the caller wrapper, which ends it with
+/// `CANCELLED` when the caller cancels and `DEADLINE_EXCEEDED` when the
+/// caller's deadline passes, and enters the call's span on every poll.
+/// Open errors are marked [`DOWNSTREAM`] as for unary calls; item errors
+/// never are.
+async fn invoke_stream<T, Tr, Fut>(
+    link: &Link,
+    method: usize,
+    cx: &CallContext,
+    enforce: MethodTimeout,
+    transport: Tr,
+) -> Result<CallStream<T, AppError>, AppError>
+where
+    T: Send + 'static,
+    Tr: FnOnce(CallContext) -> Fut,
+    Fut: Future<Output = Result<CallStream<T, AppError>, AppError>>,
+{
+    let server = &*link.server;
+    let descriptor = server.descriptor();
+    let span = call_span(link, method);
+    let opened = async {
+        let timeout = match enforce {
+            MethodTimeout::Here => server.timeout(method),
+            MethodTimeout::Transport => None,
+        };
+        let bounds = Bounds::new(cx, timeout);
+        let expired = || server.tag(bounds.expired(cx, timeout), method);
+        let cancelled = || server.tag(AppError::cancelled("the call was cancelled"), method);
+        if cx.cancel_token().is_cancelled() {
+            return Err(cancelled());
+        }
+        if bounds.passed() {
+            return Err(expired());
+        }
+        let hops = cx.hops().saturating_add(1);
+        if hops > link.max_hops {
+            return Err(server.tag(depth_exceeded(link.max_hops), method));
+        }
+        let callee = callee_context(cx, None).with_hops(hops);
+        tokio::select! {
+            biased;
+            () = cx.cancelled() => Err(cancelled()),
+            result = transport(callee) => result.map_err(|error| {
+                if bounds.method_fired(cx) && is_plain_deadline(&error) {
+                    expired()
+                } else {
+                    error
+                }
+            }),
+            () = bounds.sleep() => Err(expired()),
+        }
+    }
+    .instrument(span.clone())
+    .await;
+    match opened {
+        Ok(stream) => {
+            let deadline = cx.deadline().map(Instant::from_std);
+            Ok(CallStream::new(CallerStream {
+                inner: Some(stream),
+                cancelled: Box::pin(cx.cancel_token().clone().cancelled_owned()),
+                timer: deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
+                server: Arc::clone(&link.server),
+                method,
+                span,
+            }))
+        }
+        Err(error) => Err(mark_downstream(cx, descriptor.name(), error)),
+    }
+}
+
+/// The caller wrapper of one stream (see [`invoke_stream`]).
+struct CallerStream<T> {
+    /// `None` once the stream has ended.
+    inner: Option<CallStream<T, AppError>>,
+    /// The caller's cancellation.
+    cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
+    /// Fires at the caller's deadline.
+    timer: Option<Pin<Box<Sleep>>>,
+    server: Arc<Server>,
+    method: usize,
+    span: tracing::Span,
+}
+
+impl<T> CallerStream<T> {
+    fn end(&mut self, error: AppError) -> Poll<Option<Result<T, AppError>>> {
+        self.inner = None;
+        self.timer = None;
+        Poll::Ready(Some(Err(self.server.tag(error, self.method))))
+    }
+}
+
+impl<T> Stream for CallerStream<T> {
+    type Item = Result<T, AppError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let span = this.span.clone();
+        let _entered = span.enter();
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        if this.cancelled.as_mut().poll(cx).is_ready() {
+            return this.end(AppError::cancelled("the call was cancelled"));
+        }
+        if let Some(timer) = this.timer.as_mut()
+            && timer.as_mut().poll(cx).is_ready()
+        {
+            return this.end(AppError::deadline_exceeded(
+                "the call deadline was exceeded",
+            ));
+        }
+        let polled = Pin::new(inner).poll_next(cx);
+        match polled {
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(end) => {
+                this.inner = None;
+                this.timer = None;
+                Poll::Ready(end)
+            }
+        }
+    }
 }
 
 /// The two deadlines of one call, on tokio's clock: the caller's and, when
@@ -545,6 +798,236 @@ where
         Ok(Ok(reply)) => Rep::decode(reply).map_err(|_| server.tag(malformed_reply(), method)),
         Ok(Err(error)) | Err(error) => Err(error),
     }
+}
+
+/// `local`: the serving side's open around the implementation, in the
+/// caller's task. Typed errors are turned into their `AppError` form, so
+/// every binding hands the caller the same values.
+async fn open_local<D, Req, Item, E, EI, L, Fut>(
+    link: &Link,
+    method: usize,
+    callee: CallContext,
+    imp: Arc<D>,
+    req: Req,
+    local: L,
+) -> Result<CallStream<Item, AppError>, AppError>
+where
+    D: ?Sized,
+    Item: Send + 'static,
+    E: ComponentError,
+    EI: ComponentError,
+    L: FnOnce(Arc<D>, CallContext, Req) -> Fut,
+    Fut: Future<Output = Result<CallStream<Item, EI>, E>>,
+{
+    link.server
+        .open_stream(
+            method,
+            callee.into_inbound(),
+            None,
+            link.binding.as_str(),
+            move |cx| async move {
+                match local(imp, cx, req).await {
+                    Ok(stream) => Ok(CallStream::new(
+                        stream.map(|item| item.map_err(ComponentError::into_app_error)),
+                    )),
+                    Err(error) => Err(error.into_app_error()),
+                }
+            },
+        )
+        .await
+}
+
+/// `local-serialized`: encode the request and the context, open and run the
+/// stream on a task of its own, decode its items. The task reports the open
+/// on a `oneshot` and sends the encoded items, then the encoded terminal
+/// error, over a channel of [`SERIALIZED_STREAM_BUFFER`]; it reserves a slot
+/// before it polls the producer, so a producer never runs further ahead.
+/// While it waits for a slot it watches the component's closing, so a
+/// closed stream releases its admission even when its consumer is behind.
+/// Dropping the returned future or stream aborts the task.
+async fn open_serialized<Req, Item>(
+    server: &Arc<Server>,
+    dispatch: Arc<dyn Dispatch>,
+    method: usize,
+    callee: CallContext,
+    req: Req,
+) -> Result<CallStream<Item, AppError>, AppError>
+where
+    Req: WireMessage,
+    Item: WireMessage,
+{
+    let body = Bytes::from(req.encode_to_vec());
+    let mut wire_headers = HeaderMap::new();
+    headers::inject(&callee, &mut wire_headers);
+    // As for unary calls: the deadline pinned, the caller's child token.
+    let deadline = callee.deadline();
+    let cancel = callee.cancel_token().clone();
+    let serving = Arc::clone(server);
+    let (opened_tx, opened_rx) = oneshot::channel::<Result<(), Bytes>>();
+    let (items_tx, items_rx) = mpsc::channel::<Result<Bytes, Bytes>>(SERIALIZED_STREAM_BUFFER);
+    let task = tokio::spawn(
+        async move {
+            let mut cx =
+                headers::from_headers(&wire_headers, Some(ServiceIdentity::trusted(LOCAL_CALLER)))
+                    .with_cancel(cancel);
+            if let Some(deadline) = deadline {
+                cx = cx.with_deadline(deadline);
+            }
+            let opened = serving
+                .open_stream(
+                    method,
+                    cx,
+                    None,
+                    Binding::LocalSerialized.as_str(),
+                    move |cx| dispatch.dispatch_stream(method, cx, body),
+                )
+                .await;
+            let mut stream = match opened {
+                Ok(stream) => stream,
+                Err(error) => {
+                    drop(opened_tx.send(Err(wire::encode_error(&error))));
+                    return;
+                }
+            };
+            if opened_tx.send(Ok(())).is_err() {
+                return;
+            }
+            let closing = serving.closing().clone();
+            loop {
+                let slot = tokio::select! {
+                    biased;
+                    slot = items_tx.reserve() => match slot {
+                        Ok(slot) => Some(slot),
+                        Err(_closed) => return,
+                    },
+                    () = closing.cancelled() => None,
+                };
+                let Some(slot) = slot else {
+                    // Closed while the consumer is behind: end the stream
+                    // now, releasing its admission, and deliver its end
+                    // after the items already sent. The serving wrapper
+                    // checks closing before it polls the producer.
+                    let end = stream.next().await;
+                    drop(stream);
+                    if let Some(Err(error)) = end {
+                        drop(items_tx.send(Err(wire::encode_error(&error))).await);
+                    }
+                    return;
+                };
+                match stream.next().await {
+                    Some(Ok(item)) => slot.send(Ok(item)),
+                    Some(Err(error)) => {
+                        slot.send(Err(wire::encode_error(&error)));
+                        return;
+                    }
+                    None => return,
+                }
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
+    let task = AbortOnDrop(task);
+    match opened_rx.await {
+        Ok(Ok(())) => Ok(CallStream::new(SerializedStream::<Item> {
+            items: items_rx,
+            task: Some(task),
+            server: Arc::clone(server),
+            method,
+            item: std::marker::PhantomData,
+        })),
+        Ok(Err(error)) => {
+            Err(wire::decode_error(error).unwrap_or_else(|| server.tag(malformed_reply(), method)))
+        }
+        // The task ended without answering: it panicked or the runtime
+        // cancelled it.
+        Err(_closed) => match task.await {
+            Err(failure) => Err(server.tag(task_failed(server, method, &failure), method)),
+            Ok(()) => Err(server.tag(AppError::cancelled("the call was cancelled"), method)),
+        },
+    }
+}
+
+/// The caller's end of a `local-serialized` stream: decodes the items and
+/// the terminal error, and reads the task's outcome when the channel ends.
+struct SerializedStream<Item> {
+    items: mpsc::Receiver<Result<Bytes, Bytes>>,
+    /// `None` once its outcome was read.
+    task: Option<AbortOnDrop<()>>,
+    server: Arc<Server>,
+    method: usize,
+    item: std::marker::PhantomData<fn() -> Item>,
+}
+
+impl<Item: WireMessage> Stream for SerializedStream<Item> {
+    type Item = Result<Item, AppError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.items.poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(
+                Item::decode(bytes).map_err(|_| this.server.tag(malformed_reply(), this.method)),
+            )),
+            Poll::Ready(Some(Err(bytes))) => Poll::Ready(Some(Err(wire::decode_error(bytes)
+                .unwrap_or_else(|| this.server.tag(malformed_reply(), this.method))))),
+            Poll::Ready(None) => {
+                let Some(task) = this.task.as_mut() else {
+                    return Poll::Ready(None);
+                };
+                let outcome = Pin::new(task).poll(cx);
+                match outcome {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(outcome) => {
+                        this.task = None;
+                        match outcome {
+                            Ok(()) => Poll::Ready(None),
+                            Err(failure) => Poll::Ready(Some(Err(this.server.tag(
+                                task_failed(&this.server, this.method, &failure),
+                                this.method,
+                            )))),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `grpc`: encode the request, pass the caller side's remote gate (an
+/// admission held for the whole stream, closed when this App stops), open
+/// the stream through the remote client — which enforces the method's
+/// timeout, retries the open and drives the breaker — and decode its items.
+/// Dropping the stream resets the HTTP/2 stream.
+#[cfg(feature = "grpc")]
+async fn open_remote<Req, Item>(
+    server: &Arc<Server>,
+    client: Arc<RemoteClient>,
+    method: usize,
+    callee: CallContext,
+    req: Req,
+) -> Result<CallStream<Item, AppError>, AppError>
+where
+    Req: WireMessage,
+    Item: WireMessage,
+{
+    let body = Bytes::from(req.encode_to_vec());
+    let decoder = Arc::clone(server);
+    server
+        .open_stream(
+            method,
+            callee,
+            None,
+            Binding::Grpc.as_str(),
+            move |cx| async move {
+                let stream = Box::pin(client.open_stream(method, cx, body)).await?;
+                Ok(CallStream::new(stream.map(move |item| {
+                    item.and_then(|bytes| {
+                        Item::decode(bytes).map_err(|_| decoder.tag(malformed_reply(), method))
+                    })
+                })))
+            },
+        )
+        .await
 }
 
 fn malformed_reply() -> AppError {

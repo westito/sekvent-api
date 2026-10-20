@@ -20,12 +20,13 @@ impl prost::Name for PingReply {
 }
 
 mod proto {
-    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.echo.v1.Echo",
         &[(
             "Ping",
             "check.echo.v1.PingRequest",
             "check.echo.v1.PingReply",
+            false,
             false,
         )],
     );

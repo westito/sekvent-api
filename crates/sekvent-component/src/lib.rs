@@ -44,6 +44,8 @@
 //! | `SEKVENT_COMPONENT_<C>_POLICY`, `…_<C>_<M>_POLICY` | a named policy, `SEKVENT_POLICY_<N>_*` |
 //! | `SEKVENT_COMPONENT_<C>_<FIELD>` | resilience field for every method of `C` |
 //! | `SEKVENT_COMPONENT_<C>_<M>_<FIELD>` | resilience field of method `M` |
+//! | `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME` | lifetime of the streams of every streaming method of `C` (default 15 minutes; known only when `C` has one) |
+//! | `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` | lifetime of the streams of streaming method `M` |
 //!
 //! Fields are those of `sekvent_resilience::PolicySpec` except `RATE_LIMIT_*`:
 //! `TIMEOUT` (caller side, and serving side for gRPC-served calls), the
@@ -63,6 +65,23 @@
 //! bulkhead is full or with `UNAVAILABLE` when the component is not serving.
 //! Typed errors ([`ComponentError`](trait@ComponentError)) travel as [`AppError`]s and decode back
 //! into their variant.
+//!
+//! # Streams
+//!
+//! A `#[call(stream)]` method answers one request with a [`CallStream`]:
+//! `Result<CallStream<Item, ItemError>, Error>`, the outer `Result` being
+//! the open. The open is a call in every respect (hop limit, admission,
+//! bulkhead, authentication, `TIMEOUT`, retries and breaker under `grpc`).
+//! The stream after it ends when the producer ends, at its first error,
+//! when the consumer drops it, when the caller cancels or its deadline
+//! passes, when its lifetime (`STREAM_MAX_LIFETIME`, default
+//! [`DEFAULT_STREAM_MAX_LIFETIME`], jittered down to 90 %) passes
+//! (`UNAVAILABLE` / [`reasons::STREAM_EXPIRED`]), or when its component
+//! closes its streams (`UNAVAILABLE` / [`reasons::DRAINING`]): on
+//! [`App::stop`], [`App::close_streams`], and with `App::register` as soon
+//! as the runtime begins shutting down. An open stream holds its admission
+//! and its bulkhead permit until it ends. The method's `TIMEOUT` bounds the
+//! open only and never narrows the stream's context.
 //!
 //! # Lifecycle
 //!
@@ -108,6 +127,7 @@ mod policy;
 #[cfg(feature = "runtime")]
 mod runtime;
 mod server;
+mod stream;
 mod wire;
 
 #[doc(hidden)]
@@ -126,6 +146,7 @@ pub use sekvent_error::{AppError, ErrorCode};
 /// error enum.
 #[cfg(feature = "macros")]
 pub use sekvent_macros::{ComponentError, component};
+pub use stream::CallStream;
 
 /// Caller name a component sees for calls made in this process, under both
 /// local bindings. Reserved: no link may be named `local`, so a remote caller
@@ -142,3 +163,5 @@ pub const MAX_HOPS_KEY: &str = "SEKVENT_COMPONENT_MAX_HOPS";
 pub const DEFAULT_MAX_HOPS: u32 = 16;
 /// Prefix of named policy keys, `SEKVENT_POLICY_<NAME>_<FIELD>`.
 pub const POLICY_PREFIX: &str = "SEKVENT_POLICY_";
+/// Default of `STREAM_MAX_LIFETIME`: how long a stream may stay open.
+pub const DEFAULT_STREAM_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_mins(15);

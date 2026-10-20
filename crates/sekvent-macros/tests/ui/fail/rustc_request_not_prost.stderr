@@ -1,7 +1,7 @@
 error[E0277]: `Plain` is not a protobuf message
-  --> tests/ui/fail/rustc_request_not_prost.rs:19:1
+  --> tests/ui/fail/rustc_request_not_prost.rs:20:1
    |
-19 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+20 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    | |
    | unsatisfied trait bound
@@ -35,9 +35,9 @@ note: required by a bound in `sekvent_component::__private::Endpoint::<D>::call`
    = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Plain` is not a protobuf message
-  --> tests/ui/fail/rustc_request_not_prost.rs:19:1
+  --> tests/ui/fail/rustc_request_not_prost.rs:20:1
    |
-19 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+20 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    | |
    | the trait `Default` is not implemented for `Plain`
@@ -61,9 +61,9 @@ help: consider annotating `Plain` with `#[derive(Default)]`
    |
 
 error[E0277]: the trait bound `Plain: sekvent_component::__private::prost::message::Message` is not satisfied
-  --> tests/ui/fail/rustc_request_not_prost.rs:19:1
+  --> tests/ui/fail/rustc_request_not_prost.rs:20:1
    |
-19 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+20 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
 help: the trait `sekvent_component::__private::prost::message::Message` is not implemented for `Plain`
@@ -92,9 +92,9 @@ note: required by a bound in `sekvent_component::__private::Endpoint::<D>::call`
    |              ^^^^^^^^^^^ required by this bound in `Endpoint::<D>::call`
 
 error[E0277]: the trait bound `Plain: Default` is not satisfied
-  --> tests/ui/fail/rustc_request_not_prost.rs:19:1
+  --> tests/ui/fail/rustc_request_not_prost.rs:20:1
    |
-19 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+20 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Plain`
    |
    = note: required for `Plain` to implement `sekvent_component::__private::WireMessage`
@@ -113,9 +113,9 @@ help: consider annotating `Plain` with `#[derive(Default)]`
    |
 
 error[E0277]: `Plain` is not a protobuf message
-  --> tests/ui/fail/rustc_request_not_prost.rs:19:1
+  --> tests/ui/fail/rustc_request_not_prost.rs:20:1
    |
-19 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+20 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
 help: the trait `sekvent_component::__private::prost::message::Message` is not implemented for `Plain`
@@ -146,9 +146,9 @@ note: required by a bound in `sekvent_component::__private::serve`
    = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Plain` is not a protobuf message
-  --> tests/ui/fail/rustc_request_not_prost.rs:19:1
+  --> tests/ui/fail/rustc_request_not_prost.rs:20:1
    |
-19 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+20 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Plain`
    |
    = note: component requests and replies must be prost messages; declare the component `local_only` to use plain Rust types
@@ -169,9 +169,9 @@ help: consider annotating `Plain` with `#[derive(Default)]`
    |
 
 error[E0277]: `Plain` is not a protobuf message
-  --> tests/ui/fail/rustc_request_not_prost.rs:25:14
+  --> tests/ui/fail/rustc_request_not_prost.rs:26:14
    |
-25 |         req: Plain,
+26 |         req: Plain,
    |              ^^^^^ unsatisfied trait bound
    |
 help: the trait `sekvent_component::__private::prost::message::Message` is not implemented for `Plain`
@@ -198,9 +198,9 @@ note: required by a bound in `sekvent_component::__private::assert_wire`
    |                             ^^^^^^^^^^^ required by this bound in `assert_wire`
 
 error[E0277]: `Plain` is not a protobuf message
-  --> tests/ui/fail/rustc_request_not_prost.rs:25:14
+  --> tests/ui/fail/rustc_request_not_prost.rs:26:14
    |
-25 |         req: Plain,
+26 |         req: Plain,
    |              ^^^^^ the trait `Default` is not implemented for `Plain`
    |
    = note: component requests and replies must be prost messages; declare the component `local_only` to use plain Rust types
@@ -217,9 +217,9 @@ help: consider annotating `Plain` with `#[derive(Default)]`
    |
 
 error[E0277]: `Plain` has no protobuf type name
-  --> tests/ui/fail/rustc_request_not_prost.rs:25:14
+  --> tests/ui/fail/rustc_request_not_prost.rs:26:14
    |
-25 |         req: Plain,
+26 |         req: Plain,
    |              ^^^^^ unsatisfied trait bound
    |
 help: the trait `sekvent_component::__private::prost::name::Name` is not implemented for `Plain`
@@ -246,9 +246,9 @@ note: required by a bound in `sekvent_component::__private::assert_rpc`
    |                              ^^^^^^^^^^^^^^^ required by this bound in `assert_rpc`
 
 error[E0277]: `Plain` has no protobuf type name
-  --> tests/ui/fail/rustc_request_not_prost.rs:25:14
+  --> tests/ui/fail/rustc_request_not_prost.rs:26:14
    |
-25 |         req: Plain,
+26 |         req: Plain,
    |              ^^^^^ the trait `Default` is not implemented for `Plain`
    |
    = note: compile the messages with sekvent-proto-build, which enables prost's type names, or implement `prost::Name`

@@ -13,15 +13,24 @@
 //! an anonymous method skips the end-user authenticator but never the link
 //! check, and an optional-end-user method skips it only for a request
 //! without an `Authorization` header.
+//!
+//! A streaming method's `TIMEOUT` does not narrow the context: it bounds
+//! the open (the end user, the body, the handler's open) together with the
+//! caller's deadline. The response headers go out once the stream is open,
+//! each item is one gRPC message (at most 4 MiB), and the trailers carry
+//! the end. The response carries a [`MessageCount`] for the access log.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use sekvent_context::{CallContext, ServiceIdentity, headers};
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_link::TokenMap;
+use sekvent_telemetry::access_log::MessageCount;
+use tokio::time::Instant;
 use tonic::body::Body;
 use tonic::server::Grpc;
 use tonic::service::Routes;
@@ -32,11 +41,13 @@ use crate::__private::{BoxFuture, Dispatch};
 use crate::end_user::{EndUserAuthenticator, rejection};
 use crate::link::{DOWNSTREAM, depth_exceeded};
 use crate::server::{Server, tag};
-use crate::wire::{CatchPanic, Panicked};
-use crate::{ComponentDescriptor, reasons};
+use crate::stream::CallStream;
+use crate::wire::{CatchPanic, CatchPanicStream, Panicked};
+use crate::{Binding, ComponentDescriptor, reasons};
 
 /// The largest request message a served component decodes (4 MiB); a
 /// larger one is rejected by tonic with `OUT_OF_RANGE` before it is read.
+/// Stream items above it end the stream with `OUT_OF_RANGE`.
 pub(crate) const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 /// The original code of a converted downstream failure.
@@ -130,7 +141,8 @@ impl Served {
     /// Everything decided from the request headers alone, before the body
     /// is read and before an end user is authenticated: the link, the
     /// route, the context and its deadline (the method's timeout narrows
-    /// it), and whether the end-user authenticator must run.
+    /// it, or bounds the open of a stream), and whether the end-user
+    /// authenticator must run.
     fn prepare(&self, path: &str, wire_headers: &http::HeaderMap) -> Result<Prepared, AppError> {
         let descriptor = self.descriptor();
         let caller = self.link(wire_headers)?;
@@ -149,27 +161,33 @@ impl Served {
             && (!declared.is_optional_end_user()
                 || wire_headers.contains_key(http::header::AUTHORIZATION));
         let mut cx = headers::from_headers(wire_headers, caller);
-        if let Some(deadline) = self
+        let timeout = self
             .server
             .timeout(method)
-            .and_then(|timeout| tokio::time::Instant::now().checked_add(timeout))
-        {
-            cx = cx.with_deadline(deadline.into_std());
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let mut open_deadline = None;
+        match timeout {
+            Some(deadline) if declared.is_stream() => open_deadline = Some(deadline),
+            Some(deadline) => cx = cx.with_deadline(deadline.into_std()),
+            None => {}
         }
         Ok(Prepared {
             method,
             cx,
             end_user,
+            open_deadline,
         })
     }
 
     /// Run the end-user authenticator on the request head within the
-    /// call's deadline, and make the end user the context's caller.
+    /// call's deadline (and a stream's `open_deadline`), and make the end
+    /// user the context's caller.
     async fn authenticate(
         &self,
         method: usize,
         cx: CallContext,
         head: &http::request::Parts,
+        open_deadline: Option<Instant>,
     ) -> Result<CallContext, AppError> {
         let Some(authenticator) = &self.end_user else {
             return Ok(cx);
@@ -177,8 +195,8 @@ impl Served {
         // Deferred into the caught poll, so a sync closure that panics is
         // caught too.
         let attempt = CatchPanic::new(async move { authenticator.authenticate(head).await });
-        let outcome = match sekvent_resilience::remaining(&cx) {
-            Some(remaining) => tokio::time::timeout(remaining, attempt)
+        let outcome = match open_bound(&cx, open_deadline) {
+            Some(bound) => tokio::time::timeout_at(bound, attempt)
                 .await
                 .map_err(|_elapsed| deadline_exceeded(self.descriptor(), method))?,
             None => attempt.await,
@@ -211,6 +229,47 @@ impl Served {
             ));
         }
         Ok(())
+    }
+
+    /// Open one prepared stream through the gate: the open within the open
+    /// bound, a panic of the open or of the producer caught, an open error
+    /// passing [`from_handler`]. Item errors cross untouched.
+    async fn open(
+        &self,
+        method: usize,
+        cx: CallContext,
+        open_deadline: Option<Instant>,
+        body: Bytes,
+    ) -> Result<CallStream<Bytes, AppError>, AppError> {
+        let descriptor = self.descriptor();
+        let dispatch = Arc::clone(&self.dispatch);
+        self.server
+            .open_stream(
+                method,
+                cx,
+                open_deadline,
+                Binding::Grpc.as_str(),
+                move |cx| async move {
+                    // As for unary calls, a panic before the future exists
+                    // is caught too.
+                    let opened =
+                        CatchPanic::new(
+                            async move { dispatch.dispatch_stream(method, cx, body).await },
+                        )
+                        .await;
+                    match opened {
+                        Ok(Ok(stream)) => Ok(CallStream::new(CatchPanicStream::new(stream).map(
+                            move |item| match item {
+                                Ok(item) => item,
+                                Err(Panicked) => Err(panicked(descriptor, method)),
+                            },
+                        ))),
+                        Ok(Err(error)) => Err(from_handler(descriptor, method, error)),
+                        Err(Panicked) => Err(panicked(descriptor, method)),
+                    }
+                },
+            )
+            .await
     }
 
     /// Run one prepared call through the gate and answer.
@@ -279,6 +338,19 @@ struct Prepared {
     cx: CallContext,
     /// Whether the end-user authenticator must run.
     end_user: bool,
+    /// For a streaming method, the end of its `TIMEOUT`, which bounds the
+    /// open only.
+    open_deadline: Option<Instant>,
+}
+
+/// The earlier of the context's deadline and `open_deadline`, on tokio's
+/// clock.
+fn open_bound(cx: &CallContext, open_deadline: Option<Instant>) -> Option<Instant> {
+    let deadline = cx.deadline().map(Instant::from_std);
+    match (deadline, open_deadline) {
+        (Some(deadline), Some(open)) => Some(deadline.min(open)),
+        (deadline, open) => deadline.or(open),
+    }
 }
 
 /// The call's deadline passed while it was being served.
@@ -332,13 +404,14 @@ where
                     method,
                     mut cx,
                     end_user,
+                    open_deadline,
                 } = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(error_response(error)),
                 };
                 let (head, body) = request.into_parts();
                 if end_user {
-                    cx = match served.authenticate(method, cx, &head).await {
+                    cx = match served.authenticate(method, cx, &head, open_deadline).await {
                         Ok(cx) => cx,
                         Err(error) => return Ok(error_response(error)),
                     };
@@ -347,6 +420,9 @@ where
                     return Ok(error_response(error));
                 }
                 let request = http::Request::from_parts(head, body);
+                if descriptor.methods()[method].is_stream() {
+                    return Ok(serve_stream(served, method, cx, open_deadline, request).await);
+                }
                 // Cancels the call's token when the client resets the stream
                 // and this future is dropped, or when the deadline passes.
                 let guard = cx.cancel_token().clone().drop_guard();
@@ -367,6 +443,96 @@ where
             }
             .instrument(span),
         )
+    }
+}
+
+/// Serve one prepared stream: open it within the open bound (a trailers-only
+/// `DEADLINE_EXCEEDED` when it passes), then hand its items to tonic as
+/// they come, counted in the response's [`MessageCount`]. A drop guard
+/// cancels the call's token if the response future is dropped during the
+/// open; after it, the stream's own guard does when hyper drops the body.
+async fn serve_stream<B>(
+    served: Arc<Served>,
+    method: usize,
+    cx: CallContext,
+    open_deadline: Option<Instant>,
+    request: http::Request<B>,
+) -> http::Response<Body>
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+{
+    let descriptor = served.descriptor();
+    let guard = cx.cancel_token().clone().drop_guard();
+    let bound = open_bound(&cx, open_deadline);
+    let count = MessageCount::new();
+    let mut grpc = Grpc::new(BytesCodec)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+    let call = grpc.server_streaming(
+        StreamOpen {
+            served,
+            method,
+            cx,
+            open_deadline,
+            count: count.clone(),
+        },
+        request,
+    );
+    let mut response = match bound {
+        Some(bound) => match tokio::time::timeout_at(bound, call).await {
+            Ok(response) => response,
+            Err(_elapsed) => return error_response(deadline_exceeded(descriptor, method)),
+        },
+        None => call.await,
+    };
+    drop(guard.disarm());
+    // A trailers-only answer is a failed open: no stream, nothing to count.
+    if !response.headers().contains_key("grpc-status") {
+        response.extensions_mut().insert(count);
+    }
+    response
+}
+
+/// One prepared stream, as tonic's server-streaming server sees it.
+struct StreamOpen {
+    served: Arc<Served>,
+    method: usize,
+    cx: CallContext,
+    open_deadline: Option<Instant>,
+    count: MessageCount,
+}
+
+impl tower::Service<tonic::Request<Bytes>> for StreamOpen {
+    type Response = tonic::Response<CallStream<Bytes, tonic::Status>>;
+    type Error = tonic::Status;
+    type Future = BoxFuture<'static, Result<Self::Response, tonic::Status>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), tonic::Status>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: tonic::Request<Bytes>) -> Self::Future {
+        let served = Arc::clone(&self.served);
+        let method = self.method;
+        let cx = self.cx.clone();
+        let open_deadline = self.open_deadline;
+        let count = self.count.clone();
+        let body = request.into_inner();
+        Box::pin(async move {
+            let stream = served
+                .open(method, cx, open_deadline, body)
+                .await
+                .map_err(tonic::Status::from)?;
+            Ok(tonic::Response::new(CallStream::new(stream.map(
+                move |item| {
+                    if item.is_ok() {
+                        count.increment();
+                    }
+                    item.map_err(tonic::Status::from)
+                },
+            ))))
+        })
     }
 }
 
@@ -683,7 +849,12 @@ mod tests {
         let mut prepared = served.prepare(path, &wire)?;
         if prepared.end_user {
             prepared.cx = served
-                .authenticate(prepared.method, prepared.cx, &head(wire))
+                .authenticate(
+                    prepared.method,
+                    prepared.cx,
+                    &head(wire),
+                    prepared.open_deadline,
+                )
                 .await?;
         }
         Ok(prepared)
@@ -839,7 +1010,7 @@ mod tests {
         let unbounded = end_user_served(false, None);
         let prepared = unbounded.prepare(RESERVE, &bearer("user-1")).unwrap();
         let cx = served
-            .authenticate(prepared.method, prepared.cx, &head(bearer("user-1")))
+            .authenticate(prepared.method, prepared.cx, &head(bearer("user-1")), None)
             .await
             .unwrap();
         assert!(cx.end_user().is_some());
@@ -849,7 +1020,7 @@ mod tests {
     async fn without_an_authenticator_the_context_is_unchanged() {
         let served = served();
         let cx = served
-            .authenticate(0, CallContext::new(), &head(bearer("user-1")))
+            .authenticate(0, CallContext::new(), &head(bearer("user-1")), None)
             .await
             .unwrap();
         assert_eq!(cx.end_user(), None);

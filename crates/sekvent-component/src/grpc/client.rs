@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use http::HeaderMap;
 use http::uri::PathAndQuery;
 use sekvent_context::{CallContext, headers};
@@ -18,6 +19,7 @@ use super::codec::BytesCodec;
 use crate::link::{caller_expired, method_timeout};
 use crate::policy;
 use crate::server::{MethodPolicy, shed, tag};
+use crate::stream::CallStream;
 use crate::{ComponentDescriptor, MethodDescriptor, reasons};
 
 /// Calls one remote component: a lazily connected channel (shared with the
@@ -194,6 +196,129 @@ impl RemoteClient {
         result
     }
 
+    /// Open the stream of streaming method `method`: as [`call`](Self::call)
+    /// for the open — dead-call shedding, the breaker, budgeted retries of
+    /// idempotent methods, all within the open bound (the method's timeout
+    /// and the caller's deadline) — while the request headers carry only the
+    /// caller's deadline. The response headers are the open; the breaker
+    /// records the open's outcome only, never what happens after it.
+    ///
+    /// Items arrive as the server sends them. The server's terminal error
+    /// is decoded untouched; a transport failure mid-stream is
+    /// `UNAVAILABLE` / [`reasons::UNREACHABLE`], tagged. Dropping the
+    /// stream resets the HTTP/2 stream.
+    pub(crate) async fn open_stream(
+        &self,
+        method: usize,
+        cx: CallContext,
+        body: Bytes,
+    ) -> Result<CallStream<Bytes, AppError>, AppError> {
+        let Some(remote) = self.methods.get(method) else {
+            return Err(tag(
+                self.descriptor,
+                AppError::unimplemented(format!(
+                    "component {} has no method with index {method}",
+                    self.descriptor.name()
+                )),
+                method,
+            ));
+        };
+        let idempotent = self
+            .descriptor
+            .methods()
+            .get(method)
+            .is_some_and(MethodDescriptor::is_idempotent);
+        shed(&cx).map_err(|error| tag(self.descriptor, error, method))?;
+        let permit = match &self.breaker {
+            Some(breaker) => Some(
+                breaker
+                    .acquire()
+                    .map_err(|error| tag(self.descriptor, error, method))?,
+            ),
+            None => None,
+        };
+        let caller = cx.deadline().map(Instant::from_std);
+        let deadline = remote
+            .timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout))
+            .filter(|deadline| caller.is_none_or(|caller| *deadline < caller));
+        // The retries see the open bound; the attempts send the caller's
+        // deadline only, which bounds the whole stream.
+        let bound = match deadline {
+            Some(deadline) => cx.clone().with_deadline(deadline.into_std()),
+            None => cx.clone(),
+        };
+        let run = remote.policy.call(&bound, idempotent, || {
+            self.open_attempt(method, &remote.path, &cx, body.clone())
+        });
+        let timer = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        let finished = tokio::select! {
+            biased;
+            result = run => Some(result),
+            () = timer => None,
+        };
+        let timed_out = || {
+            tag(
+                self.descriptor,
+                method_timeout(remote.timeout.unwrap_or_default()),
+                method,
+            )
+        };
+        let result = match finished {
+            None => Err(timed_out()),
+            Some(Err(error)) if is_method_expiry(&cx, deadline, &error) => Err(timed_out()),
+            Some(result) => result,
+        };
+        if let Some(permit) = permit {
+            if caused_by_caller(&cx, &result) {
+                permit.release();
+            } else {
+                permit.record(&result);
+            }
+        }
+        result
+    }
+
+    /// One open attempt: fresh headers (context, then the bearer), a ready
+    /// channel, one server-streaming call, resolved at the response
+    /// headers. A trailers-only answer is a failed open.
+    async fn open_attempt(
+        &self,
+        method: usize,
+        path: &PathAndQuery,
+        cx: &CallContext,
+        body: Bytes,
+    ) -> Result<CallStream<Bytes, AppError>, AppError> {
+        let mut headers = HeaderMap::new();
+        headers::inject(cx, &mut headers);
+        if let Some(bearer) = &self.bearer {
+            bearer.apply(&mut headers);
+        }
+        let mut grpc = tonic::client::Grpc::new(self.channel.get());
+        grpc.ready()
+            .await
+            .map_err(|error| self.unreachable(method, error))?;
+        let mut request = tonic::Request::new(body);
+        *request.metadata_mut() = MetadataMap::from_headers(headers);
+        match grpc
+            .server_streaming(request, path.clone(), BytesCodec)
+            .await
+        {
+            Ok(response) => {
+                let descriptor = self.descriptor;
+                Ok(CallStream::new(response.into_inner().map(move |item| {
+                    item.map_err(|status| item_failure(descriptor, method, status))
+                })))
+            }
+            Err(status) => Err(self.classify(method, status)),
+        }
+    }
+
     /// One attempt: fresh headers (context, then the bearer), a ready
     /// channel, one unary call.
     async fn attempt(
@@ -252,6 +377,23 @@ impl RemoteClient {
     }
 }
 
+/// The error a stream's item failed with: a status with an underlying error
+/// is this side's transport (`UNAVAILABLE` / [`reasons::UNREACHABLE`],
+/// tagged); any other status is the server's terminal error, untouched.
+fn item_failure(
+    descriptor: &'static ComponentDescriptor,
+    method: usize,
+    status: tonic::Status,
+) -> AppError {
+    if std::error::Error::source(&status).is_none() {
+        return sekvent_error::grpc::from_status(&status);
+    }
+    let error = AppError::unavailable(format!("component {} is unreachable", descriptor.name()))
+        .with_reason(reasons::UNREACHABLE)
+        .with_source(status);
+    tag(descriptor, error, method)
+}
+
 /// Whether `error` is the method deadline (`deadline`, set only when it
 /// comes before the caller's) passing: a `DEADLINE_EXCEEDED` naming no other
 /// reason while the caller still has time. Tonic and the server enforce
@@ -272,7 +414,7 @@ fn is_method_expiry(cx: &CallContext, deadline: Option<Instant>, error: &AppErro
 /// has been turned into a `METHOD_TIMEOUT` by now, so what is left is the
 /// caller's deadline as tonic or the server enforced it from a
 /// `grpc-timeout` rounded down, possibly a moment before it passes here.
-fn caused_by_caller(cx: &CallContext, result: &Result<Bytes, AppError>) -> bool {
+fn caused_by_caller<T>(cx: &CallContext, result: &Result<T, AppError>) -> bool {
     let Err(error) = result else {
         return false;
     };
@@ -358,10 +500,12 @@ mod tests {
             MethodPolicy {
                 timeout: None,
                 spec: spec.clone(),
+                max_lifetime: None,
             },
             MethodPolicy {
                 timeout: None,
                 spec,
+                max_lifetime: None,
             },
         ];
         RemoteClient::new(INVENTORY, channel(), None, &policies, component)
@@ -465,6 +609,7 @@ mod tests {
         let now = Instant::now();
         let live = CallContext::new().with_deadline((now + Duration::from_secs(10)).into_std());
         assert!(!caused_by_caller(&live, &Ok(Bytes::new())));
+        assert!(!caused_by_caller(&live, &Ok(())));
         let other_reason = || AppError::deadline_exceeded("late").with_reason("QUEUE_TIMEOUT");
         for error in [
             other_reason(),
@@ -472,26 +617,69 @@ mod tests {
             AppError::cancelled("stopped"),
             AppError::unavailable("down"),
         ] {
-            assert!(!caused_by_caller(&live, &Err(error)));
+            assert!(!caused_by_caller::<()>(&live, &Err(error)));
         }
         assert!(
-            caused_by_caller(&live, &Err(AppError::deadline_exceeded("late"))),
+            caused_by_caller::<()>(&live, &Err(AppError::deadline_exceeded("late"))),
             "the caller's deadline enforced a moment early from a rounded grpc-timeout"
         );
 
         let expired = CallContext::new().with_deadline(now.into_std());
-        assert!(caused_by_caller(&expired, &Err(other_reason())));
+        assert!(caused_by_caller::<()>(&expired, &Err(other_reason())));
         assert!(
-            !caused_by_caller(&expired, &Err(method_timeout(Duration::from_secs(1)))),
+            !caused_by_caller::<()>(&expired, &Err(method_timeout(Duration::from_secs(1)))),
             "a method timeout is the callee's"
         );
 
         let cancelled = CallContext::new();
         cancelled.cancel_token().cancel();
-        assert!(caused_by_caller(
+        assert!(caused_by_caller::<()>(
             &cancelled,
             &Err(AppError::cancelled("stopped"))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_stream_open_follows_the_same_rules() {
+        let client = client(&PolicySpec::default()).unwrap();
+        let error = client
+            .open_stream(9, CallContext::new(), Bytes::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unimplemented);
+        assert_eq!(error.metadata()["component"], "inventory");
+
+        let cancelled = CallContext::new();
+        cancelled.cancel_token().cancel();
+        let error = client
+            .open_stream(1, cancelled, Bytes::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert_eq!(error.metadata()["method"], "release");
+
+        let cx =
+            CallContext::new().with_deadline(std::time::Instant::now() + Duration::from_secs(10));
+        let error = client.open_stream(1, cx, Bytes::new()).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(error.reason(), Some(reasons::UNREACHABLE));
+        assert_eq!(error.metadata()["method"], "release");
+    }
+
+    #[test]
+    fn item_failures_tell_the_transport_from_the_server() {
+        let status =
+            sekvent_error::grpc::to_status(&AppError::unavailable("bye").with_reason("DRAINING"));
+        let error = item_failure(INVENTORY, 0, status);
+        assert_eq!(error.reason(), Some("DRAINING"));
+        assert!(!error.metadata().contains_key("component"));
+
+        let mut status = tonic::Status::unknown("h2 reset");
+        status.set_source(Arc::new(std::io::Error::other("reset")));
+        let error = item_failure(INVENTORY, 0, status);
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(error.reason(), Some(reasons::UNREACHABLE));
+        assert_eq!(error.metadata()["method"], "reserve");
     }
 
     #[test]

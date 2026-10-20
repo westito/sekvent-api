@@ -30,9 +30,15 @@ pub mod order {
 }
 
 mod proto {
-    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.echo.v1.Echo",
-        &[("Ping", "check.echo.v1.Line", "check.echo.v1.Line", false)],
+        &[(
+            "Ping",
+            "check.echo.v1.Line",
+            "check.echo.v1.Line",
+            false,
+            false,
+        )],
     );
     #[allow(non_camel_case_types, dead_code)]
     pub type __sekvent_rpc_Echo__Ping = (super::Line, super::Line);

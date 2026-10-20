@@ -3,7 +3,8 @@
 
 /// The component has not been started yet (`UNAVAILABLE`).
 pub const NOT_STARTED: &str = "COMPONENT_NOT_STARTED";
-/// The component is stopping and accepts no new calls (`UNAVAILABLE`).
+/// The component is stopping and accepts no new calls (`UNAVAILABLE`); also
+/// what ends its open streams when it drains or closes them.
 pub const DRAINING: &str = "COMPONENT_DRAINING";
 /// The component has stopped (`UNAVAILABLE`).
 pub const STOPPED: &str = "COMPONENT_STOPPED";
@@ -36,3 +37,6 @@ pub const METHOD_TIMEOUT: &str = "METHOD_TIMEOUT";
 pub const DOWNSTREAM_FAILURE: &str = "DOWNSTREAM_FAILURE";
 /// A component method panicked (`INTERNAL`).
 pub const HANDLER_PANICKED: &str = "HANDLER_PANICKED";
+/// The stream reached its maximum lifetime (`UNAVAILABLE`, metadata
+/// `max_lifetime_ms`); open it again.
+pub const STREAM_EXPIRED: &str = "STREAM_EXPIRED";

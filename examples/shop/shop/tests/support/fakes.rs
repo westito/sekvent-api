@@ -92,6 +92,14 @@ impl Inventory for GatedInventory {
     ) -> Result<StockReply, InventoryError> {
         Err(unsupported("stock"))
     }
+
+    async fn watch_stock(
+        &self,
+        _cx: &CallContext,
+        _req: StockRequest,
+    ) -> Result<CallStream<StockReply, InventoryError>, InventoryError> {
+        Err(unsupported("watch_stock"))
+    }
 }
 
 /// Fires its `oneshot` when dropped.
@@ -162,6 +170,14 @@ impl Inventory for PendingInventory {
     ) -> Result<StockReply, InventoryError> {
         Err(unsupported("stock"))
     }
+
+    async fn watch_stock(
+        &self,
+        _cx: &CallContext,
+        _req: StockRequest,
+    ) -> Result<CallStream<StockReply, InventoryError>, InventoryError> {
+        Err(unsupported("watch_stock"))
+    }
 }
 
 /// Reason the [`FutureReasonInventory`] returns; no variant of
@@ -198,6 +214,14 @@ impl Inventory for FutureReasonInventory {
         _req: StockRequest,
     ) -> Result<StockReply, InventoryError> {
         Err(unsupported("stock"))
+    }
+
+    async fn watch_stock(
+        &self,
+        _cx: &CallContext,
+        _req: StockRequest,
+    ) -> Result<CallStream<StockReply, InventoryError>, InventoryError> {
+        Err(unsupported("watch_stock"))
     }
 }
 
@@ -308,6 +332,14 @@ impl Inventory for FlakyInventory {
             available: 1,
         })
     }
+
+    async fn watch_stock(
+        &self,
+        _cx: &CallContext,
+        _req: StockRequest,
+    ) -> Result<CallStream<StockReply, InventoryError>, InventoryError> {
+        Err(unsupported("watch_stock"))
+    }
 }
 
 /// What a [`RecordingInventory`] saw of one call's context.
@@ -381,5 +413,13 @@ impl Inventory for RecordingInventory {
             sku: req.sku,
             available: 1,
         })
+    }
+
+    async fn watch_stock(
+        &self,
+        _cx: &CallContext,
+        _req: StockRequest,
+    ) -> Result<CallStream<StockReply, InventoryError>, InventoryError> {
+        Err(unsupported("watch_stock"))
     }
 }

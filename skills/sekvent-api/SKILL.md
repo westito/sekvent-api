@@ -51,6 +51,7 @@ can describe APIs the project does not have yet.
 | Call an upstream HTTP API (retries, OAuth 2.0, context propagation) | `docs/modules/client.md` |
 | Retry, breaker, bulkhead, rate gate, timeout, TTL cache | `docs/modules/resilience.md` |
 | Components (trait + proto contract, App builder, bindings, split topology) | `docs/modules/components.md`, concepts in `docs/component-model.md` |
+| Stream live updates to a browser or service (server-streaming `#[call(stream)]`, `CallStream`, lifetime, drain, HTTP/2 keep-alive) | `docs/modules/components.md` ("How to stream replies"), `docs/modules/server.md` ("Keep long streams alive") |
 | `build.rs` protobuf codegen without `protoc` | `docs/modules/proto-build.md` |
 | Container-backed DB and MinIO tests, deterministic tests, coverage | `docs/modules/testing.md` |
 | Why something is designed the way it is | `docs/design/*.md` (decisions; the module pages describe current behaviour) |
@@ -137,7 +138,7 @@ this shape; read it before restructuring.
 | File uploads/downloads (S3, MinIO, presigned URLs) | `storage` |
 | Retry, breaker, TTL cache | `resilience` |
 | Service-to-service tokens | `link` (+ `link-axum` / `link-tonic`) |
-| Components | `component` (+ `component-grpc` for the gRPC binding) |
+| Components | `component` (+ `component-grpc` for the gRPC binding, also for serving streams; `runtime-grpc-web` for browsers) |
 
 A browser frontend: in development run Vite's dev server with
 `server.proxy` sending `/api` to the backend (one origin, no CORS); in

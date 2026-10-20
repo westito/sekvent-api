@@ -69,8 +69,8 @@ impl prost::Name for ReleaseReply {
 pub mod proto {
     /// Contract of `shop.inventory.v1.Inventory`, checked by `#[component(proto = …)]`.
     #[doc(hidden)]
-    #[allow(non_upper_case_globals, dead_code)]
-    pub const __sekvent_service_Inventory: (&str, &[(&str, &str, &str, bool)]) = (
+    #[allow(non_upper_case_globals, dead_code, clippy::type_complexity)]
+    pub const __sekvent_service_Inventory: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "shop.inventory.v1.Inventory",
         &[
             (
@@ -78,11 +78,13 @@ pub mod proto {
                 "shop.inventory.v1.ReserveRequest",
                 "shop.inventory.v1.ReserveReply",
                 false,
+                false,
             ),
             (
                 "Release",
                 "shop.inventory.v1.ReleaseRequest",
                 "shop.inventory.v1.ReleaseReply",
+                false,
                 false,
             ),
         ],

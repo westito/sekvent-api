@@ -11,8 +11,10 @@ This page is the practical guide. For the ideas behind the model and its
 roadmap, see [the component model](../component-model.md). The full design
 notes are [component-c1.md](../design/component-c1.md) (local bindings and
 lifecycle), [component-c2.md](../design/component-c2.md) (gRPC and
-contracts) and [component-end-user.md](../design/component-end-user.md)
-(serving components to end users). Most examples here come from
+contracts), [component-end-user.md](../design/component-end-user.md)
+(serving components to end users) and
+[component-streaming.md](../design/component-streaming.md) (server-streaming
+methods). Most examples here come from
 [`examples/shop`](../../examples/shop), a complete project with three
 components: inventory, notifications and orders.
 
@@ -20,8 +22,8 @@ components: inventory, notifications and orders.
 
 | Facade feature | What it adds |
 |---|---|
-| `component` | `#[sekvent::component]`, `#[derive(sekvent::ComponentError)]`, the `App` builder, the `local` and `local-serialized` bindings. Turns on `config`, `error` and `context`. |
-| `component-grpc` | The `grpc` binding and serving components over gRPC (`App::grpc_routes`). Turns on `component`. |
+| `component` | `#[sekvent::component]`, `#[derive(sekvent::ComponentError)]`, the `App` builder, `CallStream` for server-streaming methods, the `local` and `local-serialized` bindings. Turns on `config`, `error` and `context`. |
+| `component-grpc` | The `grpc` binding and serving components over gRPC (`App::grpc_routes`), unary and server-streaming. Turns on `component`. |
 | `runtime` (with `component`) | `App::register`, which runs the App as one unit of the [runtime](runtime.md). |
 | `runtime-grpc-web` (with `component-grpc`) | gRPC-Web translation on the runtime server, so browsers can call served components ([end users](#how-to-serve-components-to-end-users-browsers-apps)). |
 
@@ -71,6 +73,7 @@ service Inventory {
   rpc Reserve(ReserveRequest) returns (ReserveReply);
   rpc Release(ReleaseRequest) returns (ReleaseReply);
   rpc Stock(StockRequest) returns (StockReply);
+  rpc WatchStock(StockRequest) returns (stream StockReply);
 }
 
 message ReserveRequest { string order_id = 1; string sku = 2; uint32 quantity = 3; }
@@ -129,8 +132,16 @@ pub trait Inventory: Send + Sync + 'static {
     #[call(idempotent, timeout = "500ms")]
     async fn stock(&self, cx: &CallContext, req: StockRequest)
     -> Result<StockReply, InventoryError>;
+
+    /// Stock of one SKU now, then again after every change.
+    #[call(stream, idempotent, timeout = "500ms")]
+    async fn watch_stock(&self, cx: &CallContext, req: StockRequest)
+    -> Result<CallStream<StockReply, InventoryError>, InventoryError>;
 }
 ```
+
+`watch_stock` is a server-streaming method; see
+[How to stream replies](#how-to-stream-replies-callstream).
 
 Wiring and calling it:
 
@@ -161,9 +172,11 @@ app.stop(std::time::Duration::from_secs(5)).await?;
 - **Contract.** The proto `service` and the trait describe the same thing,
   and the `#[component]` macro rejects any mismatch at compile time. The
   service name must equal `<package>.<Trait>`. Each method maps to exactly
-  one unary RPC, named in `UpperCamelCase` (`place_order` maps to
-  `PlaceOrder`), with the same request and reply types. `()` stands for
-  `google.protobuf.Empty`.
+  one RPC, named in `UpperCamelCase` (`place_order` maps to
+  `PlaceOrder`), with the same request and reply types: a unary RPC for a
+  `#[call]` method, a server-streaming RPC (`returns (stream …)`) for a
+  `#[call(stream)]` method. `()` stands for `google.protobuf.Empty`.
+  Client-streaming and bidirectional RPCs are rejected.
 - **Handle.** The macro generates `<Trait>Handle` (`InventoryHandle`). It is
   cheap to clone and has one async method per trait method, plus
   `binding()` and either `install` and `install_with_lifecycle` (standard
@@ -179,8 +192,8 @@ app.stop(std::time::Duration::from_secs(5)).await?;
   | Binding | What happens |
   |---|---|
   | `local` (default) | A direct call on the implementation, with no encoding. |
-  | `local-serialized` | The request is encoded with prost and the context goes through the header codec. The call runs on a task of its own, and the reply or error is encoded and decoded back. Dropping the caller's future aborts the task. |
-  | `grpc` | A unary gRPC call over plaintext HTTP/2 to `SEKVENT_COMPONENT_<C>_ENDPOINT`, authenticated with a [link token](link.md). |
+  | `local-serialized` | The request is encoded with prost and the context goes through the header codec. The call runs on a task of its own, and the reply or error is encoded and decoded back; a stream's items travel over a bounded channel of 16. Dropping the caller's future (or stream) aborts the task. |
+  | `grpc` | A unary or server-streaming gRPC call over plaintext HTTP/2 to `SEKVENT_COMPONENT_<C>_ENDPOINT`, authenticated with a [link token](link.md). |
 
 - **Mode.** A `#[component]` is *standard* (any binding) by default.
   `local_only` components take plain Rust types, have no contract and can
@@ -189,7 +202,8 @@ app.stop(std::time::Duration::from_secs(5)).await?;
 - **Gate.** Every installed component has a serving gate that admits calls
   only while it is `Serving`, sheds calls that are already cancelled or
   past their deadline, applies the method's bulkhead and timeout, and
-  counts in-flight calls so that a stop can drain them.
+  counts in-flight calls so that a stop can drain them. An open stream
+  counts as in flight, and holds its bulkhead permit, until it ends.
 
 ## How to define a component's `-api` crate
 
@@ -228,7 +242,9 @@ The rules for the trait:
   `Send`, `Sync` and `'static`.
 - It needs at least one method and no associated items.
 - Every method is
-  `async fn name(&self, cx: &CallContext, req: Request) -> Result<Reply, Error>`.
+  `async fn name(&self, cx: &CallContext, req: Request) -> Result<Reply, Error>`,
+  or, for a `#[call(stream)]` method,
+  `-> Result<CallStream<Item, ItemError>, Error>`.
 - Method names are snake_case. `install`, `install_with_lifecycle`,
   `install_remote`, `binding` and `clone` are reserved because the handle
   uses them.
@@ -241,19 +257,22 @@ The rules for the trait:
 ### `#[call(...)]` options
 
 Every method needs exactly one kind attribute, and `#[call]` is the only
-kind available. `#[async_call]` and `#[deferred]` are reserved for milestone
+kind available. A server-streaming method is a `#[call]` too, with the
+`stream` option. `#[async_call]` and `#[deferred]` are reserved for milestone
 C3 and are rejected for now.
 
 | Option | Meaning |
 |---|---|
-| `idempotent` | The method may be retried. Only idempotent methods are retried automatically, and only under `grpc`. |
-| `timeout = "2s"` | A humantime string literal, positive. It bounds the **whole call**, retries included, and never extends the caller's deadline. |
-| `bulkhead = 16` | An integer literal from 1 to `u32::MAX`: the most concurrent executions where the component runs. Calls beyond it fail with `RESOURCE_EXHAUSTED` / `BULKHEAD_FULL`. |
+| `idempotent` | The method may be retried. Only idempotent methods are retried automatically, and only under `grpc`. For a stream, only the open is retried. |
+| `timeout = "2s"` | A humantime string literal, positive. It bounds the **whole call**, retries included, and never extends the caller's deadline. For a stream it bounds the **open** only. |
+| `bulkhead = 16` | An integer literal from 1 to `u32::MAX`: the most concurrent executions where the component runs. Calls beyond it fail with `RESOURCE_EXHAUSTED` / `BULKHEAD_FULL`. For a stream it is the most concurrently **open** streams. |
+| `stream` | A server-streaming method: it returns `Result<CallStream<Item, ItemError>, Error>` and maps to `rpc X(A) returns (stream B)`. The flag and the return type go together; either without the other is a compile error. See [How to stream replies](#how-to-stream-replies-callstream). |
+| `max_lifetime = "15m"` | A humantime string literal, positive, valid with `stream` only: the default lifetime of the method's streams (otherwise 15 minutes). |
 | `anonymous` | End users may call the method without credentials when the component is served with `SERVE_AUTH=bearer` or `link,bearer`. It waives end-user authentication only, never link authentication. A compile error on a `local_only` component, which is never served. See [How to serve components to end users](#how-to-serve-components-to-end-users-browsers-apps). |
 | `optional_end_user` | End users may call the method with or without credentials under `SERVE_AUTH=bearer` or `link,bearer`: a request without an `Authorization` header runs with no end user, one with it is authenticated as for any other method, and a rejected credential is refused. Never waives link authentication. Excludes `anonymous`; a compile error on a `local_only` component. See [Methods for everyone that personalise](#methods-for-everyone-that-personalise-calloptional_end_user). |
 
-`timeout` and `bulkhead` are defaults. Configuration can override each of
-them, as described in
+`timeout`, `bulkhead` and `max_lifetime` are defaults. Configuration can
+override each of them, as described in
 [How to tune resilience per component and method](#how-to-tune-resilience-per-component-and-method).
 `anonymous` and `optional_end_user` cannot be changed by configuration.
 Unknown or duplicated options are compile errors. The trybuild cases under
@@ -378,7 +397,8 @@ Inside a handler, `cx` is the **callee's** context:
   authenticated end user. Roles stay with the end user: the components
   this handler calls see subject and tenant, but no `end_user()`.
 - The deadline is the earlier of the caller's deadline and this method's
-  timeout.
+  timeout. In a `#[call(stream)]` method it is the end of the stream
+  instead: the earlier of the caller's deadline and the stream's lifetime.
 - An idempotency key the caller set for this call arrives here. A key the
   caller only *received* from upstream is not forwarded.
 
@@ -505,7 +525,9 @@ impl Lifecycle for NotificationsService {
 - `app.stop(grace)` stops components in reverse install order. Each one
   rejects new calls (`UNAVAILABLE` / `COMPONENT_DRAINING`), waits for its
   in-flight calls until `grace` has passed (in total, not per component),
-  then runs `on_stop`.
+  then runs `on_stop`. As a component starts draining, its open streams end
+  with `UNAVAILABLE` / `COMPONENT_DRAINING`, so a stream never holds the
+  stop for its grace.
   - Every started component's `on_stop` runs exactly once, even when
     another hook fails. The first hook error is returned.
   - The stop runs on its own task, so dropping the future does not
@@ -523,7 +545,11 @@ critical unit, `components`, in `Stage::Components`. The unit starts the
 App, reports ready, and stops it when its stage drains. It drains for half
 of the time left before the runtime's stop deadline, so the `on_stop` hooks
 keep the other half. Ingress units stop first, so a listener stops taking
-calls before the components drain.
+calls before the components drain. As soon as the runtime begins shutting
+down (before the `shutdown_delay`), the unit calls `app.close_streams()`:
+every open stream ends with `UNAVAILABLE` / `COMPONENT_DRAINING` and new
+streams are refused, so the listener's graceful shutdown never waits on a
+stream. Unary calls continue until their stage drains.
 
 ```rust
 let app = builder.build()?;
@@ -570,6 +596,10 @@ What stays the same under every binding:
   the call: under `local-serialized` it aborts the task, and under `grpc`
   it resets the HTTP/2 stream so the server cancels the handler's
   context.
+- **Streams.** The same items and the same terminal error (code, message,
+  reason, metadata) under every binding. What differs is how far a
+  producer runs ahead of its consumer: not at all under `local`, 16 items
+  under `local-serialized`, the HTTP/2 flow-control window under `grpc`.
 - **Hop counting.** Each component call adds one hop. A call deeper than
   `SEKVENT_COMPONENT_MAX_HOPS` (default 16) fails `FAILED_PRECONDITION` /
   `CALL_DEPTH_EXCEEDED` before anything is sent, which stops accidental
@@ -595,8 +625,9 @@ let server = Server::builder()
 ```
 
 - The paths are `/<package>.<Trait>/<Rpc>`, for example
-  `/shop.inventory.v1.Inventory/Reserve`. The wire is plain unary gRPC, so a
-  client generated from the `.proto` by any toolchain can call it.
+  `/shop.inventory.v1.Inventory/Reserve`. The wire is plain unary or
+  server-streaming gRPC, so a client generated from the `.proto` by any
+  toolchain can call it.
 - `app.grpc_routes()` returns empty routes when nothing is exposed, so it
   is safe to always mount. If a component is exposed but the routes were
   never taken, `app.start()` fails `FAILED_PRECONDITION` /
@@ -611,8 +642,10 @@ let server = Server::builder()
   method's timeout. Under the bearer modes the end user is authenticated
   next ([below](#serving-order-for-end-users)). Then the hop limit is
   checked and the call passes the component's gate and bulkhead.
-- Requests are capped at 4 MiB. A handler panic answers `INTERNAL` /
-  `HANDLER_PANICKED`, and the payload is never shown. A request body that
+- Requests are capped at 4 MiB, and so is each item of a served stream (a
+  larger item ends the stream with `OUT_OF_RANGE`). A handler panic, or a
+  producer panic in a stream, answers `INTERNAL` / `HANDLER_PANICKED`, and
+  the payload is never shown. A request body that
   does not decode is `INVALID_ARGUMENT` / `MALFORMED_REQUEST`.
 - Health: under `App::register`, every exposed service reports
   `NotServing` in `grpc.health.v1` until the App has started, `Serving`
@@ -938,6 +971,212 @@ let server = Server::builder()
 - Global layers (`ServerBuilder::layer`) wrap component calls too; see
   [Pitfalls and security](#pitfalls-and-security).
 
+## How to stream replies (`#[call(stream)]`)
+
+A server-streaming method takes one request and answers with a stream of
+replies: live stock levels, the changes of a board, the progress of a job.
+A browser reaches it over gRPC-Web (which supports server streaming and
+nothing more), a service over gRPC, and code in the same process through
+the same handle under `local` and `local-serialized`. Client-streaming and
+bidirectional RPCs are not supported: they are compile errors.
+
+A stream has two phases. The **open** is a call like any other: link and
+end-user authentication, the hop limit, the gate and the bulkhead, the
+method's `TIMEOUT`, open retries and the breaker under `grpc`. It ends when
+the method returns `Ok(CallStream)` or `Err(e)`, not at the first item. The
+**stream** follows: items until the producer ends, its first error, the
+caller's deadline, the stream's lifetime, the consumer dropping it, or its
+component closing its streams.
+
+### Declare it
+
+```proto
+service Inventory {
+  rpc Stock(StockRequest) returns (StockReply);
+  // Stock of one SKU now, then again after every change.
+  rpc WatchStock(StockRequest) returns (stream StockReply);
+}
+```
+
+```rust
+use sekvent::prelude::*;                          // CallStream comes with the prelude
+
+#[sekvent::component(name = "inventory", package = "shop.inventory.v1", proto = "crate::proto::shop::inventory::v1")]
+pub trait Inventory: Send + Sync + 'static {
+    /// Stock of one SKU now, then again after every change.
+    #[call(stream, idempotent, timeout = "500ms")]
+    async fn watch_stock(&self, cx: &CallContext, req: StockRequest)
+    -> Result<CallStream<StockReply, InventoryError>, InventoryError>;
+}
+```
+
+- The method returns `Result<CallStream<Item, ItemError>, Error>`. `Item`
+  is the RPC's output message. `Error` is the error of the open, `ItemError`
+  the error that ends the stream; both implement `ComponentError`, are
+  usually the same type, and may differ.
+- `stream` and the `CallStream` return type go together: `#[call(stream)]`
+  with another return type, a `CallStream` without `stream`, a
+  `#[call(stream)]` method on a unary RPC, a `#[call]` method on a
+  streaming RPC, and any RPC that streams requests are compile errors.
+- Every other option combines with `stream`; `max_lifetime = "…"` is valid
+  with `stream` only.
+- `local_only` components may stream too; their items are any
+  `Send + 'static` type.
+
+### Implement it
+
+`CallStream<T, E>` is a boxed, sendable stream. Build it from any
+`Stream<Item = Result<T, E>> + Send + 'static`:
+
+| Constructor | Use |
+|---|---|
+| `CallStream::new(stream)` | Wrap any stream (`futures::Stream`, the trait tonic and `tokio-stream` use). |
+| `CallStream::from_receiver(receiver)` | Items sent on a `tokio::sync::mpsc::Receiver<Result<T, E>>`; the stream ends when every sender is gone. |
+| `CallStream::iter(items)` | A fixed list, then the end. |
+| `CallStream::empty()` | Ends without an item. |
+
+The shop's inventory keeps a `tokio::sync::watch` channel per SKU and
+answers with it (`tokio-stream` with its `sync` feature):
+
+```rust
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::WatchStream;
+
+impl Inventory for InventoryService {
+    async fn watch_stock(&self, _cx: &CallContext, req: StockRequest)
+        -> Result<CallStream<StockReply, InventoryError>, InventoryError>
+    {
+        let Some(level) = self.inner.levels.get(&req.sku) else {
+            return Err(InventoryError::UnknownSku { sku: req.sku });   // the open fails
+        };
+        let sku = req.sku;
+        // The current level first, then the latest level after each change.
+        let levels = WatchStream::new(level.subscribe()).map(move |available| {
+            Ok::<_, InventoryError>(StockReply { sku: sku.clone(), available })
+        });
+        Ok(CallStream::new(levels))
+    }
+}
+```
+
+- Check, authorise and subscribe in the method body: an error returned
+  there fails the open, before any item, exactly like a unary error.
+- **A stream ends at its first error.** After it yields `Err` or `None`, it
+  yields `None` forever and has already dropped the stream it wrapped. gRPC
+  cannot continue after an error status, so every binding behaves this way.
+- The `cx` the method receives is the **stream's** context: its deadline is
+  the end of the stream (the caller's deadline or the lifetime, whichever
+  comes first), never the open's `TIMEOUT`, so a producer may clone it for
+  the calls it makes while streaming. Its token is cancelled when the
+  stream ends for any reason. A producer task feeding `from_receiver` stops
+  on `cx.cancelled()` or `Sender::closed()`; work meant to outlive the
+  stream takes `cx.detached()`.
+- `cx.caller()` and `cx.end_user()` are known during the open. A producer
+  that needs them captures them there.
+- Items are delivered in order and at most once. Items still buffered when
+  a stream ends are lost.
+
+### Consume it
+
+The handle method resolves once the stream is open. `CallStream` has an
+inherent `next()`, so no extension trait is needed; it also implements
+`Stream` and `FusedStream`.
+
+```rust
+let mut stock = inventory.watch_stock(&cx, StockRequest { sku }).await?;   // open errors: InventoryError
+while let Some(level) = stock.next().await {
+    let level = level?;                                                    // the error that ended it
+    render(level);
+}
+```
+
+Dropping the `CallStream` ends the call under every binding: the producer
+is dropped where the component runs and the stream's token is cancelled.
+Under `grpc` dropping it resets the HTTP/2 stream.
+
+### Reopen and resume
+
+The framework never reopens a stream. A consumer that must follow
+indefinitely loops: it reopens after the stream ends, with backoff after
+errors, and at once (no backoff) after `STREAM_EXPIRED` or
+`COMPONENT_DRAINING`, which mean "this stream is over, open a new one",
+possibly against another instance. Where a gap matters, put a cursor in the
+request (the last version or sequence number seen) and let the open replay
+from there. `WatchStock` needs none: its first item is always the current
+level.
+
+### Lifetime
+
+Every stream has a lifetime, enforced where the component runs (the local
+bindings and gRPC serving), counted from admission:
+
+- the default is `DEFAULT_STREAM_MAX_LIFETIME`, 15 minutes;
+- `#[call(stream, max_lifetime = "1h")]` sets the method's default;
+- `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME` and
+  `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` override it, in that
+  order of precedence (named policies do not carry it).
+
+Each stream draws its own lifetime between 90 % and 100 % of the value, so
+streams opened together (after a deploy) do not all end together. It ends
+with `UNAVAILABLE` / `STREAM_EXPIRED`, metadata `max_lifetime_ms` (the
+configured value). The lifetime also bounds how long a credential is
+trusted: tokens are checked at the open only. There is no idle timeout;
+quiet streams are normal for live updates.
+
+### Drain and shutdown
+
+- An open stream counts as in flight and holds its bulkhead permit until
+  it ends, so size a stream bulkhead for concurrent subscribers, not for a
+  rate.
+- `app.stop(grace)` ends a component's open streams with `UNAVAILABLE` /
+  `COMPONENT_DRAINING` as the component starts draining, and refuses new
+  opens; the stop does not wait out its grace for them.
+- Under `App::register`, the App closes every stream as soon as the runtime
+  begins shutting down (`app.close_streams()`), before the listener drains
+  and before the `shutdown_delay`, so a graceful shutdown never waits on a
+  stream. Unary calls are not affected.
+- Without the runtime, call `app.close_streams()` yourself before draining
+  your own server, then `app.stop(grace)`.
+- Under `grpc` the caller's App also holds each outbound stream and ends it
+  with `COMPONENT_DRAINING` when it stops.
+
+### Browsers
+
+Mount the routes with gRPC-Web as in
+[Mount the routes for browsers](#mount-the-routes-for-browsers); a browser
+receives every item as it is produced. Two deployment facts:
+
+- Over HTTP/1.1 every open stream holds one connection: one of a browser's
+  six per origin, and one of the server's `max_connections`. Put HTTP/2 in
+  front of browsers (TLS at the proxy) when a page opens several streams.
+- Proxies cut quiet responses after their idle timeout (often 60 s). A
+  stream that may stay quiet longer sends application heartbeats (a
+  `oneof` in the item message), or lets the client reopen. On HTTP/2
+  connections to the runtime server,
+  [`ServerBuilder::http2_keep_alive`](server.md#keep-long-streams-alive) detects
+  dead peers.
+
+### What ends a stream
+
+| Cause | The consumer sees |
+|---|---|
+| The producer ends | `None` (gRPC `OK`) |
+| The producer yields `Err(e)` | `Err(e)`, then `None` |
+| The caller's context is cancelled | `CANCELLED` |
+| The caller's deadline passes | `DEADLINE_EXCEEDED`, no reason |
+| The lifetime passes | `UNAVAILABLE` / `STREAM_EXPIRED` |
+| The component drains, `close_streams`, runtime shutdown | `UNAVAILABLE` / `COMPONENT_DRAINING` (`COMPONENT_STOPPED` once stopped) |
+| The producer panics | `local`: the panic propagates into the consumer's poll; `local-serialized`: `INTERNAL`; `grpc`: `INTERNAL` / `HANDLER_PANICKED` |
+| The transport fails (`grpc`) | `UNAVAILABLE` / `COMPONENT_UNREACHABLE` |
+| An item does not decode | `INTERNAL` / `MALFORMED_REPLY` |
+| An item is above 4 MiB (`grpc`) | `OUT_OF_RANGE` |
+
+Where the component runs, every stream logs one `debug` event
+`stream ended` with `component`, `method`, `binding`, `items`,
+`duration_ms`, `outcome` and the terminal error's `code` and `reason`.
+Served streams also get the access log line, with `messages`
+([telemetry](telemetry.md)).
+
 ## How to tune resilience per component and method
 
 Policies come from [`PolicySpec`](resilience.md) fields, layered from the
@@ -952,11 +1191,12 @@ lowest precedence to the highest:
 
 | Field | Levels | Used by |
 |---|---|---|
-| `TIMEOUT` | method, component, named | The caller under every binding (the whole call, retries included), and the serving side for gRPC-served calls. |
-| `BULKHEAD_MAX_CONCURRENT`, `BULKHEAD_MAX_QUEUE`, `BULKHEAD_QUEUE_TIMEOUT` | method, component, named | The serving side, where the component runs. A `grpc` caller has no bulkhead. |
-| `RETRY_MAX_ATTEMPTS`, `RETRY_INITIAL_BACKOFF`, `RETRY_MAX_BACKOFF`, `RETRY_MULTIPLIER`, `RETRY_JITTER`, `RETRY_MAX_RETRY_AFTER` | method, component, named | The `grpc` caller, for `idempotent` methods only, within the deadline. |
+| `TIMEOUT` | method, component, named | The caller under every binding (the whole call, retries included), and the serving side for gRPC-served calls. On a streaming method it bounds the open. |
+| `BULKHEAD_MAX_CONCURRENT`, `BULKHEAD_MAX_QUEUE`, `BULKHEAD_QUEUE_TIMEOUT` | method, component, named | The serving side, where the component runs. A `grpc` caller has no bulkhead. On a streaming method it bounds concurrently open streams. |
+| `RETRY_MAX_ATTEMPTS`, `RETRY_INITIAL_BACKOFF`, `RETRY_MAX_BACKOFF`, `RETRY_MULTIPLIER`, `RETRY_JITTER`, `RETRY_MAX_RETRY_AFTER` | method, component, named | The `grpc` caller, for `idempotent` methods only, within the deadline. On a streaming method, opens only. |
 | `RETRY_BUDGET_RATIO` (default 0.2), `RETRY_BUDGET_MIN_PER_SEC` (default 10) | component, named | One budget per remote component, shared by its methods. |
-| `BREAKER_ENABLED`, `BREAKER_FAILURE_RATE`, `BREAKER_WINDOW`, `BREAKER_MIN_CALLS`, `BREAKER_WAIT_IN_OPEN`, `BREAKER_PERMITTED_IN_HALF_OPEN` | component, named | One breaker per remote component. |
+| `BREAKER_ENABLED`, `BREAKER_FAILURE_RATE`, `BREAKER_WINDOW`, `BREAKER_MIN_CALLS`, `BREAKER_WAIT_IN_OPEN`, `BREAKER_PERMITTED_IN_HALF_OPEN` | component, named | One breaker per remote component. Streams count their opens only. |
+| `STREAM_MAX_LIFETIME` | method, component (not named) | The serving side, where the component runs: the lifetime of a streaming method's streams. Known only for streaming methods, and at component level only for components that have one. |
 
 The value formats and the meaning of each field are documented in
 [resilience](resilience.md). Additional rules:
@@ -1001,6 +1241,13 @@ Under `grpc`:
   The `downstream` metadata names the component where it started, and
   `downstream_code` / `downstream_reason` keep the original values. Callers
   above therefore neither retry nor blame the healthy component in between.
+- **Streams.** Retries, the breaker and the method timeout apply to a
+  stream's **open** only: the open is retried (when `idempotent`) and
+  counted by the breaker like a unary call, and it is complete once the
+  server answers with response headers. Nothing after the open reaches the
+  breaker, and the framework never reopens a stream that ended. An error
+  that ends a stream crosses every hop unchanged; it is never converted to
+  `DOWNSTREAM_FAILURE`.
 
 The `grpc` caller connects lazily, with one channel per endpoint shared
 by every component on it. The connect timeout is 5 s, with HTTP/2
@@ -1023,13 +1270,14 @@ requires them.
 | `SEKVENT_COMPONENT_<C>_SERVE` | `grpc` or `none` | `none` |
 | `SEKVENT_COMPONENT_<C>_SERVE_AUTH` | `link`, `bearer`, `link,bearer` (or `bearer,link`), `none`. A mode with `bearer` needs `AppBuilder::end_user_authenticator`. | `link` |
 | `SEKVENT_COMPONENT_<C>_POLICY`, `SEKVENT_COMPONENT_<C>_<M>_POLICY` | a policy name | — |
+| `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME`, `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` | humantime (`15m`, `2h`) or whole seconds, above zero; streaming methods only | the `max_lifetime` attribute, else 15 minutes |
 | `SEKVENT_COMPONENT_<C>_<FIELD>`, `SEKVENT_COMPONENT_<C>_<M>_<FIELD>` | resilience fields, as in the previous section | attribute and framework defaults |
 | `SEKVENT_POLICY_<NAME>_<FIELD>` | named policy fields | — |
 | `SEKVENT_LINK_OUTBOUND_<LINK>`, `SEKVENT_LINK_INBOUND_<CALLER>`, `SEKVENT_LINK_TRUSTED` | see [link](link.md) | — |
 
 The constants `CONFIG_PREFIX`, `DEFAULT_BINDING_KEY`, `MAX_HOPS_KEY`,
-`DEFAULT_MAX_HOPS`, `POLICY_PREFIX` and `LOCAL_CALLER` are exported from
-`sekvent::component`. Two components or methods whose names produce the
+`DEFAULT_MAX_HOPS`, `DEFAULT_STREAM_MAX_LIFETIME`, `POLICY_PREFIX` and
+`LOCAL_CALLER` are exported from `sekvent::component`. Two components or methods whose names produce the
 same key fail the build with `KeyCollision`.
 
 ## Contracts: `cargo sekvent contract`
@@ -1098,8 +1346,9 @@ metadata the server sent.
 | Constant | Reason | Code | When |
 |---|---|---|---|
 | `NOT_STARTED` | `COMPONENT_NOT_STARTED` | `UNAVAILABLE` | Called before `start` |
-| `DRAINING` | `COMPONENT_DRAINING` | `UNAVAILABLE` | Called while stopping |
-| `STOPPED` | `COMPONENT_STOPPED` | `UNAVAILABLE` | Called after `stop` |
+| `DRAINING` | `COMPONENT_DRAINING` | `UNAVAILABLE` | Called while stopping. Also ends every open stream of a component that drains, after `close_streams`, or when the runtime begins shutting down, and refuses new opens then; reopen elsewhere at once |
+| `STOPPED` | `COMPONENT_STOPPED` | `UNAVAILABLE` | Called after `stop` (and a stream opened then) |
+| `STREAM_EXPIRED` | `STREAM_EXPIRED` | `UNAVAILABLE` | A stream reached its lifetime; metadata `max_lifetime_ms`. Reopen at once |
 | `BULKHEAD_FULL` | `BULKHEAD_FULL` | `RESOURCE_EXHAUSTED` | The method's bulkhead is full |
 | `CIRCUIT_OPEN` | `CIRCUIT_OPEN` | `UNAVAILABLE` | The remote component's breaker is open |
 | `UNREACHABLE` | `COMPONENT_UNREACHABLE` | `UNAVAILABLE` | A transport failure (connection refused, reset) |
@@ -1112,8 +1361,10 @@ metadata the server sent.
 | `DOWNSTREAM_FAILURE` | `DOWNSTREAM_FAILURE` | `INTERNAL` | A transient failure further down the chain |
 | `HANDLER_PANICKED` | `HANDLER_PANICKED` | `INTERNAL` | A method panicked |
 
-The caller's own deadline gives a plain `DEADLINE_EXCEEDED` with no reason.
-Cancellation gives `CANCELLED`. A rejected link token gives
+The caller's own deadline gives a plain `DEADLINE_EXCEEDED` with no reason,
+also when it passes in the middle of a stream. Cancellation gives
+`CANCELLED`. A transport failure in the middle of a stream is
+`UNAVAILABLE` / `COMPONENT_UNREACHABLE`; nothing retries it. A rejected link token gives
 `UNAUTHENTICATED` with no reason. A rejected end user gets
 `UNAUTHENTICATED` with `invalid or expired credentials` and no reason; other
 end-user authenticator errors pass through unchanged
@@ -1160,6 +1411,12 @@ key }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
     warm the lazy gRPC channel before asserting on deadlines.
   - An address nobody listens on is `127.0.0.1:1`.
   - Never sleep to wait for something.
+- **Streams on the paused clock.** A test that waits on a stream that is not
+  meant to end lets tokio auto-advance into the stream's lifetime once every
+  task is idle. Set a long lifetime, or expect `STREAM_EXPIRED` and assert
+  when it came: between 90 % and 100 % of the configured value.
+  `examples/shop/shop/tests/streams.rs` runs `WatchStock` under all three
+  profiles, including the lifetime and a drain with a stream open.
 - **Make split-topology retries fast** with
   `SEKVENT_COMPONENT_<C>_RETRY_INITIAL_BACKOFF=1ms`, `…_MAX_BACKOFF=1ms`
   and `…_RETRY_JITTER=none`.
@@ -1209,7 +1466,28 @@ key }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
 - **`local_only` is an on-ramp.** To make the component remote-capable,
   remove `local_only`, add the proto `service`, and set `proto = "…"`.
 - **Breaking proto changes** need a new package. Never edit a baseline by
-  hand to make `check` pass.
+  hand to make `check` pass. Turning a unary RPC into a streaming one, or
+  back, is a breaking change.
+- **An unpolled stream holds a drain.** A stream notices that its component
+  closed at its next poll; until then it counts as in flight and the drain
+  waits for it, within the grace. Keep consuming streams you hold, or drop
+  them.
+- **Over HTTP/1.1 every open stream holds a connection.** That is one of a
+  browser's six per origin and one of the server's `max_connections`. Put
+  HTTP/2 (TLS at the proxy) in front of browsers that open several streams.
+- **Proxies cut quiet responses.** Many proxies close a response that sends
+  nothing for their idle timeout (often 60 s). A stream that may stay quiet
+  longer sends its own heartbeat items (for example a `oneof` in the item
+  message), or the client reopens it. There is no idle timeout of the
+  framework's own.
+- **Credentials are not re-checked during a stream.** A token that expires
+  or is revoked after the open does not end the stream; its lifetime does.
+  Keep `STREAM_MAX_LIFETIME` no longer than your access tokens (and link
+  tokens) should be trusted.
+- **Outside the runtime, close streams first.** An application that serves
+  `app.grpc_routes()` on a server of its own calls `app.close_streams()`
+  before draining that server, then `app.stop(grace)`; otherwise the
+  server's graceful shutdown waits on every open stream.
 
 ## See also
 
@@ -1218,6 +1496,7 @@ key }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
 - [link](link.md) — service tokens
 - [auth](auth.md) — `BearerAuth::end_user`, `EndUserClaims`, role checks
 - [component-end-user.md](../design/component-end-user.md) — design note on serving components to end users
+- [component-streaming.md](../design/component-streaming.md) — design note on server-streaming methods
 - [resilience](resilience.md) — policy fields and their semantics
 - [runtime](runtime.md), [server](server.md) — running the App and serving gRPC
 - [error](error.md), [context](context.md) — `AppError`, `ErrorCode`, `CallContext`

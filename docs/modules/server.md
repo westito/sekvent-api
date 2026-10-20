@@ -18,7 +18,7 @@ headers, and with `runtime-vfs` the same listener can serve a built frontend
 | Facade feature | `runtime` (on by default) |
 | gRPC-Web | `runtime-grpc-web`. **Off in the facade's defaults** (the internal crate's `grpc-web` feature is on by default, the facade turns it off). Without it, `ServerBuilder::grpc_web(true)` has no effect. |
 | Static frontend | `runtime-vfs` (`Vfs`, `Directory`, `StaticSite`, `ServerBuilder::site`); `runtime-vfs-embed` adds `Embedded` and re-exports `rust-embed`. See [Serve a bundled frontend](#serve-a-bundled-frontend). |
-| Module | `use sekvent::runtime::{Server, ServerBuilder, Ctx, Cors, Download, Disposition, CacheControl, HealthVisibility};` |
+| Module | `use sekvent::runtime::{Server, ServerBuilder, Ctx, Cors, Download, Disposition, CacheControl, HealthVisibility, Http2KeepAlive};` |
 | Prelude | `Server`, `ServerBuilder`, `Ctx` |
 | Your manifest | `axum` (0.8) for REST routes and `tonic` (0.14) for gRPC services, at the versions the workspace pins |
 
@@ -199,6 +199,16 @@ let builder = Runtime::builder()
 Ingress is the last stage to start and the first to drain: the listener
 only opens once infrastructure, components and workers are up.
 
+**Long-lived streams and graceful shutdown.** The graceful drain waits for
+every open response, and a streaming response (a server-streaming gRPC
+call, a gRPC-Web stream, a long download) stays open until its producer
+ends. A stream nobody ends holds the drain until the stage grace runs out
+and the unit is aborted. [Component streams](components.md#how-to-stream-replies-callstream)
+do not: under `App::register` the App ends them with `UNAVAILABLE` /
+`COMPONENT_DRAINING` as soon as shutdown begins, before this unit drains.
+A tonic streaming service of your own must end its streams on shutdown
+itself (watch `ShutdownTrigger::triggered()`).
+
 ### Read the call context in handlers
 
 axum handlers take the `Ctx` extractor:
@@ -324,7 +334,41 @@ in your logs.
 | raw `Body` handlers | unbounded | A handler reading `axum::body::Body` directly must bound it itself, e.g. `http_body_util::Limited`. |
 | gRPC message size | tonic: 4 MiB decoding | Set per service: `OrdersServer::new(svc).max_decoding_message_size(16 << 20)`. |
 | `header_read_timeout(Some(d))` | 30 s | Longest a new connection may stay silent, and an HTTP/1 client may take to send its headers, before it is closed. `None` waits forever; zero is invalid. |
-| `max_connections(Some(n))` | 10 000 | Beyond it, new connections wait in the OS accept queue until one closes. `None` removes the limit; 0 is invalid. |
+| `max_connections(Some(n))` | 10 000 | Beyond it, new connections wait in the OS accept queue until one closes. `None` removes the limit; 0 is invalid. Over HTTP/1.1 (gRPC-Web through most proxies) every open stream holds a whole connection, so size the limit for concurrent streams as well as for requests. |
+| `http2_keep_alive(Some(Http2KeepAlive { interval, timeout }))` | `None` | HTTP/2 PING frames every `interval` on idle connections; a connection whose ping is not acknowledged within `timeout` is closed. Both must be non-zero. See [Keep long streams alive](#keep-long-streams-alive). |
+
+### Keep long streams alive
+
+A quiet stream to a client that vanished (a laptop closing its lid, a
+dropped mobile connection) is only noticed when the server next writes to
+it. Turn on HTTP/2 keep-alive on servers that serve streams:
+
+```rust
+use std::time::Duration;
+use sekvent::runtime::{Http2KeepAlive, Server};
+
+let server = Server::builder()
+    .grpc_routes(app.grpc_routes())
+    .http2_keep_alive(Some(Http2KeepAlive {
+        interval: Duration::from_secs(30),
+        timeout: Duration::from_secs(20),
+    }))
+    .bind(addr)
+    .await?;
+```
+
+- `30 s` / `20 s` is the recommendation for services that serve streams.
+  It is off by default, so services that serve only unary calls do not
+  change.
+- A dead connection is closed after at most `interval + timeout`; its
+  streams end and their producers are dropped.
+- HTTP/1.1 connections get no pings. Behind a proxy that speaks HTTP/1.1 to
+  browsers (most gRPC-Web setups), quiet streams need **application
+  heartbeats**: the stream sends an item now and then (a `oneof` in the item
+  message), which also keeps the proxy from cutting the response after its
+  idle timeout (often 60 s).
+- Component streams also end at their lifetime (`STREAM_MAX_LIFETIME`, 15
+  minutes by default), which bounds a dead peer when neither applies.
 
 ### Configure CORS
 
@@ -466,7 +510,10 @@ With `access_log(true)` (the default) each request is logged once on
 completion: target `sekvent::access`, message `request completed`, fields
 `request_id`, `method`, `path` (never the query), `route`, `protocol`
 (`http`, `grpc`, `grpc-web`), `status`, `grpc_status`, `latency_ms` and
-`aborted`. Levels: `warn` for HTTP 5xx and gRPC `UNKNOWN`, `INTERNAL`,
+`aborted`, plus `messages` for a streaming response that counts its
+messages (component streams do: one per item). For a stream the line is
+written when the response ends or is dropped, so `latency_ms` is the
+stream's duration and `grpc_status` comes from its trailers. Levels: `warn` for HTTP 5xx and gRPC `UNKNOWN`, `INTERNAL`,
 `DATA_LOSS`; `debug` for health traffic; `info` otherwise. The access log and
 the `request` span never record headers, bodies, query strings or peer
 addresses, but they do record paths, so keep secrets out of paths. This
@@ -774,7 +821,7 @@ the lifecycle.
 
 | Situation | Result |
 |---|---|
-| invalid prefix, zero header timeout, connection limit 0 or too large, zero body limit, invalid CORS | `bind`/`from_listener`: `INVALID_ARGUMENT` |
+| invalid prefix, zero header timeout, connection limit 0 or too large, zero body limit, zero keep-alive interval or timeout, invalid CORS | `bind`/`from_listener`: `INVALID_ARGUMENT` |
 | `grpc_routes` twice, or after `add_service` | `bind`/`from_listener`: `INVALID_ARGUMENT`, `gRPC routes were given more than once; use add_service to add more` |
 | `site(..)` without a prefix, or twice | `bind`/`from_listener`: `INVALID_ARGUMENT` |
 | address in use | `bind`: `UNAVAILABLE`, `could not listen on <addr>` |
@@ -786,8 +833,8 @@ the lifecycle.
 Builder defaults: no prefix, `grpc_at_root(true)`, `grpc_web(true)`,
 `health_routes(true)`, `grpc_health(true)`, `HealthVisibility::Minimal`, no
 authenticator, `header_read_timeout(Some(30 s))`,
-`max_connections(Some(10_000))`, no CORS, `rest_body_limit(2 MiB)`, no
-layers, `access_log(true)`.
+`max_connections(Some(10_000))`, `http2_keep_alive(None)`, no CORS,
+`rest_body_limit(2 MiB)`, no layers, `access_log(true)`.
 
 ## Testing
 
@@ -857,6 +904,11 @@ layers, `access_log(true)`.
 - **`Full` health visibility leaks topology** (probe names, version); keep it
   for internal listeners.
 - **Raw body handlers** bypass `rest_body_limit`; bound them yourself.
+- **Streams hold connections and drains.** Over HTTP/1.1 each open stream
+  occupies a connection (one of a browser's six per origin, one of
+  `max_connections`). A streaming response that never ends holds the
+  graceful shutdown until the stage grace; component streams end at
+  shutdown begin, your own tonic streams must do the same.
 - **Upload limits**: raise `DefaultBodyLimit` on the upload route only, not
   globally with `rest_body_limit`.
 

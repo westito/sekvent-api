@@ -31,7 +31,7 @@ sqlx 0.9 and sea-orm 2.0.
 | `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate`, `db-lease` | Named pools, migrations, distinct-target check, list filters, readiness probes per pool, leases with fencing tokens for singleton jobs |
 | `sekvent-sso` | `sso` | Browser single sign-on: OAuth 2.0 authorization code flow with a signed state cookie, a Bitbucket Cloud provider (workspace members only), one-time handoff codes |
 | `sekvent-storage` | `storage` | S3-compatible object storage: presigned browser uploads and downloads, server-side head, delete and copy, a bucket readiness probe; own SigV4 signer on the rustls/ring stack |
-| `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |
+| `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, unary and server-streaming methods, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |
 | `sekvent-testing` | not re-exported (`[dev-dependencies]`) | Postgres, MySQL and MinIO test containers, a reaper, `await_until!` |
 | `sekvent-proto-build` | not re-exported (`[build-dependencies]`) | `build.rs` protobuf codegen on top of `tonic-prost-build`; protos compile in-process with protox, so no `protoc` is needed |
 | `cargo-sekvent` | — | The `cargo sekvent` CLI |
@@ -234,7 +234,11 @@ its `sekvent-runtime` server; callers set
 and a link token. A served component can also face end users directly
 (browsers over gRPC-Web, native apps): `…_SERVE_AUTH=bearer` hands each call
 to an end-user authenticator registered on the App, and
-`#[call(anonymous)]` opens public RPCs such as sign-in. `cargo sekvent
+`#[call(anonymous)]` opens public RPCs such as sign-in. Methods may also
+stream: `#[call(stream)]` returns a `CallStream` of replies (live updates
+to a browser or another service), with the same bindings, authentication
+and gate, a 15-minute default lifetime, and streams that end at once when
+the component drains. `cargo sekvent
 contract check` keeps the protos wire-compatible with committed baselines.
 
 Enable it with the facade feature `component` (plus `component-grpc` for
@@ -243,7 +247,8 @@ runs every component as one runtime unit). The design is in
 [docs/component-model.md](docs/component-model.md), the specifications in
 [docs/design/component-c1.md](docs/design/component-c1.md),
 [docs/design/component-c2.md](docs/design/component-c2.md),
-[docs/design/component-end-user.md](docs/design/component-end-user.md) and, for jobs and
+[docs/design/component-end-user.md](docs/design/component-end-user.md),
+[docs/design/component-streaming.md](docs/design/component-streaming.md) and, for jobs and
 leases, [docs/design/p8-service-essentials.md](docs/design/p8-service-essentials.md), and
 [examples/shop](examples/shop) is a complete three-component example whose
 tests run under `monolith-local`, `monolith-serialized` and a `split-grpc`

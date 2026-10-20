@@ -32,7 +32,7 @@ impl prost::Name for PingReply {
 /// The contract sekvent-proto-build would generate for `check.echo.v1`.
 mod proto {
     #[allow(non_upper_case_globals)]
-    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.echo.v1.Echo",
         &[
             (
@@ -40,11 +40,13 @@ mod proto {
                 "check.echo.v1.PingRequest",
                 "check.echo.v1.PingReply",
                 false,
+                false,
             ),
             (
                 "Twice",
                 "check.echo.v1.PingRequest",
                 "check.echo.v1.PingReply",
+                false,
                 false,
             ),
         ],

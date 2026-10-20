@@ -1,16 +1,19 @@
 //! Compile-time checks that a component trait and its proto service agree.
 //!
-//! `#[component(proto = ...)]` evaluates [`assert_service`] once and
-//! [`assert_rpc`] and [`assert_rpc_types`] once per method in `const` items,
-//! so a mismatch fails the build with one of the messages below. Together
-//! they enforce an exact one-to-one mapping between the trait's methods and
-//! the service's RPCs, with identical request and reply types.
+//! `#[component(proto = ...)]` evaluates [`assert_service`] once, and
+//! [`assert_rpc`] (unary methods) or [`assert_stream_rpc`] (`#[call(stream)]`
+//! methods) and [`assert_rpc_types`] once per method in `const` items, so a
+//! mismatch fails the build with one of the messages below. Together they
+//! enforce an exact one-to-one mapping between the trait's methods and the
+//! service's RPCs, with identical request and reply (or item) types, and
+//! with server streaming exactly where the trait declares it. Client and
+//! bidirectional streaming RPCs never map to a method.
 
 use crate::__private::WireMessage;
 
 /// One RPC as sekvent-proto-build emits it: (RPC name, request full name,
-/// reply full name, streaming).
-pub type ProtoRpc = (&'static str, &'static str, &'static str, bool);
+/// reply full name, client streaming, server streaming).
+pub type ProtoRpc = (&'static str, &'static str, &'static str, bool, bool);
 /// A proto service as sekvent-proto-build emits it: (full name, RPCs).
 pub type ProtoService = (&'static str, &'static [ProtoRpc]);
 
@@ -86,8 +89,8 @@ pub const fn assert_service(proto: ProtoService, service: &str, rpcs: &[&str]) {
     }
 }
 
-/// Const-panics unless `proto` has a non-streaming RPC `rpc` whose request
-/// and reply full names agree with `Req` and `Rep` (see [`full_name_eq`]).
+/// Const-panics unless `proto` has a unary RPC `rpc` whose request and
+/// reply full names agree with `Req` and `Rep` (see [`full_name_eq`]).
 /// [`assert_rpc_types`] then checks that the types are the very ones the
 /// proto service declares.
 pub const fn assert_rpc<Req: ContractMessage, Rep: ContractMessage>(
@@ -97,11 +100,15 @@ pub const fn assert_rpc<Req: ContractMessage, Rep: ContractMessage>(
     let rpcs = proto.1;
     let mut index = 0;
     while index < rpcs.len() {
-        let (name, request, reply, streaming) = rpcs[index];
+        let (name, request, reply, client_streaming, server_streaming) = rpcs[index];
         if str_eq(name, rpc) {
             assert!(
-                !streaming,
-                "component contract: the RPC named after this method is streaming; component methods are unary"
+                !client_streaming,
+                "component contract: the RPC named after this method streams requests; component methods take one request"
+            );
+            assert!(
+                !server_streaming,
+                "component contract: the RPC named after this method streams its replies; declare the method #[call(stream)]"
             );
             assert!(
                 full_name_eq(request, Req::PACKAGE, Req::NAME),
@@ -110,6 +117,42 @@ pub const fn assert_rpc<Req: ContractMessage, Rep: ContractMessage>(
             assert!(
                 full_name_eq(reply, Rep::PACKAGE, Rep::NAME),
                 "component contract: this method's reply type is not the RPC's output type"
+            );
+            return;
+        }
+        index += 1;
+    }
+    panic!("component contract: the proto service has no RPC named after this method");
+}
+
+/// Const-panics unless `proto` has an RPC `rpc` that streams its replies
+/// and not its requests, whose request full name agrees with `Req` and
+/// whose output full name agrees with `Item`, the stream's item type.
+/// [`assert_rpc_types`] then checks the types themselves.
+pub const fn assert_stream_rpc<Req: ContractMessage, Item: ContractMessage>(
+    proto: ProtoService,
+    rpc: &str,
+) {
+    let rpcs = proto.1;
+    let mut index = 0;
+    while index < rpcs.len() {
+        let (name, request, reply, client_streaming, server_streaming) = rpcs[index];
+        if str_eq(name, rpc) {
+            assert!(
+                !client_streaming,
+                "component contract: the RPC named after this method streams requests; component methods take one request"
+            );
+            assert!(
+                server_streaming,
+                "component contract: the RPC named after this method does not stream its replies; remove stream from #[call]"
+            );
+            assert!(
+                full_name_eq(request, Req::PACKAGE, Req::NAME),
+                "component contract: this method's request type is not the RPC's input type"
+            );
+            assert!(
+                full_name_eq(reply, Item::PACKAGE, Item::NAME),
+                "component contract: this method's stream item type is not the RPC's output type"
             );
             return;
         }
@@ -259,21 +302,33 @@ mod tests {
     const SERVICE: ProtoService = (
         "shop.v1.Desk",
         &[
-            ("Ask", "shop.v1.Ask", "shop.v1.Answer", false),
-            ("Stream", "shop.v1.Ask", "shop.v1.Answer", true),
-            ("Plain", "Bare", "common.money.v1.Money", false),
-            ("Lines", "shop.v1.Ask", "shop.v1.Answer.Line", false),
-            ("Clear", "shop.v1.Ask", "google.protobuf.Empty", false),
+            ("Ask", "shop.v1.Ask", "shop.v1.Answer", false, false),
+            ("Stream", "shop.v1.Ask", "shop.v1.Answer", false, true),
+            ("Plain", "Bare", "common.money.v1.Money", false, false),
+            ("Lines", "shop.v1.Ask", "shop.v1.Answer.Line", false, false),
+            (
+                "Clear",
+                "shop.v1.Ask",
+                "google.protobuf.Empty",
+                false,
+                false,
+            ),
             (
                 "Touch",
                 "google.protobuf.Empty",
                 "google.protobuf.Empty",
                 false,
+                false,
             ),
+            ("Upload", "shop.v1.Ask", "shop.v1.Answer", true, false),
+            ("Chat", "shop.v1.Ask", "shop.v1.Answer", true, true),
+            ("Feed", "Bare", "shop.v1.Answer.Line", false, true),
         ],
     );
 
-    const ALL: &[&str] = &["Ask", "Stream", "Plain", "Lines", "Clear", "Touch"];
+    const ALL: &[&str] = &[
+        "Ask", "Stream", "Plain", "Lines", "Clear", "Touch", "Upload", "Chat", "Feed",
+    ];
 
     // The passing cases are checked where the macro checks them: in consts.
     const _: () = {
@@ -286,6 +341,9 @@ mod tests {
         assert_rpc_types::<Ask, Answer, (Ask, Answer)>();
         assert_rpc_types::<Ask, Line, (Ask, Line)>();
         assert_rpc_types::<(), (), ((), ())>();
+        assert_stream_rpc::<Ask, Answer>(SERVICE, "Stream");
+        assert_stream_rpc::<Bare, Line>(SERVICE, "Feed");
+        assert_rpc_types::<Bare, Line, (Bare, Line)>();
     };
 
     #[test]
@@ -294,8 +352,12 @@ mod tests {
         assert_service(
             SERVICE,
             "shop.v1.Desk",
-            &["Touch", "Clear", "Lines", "Plain", "Stream", "Ask"],
+            &[
+                "Feed", "Chat", "Upload", "Touch", "Clear", "Lines", "Plain", "Stream", "Ask",
+            ],
         );
+        assert_stream_rpc::<Ask, Answer>(SERVICE, "Stream");
+        assert_stream_rpc::<Bare, Line>(SERVICE, "Feed");
         assert_rpc::<Ask, Answer>(SERVICE, "Ask");
         assert_rpc::<Bare, Money>(SERVICE, "Plain");
         assert_rpc::<Ask, Line>(SERVICE, "Lines");
@@ -329,7 +391,9 @@ mod tests {
         assert_service(
             SERVICE,
             "shop.v1.Desk",
-            &["Ask", "Stream", "Plain", "Lines", "Clear"],
+            &[
+                "Ask", "Stream", "Plain", "Lines", "Clear", "Upload", "Chat", "Feed",
+            ],
         );
     }
 
@@ -343,7 +407,9 @@ mod tests {
         assert_service(
             SERVICE,
             "shop.v1.Desk",
-            &["Ask", "Stream", "Plain", "Lines", "Clear", "Ask"],
+            &[
+                "Ask", "Stream", "Plain", "Lines", "Clear", "Upload", "Chat", "Feed", "Ask",
+            ],
         );
     }
 
@@ -353,7 +419,7 @@ mod tests {
     )]
     fn two_methods_with_one_rpc_name() {
         assert_service(
-            ("a.v1.S", &[("Get", "a.v1.R", "a.v1.R", false)]),
+            ("a.v1.S", &[("Get", "a.v1.R", "a.v1.R", false, false)]),
             "a.v1.S",
             &["Get", "Get"],
         );
@@ -366,8 +432,8 @@ mod tests {
             (
                 "a.v1.S",
                 &[
-                    ("Get", "a.v1.R", "a.v1.R", false),
-                    ("Get", "a.v1.R", "a.v1.R", false),
+                    ("Get", "a.v1.R", "a.v1.R", false, false),
+                    ("Get", "a.v1.R", "a.v1.R", false, false),
                 ],
             ),
             "a.v1.S",
@@ -385,10 +451,74 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "component contract: the RPC named after this method is streaming; component methods are unary"
+        expected = "component contract: the RPC named after this method streams its replies; declare the method #[call(stream)]"
     )]
-    fn a_streaming_rpc() {
+    fn a_server_streaming_rpc_for_a_unary_method() {
         assert_rpc::<Ask, Answer>(SERVICE, "Stream");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component contract: the RPC named after this method streams requests; component methods take one request"
+    )]
+    fn a_client_streaming_rpc_for_a_unary_method() {
+        assert_rpc::<Ask, Answer>(SERVICE, "Upload");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component contract: the RPC named after this method streams requests; component methods take one request"
+    )]
+    fn a_bidirectional_rpc_for_a_unary_method() {
+        assert_rpc::<Ask, Answer>(SERVICE, "Chat");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component contract: the RPC named after this method streams requests; component methods take one request"
+    )]
+    fn a_client_streaming_rpc_for_a_stream_method() {
+        assert_stream_rpc::<Ask, Answer>(SERVICE, "Upload");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component contract: the RPC named after this method streams requests; component methods take one request"
+    )]
+    fn a_bidirectional_rpc_for_a_stream_method() {
+        assert_stream_rpc::<Ask, Answer>(SERVICE, "Chat");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component contract: the RPC named after this method does not stream its replies; remove stream from #[call]"
+    )]
+    fn a_unary_rpc_for_a_stream_method() {
+        assert_stream_rpc::<Ask, Answer>(SERVICE, "Ask");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component contract: this method's stream item type is not the RPC's output type"
+    )]
+    fn another_stream_item() {
+        assert_stream_rpc::<Ask, Ask>(SERVICE, "Stream");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component contract: this method's request type is not the RPC's input type"
+    )]
+    fn another_stream_request() {
+        assert_stream_rpc::<Answer, Answer>(SERVICE, "Stream");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "component contract: the proto service has no RPC named after this method"
+    )]
+    fn a_missing_stream_rpc() {
+        assert_stream_rpc::<Ask, Answer>(SERVICE, "Tell");
     }
 
     #[test]
@@ -423,7 +553,7 @@ mod tests {
         assert_rpc::<Money, Answer>(
             (
                 "x.v1.S",
-                &[("Ask", "billing.v1.Money", "shop.v1.Answer", false)],
+                &[("Ask", "billing.v1.Money", "shop.v1.Answer", false, false)],
             ),
             "Ask",
         );

@@ -1,7 +1,7 @@
 error[E0080]: evaluation panicked: component contract: this method's request type is not the RPC's input type
-  --> tests/ui/fail/p3_wrong_request.rs:53:1
+  --> tests/ui/fail/p3_wrong_request.rs:54:1
    |
-53 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+54 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
    |
 note: inside `sekvent_component::__private::assert_rpc::<PingRequest, PingReply>`
@@ -19,9 +19,9 @@ note: inside `sekvent_component::__private::assert_rpc::<PingRequest, PingReply>
    | |_____________- in this macro invocation
 
 error[E0277]: this method's request type `PingRequest` is not the RPC's input type `ShoutRequest`
-  --> tests/ui/fail/p3_wrong_request.rs:59:14
+  --> tests/ui/fail/p3_wrong_request.rs:60:14
    |
-59 |         req: PingRequest,
+60 |         req: PingRequest,
    |              ^^^^^^^^^^^ the proto service expects `ShoutRequest` here
    |
 help: the trait `sekvent_component::__private::SameRequest<ShoutRequest>` is not implemented for `PingRequest`

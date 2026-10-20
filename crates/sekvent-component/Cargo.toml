@@ -15,7 +15,15 @@ macros = ["dep:sekvent-macros"]
 # `App::register`: run all components as one sekvent-runtime unit.
 runtime = ["dep:sekvent-runtime"]
 # The `grpc` binding and serving components over gRPC.
-grpc = ["dep:sekvent-link", "dep:tonic", "dep:axum", "dep:http-body", "dep:tower", "sekvent-error/grpc"]
+grpc = [
+    "dep:sekvent-link",
+    "dep:sekvent-telemetry",
+    "dep:tonic",
+    "dep:axum",
+    "dep:http-body",
+    "dep:tower",
+    "sekvent-error/grpc",
+]
 
 [dependencies]
 sekvent-config = { workspace = true }
@@ -24,13 +32,21 @@ sekvent-context = { workspace = true }
 sekvent-resilience = { workspace = true }
 sekvent-macros = { workspace = true, optional = true }
 sekvent-link = { workspace = true, optional = true }
+# `MessageCount`: the item count of a served stream in the access log.
+sekvent-telemetry = { workspace = true, optional = true }
 # Path, not workspace: keeps sekvent-runtime's default grpc-web feature off.
 sekvent-runtime = { path = "../sekvent-runtime", default-features = false, optional = true }
 bytes = { workspace = true }
+# `Stream` and `FusedStream` of `CallStream`.
+futures = { workspace = true }
 http = { workspace = true }
 prost = { workspace = true }
+# Lifetime jitter of streams.
+rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# The closing signal of a component's streams.
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tonic = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
@@ -48,8 +64,11 @@ tonic-types = { workspace = true }
 tonic-health = { workspace = true }
 # A plain HTTP/2 client for raw serving tests.
 hyper-util = { workspace = true }
-# Request bodies for the HTTP/1.1 gRPC-Web tests.
+# A one-connection HTTP/1.1 client the gRPC-Web stream tests can close.
+hyper = { workspace = true, features = ["client", "http1"] }# Request bodies for the HTTP/1.1 gRPC-Web tests.
 http-body-util = { workspace = true }
+# Every stream case under both in-process bindings.
+rstest = { workspace = true }
 # The runtime server with its gRPC-Web translation, for the gRPC-Web tests.
 sekvent-runtime = { path = "../sekvent-runtime", features = ["grpc-web"] }
 

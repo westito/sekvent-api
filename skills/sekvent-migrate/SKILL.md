@@ -159,6 +159,7 @@ line. The `sekvent` skill has the recipes with real API names.
 | semaphores or token buckets guarding an upstream quota | `sekvent::resilience::RateGate`; timeouts, bulkheads and breakers from the same module |
 | `tonic-build`/`prost-build` calls in `build.rs` | `sekvent_proto_build::ProtoBuild` (`messages_only` / `services_only` for split proto crates) |
 | custom lifecycle, signal handling, health routes | `Runtime::builder()` units and `Server::builder()`; `/livez`, `/readyz`, `/healthz` and `grpc.health.v1` come built in |
+| a hand-written server-streaming tonic service (live updates, `watch`/`broadcast` fan-out, polling endpoints a browser hits) | a `#[call(stream)]` component method returning `CallStream` (`rpc X(A) returns (stream B)` in the contract): auth, deadlines, drain at shutdown, lifetime and gRPC-Web come with it; carry a cursor in the request if clients must resume |
 | shared-secret checks between services | `sekvent::link` tokens (`SEKVENT_LINK_*`) with `link-axum` / `link-tonic` |
 | an internal module called through a trait, or two services that talk over hand-written gRPC clients | a component (`#[sekvent::component(…, proto = "…")]`, the `.proto` `service` as its contract): `local` in one binary, `grpc` across processes by configuration (`component-grpc`); keep existing public gRPC APIs as they are and move only internal calls |
 

@@ -715,7 +715,22 @@ impl App {
         }
     }
 
-    /// Stop every component in reverse install order: reject new calls, wait
+    /// End every open stream of every component with `UNAVAILABLE` /
+    /// `COMPONENT_DRAINING` and refuse new ones the same way; unary calls
+    /// are not affected. Irreversible. `App::register` calls it when the
+    /// runtime begins shutting down; call it yourself before draining a
+    /// server you run outside the runtime.
+    ///
+    /// A stream that is being consumed ends at once; one nobody polls ends
+    /// at its next poll and counts as in flight until then.
+    pub fn close_streams(&self) {
+        for component in &self.inner.components {
+            component.server.close_streams();
+        }
+    }
+
+    /// Stop every component in reverse install order: reject new calls and
+    /// end its open streams (`UNAVAILABLE` / `COMPONENT_DRAINING`), wait
     /// for in-flight calls until `grace` has passed (in total, not per
     /// component), then run its `on_stop` hook. `grace` bounds the drain
     /// only; the hooks run to completion after it.

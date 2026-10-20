@@ -204,7 +204,7 @@ fn compact(text: &str) -> String {
     dense.replace(",]", "]").replace(",)", ")")
 }
 
-/// A package with two services, a streaming RPC, a type from another
+/// A package with two services, streaming RPCs of every kind, a type from another
 /// package and a nested message next to a top-level one of the same name,
 /// importing the fixtures' `common.v1`.
 fn contract_fixture(dir: &Path) {
@@ -227,6 +227,8 @@ fn contract_fixture(dir: &Path) {
            rpc Balance(GetEntryRequest) returns (common.v1.Money);\n\
            rpc Follow(GetEntryRequest) returns (stream Entry);\n\
            rpc Relabel(Entry.Line) returns (Line);\n\
+           rpc Import(stream Entry) returns (Ack);\n\
+           rpc Sync(stream Entry) returns (stream Entry);\n\
          }\n\
          service Audit { rpc Record(Entry) returns (Ack); }\n",
     )
@@ -236,31 +238,35 @@ fn contract_fixture(dir: &Path) {
 const ENTRIES_CONTRACT: &str = r#"
     /// Contract of `ledger.v1.Entries`, checked by `#[component(proto = …)]`.
     #[doc(hidden)]
-    #[allow(non_upper_case_globals, dead_code)]
-    pub const __sekvent_service_Entries: (&str, &[(&str, &str, &str, bool)]) = (
+    #[allow(non_upper_case_globals, dead_code, clippy::type_complexity)]
+    pub const __sekvent_service_Entries: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "ledger.v1.Entries",
         &[
-            ("GetEntry", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", false),
-            ("Balance", "ledger.v1.GetEntryRequest", "common.v1.Money", false),
-            ("Follow", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", true),
-            ("Relabel", "ledger.v1.Entry.Line", "ledger.v1.Line", false),
+            ("GetEntry", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", false, false),
+            ("Balance", "ledger.v1.GetEntryRequest", "common.v1.Money", false, false),
+            ("Follow", "ledger.v1.GetEntryRequest", "ledger.v1.Entry", false, true),
+            ("Relabel", "ledger.v1.Entry.Line", "ledger.v1.Line", false, false),
+            ("Import", "ledger.v1.Entry", "ledger.v1.Ack", true, false),
+            ("Sync", "ledger.v1.Entry", "ledger.v1.Entry", true, true),
         ],
     );
 "#;
 
 /// The per-RPC type aliases of `ledger.v1.Entries`, with the Rust paths
 /// prost resolves from the package module.
-const ENTRIES_TYPES: [&str; 4] = [
+const ENTRIES_TYPES: [&str; 6] = [
     "pub type __sekvent_rpc_Entries__GetEntry = (GetEntryRequest, Entry);",
     "pub type __sekvent_rpc_Entries__Balance = (GetEntryRequest, super::super::common::v1::Money);",
     "pub type __sekvent_rpc_Entries__Follow = (GetEntryRequest, Entry);",
     "pub type __sekvent_rpc_Entries__Relabel = (entry::Line, Line);",
+    "pub type __sekvent_rpc_Entries__Import = (Entry, Ack);",
+    "pub type __sekvent_rpc_Entries__Sync = (Entry, Entry);",
 ];
 
 const AUDIT_CONTRACT: &str = r#"
-    pub const __sekvent_service_Audit: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Audit: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "ledger.v1.Audit",
-        &[("Record", "ledger.v1.Entry", "ledger.v1.Ack", false)],
+        &[("Record", "ledger.v1.Entry", "ledger.v1.Ack", false, false)],
     );
     /// Request and reply of `ledger.v1.Audit.Record`, checked by `#[component(proto = …)]`.
     #[doc(hidden)]
@@ -317,9 +323,9 @@ fn both_emits_contracts_next_to_the_stubs() {
     assert!(billing.contains("invoices_server"));
     assert!(
         compact(&billing).contains(&compact(
-            r#"pub const __sekvent_service_Invoices: (&str, &[(&str, &str, &str, bool)]) = (
+            r#"pub const __sekvent_service_Invoices: (&str, &[(&str, &str, &str, bool, bool)]) = (
                 "billing.v1.Invoices",
-                &[("GetInvoice", "billing.v1.GetInvoiceRequest", "billing.v1.Invoice", false)],
+                &[("GetInvoice", "billing.v1.GetInvoiceRequest", "billing.v1.Invoice", false, false)],
             );"#
         )),
         "{billing}"
@@ -358,8 +364,8 @@ fn empty_is_the_unit_type_in_the_rpc_types() {
 
     let chores = compact(&read(&out.path().join("chores.v1.rs")));
     for needle in [
-        r#"("Clear","chores.v1.Chore","google.protobuf.Empty",false)"#,
-        r#"("Tick","google.protobuf.Empty","chores.v1.Chore",false)"#,
+        r#"("Clear","chores.v1.Chore","google.protobuf.Empty",false,false)"#,
+        r#"("Tick","google.protobuf.Empty","chores.v1.Chore",false,false)"#,
         "pubtype__sekvent_rpc_Chores__Clear=(Chore,());",
         "pubtype__sekvent_rpc_Chores__Tick=((),Chore);",
     ] {

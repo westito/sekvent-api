@@ -1,7 +1,7 @@
 error[E0277]: this method's request type `Inner` is not the RPC's input type `outer::Inner`
-  --> tests/ui/fail/p10_top_level_for_nested.rs:53:14
+  --> tests/ui/fail/p10_top_level_for_nested.rs:54:14
    |
-53 |         req: Inner,
+54 |         req: Inner,
    |              ^^^^^ the proto service expects `outer::Inner` here
    |
 help: the trait `sekvent_component::__private::SameRequest<outer::Inner>` is not implemented for `Inner`

@@ -4,12 +4,13 @@
 pub struct PlainError;
 
 mod proto {
-    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.echo.v1.Echo",
         &[(
             "Ping",
             "google.protobuf.StringValue",
             "google.protobuf.StringValue",
+            false,
             false,
         )],
     );

@@ -12,7 +12,10 @@
 > and `cargo sekvent contract emit | check`; see
 > [design/component-c2.md](design/component-c2.md). Serving components
 > directly to end users (`SERVE_AUTH=bearer`, `#[call(anonymous)]`); see
-> [design/component-end-user.md](design/component-end-user.md). C4: interval, cron
+> [design/component-end-user.md](design/component-end-user.md).
+> Server-streaming methods (`#[call(stream)]`, `CallStream`) under every
+> binding, served over gRPC and gRPC-Web; see
+> [design/component-streaming.md](design/component-streaming.md). C4: interval, cron
 > and manual jobs in `sekvent-runtime` (`RuntimeBuilder::job`, facade
 > feature `runtime-cron` for cron) and singleton jobs over a database lease
 > with fencing tokens in `sekvent-db` (`LeaseStore`, `LeaseGuard`, facade
@@ -105,7 +108,8 @@ will sit.) From the trait the macro generates:
   the reply;
 - compile-time checks that the trait and the proto's `Billing` service agree
   exactly: the service name `<package>.<Trait>`, one RPC per method named
-  after it in UpperCamelCase, and each RPC's request and reply types.
+  after it in UpperCamelCase, each RPC's request and reply types, and
+  whether it streams its replies.
 
 No per-component tonic code is generated: one generic byte-level gRPC
 client and service carry every component over the standard
@@ -120,7 +124,10 @@ Every method:
   caller identity, idempotency key);
 - takes exactly one owned request, a prost message that is `Send + 'static`;
 - returns `Result<Reply, E>` where `Reply` is a prost message (or `()` for
-  `#[deferred]`) and `E` is the component's error type;
+  `#[deferred]`) and `E` is the component's error type, or, for a
+  server-streaming `#[call(stream)]` method, `Result<CallStream<Item, E>, E>`
+  where `Item` is the RPC's output message (the error that ends the stream
+  may be a second `ComponentError` type);
 - has no lifetimes and no generic parameters.
 
 Anything else is a compile error with a message that names the rule.
@@ -158,6 +165,17 @@ call into a queued one or the other way round.
 | `#[deferred]` | `Result<Accepted, E>` | Durable one-way command; `Accepted` once the command is committed | `local`, `db-queue`, `grpc-push`, `nats` |
 | `Topic<E>` | `Result<Accepted, _>` on publish | Events published to any number of subscribers | `local`, `db-queue`, `grpc-push`, `nats` |
 
+**Streams are calls.** `#[call(stream)]` is a variant of `#[call]`, not a
+kind of its own: one request, a `CallStream` of replies, with the same
+bindings and options. Its open is a call (timed by `TIMEOUT`, retried when
+`idempotent`, counted by the breaker, authenticated, hop-limited); after it
+the caller's deadline, a maximum lifetime (`STREAM_MAX_LIFETIME`, 15
+minutes by default), the consumer and the component's gate end it. A stream
+holds its admission and bulkhead permit for its life, and ends with
+`UNAVAILABLE` / `COMPONENT_DRAINING` when its component drains or the
+runtime begins shutting down. See
+[components: How to stream replies](modules/components.md#how-to-stream-replies-callstream).
+
 **`#[async_call]`.** The handle returns a `Ticket<Reply>` carrying a
 correlation id. The reply is delivered in one of two ways:
 
@@ -181,7 +199,9 @@ topics are declared and subscribed to is settled in milestone C3.
 |---|---|---|
 | `idempotent` | method | The method may be retried; required for any automatic retry |
 | `timeout = "…"` | method | Default deadline, capped by the caller's own deadline |
-| `bulkhead = N` | method | At most `N` concurrent executions; excess is shed with `RESOURCE_EXHAUSTED` |
+| `bulkhead = N` | method | At most `N` concurrent executions; excess is shed with `RESOURCE_EXHAUSTED`. For a stream: at most `N` open streams |
+| `stream` | `#[call]` method | Server streaming: returns `Result<CallStream<Item, E>, E>`, maps to `returns (stream Item)` |
+| `max_lifetime = "…"` | `#[call(stream)]` method | Default stream lifetime (otherwise 15 minutes); `STREAM_MAX_LIFETIME` keys override it |
 | `#[component(proto = "…")]` | component | The module generated for the component's proto package; required unless `local_only` |
 | `#[component(local_only)]` | component | The on-ramp: in-process only, no contract (and no `proto`); the App builder rejects any remote binding |
 | `#[component(remote_only)]` | component | Never runs in this binary; the App builder rejects a local binding |
@@ -216,6 +236,10 @@ stable. Removing the flag and adding the proto `service` with
   open or closed. New services, RPCs, fields and values, and renames, are
   compatible (the binary wire carries numbers only). `[contract]` in
   `sekvent.toml` lists the proto roots and adds the check to the gate.
+- `rpc X(A) returns (B)` maps to `#[call]` and `rpc X(A) returns (stream B)`
+  to `#[call(stream)]`, checked both ways at compile time. Client-streaming
+  and bidirectional RPCs are rejected. Turning a unary RPC into a streaming
+  one, or back, is a breaking change.
 - Error reasons live in Rust (`ComponentError`) and are outside `contract
   check`; an unknown reason always decodes into the `#[other]` variant.
 - A breaking change means a new package: `billing.v2` is a second
@@ -226,9 +250,9 @@ stable. Removing the flag and adding the proto `service` with
 
 | Binding | What happens |
 |---|---|
-| `local` | Direct call on the implementation; no encoding |
-| `local-serialized` | The request is encoded, the `CallContext` goes through the header codec, the call runs on a separate task and the reply or error is encoded and decoded back; the task is aborted when the caller drops the future |
-| `grpc` | Unary gRPC call to the component's endpoint (plaintext HTTP/2), authenticated with a link token; the request context travels as headers (`grpc-timeout`, request id, trace, idempotency key, hop count) |
+| `local` | Direct call on the implementation; no encoding. A stream's producer is polled by the consumer, in its task |
+| `local-serialized` | The request is encoded, the `CallContext` goes through the header codec, the call runs on a separate task and the reply or error is encoded and decoded back; the task is aborted when the caller drops the future. A stream's items cross a bounded channel of 16 (backpressure) |
+| `grpc` | Unary or server-streaming gRPC call to the component's endpoint (plaintext HTTP/2), authenticated with a link token; the request context travels as headers (`grpc-timeout`, request id, trace, idempotency key, hop count). Dropping a stream resets its HTTP/2 stream |
 | `db-queue` | SQL outbox and consumer in the component's database (see Bus) |
 | `grpc-push` | A relay reads the outbox and pushes messages to the remote service's `Deliver` RPC |
 | `nats` | NATS JetStream (later milestone) |
@@ -346,6 +370,12 @@ calls were seen, stays open 30 s and then lets 3 probes through.
 `TIMEOUT` is the deadline of the whole call, retries included; configuration
 never makes a method retryable.
 
+For a stream these policies cover the **open** only: `TIMEOUT` bounds the
+open (it never narrows the stream's context), retries reopen only a failed
+open, and the breaker counts open outcomes. Bulkheads count open streams
+for their whole life. The framework never reopens a stream that ended;
+consumers reopen, at once after `STREAM_EXPIRED` or `COMPONENT_DRAINING`.
+
 Policy precedence, lowest to highest:
 
 1. the framework default (remote bindings only);
@@ -356,7 +386,8 @@ Policy precedence, lowest to highest:
 5. a method-level override, `…_<C>_<M>_<FIELD>`.
 
 Fields: `TIMEOUT`, `BULKHEAD_MAX_CONCURRENT`, `BULKHEAD_MAX_QUEUE`,
-`BULKHEAD_QUEUE_TIMEOUT` and the `RETRY_*` fields per method or component;
+`BULKHEAD_QUEUE_TIMEOUT` and the `RETRY_*` fields per method or component
+(plus `STREAM_MAX_LIFETIME` for streaming methods, never in a named policy);
 `RETRY_BUDGET_*` and `BREAKER_*` per component only, because their state
 belongs to the endpoint. A reference to a policy with no keys, or a
 `SEKVENT_POLICY_*` key no referenced policy uses, fails the build.
@@ -448,7 +479,8 @@ Call sites do not change: callers already hold the handle.
 - Joins across components' data.
 - Exactly-once delivery. Delivery is at least once; the inbox deduplicates.
 - Ordering guarantees across messages.
-- Streaming RPCs.
+- Client-streaming and bidirectional RPCs (server streaming is
+  `#[call(stream)]`; browsers over gRPC-Web can only do server streaming).
 - Cancelling work that is already queued.
 - Placement, service discovery and deployment. Where a service runs and how
   it is reached is configuration supplied by the environment.

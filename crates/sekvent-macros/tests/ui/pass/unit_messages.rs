@@ -21,7 +21,7 @@ impl prost::Name for Chore {
 /// The contract sekvent-proto-build would generate for `check.chores.v1`.
 mod proto {
     #[allow(non_upper_case_globals)]
-    pub const __sekvent_service_Chores: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Chores: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.chores.v1.Chores",
         &[
             (
@@ -29,17 +29,20 @@ mod proto {
                 "check.chores.v1.Chore",
                 "google.protobuf.Empty",
                 false,
+                false,
             ),
             (
                 "Next",
                 "google.protobuf.Empty",
                 "check.chores.v1.Chore",
                 false,
+                false,
             ),
             (
                 "Clear",
                 "google.protobuf.Empty",
                 "google.protobuf.Empty",
+                false,
                 false,
             ),
         ],

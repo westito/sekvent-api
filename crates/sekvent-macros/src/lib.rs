@@ -101,6 +101,11 @@ pub fn derive_env_config(input: TokenStream) -> TokenStream {
 /// (sekvent-proto-build enables prost's type names), or `()` for
 /// `google.protobuf.Empty`; each error type implements `ComponentError`.
 ///
+/// A server-streaming method is marked `#[call(stream)]` and returns
+/// `Result<CallStream<Item, ItemError>, Error>`: the outer error fails the
+/// open, the item error ends the stream. It accepts the other options and
+/// `max_lifetime = "<humantime>"`, the default lifetime of its streams.
+///
 /// The macro keeps the trait (its methods become `fn -> impl Future + Send`,
 /// so implementations still write `async fn`) and generates `<Trait>Handle`
 /// with one method per trait method plus `binding`, `install` and

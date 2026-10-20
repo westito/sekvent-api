@@ -10,6 +10,9 @@
 //! - `SEKVENT_COMPONENT_<C>_BINDING`, `_ENDPOINT`, `_LINK`, `_AUTH`, `_SERVE`,
 //!   `_SERVE_AUTH`, `_POLICY` and the component policy fields;
 //! - `SEKVENT_COMPONENT_<C>_<M>_POLICY` and the method policy fields;
+//! - `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME` when `<C>` has a streaming
+//!   method, and `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` for each
+//!   streaming method `<M>`;
 //! - `SEKVENT_POLICY_<N>_<FIELD>`: named policies, checked in [`crate::policy`].
 
 use std::collections::HashMap;
@@ -387,17 +390,24 @@ fn known_keys(entries: &[Entry], errors: &mut Vec<BuildError>) -> Vec<String> {
     for entry in entries {
         let component = entry.descriptor.name();
         let owner = format!("component {component}");
+        let streams = entry
+            .descriptor
+            .methods()
+            .iter()
+            .any(crate::MethodDescriptor::is_stream);
         for suffix in COMPONENT_KEYS
             .iter()
             .copied()
             .chain(policy::component_fields())
+            .chain(streams.then_some(policy::STREAM_MAX_LIFETIME))
         {
             claim(key(&[component, suffix]), &owner);
         }
         for method in entry.descriptor.methods() {
             let owner = format!("method {component}.{}", method.name());
-            for suffix in
-                std::iter::once(policy::POLICY).chain(policy::METHOD_FIELDS.iter().copied())
+            for suffix in std::iter::once(policy::POLICY)
+                .chain(policy::METHOD_FIELDS.iter().copied())
+                .chain(method.is_stream().then_some(policy::STREAM_MAX_LIFETIME))
             {
                 claim(key(&[component, method.name(), suffix]), &owner);
             }
@@ -1323,6 +1333,129 @@ mod tests {
             errors
                 .iter()
                 .all(|error| matches!(error, BuildError::KeyCollision { .. }))
+        );
+    }
+
+    const FEED: &ComponentDescriptor = &ComponentDescriptor::new(
+        "feed",
+        "Feed",
+        &[
+            MethodDescriptor::call("lines", "Lines").with_stream(),
+            MethodDescriptor::call("count", "Count"),
+        ],
+    );
+
+    #[test]
+    fn stream_lifetime_keys_are_known_only_where_there_are_streams() {
+        let resolved = one(
+            &[
+                ("SEKVENT_COMPONENT_FEED_STREAM_MAX_LIFETIME", "1h"),
+                ("SEKVENT_COMPONENT_FEED_LINES_STREAM_MAX_LIFETIME", "5m"),
+            ],
+            FEED,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.policies[0].max_lifetime,
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(resolved.policies[1].max_lifetime, None);
+        let default = one(&[], FEED).unwrap();
+        assert_eq!(
+            default.policies[0].max_lifetime,
+            Some(crate::DEFAULT_STREAM_MAX_LIFETIME)
+        );
+
+        // A unary method, a component without streams and a named policy do
+        // not know the key.
+        let error = resolve(
+            &source(&[
+                ("SEKVENT_COMPONENT_FEED_COUNT_STREAM_MAX_LIFETIME", "1h"),
+                ("SEKVENT_COMPONENT_INVENTORY_STREAM_MAX_LIFETIME", "1h"),
+                ("SEKVENT_COMPONENT_FEED_POLICY", "live"),
+                ("SEKVENT_POLICY_LIVE_TIMEOUT", "1s"),
+                ("SEKVENT_POLICY_LIVE_STREAM_MAX_LIFETIME", "1h"),
+            ]),
+            &[entry(FEED), entry(INVENTORY)],
+        )
+        .unwrap_err();
+        let errors = errors(error);
+        let unknown: Vec<&String> = errors
+            .iter()
+            .flat_map(|error| match error {
+                BuildError::Config(ConfigError::UnknownKeys { keys, .. }) => keys.iter().collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(
+            unknown,
+            [
+                "SEKVENT_COMPONENT_FEED_COUNT_STREAM_MAX_LIFETIME",
+                "SEKVENT_COMPONENT_INVENTORY_STREAM_MAX_LIFETIME",
+                "SEKVENT_POLICY_LIVE_STREAM_MAX_LIFETIME",
+            ],
+            "{errors:?}"
+        );
+        let suggested = errors.iter().any(|error| {
+            matches!(
+                error,
+                BuildError::Config(ConfigError::UnknownKeys { suggestions, .. })
+                    if suggestions.iter().any(|(unknown, _)| {
+                        unknown == "SEKVENT_COMPONENT_FEED_COUNT_STREAM_MAX_LIFETIME"
+                    })
+            )
+        });
+        assert!(suggested, "{errors:?}");
+    }
+
+    #[test]
+    fn stream_lifetime_values_name_the_key_only() {
+        let error = one(
+            &[("SEKVENT_COMPONENT_FEED_LINES_STREAM_MAX_LIFETIME", "0")],
+            FEED,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, BuildError::Config(ConfigError::Invalid { key, .. })
+                if key == "SEKVENT_COMPONENT_FEED_LINES_STREAM_MAX_LIFETIME"),
+            "{error}"
+        );
+        let error = one(
+            &[("SEKVENT_COMPONENT_FEED_STREAM_MAX_LIFETIME", "soonish")],
+            FEED,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, BuildError::Config(ConfigError::Malformed { key, .. })
+                if key == "SEKVENT_COMPONENT_FEED_STREAM_MAX_LIFETIME"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("soonish"), "{error}");
+    }
+
+    #[test]
+    fn a_streaming_method_named_stream_collides_with_a_component_a_stream() {
+        const A: &ComponentDescriptor = &ComponentDescriptor::new(
+            "a",
+            "A",
+            &[MethodDescriptor::call("stream", "Stream").with_stream()],
+        );
+        const A_STREAM: &ComponentDescriptor = &ComponentDescriptor::new(
+            "a_stream",
+            "AStream",
+            &[MethodDescriptor::call("feed", "Feed").with_stream()],
+        );
+        let error = resolve(&MapSource::new(), &[entry(A), entry(A_STREAM)]).unwrap_err();
+        let errors = errors(error);
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                BuildError::KeyCollision { key, first, second }
+                    if key == "SEKVENT_COMPONENT_A_STREAM_STREAM_MAX_LIFETIME"
+                        && first == "method a.stream"
+                        && second == "component a_stream"
+            )),
+            "{errors:?}"
         );
     }
 

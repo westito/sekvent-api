@@ -70,7 +70,8 @@
 //! `AppError`, `ErrorCode`, `CallContext`, `Secret`, `EnvConfig`,
 //! `FromConfig`, the runtime and server builders and `JobSpec` and
 //! `JobContext` for background jobs, and with `component`
-//! the `App`, the `ComponentError` trait and derive, and `Lifecycle`.
+//! the `App`, the `ComponentError` trait and derive, `Lifecycle`, and
+//! `CallStream` for server-streaming methods.
 //!
 //! # Components
 //!
@@ -165,5 +166,5 @@ pub mod prelude {
     };
 
     #[cfg(feature = "component")]
-    pub use sekvent_component::{App, ComponentError, Lifecycle};
+    pub use sekvent_component::{App, CallStream, ComponentError, Lifecycle};
 }

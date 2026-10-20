@@ -31,12 +31,13 @@ impl prost::Name for RecordReply {
 /// The contract sekvent-proto-build would generate for `check.ledger.v1`.
 pub mod ledger_proto {
     #[allow(non_upper_case_globals)]
-    pub const __sekvent_service_Ledger: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Ledger: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.ledger.v1.Ledger",
         &[(
             "Record",
             "check.ledger.v1.RecordRequest",
             "check.ledger.v1.RecordReply",
+            false,
             false,
         )],
     );

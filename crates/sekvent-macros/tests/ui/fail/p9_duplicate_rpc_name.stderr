@@ -1,5 +1,5 @@
 error: methods `get_v2` and `get_v_2` both map to the RPC name `GetV2`; rename one
-  --> tests/ui/fail/p9_duplicate_rpc_name.rs:40:14
+  --> tests/ui/fail/p9_duplicate_rpc_name.rs:41:14
    |
-40 |     async fn get_v_2(
+41 |     async fn get_v_2(
    |              ^^^^^^^

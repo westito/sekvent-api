@@ -1,6 +1,6 @@
 //! Parsing and validation of `#[component]` arguments and the trait.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use proc_macro2::{Span, TokenStream, TokenTree};
@@ -35,6 +35,7 @@ const BAD_SUPERTRAIT: &str =
     "a component trait may only have `Send`, `Sync` and `'static` as supertraits";
 const MULTIPLE_KINDS: &str = "a method has exactly one kind attribute";
 const BAD_TIMEOUT: &str = "timeout must be a positive duration such as \"2s\" or \"250ms\"";
+const BAD_MAX_LIFETIME: &str = "max_lifetime must be a positive duration such as \"15m\" or \"1h\"";
 const BAD_BULKHEAD: &str = "bulkhead must be an integer from 1 to 4294967295";
 const BAD_METHOD_ATTR: &str =
     "only doc comments and the kind attribute are allowed on a component method";
@@ -46,6 +47,10 @@ const BAD_PATTERN: &str = "arguments must be plain identifiers";
 const BAD_REQUEST: &str = "the request must be an owned type without lifetimes or `impl Trait`";
 const BAD_RETURN: &str = "the return type must be Result<Reply, Error>";
 const BAD_REPLY_OR_ERROR: &str = "reply and error types cannot contain lifetimes or `impl Trait`";
+const BAD_STREAM_RETURN: &str =
+    "a #[call(stream)] method returns Result<CallStream<Item, Error>, Error>";
+const CALL_STREAM_WITHOUT_STREAM: &str = "a method that returns a CallStream needs #[call(stream)]";
+const MAX_LIFETIME_WITHOUT_STREAM: &str = "`max_lifetime` applies to #[call(stream)] methods only";
 const BAD_METHOD_NAME: &str =
     "method names must be snake_case ([a-z][a-z0-9_]*, without `__` or a trailing `_`)";
 const MISSING_PROTO: &str = "missing `proto = \"...\"`: the module generated for the component's proto package, such as \"crate::proto::shop::inventory::v1\"; only a local_only component may omit it";
@@ -101,8 +106,13 @@ pub(crate) struct Method {
     pub(crate) request: Type,
     /// The return type as written (`Result<Reply, Error>`).
     pub(crate) output: Type,
+    /// The reply, or the item of a `#[call(stream)]` method.
     pub(crate) reply: Type,
+    /// The error of the call, or of a stream's open.
     pub(crate) error: Type,
+    /// The error that ends the stream; present exactly for `#[call(stream)]`
+    /// methods.
+    pub(crate) item_error: Option<Type>,
     pub(crate) policy: CallPolicy,
     /// Where the `#[call]` arguments that only matter when serving were given.
     pub(crate) served: ServedArgs,
@@ -117,6 +127,7 @@ pub(crate) struct ServedArgs {
 }
 
 /// Arguments of `#[call(...)]`.
+#[allow(clippy::struct_excessive_bools)] // independent attribute flags, not a state machine.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CallPolicy {
     pub(crate) idempotent: bool,
@@ -127,6 +138,10 @@ pub(crate) struct CallPolicy {
     /// End users may call the method with or without credentials; a
     /// credential, when sent, is authenticated.
     pub(crate) optional_end_user: bool,
+    /// The method answers with a `CallStream` (server streaming).
+    pub(crate) stream: bool,
+    /// Default lifetime of the method's streams.
+    pub(crate) max_lifetime: Option<Duration>,
 }
 
 /// Parse and validate the attribute arguments.
@@ -394,9 +409,9 @@ fn method(function: TraitItemFn) -> Result<Method> {
     let (docs, policy, served) = method_attrs(&function, &mut errors);
     check_modifiers(&function, &mut errors);
     let arguments = arguments(&function, &mut errors);
-    let returned = returned(&function, &mut errors);
+    let returned = returned(&function, policy.map(|policy| policy.stream), &mut errors);
     errors.finish()?;
-    let (Some((context, request)), Some((output, reply, error))) = (arguments, returned) else {
+    let (Some((context, request)), Some(returned)) = (arguments, returned) else {
         return Err(Error::new_spanned(&ident, BAD_ARITY));
     };
     Ok(Method {
@@ -406,22 +421,24 @@ fn method(function: TraitItemFn) -> Result<Method> {
         inputs: function.sig.inputs,
         context,
         request,
-        output,
-        reply,
-        error,
-        policy,
+        output: returned.output,
+        reply: returned.reply,
+        error: returned.error,
+        item_error: returned.item_error,
+        policy: policy.unwrap_or_default(),
         served,
     })
 }
 
-/// Doc comments to keep, the `#[call]` policy and the spans of its
-/// serving-only arguments.
+/// Doc comments to keep, the `#[call]` policy (`None` unless the first kind
+/// attribute is a valid `#[call]`) and the spans of its serving-only
+/// arguments.
 fn method_attrs(
     function: &TraitItemFn,
     errors: &mut Errors,
-) -> (Vec<Attribute>, CallPolicy, ServedArgs) {
+) -> (Vec<Attribute>, Option<CallPolicy>, ServedArgs) {
     let mut docs = Vec::new();
-    let mut policy = CallPolicy::default();
+    let mut policy = None;
     let mut served = ServedArgs::default();
     let mut kinds = 0_usize;
     for attr in &function.attrs {
@@ -442,8 +459,10 @@ fn method_attrs(
             errors.push(Error::new_spanned(attr, MULTIPLE_KINDS));
         }
         if kind == "call" {
-            if kinds == 1 {
-                (policy, served) = errors.take(call_policy(attr)).unwrap_or_default();
+            if kinds == 1
+                && let Some((parsed, spans)) = errors.take(call_policy(attr))
+            {
+                (policy, served) = (Some(parsed), spans);
             }
         } else {
             errors.push(Error::new_spanned(
@@ -465,8 +484,9 @@ fn method_attrs(
 }
 
 /// `#[call]` or `#[call(idempotent, timeout = "2s", bulkhead = 16, anonymous)]`
-/// (or `optional_end_user` in place of `anonymous`). Also returns the spans
-/// of the serving-only arguments.
+/// (or `optional_end_user` in place of `anonymous`), plus `stream` and
+/// `max_lifetime = "10m"` for a streaming method. Also returns the spans of
+/// the serving-only arguments.
 pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, ServedArgs)> {
     let mut policy = CallPolicy::default();
     let mut served = ServedArgs::default();
@@ -474,29 +494,22 @@ pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, ServedArgs)> 
         return Ok((policy, served));
     }
     let mut errors = Errors::default();
-    let (mut idempotent, mut timeout, mut bulkhead, mut anonymous, mut optional_end_user) =
-        (false, false, false, false, false);
+    let mut seen = HashSet::new();
+    let mut max_lifetime = None;
     attr.parse_nested_meta(|meta| {
         let key = path_name(&meta.path);
-        let seen = match key.as_str() {
-            "idempotent" => &mut idempotent,
-            "timeout" => &mut timeout,
-            "bulkhead" => &mut bulkhead,
-            "anonymous" => &mut anonymous,
-            "optional_end_user" => &mut optional_end_user,
-            _ => {
-                return Err(meta.error(format!(
-                    "unknown #[call] argument `{key}`; expected idempotent, timeout, bulkhead, \
-                     anonymous or optional_end_user"
-                )));
-            }
-        };
-        if *seen {
+        if !CALL_ARGUMENTS.contains(&key.as_str()) {
+            return Err(meta.error(format!(
+                "unknown #[call] argument `{key}`; expected idempotent, timeout, bulkhead, \
+                 anonymous, optional_end_user, stream or max_lifetime"
+            )));
+        }
+        if !seen.insert(key.clone()) {
             return Err(meta.error(format!("duplicate #[call] argument `{key}`")));
         }
-        *seen = true;
         match key.as_str() {
             "idempotent" => policy.idempotent = true,
+            "stream" => policy.stream = true,
             "anonymous" => {
                 policy.anonymous = true;
                 served.anonymous = Some(meta.path.span());
@@ -509,6 +522,11 @@ pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, ServedArgs)> 
                 let value: Expr = meta.value()?.parse()?;
                 policy.timeout = errors.take(timeout_value(&value));
             }
+            "max_lifetime" => {
+                max_lifetime = Some(meta.path.span());
+                let value: Expr = meta.value()?.parse()?;
+                policy.max_lifetime = errors.take(max_lifetime_value(&value));
+            }
             _ => {
                 let value: Expr = meta.value()?.parse()?;
                 policy.bulkhead = errors.take(bulkhead_value(&value));
@@ -519,12 +537,36 @@ pub(crate) fn call_policy(attr: &Attribute) -> Result<(CallPolicy, ServedArgs)> 
     if let (Some(_), Some(second)) = (served.anonymous, served.optional_end_user) {
         errors.push(Error::new(second, ANONYMOUS_AND_OPTIONAL_END_USER));
     }
+    if let Some(span) = max_lifetime.filter(|_| !policy.stream) {
+        errors.push(Error::new(span, MAX_LIFETIME_WITHOUT_STREAM));
+    }
     errors.finish()?;
     Ok((policy, served))
 }
 
-/// A humantime string literal for a positive duration.
+/// The arguments `#[call(...)]` accepts.
+const CALL_ARGUMENTS: [&str; 7] = [
+    "idempotent",
+    "timeout",
+    "bulkhead",
+    "anonymous",
+    "optional_end_user",
+    "stream",
+    "max_lifetime",
+];
+
+/// `timeout = "..."`: a humantime string literal for a positive duration.
 pub(crate) fn timeout_value(value: &Expr) -> Result<Duration> {
+    duration_value(value, BAD_TIMEOUT)
+}
+
+/// `max_lifetime = "..."`: a humantime string literal for a positive duration.
+pub(crate) fn max_lifetime_value(value: &Expr) -> Result<Duration> {
+    duration_value(value, BAD_MAX_LIFETIME)
+}
+
+/// A humantime string literal for a positive duration, or `message`.
+fn duration_value(value: &Expr, message: &str) -> Result<Duration> {
     let parsed = match value {
         Expr::Lit(ExprLit {
             lit: Lit::Str(text),
@@ -534,7 +576,7 @@ pub(crate) fn timeout_value(value: &Expr) -> Result<Duration> {
     };
     parsed
         .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| Error::new_spanned(value, BAD_TIMEOUT))
+        .ok_or_else(|| Error::new_spanned(value, message))
 }
 
 /// An integer literal in `1..=u32::MAX`.
@@ -677,31 +719,84 @@ fn context_type(ty: &Type) -> Option<Type> {
         .then(|| (*reference.elem).clone())
 }
 
-/// The return type, the reply and the error, when the return type is valid.
-fn returned(function: &TraitItemFn, errors: &mut Errors) -> Option<(Type, Type, Type)> {
+/// The parts of a valid return type.
+struct Returned {
+    output: Type,
+    reply: Type,
+    error: Type,
+    item_error: Option<Type>,
+}
+
+/// The return type and its parts, when it is valid. `stream` is the
+/// method's `#[call(stream)]` flag, `None` when the kind attribute is
+/// missing or invalid (no check that depends on it then).
+fn returned(function: &TraitItemFn, stream: Option<bool>, errors: &mut Errors) -> Option<Returned> {
     let sig = &function.sig;
+    let shape = if stream == Some(true) {
+        BAD_STREAM_RETURN
+    } else {
+        BAD_RETURN
+    };
     let ReturnType::Type(_, output) = &sig.output else {
-        errors.push(Error::new(sig.paren_token.span.close(), BAD_RETURN));
+        errors.push(Error::new(sig.paren_token.span.close(), shape));
         return None;
     };
     let Some((reply, error)) = result_arguments(output) else {
-        errors.push(Error::new_spanned(output, BAD_RETURN));
+        errors.push(Error::new_spanned(output, shape));
         return None;
     };
+    let (reply, item_error) = if stream == Some(true) {
+        let Some((item, item_error)) = call_stream_arguments(reply) else {
+            errors.push(Error::new_spanned(reply, BAD_STREAM_RETURN));
+            return None;
+        };
+        (item, Some(item_error))
+    } else if stream == Some(false) && is_call_stream(reply) {
+        errors.push(Error::new_spanned(reply, CALL_STREAM_WITHOUT_STREAM));
+        return None;
+    } else {
+        (reply, None)
+    };
     let mut valid = true;
-    if borrows_or_impl(reply.to_token_stream()) {
-        errors.push(Error::new_spanned(reply, BAD_REPLY_OR_ERROR));
-        valid = false;
+    for ty in [Some(reply), item_error, Some(error)].into_iter().flatten() {
+        if borrows_or_impl(ty.to_token_stream()) {
+            errors.push(Error::new_spanned(ty, BAD_REPLY_OR_ERROR));
+            valid = false;
+        }
     }
-    if borrows_or_impl(error.to_token_stream()) {
-        errors.push(Error::new_spanned(error, BAD_REPLY_OR_ERROR));
-        valid = false;
-    }
-    valid.then(|| ((**output).clone(), reply.clone(), error.clone()))
+    valid.then(|| Returned {
+        output: (**output).clone(),
+        reply: reply.clone(),
+        error: error.clone(),
+        item_error: item_error.cloned(),
+    })
 }
 
 /// `(Reply, Error)` of a path ending in `Result<Reply, Error>`.
 fn result_arguments(ty: &Type) -> Option<(&Type, &Type)> {
+    two_type_arguments(ty, "Result")
+}
+
+/// `(Item, ItemError)` of a path ending in `CallStream<Item, ItemError>`.
+fn call_stream_arguments(ty: &Type) -> Option<(&Type, &Type)> {
+    two_type_arguments(ty, "CallStream")
+}
+
+/// Whether `ty` is a path whose last segment is `CallStream`, whatever its
+/// arguments.
+fn is_call_stream(ty: &Type) -> bool {
+    let Type::Path(path) = peel(ty) else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "CallStream")
+}
+
+/// The two type arguments of a path ending in `name<A, B>`, without a
+/// qualified self and without arguments on earlier segments.
+fn two_type_arguments<'a>(ty: &'a Type, name: &str) -> Option<(&'a Type, &'a Type)> {
     let Type::Path(path) = peel(ty) else {
         return None;
     };
@@ -716,7 +811,7 @@ fn result_arguments(ty: &Type) -> Option<(&Type, &Type)> {
         .rev()
         .skip(1)
         .any(|segment| !segment.arguments.is_none());
-    if last.ident != "Result" || prefixed_with_arguments {
+    if last.ident != name || prefixed_with_arguments {
         return None;
     }
     let PathArguments::AngleBracketed(arguments) = &last.arguments else {
@@ -724,8 +819,8 @@ fn result_arguments(ty: &Type) -> Option<(&Type, &Type)> {
     };
     let mut types = arguments.args.iter();
     match (types.next(), types.next(), types.next()) {
-        (Some(GenericArgument::Type(reply)), Some(GenericArgument::Type(error)), None) => {
-            Some((reply, error))
+        (Some(GenericArgument::Type(first)), Some(GenericArgument::Type(second)), None) => {
+            Some((first, second))
         }
         _ => None,
     }

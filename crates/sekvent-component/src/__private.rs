@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub use bytes::Bytes;
 pub use prost;
 
+use futures::StreamExt as _;
 use sekvent_context::CallContext;
 use sekvent_error::AppError;
 
@@ -18,13 +19,13 @@ use crate::app::{Built, Handle, RemoteFactory, erase};
 use crate::lifecycle::LifecycleDyn;
 use crate::link::Route;
 use crate::{
-    AppBuilder, Binding, BuildError, ComponentDescriptor, ComponentError, ComponentHandle, Deps,
-    Lifecycle, reasons,
+    AppBuilder, Binding, BuildError, CallStream, ComponentDescriptor, ComponentError,
+    ComponentHandle, Deps, Lifecycle, reasons,
 };
 
 pub use crate::contract::{
     ContractMessage, ProtoRpc, ProtoService, RpcTypes, SameReply, SameRequest, assert_rpc,
-    assert_rpc_types, assert_service,
+    assert_rpc_types, assert_service, assert_stream_rpc,
 };
 pub use crate::link::Endpoint;
 
@@ -66,13 +67,78 @@ pub const fn assert_metadata<T: MetadataValue>() {}
 
 /// Byte-level dispatcher of one component, generated per component.
 pub trait Dispatch: Send + Sync + 'static {
-    /// Decode the request of method `method`, run it and encode the reply.
+    /// Unary methods: decode the request of method `method`, run it and
+    /// encode the reply. Default: `UNIMPLEMENTED` (a component without any).
     fn dispatch(
         &self,
         method: usize,
-        cx: CallContext,
-        body: Bytes,
-    ) -> BoxFuture<'static, Result<Bytes, AppError>>;
+        _cx: CallContext,
+        _body: Bytes,
+    ) -> BoxFuture<'static, Result<Bytes, AppError>> {
+        Box::pin(std::future::ready(Err(AppError::unimplemented(format!(
+            "the component has no unary method with index {method}"
+        )))))
+    }
+
+    /// Streaming methods: decode the request of method `method` and open
+    /// the stream of encoded items. Default: `UNIMPLEMENTED` (a component
+    /// without any).
+    fn dispatch_stream(
+        &self,
+        method: usize,
+        _cx: CallContext,
+        _body: Bytes,
+    ) -> BoxFuture<'static, Result<CallStream<Bytes, AppError>, AppError>> {
+        Box::pin(std::future::ready(Err(AppError::unimplemented(format!(
+            "the component has no streaming method with index {method}"
+        )))))
+    }
+}
+
+/// `INVALID_ARGUMENT` / `MALFORMED_REQUEST`.
+fn malformed_request() -> AppError {
+    AppError::invalid_argument("the request could not be decoded")
+        .with_reason(reasons::MALFORMED_REQUEST)
+}
+
+/// Decode `Req` (`INVALID_ARGUMENT` / `MALFORMED_REQUEST`), open the stream
+/// with `call`, map an open error with `E::into_app_error`, then encode
+/// every item and map the error that ends the stream with
+/// `EI::into_app_error`.
+pub fn serve_stream<Req, Item, E, EI, F, Fut>(
+    cx: CallContext,
+    body: Bytes,
+    call: F,
+) -> BoxFuture<'static, Result<CallStream<Bytes, AppError>, AppError>>
+where
+    Req: WireMessage,
+    Item: WireMessage,
+    E: ComponentError,
+    EI: ComponentError,
+    F: FnOnce(CallContext, Req) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<CallStream<Item, EI>, E>> + Send + 'static,
+{
+    Box::pin(async move {
+        let request = Req::decode(body).map_err(|_| malformed_request())?;
+        let stream = call(cx, request)
+            .await
+            .map_err(ComponentError::into_app_error)?;
+        Ok(CallStream::new(stream.map(|item| match item {
+            Ok(item) => Ok(Bytes::from(item.encode_to_vec())),
+            Err(error) => Err(error.into_app_error()),
+        })))
+    })
+}
+
+/// `UNIMPLEMENTED` naming the component and the index.
+pub fn unknown_stream_method(
+    descriptor: &'static ComponentDescriptor,
+    method: usize,
+) -> BoxFuture<'static, Result<CallStream<Bytes, AppError>, AppError>> {
+    Box::pin(std::future::ready(Err(AppError::unimplemented(format!(
+        "component {} has no streaming method with index {method}",
+        descriptor.name()
+    )))))
 }
 
 /// Decode `Req` (`INVALID_ARGUMENT` / `MALFORMED_REQUEST` on failure), run
@@ -91,10 +157,7 @@ where
     Fut: Future<Output = Result<Rep, E>> + Send + 'static,
 {
     Box::pin(async move {
-        let request = Req::decode(body).map_err(|_| {
-            AppError::invalid_argument("the request could not be decoded")
-                .with_reason(reasons::MALFORMED_REQUEST)
-        })?;
+        let request = Req::decode(body).map_err(|_| malformed_request())?;
         let reply = call(cx, request)
             .await
             .map_err(ComponentError::into_app_error)?;
@@ -305,6 +368,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(Text::decode(unit).unwrap().text, "ok");
+    }
+
+    async fn texts(_cx: CallContext, req: Text) -> Result<CallStream<Text, AppError>, AppError> {
+        if req.text.is_empty() {
+            return Err(AppError::invalid_argument("empty").with_reason("EMPTY_TEXT"));
+        }
+        Ok(CallStream::iter([
+            Ok(req.clone()),
+            Ok(req),
+            Err(AppError::not_found("gone").with_reason("GONE")),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn serve_stream_decodes_opens_and_encodes_every_item() {
+        let mut stream = serve_stream::<Text, Text, AppError, AppError, _, _>(
+            CallContext::new(),
+            body("hi"),
+            texts,
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let item = stream.next().await.unwrap().unwrap();
+            assert_eq!(Text::decode(item).unwrap().text, "hi");
+        }
+        let end = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(end.reason(), Some("GONE"));
+        assert!(stream.next().await.is_none());
+
+        let error = serve_stream::<Text, Text, AppError, AppError, _, _>(
+            CallContext::new(),
+            body(""),
+            texts,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.reason(), Some("EMPTY_TEXT"));
+
+        let garbage = serve_stream::<Text, Text, AppError, AppError, _, _>(
+            CallContext::new(),
+            Bytes::from_static(&[0x0a, 0xff]),
+            texts,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(garbage.code(), ErrorCode::InvalidArgument);
+        assert_eq!(garbage.reason(), Some(reasons::MALFORMED_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn dispatch_defaults_and_unknown_streams_are_unimplemented() {
+        struct Nothing;
+        impl Dispatch for Nothing {}
+        let error = Nothing
+            .dispatch(2, CallContext::new(), Bytes::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unimplemented);
+        assert!(error.message().contains('2'), "{error}");
+        let error = Nothing
+            .dispatch_stream(3, CallContext::new(), Bytes::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unimplemented);
+        assert!(error.message().contains('3'), "{error}");
+        let error = unknown_stream_method(ECHO, 4).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unimplemented);
+        assert!(error.message().contains("echo"), "{error}");
+        assert!(error.message().contains('4'), "{error}");
     }
 
     #[tokio::test]

@@ -20,6 +20,12 @@
       "reply": "shop.inventory.v1.StockReply",
       "client_streaming": false,
       "server_streaming": false
+    },
+    "WatchStock": {
+      "request": "shop.inventory.v1.StockRequest",
+      "reply": "shop.inventory.v1.StockReply",
+      "client_streaming": false,
+      "server_streaming": true
     }
   },
   "messages": {

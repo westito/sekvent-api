@@ -152,7 +152,11 @@ Shutdown begins on the first of:
 Then, in order:
 
 1. Health turns not serving: readiness becomes false, every named gRPC
-   service reports `NOT_SERVING`.
+   service reports `NOT_SERVING`. At the same moment a component App run
+   by `App::register` closes its streams: every open
+   [component stream](components.md#how-to-stream-replies-callstream) ends
+   with `UNAVAILABLE` / `COMPONENT_DRAINING` and new ones are refused, so
+   the listener's drain never waits on a stream. Unary calls continue.
 2. The runtime waits `shutdown_delay` (default 0) so load balancers notice.
 3. Stages drain in reverse start order. For each stage, the stop deadline is
    set, then every unit's `shutdown()` token fires; the units of the stage
@@ -215,7 +219,9 @@ produce units:
   [Server](server.md).
 - `app.register(builder)` — the component App (`App::register(&self,
   RuntimeBuilder) -> RuntimeBuilder`, so `let builder = app.register(builder);`),
-  in `Stage::Components`; see [Components](components.md).
+  in `Stage::Components`; see [Components](components.md). It also watches
+  the builder's `shutdown_trigger()` and calls `app.close_streams()` as
+  soon as shutdown begins.
 
 A factory that captures state clones it per run:
 

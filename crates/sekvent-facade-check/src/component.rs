@@ -1,6 +1,7 @@
 //! A standard component (`echo`) and a `local_only` one (`notes`), declared
-//! through the facade alone. `echo`'s contract is the hand-written
-//! [`proto`] module, shaped like sekvent-proto-build's output.
+//! through the facade alone, each with a unary and a server-streaming
+//! method. `echo`'s contract is the hand-written [`proto`] module, shaped
+//! like sekvent-proto-build's output.
 
 use sekvent::component::BuildError;
 use sekvent::config::ConfigSource;
@@ -11,20 +12,34 @@ use sekvent::prelude::*;
 pub mod proto {
     /// Contract of `check.echo.v1.Echo`, checked by `#[component(proto = …)]`.
     #[doc(hidden)]
-    #[allow(non_upper_case_globals, dead_code)]
-    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool)]) = (
+    #[allow(non_upper_case_globals, dead_code, clippy::type_complexity)]
+    pub const __sekvent_service_Echo: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.echo.v1.Echo",
-        &[(
-            "Ping",
-            "check.echo.v1.PingRequest",
-            "check.echo.v1.PingReply",
-            false,
-        )],
+        &[
+            (
+                "Ping",
+                "check.echo.v1.PingRequest",
+                "check.echo.v1.PingReply",
+                false,
+                false,
+            ),
+            (
+                "Pings",
+                "check.echo.v1.PingRequest",
+                "check.echo.v1.PingReply",
+                false,
+                true,
+            ),
+        ],
     );
     /// Request and reply of `check.echo.v1.Echo.Ping`, checked by `#[component(proto = …)]`.
     #[doc(hidden)]
     #[allow(non_camel_case_types, dead_code)]
     pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingReply);
+    /// Request and reply of `check.echo.v1.Echo.Pings`, checked by `#[component(proto = …)]`.
+    #[doc(hidden)]
+    #[allow(non_camel_case_types, dead_code)]
+    pub type __sekvent_rpc_Echo__Pings = (super::PingRequest, super::PingReply);
 }
 
 /// Text to echo.
@@ -53,10 +68,10 @@ impl prost::Name for PingReply {
     const PACKAGE: &'static str = "check.echo.v1";
 }
 
-/// What [`Echo::ping`] can fail with.
+/// What [`Echo::ping`] and [`Echo::pings`] can fail with.
 #[derive(Debug, sekvent::ComponentError)]
 pub enum EchoError {
-    /// The request had no text.
+    /// The request had no text, or a word of it was empty.
     #[reason("EMPTY_TEXT", code = InvalidArgument)]
     EmptyText,
     /// Any other error.
@@ -75,14 +90,31 @@ pub trait Echo: Send + Sync + 'static {
     /// credentials when served to them.
     #[call(timeout = "1s", optional_end_user)]
     async fn ping(&self, cx: &CallContext, req: PingRequest) -> Result<PingReply, EchoError>;
+
+    /// Each space-separated word of the request's text; an empty word ends
+    /// the stream with [`EchoError::EmptyText`].
+    #[call(stream, timeout = "1s", max_lifetime = "5m")]
+    async fn pings(
+        &self,
+        cx: &CallContext,
+        req: PingRequest,
+    ) -> Result<CallStream<PingReply, EchoError>, EchoError>;
 }
 
-/// Counts the characters of a note; takes plain Rust values.
+/// Counts and spells the characters of a note; takes plain Rust values.
 #[sekvent::component(name = "notes", local_only)]
 pub trait Notes: Send + Sync + 'static {
     /// The number of characters in the note.
     #[call]
     async fn add(&self, cx: &CallContext, req: String) -> Result<usize, AppError>;
+
+    /// The characters of the note, one by one; an empty note is refused.
+    #[call(stream)]
+    async fn letters(
+        &self,
+        cx: &CallContext,
+        req: String,
+    ) -> Result<CallStream<char, AppError>, AppError>;
 }
 
 /// The [`Echo`] implementation.
@@ -96,6 +128,30 @@ impl Echo for EchoService {
         }
         Ok(PingReply { text: req.text })
     }
+
+    async fn pings(
+        &self,
+        _cx: &CallContext,
+        req: PingRequest,
+    ) -> Result<CallStream<PingReply, EchoError>, EchoError> {
+        if req.text.is_empty() {
+            return Err(EchoError::EmptyText);
+        }
+        let words: Vec<Result<PingReply, EchoError>> = req
+            .text
+            .split(' ')
+            .map(|word| {
+                if word.is_empty() {
+                    Err(EchoError::EmptyText)
+                } else {
+                    Ok(PingReply {
+                        text: word.to_owned(),
+                    })
+                }
+            })
+            .collect();
+        Ok(CallStream::iter(words))
+    }
 }
 
 /// The [`Notes`] implementation.
@@ -105,6 +161,18 @@ pub struct NotesService;
 impl Notes for NotesService {
     async fn add(&self, _cx: &CallContext, req: String) -> Result<usize, AppError> {
         Ok(req.chars().count())
+    }
+
+    async fn letters(
+        &self,
+        _cx: &CallContext,
+        req: String,
+    ) -> Result<CallStream<char, AppError>, AppError> {
+        if req.is_empty() {
+            return Err(AppError::invalid_argument("the note is empty"));
+        }
+        let letters: Vec<Result<char, AppError>> = req.chars().map(Ok).collect();
+        Ok(CallStream::iter(letters))
     }
 }
 
@@ -169,6 +237,62 @@ mod tests {
         }
     }
 
+    /// Every item of `stream` up to its end, and the error that ended it.
+    async fn drain<T, E>(mut stream: CallStream<T, E>) -> (Vec<T>, Option<E>) {
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(item) => items.push(item),
+                Err(error) => {
+                    assert!(stream.next().await.is_none(), "a stream ends at its error");
+                    return (items, Some(error));
+                }
+            }
+        }
+        (items, None)
+    }
+
+    #[tokio::test]
+    async fn both_components_stream_under_both_bindings() {
+        for binding in [Binding::Local, Binding::LocalSerialized] {
+            let built = app(&bound(binding)).unwrap();
+            built.start().await.unwrap();
+            let cx = CallContext::new();
+            let echo = built.handle::<EchoHandle>().unwrap();
+            let words = |text: &str| PingRequest {
+                text: text.to_owned(),
+            };
+
+            let stream = echo.pings(&cx, words("to be")).await.unwrap();
+            let (items, end) = drain(stream).await;
+            let texts: Vec<String> = items.into_iter().map(|reply| reply.text).collect();
+            assert_eq!(texts, ["to", "be"], "{binding}");
+            assert!(end.is_none(), "{binding}: {end:?}");
+
+            let stream = echo.pings(&cx, words("to  be")).await.unwrap();
+            let (items, end) = drain(stream).await;
+            assert_eq!(items.len(), 1, "{binding}");
+            assert!(
+                matches!(end, Some(EchoError::EmptyText)),
+                "{binding}: {end:?}"
+            );
+
+            let error = echo.pings(&cx, words("")).await.unwrap_err();
+            assert!(
+                matches!(error, EchoError::EmptyText),
+                "{binding}: {error:?}"
+            );
+
+            let notes = built.handle::<NotesHandle>().unwrap();
+            let stream = notes.letters(&cx, "hé".to_owned()).await.unwrap();
+            assert_eq!(drain(stream).await.0, ['h', 'é'], "{binding}");
+            let error = notes.letters(&cx, String::new()).await.unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{binding}");
+
+            built.stop(Duration::from_secs(1)).await.unwrap();
+        }
+    }
+
     #[test]
     fn the_call_options_reach_the_descriptor() {
         use sekvent::component::ComponentHandle;
@@ -177,6 +301,18 @@ mod tests {
         assert_eq!(ping.timeout(), Some(Duration::from_secs(1)));
         assert!(ping.is_optional_end_user());
         assert!(!ping.is_anonymous());
+        assert!(!ping.is_stream());
+        assert_eq!(ping.max_lifetime(), None);
+
+        let pings = EchoHandle::DESCRIPTOR.methods()[1];
+        assert_eq!(pings.rpc(), "Pings");
+        assert!(pings.is_stream());
+        assert_eq!(pings.timeout(), Some(Duration::from_secs(1)));
+        assert_eq!(pings.max_lifetime(), Some(Duration::from_secs(300)));
+
+        let letters = NotesHandle::DESCRIPTOR.methods()[1];
+        assert!(letters.is_stream());
+        assert_eq!(letters.max_lifetime(), None);
     }
 
     #[test]

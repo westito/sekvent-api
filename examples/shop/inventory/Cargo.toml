@@ -11,9 +11,8 @@ publish = false
 [dependencies]
 inventory-api = { path = "../inventory-api" }
 sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
-
-[dev-dependencies]
 tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true

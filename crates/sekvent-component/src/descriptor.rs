@@ -15,6 +15,8 @@ pub enum MethodKind {
 ///
 /// Built with `const` builders so generated code keeps compiling when fields
 /// are added.
+// Independent flags of the `#[call]` attribute, set by const builders.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MethodDescriptor {
     name: &'static str,
@@ -25,6 +27,8 @@ pub struct MethodDescriptor {
     bulkhead: Option<u32>,
     anonymous: bool,
     optional_end_user: bool,
+    stream: bool,
+    max_lifetime: Option<Duration>,
 }
 
 impl MethodDescriptor {
@@ -41,7 +45,25 @@ impl MethodDescriptor {
             bulkhead: None,
             anonymous: false,
             optional_end_user: false,
+            stream: false,
+            max_lifetime: None,
         }
+    }
+
+    /// A server-streaming call: the method answers with a
+    /// [`CallStream`](crate::CallStream).
+    #[must_use]
+    pub const fn with_stream(mut self) -> Self {
+        self.stream = true;
+        self
+    }
+
+    /// Default lifetime of the method's streams
+    /// (`#[call(stream, max_lifetime = …)]`).
+    #[must_use]
+    pub const fn with_max_lifetime(mut self, max_lifetime: Duration) -> Self {
+        self.max_lifetime = Some(max_lifetime);
+        self
     }
 
     /// Mark the method safe to repeat.
@@ -127,6 +149,16 @@ impl MethodDescriptor {
     /// credentials that are sent being authenticated.
     pub const fn is_optional_end_user(&self) -> bool {
         self.optional_end_user
+    }
+
+    /// Whether the method is a server-streaming call.
+    pub const fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    /// The declared default lifetime of the method's streams, if any.
+    pub const fn max_lifetime(&self) -> Option<Duration> {
+        self.max_lifetime
     }
 }
 
@@ -256,6 +288,24 @@ mod tests {
         assert!(anonymous.is_anonymous() && !anonymous.is_optional_end_user());
         let optional = release.with_optional_end_user();
         assert!(optional.is_optional_end_user() && !optional.is_anonymous());
+        assert!(!reserve.is_stream());
+        assert_eq!(reserve.max_lifetime(), None);
+    }
+
+    #[test]
+    fn stream_builders_and_getters() {
+        const TICKS: MethodDescriptor = MethodDescriptor::call("ticks", "Ticks")
+            .with_stream()
+            .with_idempotent()
+            .with_max_lifetime(Duration::from_secs(600));
+        assert!(TICKS.is_stream());
+        assert_eq!(TICKS.kind(), MethodKind::Call, "a stream is a call");
+        assert_eq!(TICKS.max_lifetime(), Some(Duration::from_secs(600)));
+        assert!(TICKS.is_idempotent());
+        let plain = MethodDescriptor::call("feed", "Feed").with_stream();
+        assert!(plain.is_stream());
+        assert_eq!(plain.max_lifetime(), None);
+        assert_ne!(plain, MethodDescriptor::call("feed", "Feed"));
     }
 
     #[test]

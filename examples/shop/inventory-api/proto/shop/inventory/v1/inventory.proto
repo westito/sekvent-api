@@ -14,6 +14,8 @@ service Inventory {
   rpc Release(ReleaseRequest) returns (ReleaseReply);
   // How many units of a SKU are available.
   rpc Stock(StockRequest) returns (StockReply);
+  // Stock of one SKU now, then again after every change.
+  rpc WatchStock(StockRequest) returns (stream StockReply);
 }
 
 // Reserve `quantity` units of `sku` for an order.
@@ -44,7 +46,7 @@ message StockRequest {
   string sku = 1;
 }
 
-// Units of `sku` available right now.
+// Units of `sku` available right now; each item of `WatchStock` is one.
 message StockReply {
   string sku = 1;
   uint32 available = 2;

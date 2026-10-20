@@ -155,6 +155,45 @@ impl<F: Future> Future for CatchPanic<F> {
         }
     }
 }
+
+#[cfg(feature = "grpc")]
+/// A stream whose panic, raised while it is polled, becomes a last
+/// `Err(Panicked)` item instead of unwinding into the caller; the stream is
+/// dropped then and the payload never shown.
+pub(crate) struct CatchPanicStream<S>(Option<Pin<Box<S>>>);
+
+#[cfg(feature = "grpc")]
+impl<S: futures::Stream> CatchPanicStream<S> {
+    pub(crate) fn new(stream: S) -> Self {
+        Self(Some(Box::pin(stream)))
+    }
+}
+
+#[cfg(feature = "grpc")]
+impl<S: futures::Stream> futures::Stream for CatchPanicStream<S> {
+    type Item = Result<S::Item, Panicked>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let Some(inner) = this.0.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let polled = std::panic::catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll_next(cx)));
+        match polled {
+            Ok(Poll::Ready(Some(item))) => Poll::Ready(Some(Ok(item))),
+            Ok(Poll::Ready(None)) => {
+                this.0 = None;
+                Poll::Ready(None)
+            }
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_payload) => {
+                this.0 = None;
+                Poll::Ready(Some(Err(Panicked)))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -244,6 +283,29 @@ mod tests {
         })
         .await;
         assert_eq!(caught, Err::<(), _>(Panicked));
+    }
+
+    #[cfg(feature = "grpc")]
+    #[tokio::test]
+    async fn a_panicking_stream_ends_with_its_panic() {
+        use futures::StreamExt as _;
+
+        let mut count = 0;
+        let stream = futures::stream::poll_fn(move |_| {
+            count += 1;
+            assert!(count < 3, "secret payload");
+            Poll::Ready(Some(count))
+        });
+        let items: Vec<_> = CatchPanicStream::new(stream).collect().await;
+        assert_eq!(items, [Ok(1), Ok(2), Err(Panicked)]);
+
+        let ended: Vec<_> = CatchPanicStream::new(futures::stream::iter([7]))
+            .collect()
+            .await;
+        assert_eq!(ended, [Ok(7)]);
+        let mut done = CatchPanicStream::new(futures::stream::empty::<u8>());
+        assert_eq!(done.next().await, None);
+        assert_eq!(done.next().await, None);
     }
 
     #[cfg(feature = "grpc")]

@@ -2218,6 +2218,7 @@ dependencies = [
  "inventory-api",
  "sekvent-api",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -4149,11 +4150,15 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "futures",
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
  "hyper-util",
  "prost",
+ "rand 0.10.3",
+ "rstest",
  "sekvent-component",
  "sekvent-config",
  "sekvent-context",
@@ -4162,8 +4167,10 @@ dependencies = [
  "sekvent-macros",
  "sekvent-resilience",
  "sekvent-runtime",
+ "sekvent-telemetry",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tonic",
  "tonic-health",
  "tonic-prost",

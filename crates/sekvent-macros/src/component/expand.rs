@@ -184,33 +184,49 @@ fn handle(args: &Args, component: &Component, names: &Names, krate: &TokenStream
     }
 }
 
-/// `MethodDescriptor::call("reserve", "Reserve")` plus the `#[call]` policy.
+/// `MethodDescriptor::call("reserve", "Reserve")` plus the `#[call]` policy:
+/// `stream` first, then `idempotent`, `timeout`, `bulkhead`, `max_lifetime`,
+/// `anonymous` and `optional_end_user`.
 fn method_descriptor(method: &Method, krate: &TokenStream) -> TokenStream {
     let name = method.ident.to_string();
     let rpc = rpc_name(&name);
     let policy = &method.policy;
+    let stream = policy.stream.then(|| quote!(.with_stream()));
     let idempotent = policy.idempotent.then(|| quote!(.with_idempotent()));
     let timeout = policy.timeout.map(|timeout| {
-        let secs = timeout.as_secs();
-        let nanos = timeout.subsec_nanos();
-        quote!(.with_timeout(::core::time::Duration::new(#secs, #nanos)))
+        let timeout = duration(timeout);
+        quote!(.with_timeout(#timeout))
     });
     let bulkhead = policy.bulkhead.map(|limit| quote!(.with_bulkhead(#limit)));
+    let max_lifetime = policy.max_lifetime.map(|lifetime| {
+        let lifetime = duration(lifetime);
+        quote!(.with_max_lifetime(#lifetime))
+    });
     let anonymous = policy.anonymous.then(|| quote!(.with_anonymous()));
     let optional_end_user = policy
         .optional_end_user
         .then(|| quote!(.with_optional_end_user()));
     quote! {
         #krate::MethodDescriptor::call(#name, #rpc)
+            #stream
             #idempotent
             #timeout
             #bulkhead
+            #max_lifetime
             #anonymous
             #optional_end_user
     }
 }
 
-/// One handle method: route the call through the endpoint.
+/// `::core::time::Duration::new(secs, nanos)`.
+fn duration(duration: std::time::Duration) -> TokenStream {
+    let secs = duration.as_secs();
+    let nanos = duration.subsec_nanos();
+    quote!(::core::time::Duration::new(#secs, #nanos))
+}
+
+/// One handle method: route the call (or a stream's open) through the
+/// endpoint.
 fn handle_method(
     mode: Mode,
     index: usize,
@@ -234,10 +250,11 @@ fn handle_method(
     };
     let object = &names.object;
     let hidden = hidden_name(method);
-    let route = if mode == Mode::LocalOnly {
-        quote!(call_local)
-    } else {
-        quote!(call)
+    let route = match (mode == Mode::LocalOnly, method.policy.stream) {
+        (false, false) => quote!(call),
+        (true, false) => quote!(call_local),
+        (false, true) => quote!(call_stream),
+        (true, true) => quote!(call_stream_local),
     };
     let (cx, req, imp) = (local("cx"), local("req"), local("imp"));
     quote! {
@@ -369,14 +386,40 @@ fn descriptor(
     }
 }
 
-/// The byte-level dispatcher (standard and `remote_only` components).
+/// The byte-level dispatcher (standard and `remote_only` components):
+/// `dispatch` for the unary methods and `dispatch_stream` for the streaming
+/// ones, each only when the component has such methods (the trait's
+/// defaults answer `UNIMPLEMENTED`).
 fn dispatcher(component: &Component, names: &Names, krate: &TokenStream) -> TokenStream {
     let vis = &component.vis;
     let Names {
-        handle,
-        object,
-        dispatcher,
+        object, dispatcher, ..
     } = names;
+    let unary = component.methods.iter().any(|method| !method.policy.stream);
+    let streaming = component.methods.iter().any(|method| method.policy.stream);
+    let dispatch = unary.then(|| dispatch_fn(component, false, names, krate));
+    let dispatch_stream = streaming.then(|| dispatch_fn(component, true, names, krate));
+    quote! {
+        #[doc(hidden)]
+        #vis struct #dispatcher(::std::sync::Arc<dyn #object>);
+
+        #[allow(clippy::all, clippy::pedantic)]
+        impl #krate::__private::Dispatch for #dispatcher {
+            #dispatch
+            #dispatch_stream
+        }
+    }
+}
+
+/// `dispatch` over the unary methods, or `dispatch_stream` over the
+/// streaming ones, matching on the declaration index.
+fn dispatch_fn(
+    component: &Component,
+    stream: bool,
+    names: &Names,
+    krate: &TokenStream,
+) -> TokenStream {
+    let Names { handle, object, .. } = names;
     let (method, cx, body, imp, req) = (
         local("method"),
         local("cx"),
@@ -384,40 +427,55 @@ fn dispatcher(component: &Component, names: &Names, krate: &TokenStream) -> Toke
         local("imp"),
         local("req"),
     );
-    let arms = component.methods.iter().enumerate().map(|(index, one)| {
-        let request = &one.request;
-        let hidden = hidden_name(one);
-        quote! {
-            #index => #krate::__private::serve(#cx, #body,
-                move |#cx: #krate::CallContext, #req: #request| async move {
-                    #object::#hidden(&*#imp, &#cx, #req).await
-                }),
-        }
-    });
+    let (name, serve, unknown, answer) = if stream {
+        (
+            quote!(dispatch_stream),
+            quote!(serve_stream),
+            quote!(unknown_stream_method),
+            quote!(#krate::CallStream<#krate::__private::Bytes, #krate::AppError>),
+        )
+    } else {
+        (
+            quote!(dispatch),
+            quote!(serve),
+            quote!(unknown_method),
+            quote!(#krate::__private::Bytes),
+        )
+    };
+    let arms = component
+        .methods
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| one.policy.stream == stream)
+        .map(|(index, one)| {
+            let request = &one.request;
+            let hidden = hidden_name(one);
+            quote! {
+                #index => #krate::__private::#serve(#cx, #body,
+                    move |#cx: #krate::CallContext, #req: #request| async move {
+                        #object::#hidden(&*#imp, &#cx, #req).await
+                    }),
+            }
+        });
     quote! {
-        #[doc(hidden)]
-        #vis struct #dispatcher(::std::sync::Arc<dyn #object>);
-
-        #[allow(clippy::all, clippy::pedantic)]
-        impl #krate::__private::Dispatch for #dispatcher {
-            fn dispatch(&self, #method: usize, #cx: #krate::CallContext,
-                        #body: #krate::__private::Bytes)
-                -> #krate::__private::BoxFuture<'static,
-                    ::core::result::Result<#krate::__private::Bytes, #krate::AppError>>
-            {
-                let #imp = ::std::sync::Arc::clone(&self.0);
-                match #method {
-                    #(#arms)*
-                    _ => #krate::__private::unknown_method(
-                        <#handle as #krate::ComponentHandle>::DESCRIPTOR, #method),
-                }
+        fn #name(&self, #method: usize, #cx: #krate::CallContext,
+                 #body: #krate::__private::Bytes)
+            -> #krate::__private::BoxFuture<'static,
+                ::core::result::Result<#answer, #krate::AppError>>
+        {
+            let #imp = ::std::sync::Arc::clone(&self.0);
+            match #method {
+                #(#arms)*
+                _ => #krate::__private::#unknown(
+                    <#handle as #krate::ComponentHandle>::DESCRIPTOR, #method),
             }
         }
     }
 }
 
 /// Type assertions rustc checks for the macro: messages (or local types)
-/// and component errors.
+/// and component errors; for a streaming method the request, the item, the
+/// open's error and the item error.
 fn assertions(mode: Mode, component: &Component, krate: &TokenStream) -> TokenStream {
     let message = if mode == Mode::LocalOnly {
         quote!(assert_local)
@@ -440,7 +498,12 @@ fn assertions(mode: Mode, component: &Component, krate: &TokenStream) -> TokenSt
         let error = quote_spanned!(error.span()=>
             #krate::__private::assert_error::<#error>();
         );
-        quote!(#request #reply #error)
+        let item_error = method.item_error.as_ref().map(|item_error| {
+            quote_spanned!(item_error.span()=>
+                #krate::__private::assert_error::<#item_error>();
+            )
+        });
+        quote!(#request #reply #error #item_error)
     });
     quote! {
         const _: () = {
@@ -451,10 +514,10 @@ fn assertions(mode: Mode, component: &Component, krate: &TokenStream) -> TokenSt
 
 /// The checks tying the trait to what sekvent-proto-build emitted into the
 /// `proto` module: the `__sekvent_service_<Trait>` constant (service name,
-/// one RPC per method and no other, unary) and, per method, the
-/// `__sekvent_rpc_<Trait>__<Rpc>` alias of the RPC's Rust request and reply
-/// types, compared by type identity. Nothing for a `local_only` component,
-/// which has no `proto`.
+/// one RPC per method and no other, unary or streaming its replies as the
+/// method is) and, per method, the `__sekvent_rpc_<Trait>__<Rpc>` alias of
+/// the RPC's Rust request and reply (or item) types, compared by type
+/// identity. Nothing for a `local_only` component, which has no `proto`.
 fn contract(args: &Args, component: &Component, krate: &TokenStream) -> TokenStream {
     let (Some(proto), Some(package)) = (&args.proto, &args.package) else {
         return TokenStream::new();
@@ -477,8 +540,14 @@ fn contract(args: &Args, component: &Component, krate: &TokenStream) -> TokenStr
     let checks = component.methods.iter().zip(&rpcs).map(|(method, rpc)| {
         let Method { request, reply, .. } = method;
         let types = format_ident!("__sekvent_rpc_{}__{}", service_name, rpc);
+        let assert = if method.policy.stream {
+            "assert_stream_rpc"
+        } else {
+            "assert_rpc"
+        };
+        let assert = Ident::new(assert, method.signature);
         quote_spanned! {method.signature=>
-            const _: () = #krate::__private::assert_rpc::<#request, #reply>(
+            const _: () = #krate::__private::#assert::<#request, #reply>(
                 #proto::#constant,
                 #rpc,
             );

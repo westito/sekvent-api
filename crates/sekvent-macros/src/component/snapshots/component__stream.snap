@@ -1,0 +1,298 @@
+---
+source: crates/sekvent-macros/src/component/tests.rs
+expression: text
+---
+pub trait Ticker: Send + Sync + 'static {
+    /// Ticks of a series, from `from` on, as they happen.
+    fn ticks(
+        &self,
+        cx: &CallContext,
+        req: TicksRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<CallStream<Tick, TickerError>, TickerError>,
+    > + ::core::marker::Send;
+    /// The latest tick of a series.
+    fn latest(
+        &self,
+        cx: &CallContext,
+        req: LatestRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<Tick, TickerError>,
+    > + ::core::marker::Send;
+}
+#[doc(hidden)]
+pub trait __TickerDyn: ::core::marker::Send + ::core::marker::Sync + 'static {
+    fn __ticks<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: TicksRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'a,
+        Result<CallStream<Tick, TickerError>, TickerError>,
+    >;
+    fn __latest<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: LatestRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<'a, Result<Tick, TickerError>>;
+}
+#[allow(clippy::all, clippy::pedantic)]
+impl<__SekventImpl: Ticker> __TickerDyn for __SekventImpl {
+    fn __ticks<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: TicksRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'a,
+        Result<CallStream<Tick, TickerError>, TickerError>,
+    > {
+        ::std::boxed::Box::pin(<__SekventImpl as Ticker>::ticks(self, cx, req))
+    }
+    fn __latest<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: LatestRequest,
+    ) -> ::sekvent_component::__private::BoxFuture<'a, Result<Tick, TickerError>> {
+        ::std::boxed::Box::pin(<__SekventImpl as Ticker>::latest(self, cx, req))
+    }
+}
+/// Cloneable handle to the [`Ticker`] component (`ticker`).
+///
+/// Get it from `Deps::handle` in a factory or from `App::handle`; the App
+/// builder decides whether its calls run in-process or across a
+/// serialization boundary.
+#[derive(Clone, Debug)]
+pub struct TickerHandle(::sekvent_component::__private::Endpoint<dyn __TickerDyn>);
+#[allow(clippy::all, clippy::pedantic)]
+impl TickerHandle {
+    #[doc(hidden)]
+    pub const __METHODS: &'static [::sekvent_component::MethodDescriptor] = &[
+        ::sekvent_component::MethodDescriptor::call("ticks", "Ticks")
+            .with_stream()
+            .with_idempotent()
+            .with_timeout(::core::time::Duration::new(1u64, 0u32))
+            .with_bulkhead(8u32)
+            .with_max_lifetime(::core::time::Duration::new(600u64, 0u32)),
+        ::sekvent_component::MethodDescriptor::call("latest", "Latest")
+            .with_idempotent()
+            .with_timeout(::core::time::Duration::new(0u64, 500000000u32)),
+    ];
+    /// Ticks of a series, from `from` on, as they happen.
+    pub fn ticks<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: TicksRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<CallStream<Tick, TickerError>, TickerError>,
+    > + ::core::marker::Send + 'a {
+        self.0
+            .call_stream(
+                0usize,
+                cx,
+                req,
+                |
+                    imp: ::std::sync::Arc<dyn __TickerDyn>,
+                    cx: ::sekvent_component::CallContext,
+                    req: TicksRequest|
+                async move { __TickerDyn::__ticks(&*imp, &cx, req).await },
+            )
+    }
+    /// The latest tick of a series.
+    pub fn latest<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        req: LatestRequest,
+    ) -> impl ::core::future::Future<
+        Output = Result<Tick, TickerError>,
+    > + ::core::marker::Send + 'a {
+        self.0
+            .call(
+                1usize,
+                cx,
+                req,
+                |
+                    imp: ::std::sync::Arc<dyn __TickerDyn>,
+                    cx: ::sekvent_component::CallContext,
+                    req: LatestRequest|
+                async move { __TickerDyn::__latest(&*imp, &cx, req).await },
+            )
+    }
+    /// The binding this handle's calls use.
+    pub fn binding(&self) -> ::sekvent_component::Binding {
+        self.0.binding()
+    }
+    /// Install the implementation `factory` builds. The factory runs during
+    /// `AppBuilder::build`, in install order, and only when the component is
+    /// bound `local` or `local-serialized`.
+    pub fn install<__SekventImpl, __SekventFactory>(
+        app: &mut ::sekvent_component::AppBuilder<'_>,
+        factory: __SekventFactory,
+    ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
+    where
+        __SekventImpl: Ticker,
+        __SekventFactory: ::core::ops::FnOnce(
+                &mut ::sekvent_component::Deps<'_>,
+            ) -> ::core::result::Result<__SekventImpl, ::sekvent_component::AppError>
+            + ::core::marker::Send + 'static,
+    {
+        ::sekvent_component::__private::install_local(
+            app,
+            TickerHandle,
+            move |deps| {
+                let imp: ::std::sync::Arc<dyn __TickerDyn> = ::std::sync::Arc::new(
+                    factory(deps)?,
+                );
+                let dispatch = ::std::sync::Arc::new(
+                    __TickerDispatcher(::std::sync::Arc::clone(&imp)),
+                );
+                ::core::result::Result::Ok(
+                    ::sekvent_component::__private::Local::new(imp)
+                        .with_dispatch(dispatch),
+                )
+            },
+        )
+    }
+    /// Like [`TickerHandle::install`], and also run the implementation's
+    /// `Lifecycle` hooks when the App starts and stops.
+    pub fn install_with_lifecycle<__SekventImpl, __SekventFactory>(
+        app: &mut ::sekvent_component::AppBuilder<'_>,
+        factory: __SekventFactory,
+    ) -> ::core::result::Result<(), ::sekvent_component::BuildError>
+    where
+        __SekventImpl: Ticker + ::sekvent_component::Lifecycle,
+        __SekventFactory: ::core::ops::FnOnce(
+                &mut ::sekvent_component::Deps<'_>,
+            ) -> ::core::result::Result<__SekventImpl, ::sekvent_component::AppError>
+            + ::core::marker::Send + 'static,
+    {
+        ::sekvent_component::__private::install_local(
+            app,
+            TickerHandle,
+            move |deps| {
+                let concrete = ::std::sync::Arc::new(factory(deps)?);
+                let imp: ::std::sync::Arc<dyn __TickerDyn> = ::std::sync::Arc::<
+                    __SekventImpl,
+                >::clone(&concrete);
+                let dispatch = ::std::sync::Arc::new(
+                    __TickerDispatcher(::std::sync::Arc::clone(&imp)),
+                );
+                ::core::result::Result::Ok(
+                    ::sekvent_component::__private::Local::new(imp)
+                        .with_dispatch(dispatch)
+                        .with_lifecycle(concrete),
+                )
+            },
+        )
+    }
+}
+#[allow(clippy::all, clippy::pedantic)]
+impl ::sekvent_component::ComponentHandle for TickerHandle {
+    const DESCRIPTOR: &'static ::sekvent_component::ComponentDescriptor = &::sekvent_component::ComponentDescriptor::new(
+            "ticker",
+            "Ticker",
+            TickerHandle::__METHODS,
+        )
+        .with_package("shop.ticker.v1");
+}
+#[doc(hidden)]
+pub struct __TickerDispatcher(::std::sync::Arc<dyn __TickerDyn>);
+#[allow(clippy::all, clippy::pedantic)]
+impl ::sekvent_component::__private::Dispatch for __TickerDispatcher {
+    fn dispatch(
+        &self,
+        method: usize,
+        cx: ::sekvent_component::CallContext,
+        body: ::sekvent_component::__private::Bytes,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'static,
+        ::core::result::Result<
+            ::sekvent_component::__private::Bytes,
+            ::sekvent_component::AppError,
+        >,
+    > {
+        let imp = ::std::sync::Arc::clone(&self.0);
+        match method {
+            1usize => {
+                ::sekvent_component::__private::serve(
+                    cx,
+                    body,
+                    move |cx: ::sekvent_component::CallContext, req: LatestRequest| async move {
+                        __TickerDyn::__latest(&*imp, &cx, req).await
+                    },
+                )
+            }
+            _ => {
+                ::sekvent_component::__private::unknown_method(
+                    <TickerHandle as ::sekvent_component::ComponentHandle>::DESCRIPTOR,
+                    method,
+                )
+            }
+        }
+    }
+    fn dispatch_stream(
+        &self,
+        method: usize,
+        cx: ::sekvent_component::CallContext,
+        body: ::sekvent_component::__private::Bytes,
+    ) -> ::sekvent_component::__private::BoxFuture<
+        'static,
+        ::core::result::Result<
+            ::sekvent_component::CallStream<
+                ::sekvent_component::__private::Bytes,
+                ::sekvent_component::AppError,
+            >,
+            ::sekvent_component::AppError,
+        >,
+    > {
+        let imp = ::std::sync::Arc::clone(&self.0);
+        match method {
+            0usize => {
+                ::sekvent_component::__private::serve_stream(
+                    cx,
+                    body,
+                    move |cx: ::sekvent_component::CallContext, req: TicksRequest| async move {
+                        __TickerDyn::__ticks(&*imp, &cx, req).await
+                    },
+                )
+            }
+            _ => {
+                ::sekvent_component::__private::unknown_stream_method(
+                    <TickerHandle as ::sekvent_component::ComponentHandle>::DESCRIPTOR,
+                    method,
+                )
+            }
+        }
+    }
+}
+const _: () = {
+    ::sekvent_component::__private::assert_wire::<TicksRequest>();
+    ::sekvent_component::__private::assert_wire::<Tick>();
+    ::sekvent_component::__private::assert_error::<TickerError>();
+    ::sekvent_component::__private::assert_error::<TickerError>();
+    ::sekvent_component::__private::assert_wire::<LatestRequest>();
+    ::sekvent_component::__private::assert_wire::<Tick>();
+    ::sekvent_component::__private::assert_error::<TickerError>();
+};
+const _: () = ::sekvent_component::__private::assert_service(
+    crate::proto::shop::ticker::v1::__sekvent_service_Ticker,
+    "shop.ticker.v1.Ticker",
+    &["Ticks", "Latest"],
+);
+const _: () = ::sekvent_component::__private::assert_stream_rpc::<
+    TicksRequest,
+    Tick,
+>(crate::proto::shop::ticker::v1::__sekvent_service_Ticker, "Ticks");
+const _: () = ::sekvent_component::__private::assert_rpc_types::<
+    TicksRequest,
+    Tick,
+    crate::proto::shop::ticker::v1::__sekvent_rpc_Ticker__Ticks,
+>();
+const _: () = ::sekvent_component::__private::assert_rpc::<
+    LatestRequest,
+    Tick,
+>(crate::proto::shop::ticker::v1::__sekvent_service_Ticker, "Latest");
+const _: () = ::sekvent_component::__private::assert_rpc_types::<
+    LatestRequest,
+    Tick,
+    crate::proto::shop::ticker::v1::__sekvent_rpc_Ticker__Latest,
+>();

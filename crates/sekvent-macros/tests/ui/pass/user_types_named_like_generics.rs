@@ -42,11 +42,23 @@ impl prost::Name for Verdict {
 /// The contract sekvent-proto-build would generate for `check.letters.v1`.
 mod proto {
     #[allow(non_upper_case_globals)]
-    pub const __sekvent_service_Letters: (&str, &[(&str, &str, &str, bool)]) = (
+    pub const __sekvent_service_Letters: (&str, &[(&str, &str, &str, bool, bool)]) = (
         "check.letters.v1.Letters",
         &[
-            ("Measure", "check.letters.v1.T", "check.letters.v1.F", false),
-            ("Check", "check.letters.v1.F", "check.letters.v1.Verdict", false),
+            (
+                "Measure",
+                "check.letters.v1.T",
+                "check.letters.v1.F",
+                false,
+                false,
+            ),
+            (
+                "Check",
+                "check.letters.v1.F",
+                "check.letters.v1.Verdict",
+                false,
+                false,
+            ),
         ],
     );
     #[allow(non_camel_case_types, dead_code)]

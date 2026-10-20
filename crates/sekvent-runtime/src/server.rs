@@ -87,6 +87,16 @@ impl<S: Send + Sync> FromRequestParts<S> for Ctx {
     }
 }
 
+/// HTTP/2 keep-alive pings for [`ServerBuilder::http2_keep_alive`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Http2KeepAlive {
+    /// Pause after the last frame read before a PING is sent.
+    pub interval: Duration,
+    /// Longest wait for the PING's acknowledgement before the connection
+    /// is closed.
+    pub timeout: Duration,
+}
+
 /// Configures a [`Server`].
 #[allow(
     clippy::struct_excessive_bools,
@@ -104,6 +114,7 @@ pub struct ServerBuilder {
     authenticator: Option<Authenticator>,
     header_read_timeout: Option<Duration>,
     max_connections: Option<usize>,
+    http2_keep_alive: Option<Http2KeepAlive>,
     cors: Option<Cors>,
     rest_body_limit: usize,
     layers: Vec<ServerLayer>,
@@ -123,6 +134,7 @@ impl fmt::Debug for ServerBuilder {
             .field("visibility", &self.visibility)
             .field("header_read_timeout", &self.header_read_timeout)
             .field("max_connections", &self.max_connections)
+            .field("http2_keep_alive", &self.http2_keep_alive)
             .field("cors", &self.cors)
             .field("rest_body_limit", &self.rest_body_limit)
             .field("layers", &self.layers.len())
@@ -269,6 +281,17 @@ impl ServerBuilder {
         self
     }
 
+    /// Sends HTTP/2 PING frames every `interval` on idle connections and
+    /// closes a connection whose ping is not acknowledged within `timeout`,
+    /// so a stream to a vanished peer does not stay open. `None` (the
+    /// default) sends no pings. Both durations must be non-zero. HTTP/1.1
+    /// connections (gRPC-Web through most proxies) get no pings.
+    #[must_use]
+    pub fn http2_keep_alive(mut self, keep_alive: Option<Http2KeepAlive>) -> Self {
+        self.http2_keep_alive = keep_alive;
+        self
+    }
+
     /// Answer browsers' cross-origin requests (REST and gRPC-Web). Off by
     /// default. Preflights are answered before authentication and handlers,
     /// other `OPTIONS` requests reach the application, and these rules
@@ -380,6 +403,7 @@ impl ServerBuilder {
                     authenticator: self.authenticator,
                     header_read_timeout: self.header_read_timeout,
                     max_connections: self.max_connections,
+                    http2_keep_alive: self.http2_keep_alive,
                     cors: self.cors,
                     rest_body_limit: self.rest_body_limit,
                     layers: self.layers,
@@ -410,6 +434,14 @@ impl ServerBuilder {
                 "the connection limit must be between 1 and {}",
                 Semaphore::MAX_PERMITS
             )));
+        }
+        if self
+            .http2_keep_alive
+            .is_some_and(|keep_alive| keep_alive.interval.is_zero() || keep_alive.timeout.is_zero())
+        {
+            return Err(AppError::invalid_argument(
+                "the HTTP/2 keep-alive interval and timeout must be positive",
+            ));
         }
         if self.site.is_some() && self.prefix.is_none() {
             return Err(AppError::invalid_argument(
@@ -481,6 +513,7 @@ struct ServerConfig {
     authenticator: Option<Authenticator>,
     header_read_timeout: Option<Duration>,
     max_connections: Option<usize>,
+    http2_keep_alive: Option<Http2KeepAlive>,
     cors: Option<Cors>,
     rest_body_limit: usize,
     layers: Vec<ServerLayer>,
@@ -616,6 +649,7 @@ impl Server {
             authenticator: None,
             header_read_timeout: Some(Duration::from_secs(30)),
             max_connections: Some(10_000),
+            http2_keep_alive: None,
             cors: None,
             rest_body_limit: DEFAULT_REST_BODY_LIMIT,
             layers: Vec::new(),
@@ -741,6 +775,13 @@ impl Server {
             .http1()
             .timer(TokioTimer::new())
             .header_read_timeout(config.header_read_timeout);
+        if let Some(keep_alive) = config.http2_keep_alive {
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .keep_alive_interval(keep_alive.interval)
+                .keep_alive_timeout(keep_alive.timeout);
+        }
         let builder = Arc::new(builder);
         let limit = config
             .max_connections
@@ -1227,12 +1268,23 @@ mod tests {
         );
         let reused = Server::builder().from_listener(taken).unwrap();
         assert_eq!(reused.local_addr(), addr);
-        assert!(format!("{:?}", Server::builder()).contains("max_connections: Some(10000)"));
+        let debug = format!("{:?}", Server::builder());
+        assert!(debug.contains("max_connections: Some(10000)"), "{debug}");
+        assert!(debug.contains("http2_keep_alive: None"), "{debug}");
 
+        let keep_alive = |interval: u64, timeout: u64| {
+            Server::builder().http2_keep_alive(Some(Http2KeepAlive {
+                interval: Duration::from_secs(interval),
+                timeout: Duration::from_secs(timeout),
+            }))
+        };
+        assert!(keep_alive(30, 20).bind(localhost()).await.is_ok());
         for limits in [
             Server::builder().header_read_timeout(Some(Duration::ZERO)),
             Server::builder().max_connections(Some(0)),
             Server::builder().max_connections(Some(usize::MAX)),
+            keep_alive(0, 20),
+            keep_alive(30, 0),
         ] {
             let error = limits.bind(localhost()).await.unwrap_err();
             assert_eq!(error.code(), ErrorCode::InvalidArgument);

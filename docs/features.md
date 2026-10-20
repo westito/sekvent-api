@@ -45,7 +45,7 @@ example an `-api` crate that only declares a component contract).
 | `client` | `sekvent::client` (outbound HTTP, OAuth 2.0) | `sekvent-client` | [client](modules/client.md) |
 | `db` | `sekvent::db` (pools, migrations, filters, errors) | `sekvent-db` | [db](modules/db.md) |
 | `storage` | `sekvent::storage` (S3-compatible object storage, presigned uploads and downloads) | `sekvent-storage` | [storage](modules/storage.md) |
-| `component` | `sekvent::component` plus `sekvent::{App, ComponentError, component}` | `sekvent-component` | [components](modules/components.md) |
+| `component` | `sekvent::component` plus `sekvent::{App, ComponentError, component}`; unary and server-streaming methods (`CallStream`) | `sekvent-component` | [components](modules/components.md) |
 
 `component` also turns on `config`, `error` and `context`.
 
@@ -71,7 +71,7 @@ example an `-api` crate that only declares a component contract).
 | `db-migrate` | `db` | `migrate_on_boot` with sqlx migrations |
 | `db-sea-orm-migrate` | `db` | `run_sea_orm_migrations` with sea-orm-migration |
 | `db-lease` | `db` | `LeaseStore`, fencing tokens; with `runtime`, `LeaseGuard` for singleton jobs |
-| `component-grpc` | `component` | The `grpc` binding and serving components over gRPC |
+| `component-grpc` | `component` | The `grpc` binding and serving components over gRPC, unary and server-streaming (`#[call(stream)]`, also to browsers over gRPC-Web) |
 | `full` | everything above | Every module and integration (handy for experiments, not for services) |
 
 ## Features that combine
@@ -111,4 +111,4 @@ its feature:
 | `error` | `AppError`, `ErrorCode` |
 | `context` | `CallContext` |
 | `runtime` | `Ctx`, `JobContext`, `JobSpec`, `Runtime`, `RuntimeBuilder`, `RuntimeHandle`, `Server`, `ServerBuilder`, `ShutdownTrigger`, `Stage`, `UnitContext`, `UnitPolicy` |
-| `component` | `App`, `ComponentError`, `Lifecycle` |
+| `component` | `App`, `CallStream`, `ComponentError`, `Lifecycle` |

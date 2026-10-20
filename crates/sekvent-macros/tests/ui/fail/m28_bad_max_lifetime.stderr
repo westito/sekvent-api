@@ -1,0 +1,11 @@
+error: max_lifetime must be a positive duration such as "15m" or "1h"
+ --> tests/ui/fail/m28_bad_max_lifetime.rs:5:35
+  |
+5 |     #[call(stream, max_lifetime = "0s")]
+  |                                   ^^^^
+
+error: max_lifetime must be a positive duration such as "15m" or "1h"
+  --> tests/ui/fail/m28_bad_max_lifetime.rs:15:35
+   |
+15 |     #[call(stream, max_lifetime = 600)]
+   |                                   ^^^

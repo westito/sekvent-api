@@ -68,7 +68,7 @@ repository; describe behaviour in your own words and use neutral examples
 | `sekvent-sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), state cookie, handoff codes | config, error, context, client |
 | `sekvent-storage` | S3-compatible object storage: SigV4 presigned uploads and downloads, head, delete, copy, bucket probe | config, error, context, client, resilience, runtime (optional) |
 | `sekvent-db` | named pools, migrations, distinct-target check, sea-orm filters, probes, leases | config, error, runtime (optional) |
-| `sekvent-component` | components, App builder, local, serialized and gRPC bindings | config, error, context, resilience, link (optional), macros, runtime (optional) |
+| `sekvent-component` | components, App builder, local, serialized and gRPC bindings, server-streaming methods | config, error, context, resilience, link (optional), macros, runtime (optional), telemetry (optional) |
 | `sekvent-testing` | Postgres/MySQL/MinIO containers, reaper, `await_until!` | — |
 | `sekvent-proto-build` | build.rs codegen helpers, component service-contract constants and RPC type aliases | — |
 | `sekvent-api` (lib `sekvent`) | facade re-exporting the above behind features | all |
@@ -107,6 +107,7 @@ cycle, and keep `sekvent-error` and `sekvent-context` dependency-light.
 Specs: `docs/component-model.md` (overview), `docs/design/component-c1.md`
 (local bindings, lifecycle), `docs/design/component-c2.md` (gRPC, contracts),
 `docs/design/component-end-user.md` (serving to end users),
+`docs/design/component-streaming.md` (server-streaming methods),
 `docs/design/p8-service-essentials.md` (jobs, leases).
 Milestones C1, C2 and C4 are done (C4: jobs in `sekvent-runtime`, leases in
 `sekvent-db`); C3 and C5 (bus, async/deferred calls, NATS, extraction
@@ -119,17 +120,25 @@ tooling) are not started.
   exact 1:1 method/RPC mapping and request/reply types by identity (nested
   messages included). `()` maps to `google.protobuf.Empty`. `local_only`
   components have no contract.
+- Methods are unary or server-streaming (`#[call(stream)]`,
+  `Result<CallStream<Item, E>, E>`); client and bidirectional streaming are
+  rejected at compile time. A stream's open is a call (`TIMEOUT`, open
+  retries, breaker, hop limit, auth); after it, the caller's deadline,
+  `STREAM_MAX_LIFETIME` (15 min), the consumer and the gate end it; it
+  holds its admission and bulkhead permit for its life; `App::register`
+  closes streams when shutdown begins.
 - The `grpc` binding (feature `grpc`, facade `component-grpc`) is one
   generic byte-level tonic client and service over C1's `Dispatch`; never
   generate per-component tonic code, and keep `-api` crates free of tonic.
   Transport is plaintext HTTP/2 with link tokens; TLS comes later.
 - Serving order is fixed: authenticate and decode the context from request
   **headers** before the body is read (trailers are never trusted), exact
-  `/<service>/<Rpc>` routing, then the gate. Requests are capped at 4 MiB.
-  A handler panic answers `INTERNAL` (`HANDLER_PANICKED`).
-- A method `TIMEOUT` bounds the whole call and, when it fires while the
-  caller still has time, fails with `METHOD_TIMEOUT` and counts against the
-  callee's breaker; the caller's own deadline or cancellation never does.
+  `/<service>/<Rpc>` routing, then the gate. Requests are capped at 4 MiB,
+  and so are the items of a served stream. A handler panic answers
+  `INTERNAL` (`HANDLER_PANICKED`).
+- A method `TIMEOUT` bounds the whole call (for a stream, the open) and,
+  when it fires while the caller still has time, fails with
+  `METHOD_TIMEOUT` and counts against the callee's breaker; the caller's own deadline or cancellation never does.
   Transient failures from further down a call chain become `INTERNAL`
   (`DOWNSTREAM_FAILURE`) at the serving boundary so callers above neither
   retry nor blame the healthy component in between.

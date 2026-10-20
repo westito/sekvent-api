@@ -1,0 +1,5 @@
+error: `max_lifetime` applies to #[call(stream)] methods only
+ --> tests/ui/fail/m27_max_lifetime_without_stream.rs:5:12
+  |
+5 |     #[call(max_lifetime = "10m")]
+  |            ^^^^^^^^^^^^

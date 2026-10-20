@@ -84,10 +84,12 @@
 //! In messages-only and combined mode, every proto `service` also gets a
 //! constant `__sekvent_service_<Service>` in its package's module: the
 //! service's full name and, per RPC, the RPC name, the request and reply
-//! full names and whether it streams. Every RPC also gets a type alias
-//! `__sekvent_rpc_<Service>__<Rpc>` of its Rust `(Request, Reply)` types
-//! (`google.protobuf.Empty` is `()`), which tells a nested message from a
-//! top-level one of the same name. `#[component(proto = "…")]` reads both
+//! full names, whether it streams requests and whether it streams replies
+//! (`(&str, &[(&str, &str, &str, bool, bool)])`). Every RPC also gets a
+//! type alias `__sekvent_rpc_<Service>__<Rpc>` of its Rust
+//! `(Request, Reply)` types (`google.protobuf.Empty` is `()`; for a
+//! streaming RPC the reply is the item), which tells a nested message from
+//! a top-level one of the same name. `#[component(proto = "…")]` reads both
 //! to check at compile time that a component trait matches its proto
 //! service. The generated code names no sekvent crate.
 //! [`ProtoBuild::service_contracts`] turns it off; services-only mode never

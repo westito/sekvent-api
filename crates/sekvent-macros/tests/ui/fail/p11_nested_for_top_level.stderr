@@ -1,7 +1,7 @@
 error[E0277]: this method's reply type `order::Line` is not the RPC's output type `Line`
-  --> tests/ui/fail/p11_nested_for_top_level.rs:48:17
+  --> tests/ui/fail/p11_nested_for_top_level.rs:54:17
    |
-48 |     ) -> Result<order::Line, sekvent_component::AppError>;
+54 |     ) -> Result<order::Line, sekvent_component::AppError>;
    |                 ^^^^^^^^^^^ the proto service expects `Line` here
    |
 help: the trait `sekvent_component::__private::SameReply<Line>` is not implemented for `order::Line`

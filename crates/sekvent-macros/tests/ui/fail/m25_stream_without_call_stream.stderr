@@ -1,0 +1,5 @@
+error: a #[call(stream)] method returns Result<CallStream<Item, Error>, Error>
+  --> tests/ui/fail/m25_stream_without_call_stream.rs:10:17
+   |
+10 |     ) -> Result<String, sekvent_component::AppError>;
+   |                 ^^^^^^

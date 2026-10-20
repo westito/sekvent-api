@@ -1,23 +1,23 @@
 error[E0425]: cannot find type `__sekvent_rpc_Echo__Whisper` in module `crate::proto`
-  --> tests/ui/fail/p1_method_without_rpc.rs:51:1
+  --> tests/ui/fail/p1_method_without_rpc.rs:53:1
    |
-46 |     pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingReply);
+48 |     pub type __sekvent_rpc_Echo__Ping = (super::PingRequest, super::PingReply);
    |     --------------------------------------------------------------------------- similarly named type alias `__sekvent_rpc_Echo__Ping` defined here
 ...
-51 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+53 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: this error originates in the attribute macro `sekvent_component::component` (in Nightly builds, run with -Z macro-backtrace for more info)
 help: a type alias with a similar name exists
    |
-51 - #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
-51 + __sekvent_rpc_Echo__Ping
+53 - #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+53 + __sekvent_rpc_Echo__Ping
    |
 
 error[E0080]: evaluation panicked: component contract: the proto service has an RPC the trait has no method for
-  --> tests/ui/fail/p1_method_without_rpc.rs:51:1
+  --> tests/ui/fail/p1_method_without_rpc.rs:53:1
    |
-51 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+53 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
    |
 note: inside `sekvent_component::__private::assert_service`
@@ -35,9 +35,9 @@ note: inside `sekvent_component::__private::assert_service`
    | |_________- in this macro invocation
 
 error[E0080]: evaluation panicked: component contract: the proto service has no RPC named after this method
-  --> tests/ui/fail/p1_method_without_rpc.rs:51:1
+  --> tests/ui/fail/p1_method_without_rpc.rs:53:1
    |
-51 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+53 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
    |
 note: inside `sekvent_component::__private::assert_rpc::<PingRequest, PingReply>`

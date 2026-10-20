@@ -1,7 +1,7 @@
 error[E0080]: evaluation panicked: component contract: the proto service has an RPC the trait has no method for
-  --> tests/ui/fail/p2_extra_rpc.rs:51:1
+  --> tests/ui/fail/p2_extra_rpc.rs:53:1
    |
-51 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
+53 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
    |
 note: inside `sekvent_component::__private::assert_service`
