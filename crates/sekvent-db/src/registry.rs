@@ -80,7 +80,15 @@ pub struct PoolRegistry {
     unconfigured: BTreeSet<String>,
     /// Connected pools whose spec was optional; every other pool is required.
     optional: BTreeSet<String>,
-    migrations: BTreeMap<String, PathBuf>,
+    migrations: BTreeMap<String, Migrations>,
+}
+
+/// Where a pool's migrations come from.
+#[derive(Debug)]
+enum Migrations {
+    Directory(PathBuf),
+    #[cfg(feature = "migrate")]
+    Embedded(&'static sqlx::migrate::Migrator),
 }
 
 impl PoolRegistry {
@@ -116,7 +124,15 @@ impl PoolRegistry {
             }
             let pool = connect(&spec).await?;
             if let Some(dir) = spec.migrations {
-                registry.migrations.insert(spec.name.clone(), dir);
+                registry
+                    .migrations
+                    .insert(spec.name.clone(), Migrations::Directory(dir));
+            }
+            #[cfg(feature = "migrate")]
+            if let Some(migrator) = spec.embedded_migrations {
+                registry
+                    .migrations
+                    .insert(spec.name.clone(), Migrations::Embedded(migrator));
             }
             if !spec.required {
                 registry.optional.insert(spec.name.clone());
@@ -184,9 +200,14 @@ impl PoolRegistry {
         self.pools.keys().map(String::as_str)
     }
 
-    /// The migrations directory declared for `name`, if any.
+    /// The migrations directory declared for `name`, if any (`None` for
+    /// embedded migrations).
     pub fn migrations_dir(&self, name: &str) -> Option<&std::path::Path> {
-        self.migrations.get(name).map(PathBuf::as_path)
+        match self.migrations.get(name)? {
+            Migrations::Directory(dir) => Some(dir),
+            #[cfg(feature = "migrate")]
+            Migrations::Embedded(_) => None,
+        }
     }
 
     /// Close every pool.
@@ -196,18 +217,31 @@ impl PoolRegistry {
         }
     }
 
-    /// Run each pool's declared migrations, in name order.
+    /// Run each pool's declared migrations, from its directory or embedded
+    /// in the binary, in name order.
     #[cfg(feature = "migrate")]
     pub async fn migrate_all(&self) -> Result<(), DbError> {
-        for (name, dir) in &self.migrations {
+        use crate::migrate::{migrate_on_boot, run_embedded_migrations};
+
+        for (name, migrations) in &self.migrations {
             let Some(pool) = self.pools.get(name) else {
                 continue;
             };
-            let result = match pool {
+            let result = match (pool, migrations) {
                 #[cfg(feature = "sqlx-postgres")]
-                Pool::Postgres(pool) => crate::migrate::migrate_on_boot(pool, dir).await,
+                (Pool::Postgres(pool), Migrations::Directory(dir)) => {
+                    migrate_on_boot(pool, dir).await
+                }
+                #[cfg(feature = "sqlx-postgres")]
+                (Pool::Postgres(pool), Migrations::Embedded(migrator)) => {
+                    run_embedded_migrations(pool, migrator).await
+                }
                 #[cfg(feature = "sqlx-mysql")]
-                Pool::MySql(pool) => crate::migrate::migrate_on_boot(pool, dir).await,
+                (Pool::MySql(pool), Migrations::Directory(dir)) => migrate_on_boot(pool, dir).await,
+                #[cfg(feature = "sqlx-mysql")]
+                (Pool::MySql(pool), Migrations::Embedded(migrator)) => {
+                    run_embedded_migrations(pool, migrator).await
+                }
             };
             result.map_err(|error| match error {
                 DbError::Migrate { source, .. } => DbError::Migrate {

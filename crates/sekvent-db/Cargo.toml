@@ -20,6 +20,22 @@ sea-orm = ["dep:sea-orm"]
 sea-orm-postgres = ["sea-orm", "sqlx-postgres", "sea-orm/sqlx-postgres"]
 # sea-orm over the registry's MySQL pools.
 sea-orm-mysql = ["sea-orm", "sqlx-mysql", "sea-orm/sqlx-mysql"]
+# Statements built with sea-query and run through sqlx over Postgres pools
+# (`query`, the `sea_query` and `sea_query_sqlx` re-exports). No sea-orm.
+sea-query-postgres = [
+    "sqlx-postgres",
+    "dep:sea-query",
+    "dep:sea-query-sqlx",
+    "sea-query-sqlx/sqlx-postgres",
+]
+# The same over MySQL pools.
+sea-query-mysql = [
+    "sqlx-mysql",
+    "dep:sea-query",
+    "dep:sea-query-sqlx",
+    "sea-query-sqlx/sqlx-mysql",
+    "sea-query/backend-mysql",
+]
 # Migrations on boot (sqlx migrator; with `sea-orm-migrate`, sea-orm's).
 migrate = []
 # sea-orm `MigratorTrait` runner. Separate from `migrate` so sqlx-only users
@@ -41,6 +57,8 @@ tracing = { workspace = true }
 sqlx = { workspace = true, optional = true }
 sea-orm = { workspace = true, optional = true }
 sea-orm-migration = { workspace = true, optional = true }
+sea-query = { workspace = true, optional = true }
+sea-query-sqlx = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
@@ -52,6 +70,9 @@ sekvent-runtime = { path = "../sekvent-runtime", default-features = false, optio
 [dev-dependencies]
 sekvent-testing = { workspace = true, features = ["postgres", "mysql"] }
 tokio = { workspace = true, features = ["test-util"] }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

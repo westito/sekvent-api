@@ -69,6 +69,9 @@ db-sqlx-postgres = ["db", "sekvent-db/sqlx-postgres"]
 db-sqlx-mysql = ["db", "sekvent-db/sqlx-mysql"]
 db-sea-orm-postgres = ["db", "sekvent-db/sea-orm-postgres"]
 db-sea-orm-mysql = ["db", "sekvent-db/sea-orm-mysql"]
+# sekvent-db: sea-query statements run through sqlx, without sea-orm.
+db-sea-query-postgres = ["db", "sekvent-db/sea-query-postgres"]
+db-sea-query-mysql = ["db", "sekvent-db/sea-query-mysql"]
 db-migrate = ["db", "sekvent-db/migrate"]
 db-sea-orm-migrate = ["db", "sekvent-db/sea-orm-migrate"]
 # sekvent-db: leases with fencing tokens; with `runtime`, singleton jobs.
@@ -104,6 +107,8 @@ full = [
     "db-sqlx-mysql",
     "db-sea-orm-postgres",
     "db-sea-orm-mysql",
+    "db-sea-query-postgres",
+    "db-sea-query-mysql",
     "db-migrate",
     "db-sea-orm-migrate",
     "db-lease",

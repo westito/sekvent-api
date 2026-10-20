@@ -11,7 +11,7 @@ quality gate.
 Services depend on one facade package, `sekvent-api`, and turn on only the
 modules they use. Its library is named `sekvent`, so code writes
 `use sekvent::…`. The code is written for edition 2024 and tonic 0.14, axum 0.8,
-sqlx 0.9 and sea-orm 2.0.
+sqlx 0.9, sea-orm 2.0 and sea-query 1.0.
 
 ## Crates
 
@@ -28,7 +28,7 @@ sqlx 0.9 and sea-orm 2.0.
 | `sekvent-auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` | argon2id and bcrypt password schemes, JWT with injected time, login helper, async hashing helpers |
 | `sekvent-link` | `link`; `link-axum`, `link-tonic` | Service-to-service tokens, middleware, interceptors |
 | `sekvent-client` | `client` | Outbound HTTP (reqwest, rustls) with policies, context propagation, OAuth 2.0 client credentials |
-| `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate`, `db-lease` | Named pools, migrations, distinct-target check, list filters, readiness probes per pool, leases with fencing tokens for singleton jobs |
+| `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-sea-query-postgres`, `db-sea-query-mysql`, `db-migrate`, `db-sea-orm-migrate`, `db-lease` | Named pools, migrations (directory or embedded), distinct-target check, sea-query execution, list filters, readiness probes per pool, leases with fencing tokens for singleton jobs |
 | `sekvent-sso` | `sso` | Browser single sign-on: OAuth 2.0 authorization code flow with a signed state cookie, a Bitbucket Cloud provider (workspace members only), one-time handoff codes |
 | `sekvent-storage` | `storage` | S3-compatible object storage: presigned browser uploads and downloads, server-side head, delete and copy, a bucket readiness probe; own SigV4 signer on the rustls/ring stack |
 | `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, unary and server-streaming methods, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |

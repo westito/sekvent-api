@@ -44,6 +44,7 @@ can describe APIs the project does not have yet.
 | Serve a bundled SPA/frontend (Vite `dist`) from the binary next to the API; the dev proxy setup | `docs/modules/server.md` ("Serve a bundled frontend") |
 | Run interval, cron, manual or singleton jobs | `docs/modules/jobs.md` |
 | Pools, migrations, DB error mapping, list filters, probes, leases | `docs/modules/db.md` |
+| Queries with sea-query (no ORM), embedded `sqlx::migrate!` migrations, mapping a named constraint violation | `docs/modules/db.md` ("Build queries with sea-query", "Embedded migrations") |
 | Passwords (argon2id, bcrypt), login, JWT, roles | `docs/modules/auth.md` |
 | Browser single sign-on (OAuth 2.0 code flow, Bitbucket Cloud) | `docs/modules/sso.md` |
 | Browser uploads/downloads via S3-compatible storage (presigned URLs), keys, MinIO tests | `docs/modules/storage.md` |
@@ -131,6 +132,7 @@ this shape; read it before restructuring.
 | Serve a built frontend (SPA) next to the API | `runtime-vfs` (`StaticSite`, `Directory`); `runtime-vfs-embed` to compile `web/dist` into the binary (`Embedded`, `rust-embed` re-exported) |
 | Postgres / MySQL with sqlx | `db-sqlx-postgres` / `db-sqlx-mysql` (+ `db-migrate`) |
 | sea-orm | `db-sea-orm-postgres` / `db-sea-orm-mysql` (+ `db-sea-orm-migrate`) |
+| sea-query over sqlx, no ORM | `db-sea-query-postgres` / `db-sea-query-mysql` (+ `db-migrate`) |
 | Singleton jobs, leases with fencing | `db-lease` (with `runtime`: `LeaseGuard`) |
 | Passwords, JWT | `auth` (+ `auth-tokio` for hashing off the async threads, `auth-axum` / `auth-tonic` adapters) |
 | Browser single sign-on | `sso` |

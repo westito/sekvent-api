@@ -3,10 +3,10 @@
 `sekvent::db` gives a service its database plumbing without hiding SQL:
 named connection pools read from configuration, a startup check that two
 pools never point at the same database, migrations on boot, one mapping from
-driver errors to `AppError` codes, allow-listed list filters for sea-orm,
-readiness probes per pool, and database leases with fencing tokens for work
+driver errors to `AppError` codes, allow-listed list filters for sea-orm, execution
+helpers for statements built with sea-query, readiness probes per pool, and database leases with fencing tokens for work
 that must run on exactly one instance. It works with sqlx (Postgres and
-MySQL) and, on top of the same pools, sea-orm. Database URLs are `Secret`s
+MySQL) and, on top of the same pools, sea-orm or plain sea-query. Database URLs are `Secret`s
 and never appear in logs or errors; a failed connect is reported as the pool
 name plus a failure class.
 
@@ -23,11 +23,13 @@ Pick a backend and the extras you need:
 | Facade feature | `sekvent-db` feature | Adds |
 |---|---|---|
 | `db` | — | `PoolSpec`, `assert_distinct_targets`, `parse_target`, `Target`, `DbError`, `ConnectFailure`, `public_message` |
-| `db-sqlx-postgres` | `sqlx-postgres` | `PoolRegistry`, `Pool::Postgres`, `classify`, `classify_connect`, `to_app_error`, `IntoAppError`, `reasons` |
+| `db-sqlx-postgres` | `sqlx-postgres` | `PoolRegistry`, `Pool::Postgres`, `classify`, `classify_connect`, `to_app_error`, `IntoAppError`, `constraint_name`, `sqlstate`, `reasons` |
 | `db-sqlx-mysql` | `sqlx-mysql` | the same for MySQL and MariaDB (`Pool::MySql`) |
 | `db-sea-orm-postgres` | `sea-orm-postgres` | `Pool::sea_orm`, `classify_db_err`, `db_err_to_app_error`, `sekvent::db::list` (implies `db-sqlx-postgres`) |
 | `db-sea-orm-mysql` | `sea-orm-mysql` | the same over MySQL pools (implies `db-sqlx-mysql`) |
-| `db-migrate` | `migrate` | `migrate_on_boot`, `PoolRegistry::migrate_all` |
+| `db-sea-query-postgres` | `sea-query-postgres` | `sekvent::db::query` (run sea-query statements through sqlx), `sekvent::db::sea_query`, `sekvent::db::sea_query_sqlx` (implies `db-sqlx-postgres`; no sea-orm) |
+| `db-sea-query-mysql` | `sea-query-mysql` | the same over MySQL pools (implies `db-sqlx-mysql`) |
+| `db-migrate` | `migrate` | `migrate_on_boot`, `run_embedded_migrations`, `PoolSpec::with_embedded_migrations`, `PoolRegistry::migrate_all` |
 | `db-sea-orm-migrate` | `sea-orm-migrate` | `run_sea_orm_migrations` (combine with a `db-sea-orm-*` backend) |
 | `db-lease` | `lease` | `LeaseStore`, `Lease`, `HeldLease`, `FencingToken`, `LeaseInfo` (needs a sqlx backend) |
 | `db` + `runtime` | `runtime` | `PoolProbe`, `PoolRegistry::probes` (needs a sqlx backend) |
@@ -142,18 +144,18 @@ let reports = PoolSpec::new("reports_db", Secret::new(url))  // required, eager,
     .with_search_path("reports, public")                        // Postgres only
     .with_role("reports_ro")                                    // SET ROLE on every connection
     .read_only()                                                // default read-only transactions
-    .with_migrations("migrations/reports");
+    .with_migrations("migrations/reports");                     // or .with_embedded_migrations(&MIGRATOR)
 reports.validate().map_err(anyhow::Error::msg)?;               // also done by the registry
 ```
 
 `PoolSpec` is `#[non_exhaustive]` with public fields (`name`, `url`,
 `max_connections`, `min_connections`, `acquire_timeout`, `idle_timeout`,
 `max_lifetime`, `lazy`, `required`, `search_path`, `role`, `read_only`,
-`migrations`); `is_configured()` says whether the URL is non-blank. Its
+`migrations`, and with `db-migrate` `embedded_migrations`); `is_configured()` says whether the URL is non-blank. Its
 `Debug` prints the URL as `[redacted]`.
 
-`validate` rejects `max_connections == 0`, `min > max`, and a role or
-search path that is not a plain identifier (an ASCII letter or `_`, then
+`validate` rejects `max_connections == 0`, `min > max`, a migrations
+directory together with embedded migrations, and a role or search path that is not a plain identifier (an ASCII letter or `_`, then
 letters, digits, `_` or `$`, at most 63 bytes; search path entries
 comma-separated). On Postgres, search path, role and read-only are sent as
 startup parameters (`search_path`, `role`, `default_transaction_read_only`).
@@ -172,7 +174,7 @@ impl PoolRegistry {
     pub fn get_optional(&self, name: &str) -> Option<&Pool>;
     pub fn is_unconfigured(&self, name: &str) -> bool;
     pub fn names(&self) -> impl Iterator<Item = &str>;              // connected pools, sorted
-    pub fn migrations_dir(&self, name: &str) -> Option<&Path>;
+    pub fn migrations_dir(&self, name: &str) -> Option<&Path>;      // None for embedded migrations
     pub async fn close(&self);
     pub async fn migrate_all(&self) -> Result<(), DbError>;          // feature db-migrate
     pub fn probes(&self) -> Vec<PoolProbe>;                          // feature runtime
@@ -242,6 +244,7 @@ database still collide.
 
 ```rust
 pub async fn migrate_on_boot<DB>(pool: &sqlx::Pool<DB>, dir: &Path) -> Result<(), DbError>;   // db-migrate
+pub async fn run_embedded_migrations<DB>(pool: &sqlx::Pool<DB>, migrator: &Migrator) -> Result<(), DbError>; // db-migrate
 pub async fn run_sea_orm_migrations<M: MigratorTrait>(db: &DatabaseConnection) -> Result<(), DbError>; // db-sea-orm-migrate
 ```
 
@@ -251,12 +254,127 @@ pub async fn run_sea_orm_migrations<M: MigratorTrait>(db: &DatabaseConnection) -
   migrations are skipped (sqlx's migrator); an unconfigured optional pool is
   skipped.
 - By hand: `migrate_on_boot(pg, Path::new("migrations"))`.
+- Embedded in the binary: see [Embedded migrations](#embedded-migrations).
 - sea-orm: `run_sea_orm_migrations::<Migrator>(&db).await?` applies every
   pending migration of your `MigratorTrait` type.
 
 A failure is `DbError::Migrate { target, source }`: `target` is the pool
-name (from `migrate_all`), the directory (from `migrate_on_boot`) or
-`sea-orm migrator`; the migrator's error is the source, for logs only.
+name (from `migrate_all`), the directory (from `migrate_on_boot`),
+`embedded migrations` (from `run_embedded_migrations`) or `sea-orm migrator`; the migrator's error is the source, for logs only.
+
+#### Embedded migrations
+
+A directory read at startup has to ship next to the binary. To compile the
+migrations into the binary instead, use sqlx's `migrate!` macro and hand the
+static migrator to sekvent:
+
+```rust
+use sekvent::db::{PoolSpec, run_embedded_migrations};
+use sqlx::migrate::Migrator;
+
+// Path relative to the crate's Cargo.toml, read at compile time.
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+run_embedded_migrations(pg, &MIGRATOR).await?;                   // by hand, or:
+let spec = PoolSpec::from_config(&EnvSource, "ORDERS_DB_")?.with_embedded_migrations(&MIGRATOR);
+// … PoolRegistry::build(vec![spec]) … registry.migrate_all().await?;
+```
+
+- The macro expands to `::sqlx::migrate::Migrator`, so the crate that calls
+  it depends on `sqlx` directly (with its `migrate` and `macros` features,
+  the versions `cargo sekvent deps check` pins); the facade's re-exports do
+  not help a macro that names `::sqlx`.
+- Add a `build.rs` with `println!("cargo:rerun-if-changed=migrations");`.
+  Stable Rust does not track the files the macro reads, so without it a new
+  or edited migration leaves a stale binary.
+- The migrator is sqlx's: already applied migrations are skipped, each runs
+  in its own transaction, and on Postgres an advisory lock makes instances
+  that start together apply each one once. An edited, already applied
+  migration fails with a checksum mismatch: add a new one instead.
+- `with_embedded_migrations` and a migrations directory (`<P>MIGRATIONS`)
+  on the same spec are an `InvalidSetting` error.
+
+### Build queries with sea-query
+
+With `db-sea-query-postgres` (or `-mysql`) statements are built with
+[sea-query](https://docs.rs/sea-query): typed identifiers, values bound as
+parameters, no SQL in strings. sqlx runs them; there is no sea-orm in the
+graph. `sekvent::db::query` renders a statement for the executor's database
+and runs it on any sqlx executor: `&pool`, `&mut *conn` or `&mut *tx`.
+
+```rust
+pub fn build<DB: QueryBackend, S: SqlxBinder>(statement: &S) -> (String, SqlxValues);
+pub async fn execute<'c, E: Executor<'c>, S: SqlxBinder>(executor: E, statement: &S)
+    -> Result<<E::Database as Database>::QueryResult, sqlx::Error>;
+pub async fn fetch_one<'c, T: FromRow, E: Executor<'c>, S: SqlxBinder>(executor: E, statement: &S)
+    -> Result<T, sqlx::Error>;                       // RowNotFound when empty
+pub async fn fetch_optional<'c, T, E, S>(executor: E, statement: &S) -> Result<Option<T>, sqlx::Error>;
+pub async fn fetch_all<'c, T, E, S>(executor: E, statement: &S) -> Result<Vec<T>, sqlx::Error>;
+// QueryBackend: sqlx::Postgres → PostgresQueryBuilder, sqlx::MySql → MysqlQueryBuilder
+```
+
+```rust
+use sekvent::db::sea_query::{Expr, ExprTrait, Iden, PgFunc, Query};
+use sekvent::db::{IntoAppError, query};
+
+#[derive(Iden)]
+enum Orders { Table, Id, Reference, Attributes, Note, TotalCents }
+
+#[derive(sqlx::FromRow)]
+struct Order { id: i64, reference: String, attributes: serde_json::Value }
+
+async fn by_ids(pg: &sqlx::PgPool, ids: Vec<i64>) -> Result<Vec<Order>, AppError> {
+    query::fetch_all(
+        pg,
+        Query::select()
+            .columns([Orders::Id, Orders::Reference, Orders::Attributes])
+            .from(Orders::Table)
+            .and_where(Expr::col(Orders::Id).eq(PgFunc::any(ids)))   // = ANY($1), one array bind
+            .limit(100),
+    )
+    .await
+    .into_app_error()
+}
+
+async fn add_note(pg: &sqlx::PgPool, id: i64, note: &str) -> Result<i64, AppError> {
+    let mut tx = pg.begin().await.into_app_error()?;
+    let (total,): (i64,) = query::fetch_one(
+        &mut *tx,
+        Query::update()
+            .table(Orders::Table)
+            .value(Orders::Note, note)
+            .and_where(Expr::col(Orders::Id).eq(id))
+            .returning_col(Orders::TotalCents),
+    )
+    .await
+    .into_app_error()?;
+    // … more writes on &mut *tx …
+    tx.commit().await.into_app_error()?;
+    Ok(total)
+}
+```
+
+- The functions return `sqlx::Error`, so `into_app_error()` maps them as
+  usual and a caller can look at the error first (see
+  [Map specific constraint violations](#map-specific-constraint-violations)).
+- Bound values: integers, floats, strings, bools, `uuid::Uuid`,
+  `serde_json::Value` (JSONB), `chrono` dates and times,
+  `rust_decimal::Decimal`, and on Postgres arrays (`Vec<T>` → `T[]`, use
+  `PgFunc::any` for `= ANY(…)`). `Expr::cust_with_values("attributes @> $1",
+  [value])` binds values in a custom expression; never format values into
+  `Expr::cust`.
+- Transactions stay explicit: `pool.begin()`, pass `&mut *tx`, commit.
+- **Dependencies.** `#[derive(Iden)]` expands to `impl sea_query::Iden`
+  and `#[derive(sqlx::FromRow)]` to `::sqlx::…`, so a crate using these
+  derives depends on `sea-query` and `sqlx` itself; take the versions and
+  features from `cargo sekvent deps sync` (sekvent pins `sea-query` with
+  `derive` and `sea-query-sqlx`). The re-exports `sekvent::db::sea_query`
+  and `sekvent::db::sea_query_sqlx` serve every non-macro use.
+- Use sea-query for every statement. Do not use sqlx's `query!` /
+  `query_as!` macros: they need a database or committed offline data
+  (`.sqlx/`) at compile time, which the remote builder and CI do not have.
+- No pagination framework is provided: write `LIMIT` and keyset
+  conditions in the statement.
 
 ### Map database errors to `AppError`
 
@@ -264,6 +382,8 @@ name (from `migrate_all`), the directory (from `migrate_on_boot`) or
 pub fn classify(error: &sqlx::Error) -> ErrorCode;
 pub fn to_app_error(error: sqlx::Error) -> AppError;
 pub fn classify_connect(error: &sqlx::Error) -> ConnectFailure;
+pub fn constraint_name(error: &sqlx::Error) -> Option<&str>;
+pub fn sqlstate(error: &sqlx::Error) -> Option<Cow<'_, str>>;
 pub fn classify_db_err(error: &sea_orm::DbErr) -> ErrorCode;     // db-sea-orm-*
 pub fn db_err_to_app_error(error: sea_orm::DbErr) -> AppError;  // db-sea-orm-*
 pub fn public_message(code: ErrorCode) -> &'static str;
@@ -303,6 +423,31 @@ unless the server rejected the credentials. Other sea-orm errors:
 `NotConfigured` are `UNAVAILABLE`, everything else `INTERNAL`, always with
 the generic message and the `DbError` as source. `DbError::code()` tells the
 code without converting.
+
+#### Map specific constraint violations
+
+The generic mapping says *that* a unique key was violated, not which one.
+When the caller should learn more (a duplicate issue key versus a duplicate
+slug), match the constraint name before mapping the rest:
+
+```rust
+use sekvent::db::{IntoAppError, constraint_name, query};
+
+match query::execute(&mut *tx, &insert).await {
+    Ok(_) => {}
+    Err(error) if constraint_name(&error) == Some("projects_key_key") => {
+        return Err(AppError::already_exists("project key taken").with_reason("PROJECT_KEY_TAKEN"));
+    }
+    Err(error) => return Err(error).into_app_error(),
+}
+```
+
+`constraint_name` is reported by Postgres for unique, foreign-key, check and
+exclusion violations; name your constraints in migrations (`CONSTRAINT
+orders_total_non_negative CHECK (…)`) so the match is stable. MySQL does not
+report it (`None`). `sqlstate` gives the SQLSTATE (`23505` unique, `23503`
+foreign key, `23514` check, `23000` on MySQL). Neither value belongs in a
+message to the caller.
 
 `classify_connect` gives the `ConnectFailure` class used in connect errors
 and logs: `Unreachable` (I/O, TLS), `Auth` (credentials rejected, or MySQL
@@ -714,6 +859,11 @@ Startup errors are `DbError` variants: `UnknownPool`, `NotConfigured`,
   choose; never put credentials in it.
 - **Read-only is not authorization.** Use database grants for that; the
   grant errors then map to `PERMISSION_DENIED`.
+- **No SQL in strings.** With sea-query, identifiers are typed and values
+  bound; `Expr::cust` takes raw SQL, so pass values through
+  `Expr::cust_with_values` and never build its text from input.
+- **Stale embedded migrations.** Without `cargo:rerun-if-changed=migrations`
+  in `build.rs`, a changed migration directory does not rebuild the binary.
 - **List allow-lists.** Add only columns the caller may see to `sortable`,
   `filterable` and `prefix_search`.
 
@@ -725,3 +875,4 @@ Startup errors are `DbError` variants: `UnknownPool`, `NotConfigured`,
 - [Configuration](config.md) — `ConfigSource`, `Secret`, duration syntax
 - [Testing](testing.md) — container harness and deterministic tests
 - [Design: P8 service essentials](../design/p8-service-essentials.md) — probes and leases design
+- [Design: sea-query and embedded migrations](../design/db-sea-query.md)

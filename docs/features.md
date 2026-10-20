@@ -68,7 +68,9 @@ example an `-api` crate that only declares a component contract).
 | `db-sqlx-mysql` | `db` | sqlx MySQL pools, error classification, probes |
 | `db-sea-orm-postgres` | `db` | sea-orm connections on Postgres (includes sqlx Postgres) |
 | `db-sea-orm-mysql` | `db` | sea-orm connections on MySQL (includes sqlx MySQL) |
-| `db-migrate` | `db` | `migrate_on_boot` with sqlx migrations |
+| `db-sea-query-postgres` | `db` | `db::query`: sea-query statements run through sqlx on Postgres, `db::sea_query` and `db::sea_query_sqlx` re-exported (includes sqlx Postgres, no sea-orm) |
+| `db-sea-query-mysql` | `db` | the same on MySQL (includes sqlx MySQL) |
+| `db-migrate` | `db` | `migrate_on_boot` (a directory) and `run_embedded_migrations` (`sqlx::migrate!`) |
 | `db-sea-orm-migrate` | `db` | `run_sea_orm_migrations` with sea-orm-migration |
 | `db-lease` | `db` | `LeaseStore`, fencing tokens; with `runtime`, `LeaseGuard` for singleton jobs |
 | `component-grpc` | `component` | The `grpc` binding and serving components over gRPC, unary and server-streaming (`#[call(stream)]`, also to browsers over gRPC-Web) |
@@ -96,6 +98,11 @@ Some APIs need two features at once. The facade wires them for you:
 - **`sekvent-db`'s `serde` feature** (serde for `ListParams` and
   `ColumnFilter`) has no facade switch. Add `sekvent-db` from the same source
   with `features = ["serde"]` if you need it.
+- **Derive and SQL macros need their crates directly.** `#[derive(Iden)]`
+  names `sea_query::Iden`; `sqlx::migrate!` and `#[derive(sqlx::FromRow)]`
+  name `::sqlx`. A crate using them depends on `sea-query` and `sqlx`
+  itself, at the versions `cargo sekvent deps sync` writes; the re-exports
+  in `sekvent::db` cover everything else.
 - **`sekvent-testing` and `sekvent-proto-build` are not re-exported.** Add
   them as dev- and build-dependencies; see [testing](modules/testing.md) and
   [proto-build](modules/proto-build.md).

@@ -6,10 +6,11 @@
 //!
 //! | feature | adds |
 //! |---|---|
-//! | `sqlx-postgres`, `sqlx-mysql` | [`PoolRegistry`], `classify`, `to_app_error` |
+//! | `sqlx-postgres`, `sqlx-mysql` | [`PoolRegistry`], `classify`, `to_app_error`, `constraint_name`, `sqlstate` |
+//! | `sea-query-postgres`, `sea-query-mysql` | [`query`]: sea-query statements run through sqlx; `sea_query` and `sea_query_sqlx` re-exported |
 //! | `sea-orm` | `classify_db_err`, the [`list`] helpers |
 //! | `sea-orm-postgres`, `sea-orm-mysql` | `Pool::sea_orm` over the registry's pools |
-//! | `migrate` | `migrate_on_boot`, [`PoolRegistry::migrate_all`] |
+//! | `migrate` | `migrate_on_boot`, `run_embedded_migrations`, `PoolSpec::with_embedded_migrations`, [`PoolRegistry::migrate_all`] |
 //! | `sea-orm-migrate` | `run_sea_orm_migrations` |
 //! | `serde` | serde derives on the list parameters |
 //! | `runtime` (with a sqlx backend) | `PoolProbe`, `PoolRegistry::probes` for `sekvent-runtime` readiness |
@@ -73,6 +74,18 @@ mod migrate;
 #[cfg(feature = "sea-orm")]
 pub mod list;
 
+#[cfg(any(feature = "sea-query-postgres", feature = "sea-query-mysql"))]
+pub mod query;
+
+/// sea-query, as sekvent pins it. `#[derive(Iden)]` expands to
+/// `sea_query::Iden`, so a crate deriving it depends on `sea-query` itself
+/// (same version, see `cargo sekvent deps check`).
+#[cfg(any(feature = "sea-query-postgres", feature = "sea-query-mysql"))]
+pub use sea_query;
+/// The sea-query binder for sqlx (`SqlxBinder`, `SqlxValues`).
+#[cfg(any(feature = "sea-query-postgres", feature = "sea-query-mysql"))]
+pub use sea_query_sqlx;
+
 #[cfg(all(
     feature = "runtime",
     any(feature = "sqlx-postgres", feature = "sqlx-mysql")
@@ -96,7 +109,7 @@ pub use target::{Target, assert_distinct_targets, parse_target};
 #[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql", feature = "sea-orm"))]
 pub use error::IntoAppError;
 #[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql"))]
-pub use error::{classify, classify_connect, to_app_error};
+pub use error::{classify, classify_connect, constraint_name, sqlstate, to_app_error};
 #[cfg(feature = "sea-orm")]
 pub use error::{classify_db_err, db_err_to_app_error};
 
@@ -124,10 +137,10 @@ pub use lease::{
 ))]
 pub use lease::LeaseGuard;
 
+#[cfg(feature = "sea-orm-migrate")]
+pub use migrate::run_sea_orm_migrations;
 #[cfg(all(
     feature = "migrate",
     any(feature = "sqlx-postgres", feature = "sqlx-mysql")
 ))]
-pub use migrate::migrate_on_boot;
-#[cfg(feature = "sea-orm-migrate")]
-pub use migrate::run_sea_orm_migrations;
+pub use migrate::{migrate_on_boot, run_embedded_migrations};

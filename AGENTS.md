@@ -67,7 +67,7 @@ repository; describe behaviour in your own words and use neutral examples
 | `sekvent-client` | reqwest builder, resilience, context propagation, OAuth2 cache | config, context, error, resilience, telemetry |
 | `sekvent-sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), state cookie, handoff codes | config, error, context, client |
 | `sekvent-storage` | S3-compatible object storage: SigV4 presigned uploads and downloads, head, delete, copy, bucket probe | config, error, context, client, resilience, runtime (optional) |
-| `sekvent-db` | named pools, migrations, distinct-target check, sea-orm filters, probes, leases | config, error, runtime (optional) |
+| `sekvent-db` | named pools, migrations (directory or embedded), distinct-target check, sea-query execution, sea-orm filters, probes, leases | config, error, runtime (optional) |
 | `sekvent-component` | components, App builder, local, serialized and gRPC bindings, server-streaming methods | config, error, context, resilience, link (optional), macros, runtime (optional), telemetry (optional) |
 | `sekvent-testing` | Postgres/MySQL/MinIO containers, reaper, `await_until!` | — |
 | `sekvent-proto-build` | build.rs codegen helpers, component service-contract constants and RPC type aliases | — |

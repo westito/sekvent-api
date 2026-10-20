@@ -4204,14 +4204,18 @@ dependencies = [
 name = "sekvent-db"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures",
  "sea-orm",
  "sea-orm-migration",
+ "sea-query",
+ "sea-query-sqlx",
  "sekvent-config",
  "sekvent-error",
  "sekvent-runtime",
  "sekvent-testing",
  "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",

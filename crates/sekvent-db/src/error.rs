@@ -309,10 +309,25 @@ pub(crate) mod sqlx_impl {
         let reason = access(&error).map(Access::reason);
         app_error(code, reason).with_source(error)
     }
+
+    /// The SQLSTATE the server reported (`23505`, `40001`, …); `None` for
+    /// errors that did not come from the server.
+    pub fn sqlstate(error: &sqlx::Error) -> Option<std::borrow::Cow<'_, str>> {
+        error.as_database_error()?.code()
+    }
+
+    /// The name of the constraint a statement violated, so a caller can
+    /// turn one specific unique, foreign-key, check or exclusion violation
+    /// into a precise reason. Postgres reports it; MySQL does not, so there
+    /// it is always `None`. The name is for matching, not for the caller:
+    /// never put it into a message.
+    pub fn constraint_name(error: &sqlx::Error) -> Option<&str> {
+        error.as_database_error()?.constraint()
+    }
 }
 
 #[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql"))]
-pub use sqlx_impl::{classify, classify_connect, to_app_error};
+pub use sqlx_impl::{classify, classify_connect, constraint_name, sqlstate, to_app_error};
 
 /// The generic error for `code`, with `reason` when there is one.
 #[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql", feature = "sea-orm"))]
@@ -533,13 +548,15 @@ mod tests {
 
         use crate::error::sqlx_impl::{Access, access};
         use crate::{
-            ConnectFailure, IntoAppError, classify, classify_connect, reasons, to_app_error,
+            ConnectFailure, IntoAppError, classify, classify_connect, constraint_name, reasons,
+            sqlstate, to_app_error,
         };
 
         #[derive(Debug)]
         struct FakeDbError {
             code: Option<&'static str>,
             kind: ErrorKind,
+            constraint: Option<&'static str>,
         }
 
         impl fmt::Display for FakeDbError {
@@ -566,17 +583,43 @@ mod tests {
             fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
                 self
             }
+            fn constraint(&self) -> Option<&str> {
+                self.constraint
+            }
             fn kind(&self) -> ErrorKind {
                 match self.kind {
                     ErrorKind::UniqueViolation => ErrorKind::UniqueViolation,
                     ErrorKind::ForeignKeyViolation => ErrorKind::ForeignKeyViolation,
+                    ErrorKind::CheckViolation => ErrorKind::CheckViolation,
                     _ => ErrorKind::Other,
                 }
             }
         }
 
         pub(super) fn database(code: Option<&'static str>, kind: ErrorKind) -> sqlx::Error {
-            sqlx::Error::Database(Box::new(FakeDbError { code, kind }))
+            sqlx::Error::Database(Box::new(FakeDbError {
+                code,
+                kind,
+                constraint: None,
+            }))
+        }
+
+        #[test]
+        fn violations_expose_the_sqlstate_and_constraint_name() {
+            let error = sqlx::Error::Database(Box::new(FakeDbError {
+                code: Some("23505"),
+                kind: ErrorKind::UniqueViolation,
+                constraint: Some("orders_reference_key"),
+            }));
+            assert_eq!(sqlstate(&error).as_deref(), Some("23505"));
+            assert_eq!(constraint_name(&error), Some("orders_reference_key"));
+
+            let unnamed = database(Some("23514"), ErrorKind::CheckViolation);
+            assert_eq!(sqlstate(&unnamed).as_deref(), Some("23514"));
+            assert_eq!(constraint_name(&unnamed), None);
+
+            assert_eq!(sqlstate(&sqlx::Error::RowNotFound), None);
+            assert_eq!(constraint_name(&sqlx::Error::PoolClosed), None);
         }
 
         fn io() -> sqlx::Error {

@@ -154,6 +154,7 @@ line. The `sekvent` skill has the recipes with real API names.
 | tower-http `ServeDir`/`ServeFile` with an `index.html` fallback, `rust-embed`/`include_dir` handlers serving a frontend | `ServerBuilder::site(StaticSite::new(..))` over `Embedded::<Ui>` (`runtime-vfs-embed`, derive with `#[crate_path = "sekvent::runtime::vfs::rust_embed"]`) or `Directory::new(dist)` (`runtime-vfs`); the API moves under `.prefix("/api")`. Keep the same URL layout so bookmarks and the dev proxy keep working |
 | hand-made caches (a `Mutex<HashMap>` with timestamps, `moka` for a few keys) | `sekvent::resilience::TtlCache` (single flight, stale on transient errors) |
 | database health checks in a readiness handler | `PoolRegistry::probes()` registered with `RuntimeBuilder::probe` |
+| hand-written SQL strings with sqlx, or sea-query wired to sqlx by hand | `db-sea-query-*`: `sekvent::db::query` runs sea-query statements on any sqlx executor; `migrate!` migrators via `run_embedded_migrations` |
 | list endpoints building filters and pagination by hand | `sekvent::db::list` (`ListParams`, column filters) with sea-orm; pools via `PoolSpec` / `PoolRegistry` |
 | reqwest wrappers with retry loops, token caches | `sekvent::client::HttpClient` with a `PolicySpec`; `client::oauth2::ClientCredentials` for OAuth 2.0 |
 | semaphores or token buckets guarding an upstream quota | `sekvent::resilience::RateGate`; timeouts, bulkheads and breakers from the same module |

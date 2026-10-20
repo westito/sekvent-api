@@ -39,6 +39,7 @@ speed and flakes: the `rust-testing` skill.
 | Outbound HTTP, OAuth 2.0 client credentials | `client` | `client` |
 | File uploads/downloads via S3-compatible storage (presigned URLs), head, delete, copy | `storage` | `storage`; with `runtime` also `StorageProbe` |
 | Pools, migrations, list filters | `db` | `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-migrate`, `db-sea-orm-migrate` |
+| sea-query statements over sqlx (no ORM) | `db::query`, `db::sea_query` | `db-sea-query-postgres`, `db-sea-query-mysql` |
 | Readiness probes per pool | `db` (`PoolRegistry::probes`) | `db` + `runtime` + a sqlx backend |
 | Leases with fencing tokens, singleton jobs | `db` (`LeaseStore`, `LeaseGuard`) | `db-lease` + a sqlx backend; `runtime` for `LeaseGuard` |
 | A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; `component-grpc` for the `grpc` binding and serving; `runtime` for `App::register` |
@@ -618,6 +619,50 @@ let pg = pools.get("db")?.postgres().expect("a Postgres pool");
   allow-lists sortable and filterable columns; anything else is
   `INVALID_ARGUMENT`).
 - Connect errors name the pool and a failure class, never the URL.
+
+### Queries with sea-query, embedded migrations
+
+Features `db-sea-query-postgres` and `db-migrate`. The crate also depends
+on `sea-query` and `sqlx` directly (`cargo sekvent deps sync` writes the
+pinned versions): `#[derive(Iden)]`, `#[derive(sqlx::FromRow)]` and
+`sqlx::migrate!` expand to paths of those crates, not of the facade.
+
+```rust
+use sekvent::db::sea_query::{Expr, ExprTrait, Iden, Query};
+use sekvent::db::{IntoAppError, constraint_name, query, run_embedded_migrations};
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations"); // build.rs: cargo:rerun-if-changed=migrations
+run_embedded_migrations(pg, &MIGRATOR).await?;   // or PoolSpec::with_embedded_migrations(&MIGRATOR) + migrate_all
+
+#[derive(Iden)]
+enum Projects { Table, Id, Key, Name }
+
+let mut tx = pg.begin().await.into_app_error()?;
+let insert = Query::insert()
+    .into_table(Projects::Table)
+    .columns([Projects::Key, Projects::Name])
+    .values_panic([key.into(), name.into()])
+    .returning_col(Projects::Id)
+    .to_owned();
+let (id,): (i64,) = match query::fetch_one(&mut *tx, &insert).await {   // &pool, &mut *conn or &mut *tx
+    Err(e) if constraint_name(&e) == Some("projects_key_key") => {
+        return Err(AppError::already_exists("project key taken").with_reason("PROJECT_KEY_TAKEN"));
+    }
+    other => other.into_app_error()?,
+};
+tx.commit().await.into_app_error()?;
+```
+
+- `query::{execute, fetch_one, fetch_optional, fetch_all}` pick the SQL
+  dialect from the executor and bind every value; they return
+  `sqlx::Error`, so inspect it (`constraint_name`, `sqlstate`) before
+  `into_app_error()`.
+- Name constraints in migrations so the match is stable; `constraint_name`
+  is Postgres-only (`None` on MySQL). Never put it in a message.
+- Arrays: `Expr::col(c).eq(PgFunc::any(vec))`; JSONB: bind a
+  `serde_json::Value`; custom SQL only via `Expr::cust_with_values`.
+- No `sqlx::query!`/`query_as!`: they need a database or `.sqlx` offline
+  data at compile time.
 - Statement and grant failures (MySQL errno 1044, 1142, 1143, 1227, 1370;
   SQLSTATE `42501`) map to `PERMISSION_DENIED` with the message
   `permission denied`; table and column names never reach it. Rejected

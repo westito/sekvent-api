@@ -60,6 +60,13 @@ pub struct PoolSpec {
     pub read_only: bool,
     /// Directory of sqlx migrations to run on boot.
     pub migrations: Option<PathBuf>,
+    /// Migrations compiled into the binary (`sqlx::migrate!`) to run on
+    /// boot. Exclusive with [`migrations`](Self::migrations).
+    #[cfg(all(
+        feature = "migrate",
+        any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+    ))]
+    pub embedded_migrations: Option<&'static sqlx::migrate::Migrator>,
 }
 
 impl PoolSpec {
@@ -80,6 +87,11 @@ impl PoolSpec {
             role: None,
             read_only: false,
             migrations: None,
+            #[cfg(all(
+                feature = "migrate",
+                any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+            ))]
+            embedded_migrations: None,
         }
     }
 
@@ -153,6 +165,21 @@ impl PoolSpec {
         self
     }
 
+    /// Run migrations compiled into the binary on boot:
+    /// `.with_embedded_migrations(&MIGRATOR)` with
+    /// `static MIGRATOR: Migrator = sqlx::migrate!("./migrations");`.
+    /// Setting a migrations directory as well (`<P>MIGRATIONS`) is an
+    /// invalid setting.
+    #[cfg(all(
+        feature = "migrate",
+        any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+    ))]
+    #[must_use]
+    pub fn with_embedded_migrations(mut self, migrator: &'static sqlx::migrate::Migrator) -> Self {
+        self.embedded_migrations = Some(migrator);
+        self
+    }
+
     /// Check limits and identifiers. Names the pool and the setting, never
     /// the value of the URL.
     pub fn validate(&self) -> Result<(), String> {
@@ -173,6 +200,15 @@ impl PoolSpec {
             && !is_identifier(role)
         {
             return Err("role must be a plain identifier".to_owned());
+        }
+        #[cfg(all(
+            feature = "migrate",
+            any(feature = "sqlx-postgres", feature = "sqlx-mysql")
+        ))]
+        if self.migrations.is_some() && self.embedded_migrations.is_some() {
+            return Err(
+                "set either a migrations directory or embedded migrations, not both".to_owned(),
+            );
         }
         Ok(())
     }

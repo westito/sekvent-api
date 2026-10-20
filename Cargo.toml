@@ -88,6 +88,12 @@ rustls-platform-verifier = "0.7.1"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "chrono", "uuid", "json"] }
 sea-orm = { version = "2.0.4", default-features = false, features = ["macros", "runtime-tokio-rustls", "with-chrono", "with-json", "with-uuid", "with-rust_decimal"] }
 sea-orm-migration = { version = "2.0.4", default-features = false, features = ["runtime-tokio-rustls"] }
+# Statements built with sea-query and run through sqlx, without sea-orm
+# (sekvent-db `sea-query-*`). sea-query-sqlx is the binder for sqlx 0.9. The
+# backend features come from sekvent-db; never enable a runtime or TLS
+# feature here (sqlx already carries tokio and rustls with ring).
+sea-query = { version = "1.0.2", default-features = false, features = ["derive", "thread-safe"] }
+sea-query-sqlx = { version = "0.9.1", default-features = false, features = ["with-chrono", "with-json", "with-uuid", "with-rust_decimal", "postgres-array"] }
 rust_decimal = "1"
 
 # --- auth / crypto ---

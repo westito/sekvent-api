@@ -15,7 +15,7 @@
 //! | [`auth`] | `sekvent-auth` | `auth` | argon2id and bcrypt password hashing, JWT with injected time, login helper |
 //! | [`link`] | `sekvent-link` | `link` | service-to-service tokens, middleware, interceptors |
 //! | [`client`] | `sekvent-client` | `client` | outbound HTTP with policy, context propagation, OAuth 2.0 |
-//! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, list filters, readiness probes, leases |
+//! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, sea-query execution, list filters, readiness probes, leases |
 //! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local, serialized and gRPC bindings |
 //! | [`sso`] | `sekvent-sso` | `sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), one-time handoff codes |
 //! | [`storage`] | `sekvent-storage` | `storage` | S3-compatible object storage: presigned uploads and downloads, head, delete, copy |
@@ -41,7 +41,11 @@
 //! - `link-axum`, `link-tonic`: inbound middleware and interceptors.
 //! - `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`,
 //!   `db-sea-orm-mysql`: database backends.
-//! - `db-migrate`, `db-sea-orm-migrate`: migrations on boot.
+//! - `db-sea-query-postgres`, `db-sea-query-mysql`: statements built with
+//!   sea-query and run through sqlx (`db::query`, with `db::sea_query` and
+//!   `db::sea_query_sqlx` re-exported), without sea-orm.
+//! - `db-migrate`, `db-sea-orm-migrate`: migrations on boot, from a
+//!   directory or embedded in the binary.
 //! - `db-lease`: database leases with fencing tokens (`LeaseStore`), on a
 //!   sqlx backend; with `runtime` also `LeaseGuard` for singleton jobs.
 //! - `db` and `runtime` together give pool readiness probes
