@@ -36,7 +36,7 @@ fn fixtures(name: &str) -> PathBuf {
 fn migrate_target(error: &DbError) -> &str {
     match error {
         DbError::Migrate { target, source } => {
-            assert!(!source.to_string().is_empty());
+            assert_ne!(source.to_string(), "");
             target
         }
         other => panic!("expected a migrate error, got {other:?}"),

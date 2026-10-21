@@ -1066,7 +1066,7 @@ mod tests {
     fn list_params_default_to_the_first_page() {
         let params = ListParams::default();
         assert_eq!(params.page, 0);
-        assert!(params.filters.is_empty());
+        assert_eq!(params.filters, [] as [ColumnFilter; 0]);
         assert_eq!(
             start_of_day(parse_day("2024-01-02").unwrap())
                 .unwrap()

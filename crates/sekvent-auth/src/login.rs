@@ -241,7 +241,7 @@ mod tests {
         ] {
             assert_eq!(rejected.error_code(), code);
             assert_eq!(rejected.reason(), reason);
-            assert!(!rejected.to_string().is_empty());
+            assert_ne!(rejected.to_string(), "");
             let error = AppError::from(rejected);
             assert_eq!(error.code(), code);
             assert_eq!(error.message(), rejected.user_message());

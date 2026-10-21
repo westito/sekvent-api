@@ -1417,7 +1417,7 @@ mod tests {
             .expect("infallible");
         assert_eq!(response.headers()[&REQUEST_ID_HEADER], "keep-me");
         let _ = response.into_body().collect().await;
-        assert!(access(&buffer).is_empty());
+        assert_eq!(access(&buffer), [] as [LogRecord; 0]);
         let records = buffer.snapshot();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].message, "handled");

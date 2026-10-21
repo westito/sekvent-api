@@ -314,7 +314,7 @@ struct Nothing {}
 #[test]
 fn empty_struct_reads_nothing() {
     assert!(Nothing::from_config(&MapSource::new()).is_ok());
-    assert!(Nothing::keys().is_empty());
+    assert_eq!(Nothing::keys(), [] as [sekvent_config::KeyInfo; 0]);
 }
 
 #[derive(Debug, EnvConfig)]

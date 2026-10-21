@@ -676,7 +676,7 @@ mod tests {
         assert!(!target.join(".github").exists());
         let manifest = std::fs::read_to_string(target.join("Cargo.toml")).unwrap();
         assert!(manifest.contains("path = "), "{manifest}");
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
 
         let failing = crate::process::fake::FakeRunner::with_codes(&[128]);
         let options = NewOptions {
@@ -787,7 +787,7 @@ mod tests {
     fn ci_templates_and_the_agents_section_are_written_once() {
         let dir = tempfile::tempdir().unwrap();
         let first = ci_generate(dir.path(), "billing", CiProvider::Bitbucket, false).unwrap();
-        assert!(!first.is_empty());
+        assert_ne!(first, [] as [(String, WriteOutcome); 0]);
         assert!(
             first
                 .iter()

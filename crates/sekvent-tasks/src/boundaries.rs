@@ -181,7 +181,7 @@ mod tests {
     fn unknown_names_are_reported() {
         let report = check(&meta(), &[rule("orders-api", "orders-dbx")]).unwrap();
         assert_eq!(report.unknown_targets, ["orders-dbx"]);
-        assert!(report.violations.is_empty());
+        assert_eq!(report.violations, [] as [Violation; 0]);
         assert_eq!(
             check(&meta(), &[rule("nope", "serde")]),
             Err(BoundaryError::UnknownFrom("nope".into()))

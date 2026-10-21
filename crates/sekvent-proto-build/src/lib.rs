@@ -792,8 +792,14 @@ mod tests {
     #[test]
     fn other_modes_map_nothing() {
         let names = packages(&["billing.v1"]);
-        assert!(extern_paths(&Mode::MessagesOnly, &names).is_empty());
-        assert!(extern_paths(&Mode::Both, &names).is_empty());
+        assert_eq!(
+            extern_paths(&Mode::MessagesOnly, &names),
+            [] as [(String, String); 0]
+        );
+        assert_eq!(
+            extern_paths(&Mode::Both, &names),
+            [] as [(String, String); 0]
+        );
     }
 
     #[test]

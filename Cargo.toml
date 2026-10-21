@@ -15,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/westito/sekvent-api"
 publish = false
@@ -39,8 +39,8 @@ sekvent-component = { path = "crates/sekvent-component" }
 sekvent-sso = { path = "crates/sekvent-sso" }
 sekvent-storage = { path = "crates/sekvent-storage" }
 # --- async runtime ---
-tokio = { version = "1.53.1", features = ["full"] }
-tokio-util = "0.7.19"
+tokio = { version = "1.54.0", features = ["full"] }
+tokio-util = "0.7.20"
 tokio-stream = "0.1.19"
 futures = "0.3.34"
 pin-project-lite = "0.2.17"
@@ -56,16 +56,16 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 prost-build = "0.14.4"
 # Pure-Rust protobuf compiler: contract tooling reads protos without protoc.
-protox = "0.9.1"
+protox = "0.10.0"
 
 # --- HTTP ---
 axum = "0.8.9"
 tower = { version = "0.5.3", features = ["util", "timeout", "limit", "load-shed", "retry"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors", "request-id", "propagate-header"] }
 http = "1.5.0"
-http-body = "1.0.1"
+http-body = "1.1.0"
 http-body-util = "0.1.5"
-hyper = "1.11.1"
+hyper = "1.12.0"
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
 bytes = "1.12.1"
 url = "2.5.8"
@@ -80,7 +80,7 @@ rust-embed = "8.13.0"
 # reqwest gets no provider of its own; sekvent-client hands it a ready
 # rustls config built on ring and the platform verifier.
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "gzip", "charset", "http2", "query"] }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = "0.7.1"
 
 # --- persistence ---
@@ -102,20 +102,20 @@ bcrypt = "0.19.3"
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
 subtle = "2.6.1"
 hmac = "0.13.0"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 base64 = "0.23.1"
-zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
+zeroize = { version = "1.9.1", features = ["zeroize_derive"] }
 getrandom = "0.4.3"
 rand = "0.10.3"
 
 # --- serialization / misc ---
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
+serde_json = "1.0.154"
+uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.4.0"
 regex = "1.13.1"
-croner = "4.0.0"
+croner = "4.0.1"
 
 # --- errors / logging ---
 thiserror = "2.0.21"
@@ -124,7 +124,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # --- proc macros ---
-syn = { version = "3.0.6", features = ["full", "extra-traits"] }
+syn = { version = "3.0.9", features = ["full", "extra-traits"] }
 quote = "1.0.47"
 proc-macro2 = "1.0.107"
 proc-macro-crate = "3.5.0"
@@ -134,12 +134,12 @@ prettyplease = "0.3.0"
 # NOT testcontainers-modules: 0.15 requires testcontainers ^0.27, and the
 # harness only needs GenericImage.
 testcontainers = "0.28.0"
-rstest = "0.27.0"
-trybuild = "1.0.121"
-insta = "1.48.0"
+rstest = "0.28.0"
+trybuild = "1.0.122"
+insta = "1.49.0"
 tempfile = "3.27.0"
 clap = { version = "4.6.7", features = ["derive"] }
-toml = "1.1.6"
+toml = "1.1.8"
 cargo_metadata = "0.23.1"
 
 [workspace.lints.rust]

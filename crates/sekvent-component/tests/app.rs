@@ -155,7 +155,7 @@ fn a_grpc_bound_component_runs_no_factory() {
         app.handle::<InventoryHandle>().unwrap().binding(),
         Binding::Grpc
     );
-    assert!(app.grpc_services().is_empty());
+    assert_eq!(app.grpc_services(), [] as [String; 0]);
 }
 
 #[test]
@@ -319,7 +319,7 @@ async fn a_factory_sees_its_dependencies_resources_and_configuration() {
 #[test]
 fn an_empty_app_builds() {
     let app = App::builder(&MapSource::new()).build().unwrap();
-    assert!(app.components().is_empty());
+    assert_eq!(app.components(), [] as [&str; 0]);
 }
 
 #[test]

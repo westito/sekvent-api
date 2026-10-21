@@ -482,7 +482,7 @@ mod tests {
         let claims = Claims::new("user-1", 1_000, 60, NoClaims {});
         let token = keys.issue(&claims).unwrap();
         let payload = segments(&token)[1].clone();
-        assert!(!payload.is_empty());
+        assert_ne!(payload, "");
         let verified: Claims = keys.verify(&token, 1_000, &strict()).unwrap();
         assert_eq!(verified, claims);
     }

@@ -1012,7 +1012,7 @@ enum Mood { MOOD_UNSPECIFIED = 0; }
             merge_ranges(vec![[i32::MAX, i32::MAX], [1, i32::MAX]]),
             [[1, i32::MAX]]
         );
-        assert!(merge_ranges(Vec::new()).is_empty());
+        assert_eq!(merge_ranges(Vec::new()), [] as [[i32; 2]; 0]);
         assert_eq!(qualify("", "A"), "A");
         assert_eq!(qualify("a.b", "C"), "a.b.C");
     }

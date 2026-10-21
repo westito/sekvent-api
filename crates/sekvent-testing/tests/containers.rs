@@ -133,7 +133,7 @@ async fn postgres_databases_are_separate_and_reachable() {
     b.close().await.unwrap();
     assert!(pg.url().starts_with("postgres://"));
     assert!(pg.port() > 0);
-    assert!(!pg.host().is_empty());
+    assert_ne!(pg.host(), "");
     assert_eq!(
         format!("{first:?}"),
         format!("TestDatabase {{ name: {:?}, .. }}", first.name)

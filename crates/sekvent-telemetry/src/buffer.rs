@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(seqs, [4, 5]);
         assert_eq!(buffer.since(0).len(), 2);
         assert_eq!(buffer.since(4).len(), 1);
-        assert!(buffer.since(5).is_empty());
+        assert_eq!(buffer.since(5), [] as [LogRecord; 0]);
 
         buffer.clear();
         assert!(buffer.is_empty());

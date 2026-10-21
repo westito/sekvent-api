@@ -857,9 +857,12 @@ mod tests {
             uncovered([1, 10], &[[0, 0], [3, 4], [8, 20]]),
             [[1, 2], [5, 7]]
         );
-        assert!(uncovered([1, 10], &[[1, 10]]).is_empty());
+        assert_eq!(uncovered([1, 10], &[[1, 10]]), [] as [[i32; 2]; 0]);
         assert_eq!(uncovered([5, 6], &[[10, 12]]), [[5, 6]]);
-        assert!(uncovered([5, i32::MAX], &[[1, i32::MAX]]).is_empty());
+        assert_eq!(
+            uncovered([5, i32::MAX], &[[1, i32::MAX]]),
+            [] as [[i32; 2]; 0]
+        );
         assert_eq!(uncovered([5, i32::MAX], &[[1, 7], [9, i32::MAX]]), [[8, 8]]);
         assert!(covers(&[[1, 3]], 2));
         assert!(!covers(&[[1, 3]], 4));

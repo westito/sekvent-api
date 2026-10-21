@@ -330,7 +330,7 @@ mod tests {
             removed: vec!["c1".into()],
         };
         let skipped = when_available(false, || panic!("must not sweep")).unwrap();
-        assert!(skipped.removed.is_empty());
+        assert_eq!(skipped.removed, [] as [String; 0]);
         let swept = when_available(true, || Ok(removed.clone())).unwrap();
         assert_eq!(swept, removed);
     }

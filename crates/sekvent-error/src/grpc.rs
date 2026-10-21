@@ -162,14 +162,14 @@ mod tests {
         let status = to_status(&AppError::not_found("no such order"));
         assert_eq!(status.code(), Code::NotFound);
         assert_eq!(status.message(), "no such order");
-        assert!(status.details().is_empty());
+        assert_eq!(status.details(), b"");
 
         let back = from_status(&status);
         assert_eq!(back.code(), ErrorCode::NotFound);
         assert_eq!(back.message(), "no such order");
         assert!(back.reason().is_none());
         assert!(back.retry_after().is_none());
-        assert!(back.field_violations().is_empty());
+        assert_eq!(back.field_violations(), [] as [crate::FieldViolation; 0]);
     }
 
     #[test]

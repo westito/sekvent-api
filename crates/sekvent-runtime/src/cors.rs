@@ -1370,7 +1370,7 @@ mod tests {
         assert_eq!(text(response).await, "options handled");
 
         let response = call(&cors, options("/echo", None, true)).await;
-        assert!(cors_names(&response).is_empty());
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
         assert_eq!(text(response).await, "options handled");
 
         let get_with_method = Request::get("/echo")

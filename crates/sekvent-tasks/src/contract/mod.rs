@@ -428,7 +428,7 @@ mod tests {
         );
         let report = check(dir.path(), &config, &[]).unwrap();
         assert_eq!(report.exit_code(), 1);
-        assert!(report.compatible.is_empty());
+        assert_eq!(report.compatible, [] as [String; 0]);
         assert_eq!(
             report.render(),
             "breaking: orders.v1.Orders: field 2 (quantity) of orders.v1.PlaceRequest was \
@@ -441,11 +441,11 @@ mod tests {
         assert_eq!(run_check(dir.path(), &config, &[]).unwrap(), 1);
 
         let only_billing = check(dir.path(), &config, &names(&["billing.v1.Billing"])).unwrap();
-        assert!(only_billing.findings.is_empty());
+        assert_eq!(only_billing.findings, [] as [Finding; 0]);
         assert_eq!(only_billing.missing.len(), 1);
         let only_orders = check(dir.path(), &config, &names(&["orders.v1.Orders"])).unwrap();
         assert_eq!(only_orders.findings.len(), 1);
-        assert!(only_orders.missing.is_empty());
+        assert_eq!(only_orders.missing, [] as [MissingBaseline; 0]);
         let error = check(dir.path(), &config, &names(&["nope.v1.Nope"])).unwrap_err();
         assert_eq!(
             error.to_string(),

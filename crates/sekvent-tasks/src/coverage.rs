@@ -520,13 +520,13 @@ mod tests {
         // it; line 3 starts nothing and inherits line 2's zero count; line 5
         // is skipped; line 6 holds only a gap region after an uncounted one.
         assert_eq!(missed_lines(&segments), [3]);
-        assert!(missed_lines(&[]).is_empty());
+        assert_eq!(missed_lines(&[]), [] as [u64; 0]);
     }
 
     #[test]
     fn ranges_collapse_consecutive_lines() {
         assert_eq!(ranges(&[1, 2, 3, 7, 9, 10]), [(1, 3), (7, 7), (9, 10)]);
-        assert!(ranges(&[]).is_empty());
+        assert_eq!(ranges(&[]), [] as [(u64, u64); 0]);
     }
 
     #[test]
@@ -535,7 +535,10 @@ mod tests {
         let misses = misses_for_package(&export, &meta, "orders-db");
         assert_eq!(misses, [("src/lib.rs".to_owned(), vec![(3, 4)])]);
         assert_eq!(render_misses(&misses), "src/lib.rs: 3-4\n");
-        assert!(misses_for_package(&export, &meta, "orders-api").is_empty());
+        assert_eq!(
+            misses_for_package(&export, &meta, "orders-api"),
+            [] as [(String, Vec<(u64, u64)>); 0]
+        );
         let raw = [serde_json::json!(1), serde_json::json!(2)];
         assert_eq!(Segment::from_raw(&raw), None);
     }

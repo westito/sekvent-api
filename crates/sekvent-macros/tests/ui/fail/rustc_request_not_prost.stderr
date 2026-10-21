@@ -7,13 +7,13 @@ error[E0277]: `Plain` is not a protobuf message
    | unsatisfied trait bound
    | required by a bound introduced by this call
    |
-help: the trait `sekvent_component::__private::prost::message::Message` is not implemented for `Plain`
+help: the trait `sekvent_component::__private::prost::Message` is not implemented for `Plain`
   --> tests/ui/fail/rustc_request_not_prost.rs:3:1
    |
  3 | pub struct Plain;
    | ^^^^^^^^^^^^^^^^
    = note: component requests and replies must be prost messages; declare the component `local_only` to use plain Rust types
-   = help: the following other types implement trait `sekvent_component::__private::prost::message::Message`:
+   = help: the following other types implement trait `sekvent_component::__private::prost::Message`:
              ()
              Box<M>
              String
@@ -60,18 +60,18 @@ help: consider annotating `Plain` with `#[derive(Default)]`
  4 | pub struct Plain;
    |
 
-error[E0277]: the trait bound `Plain: sekvent_component::__private::prost::message::Message` is not satisfied
+error[E0277]: the trait bound `Plain: sekvent_component::__private::prost::Message` is not satisfied
   --> tests/ui/fail/rustc_request_not_prost.rs:20:1
    |
 20 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `sekvent_component::__private::prost::message::Message` is not implemented for `Plain`
+help: the trait `sekvent_component::__private::prost::Message` is not implemented for `Plain`
   --> tests/ui/fail/rustc_request_not_prost.rs:3:1
    |
  3 | pub struct Plain;
    | ^^^^^^^^^^^^^^^^
-   = help: the following other types implement trait `sekvent_component::__private::prost::message::Message`:
+   = help: the following other types implement trait `sekvent_component::__private::prost::Message`:
              ()
              Box<M>
              String
@@ -118,13 +118,13 @@ error[E0277]: `Plain` is not a protobuf message
 20 | #[sekvent_component::component(name = "echo", package = "check.echo.v1", proto = "crate::proto")]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `sekvent_component::__private::prost::message::Message` is not implemented for `Plain`
+help: the trait `sekvent_component::__private::prost::Message` is not implemented for `Plain`
   --> tests/ui/fail/rustc_request_not_prost.rs:3:1
    |
  3 | pub struct Plain;
    | ^^^^^^^^^^^^^^^^
    = note: component requests and replies must be prost messages; declare the component `local_only` to use plain Rust types
-   = help: the following other types implement trait `sekvent_component::__private::prost::message::Message`:
+   = help: the following other types implement trait `sekvent_component::__private::prost::Message`:
              ()
              Box<M>
              String
@@ -174,13 +174,13 @@ error[E0277]: `Plain` is not a protobuf message
 26 |         req: Plain,
    |              ^^^^^ unsatisfied trait bound
    |
-help: the trait `sekvent_component::__private::prost::message::Message` is not implemented for `Plain`
+help: the trait `sekvent_component::__private::prost::Message` is not implemented for `Plain`
   --> tests/ui/fail/rustc_request_not_prost.rs:3:1
    |
  3 | pub struct Plain;
    | ^^^^^^^^^^^^^^^^
    = note: component requests and replies must be prost messages; declare the component `local_only` to use plain Rust types
-   = help: the following other types implement trait `sekvent_component::__private::prost::message::Message`:
+   = help: the following other types implement trait `sekvent_component::__private::prost::Message`:
              ()
              Box<M>
              String
@@ -222,13 +222,13 @@ error[E0277]: `Plain` has no protobuf type name
 26 |         req: Plain,
    |              ^^^^^ unsatisfied trait bound
    |
-help: the trait `sekvent_component::__private::prost::name::Name` is not implemented for `Plain`
+help: the trait `sekvent_component::__private::prost::Name` is not implemented for `Plain`
   --> tests/ui/fail/rustc_request_not_prost.rs:3:1
    |
  3 | pub struct Plain;
    | ^^^^^^^^^^^^^^^^
    = note: compile the messages with sekvent-proto-build, which enables prost's type names, or implement `prost::Name`
-   = help: the following other types implement trait `sekvent_component::__private::prost::name::Name`:
+   = help: the following other types implement trait `sekvent_component::__private::prost::Name`:
              ()
              String
              Vec<u8>

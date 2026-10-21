@@ -412,16 +412,12 @@ mod tests {
         for bad in ["", "has space", long.as_str()] {
             let ctx = from_headers(&headers(&[(REQUEST_ID, bad)]), None);
             assert_ne!(ctx.request_id(), bad);
-            assert!(!ctx.request_id().is_empty());
+            assert_ne!(ctx.request_id(), "");
         }
         let mut map = HeaderMap::new();
         map.insert(REQUEST_ID, HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap());
         assert!(from_headers(&map, None).request_id().is_ascii());
-        assert!(
-            !from_headers(&HeaderMap::new(), None)
-                .request_id()
-                .is_empty()
-        );
+        assert_ne!(from_headers(&HeaderMap::new(), None).request_id(), "");
     }
 
     #[test]

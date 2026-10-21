@@ -328,7 +328,7 @@ mod tests {
             compile_or_forward(&ctx, &args(&["gate"]), |_| Ok(5)).unwrap(),
             5
         );
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
     }
 
     #[test]
@@ -359,7 +359,7 @@ mod tests {
                 compile_or_forward(&ctx, &args(&["gate"]), |_| Ok(7)).unwrap(),
                 7
             );
-            assert!(runner.calls().is_empty());
+            assert_eq!(runner.calls(), [] as [Cmd; 0]);
         }
         let mut config = Config::with_name("orders");
         config.remote.mode = RemoteMode::Local;
@@ -390,7 +390,7 @@ mod tests {
         assert!(message.contains("mode = \"local\""), "{message}");
         assert!(message.contains("SEKVENT_LOCAL=1"), "{message}");
         assert!(message.contains("from [remote].rrb"), "{message}");
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
 
         let runner = FakeRunner::default();
         let ctx = context(
@@ -406,7 +406,7 @@ mod tests {
             message.contains("rrb not found at /nonexistent/env-rrb (from BUILD_CMD)"),
             "{message}"
         );
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
 
         let mut unpinned = Config::with_name("orders");
         unpinned.remote.mode = RemoteMode::Rrb;
@@ -418,7 +418,7 @@ mod tests {
         assert!(message.contains("needs the rrb executable"), "{message}");
         assert!(message.contains("[remote].rrb"), "{message}");
         assert!(message.contains("BUILD_CMD"), "{message}");
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
 
         let bare = RrbSource::Config("sekvent-no-such-rrb-binary".into());
         let error = resolve_rrb(&bare, None).unwrap_err();

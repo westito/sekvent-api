@@ -600,7 +600,7 @@ mod tests {
         let sweeper = FakeSweeper::default();
         let ctx = context(config(), &runner, &sweeper);
         assert_eq!(boundaries(&ctx).unwrap(), 0);
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
         assert!(run_steps(&ctx, "gate", &[Step::Boundaries], None).is_err());
     }
 

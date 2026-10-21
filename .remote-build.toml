@@ -11,10 +11,10 @@ name = "sekvent"
 exclude = []
 
 [image]
-# The r2 revision carries cargo-llvm-cov and the docker client, both needed by
+# The image carries cargo-llvm-cov and the docker client, both needed by
 # the coverage gate and the testcontainers harness tests. The Rust version in
 # the tag must agree with rust-toolchain.toml.
-base = "remote-builder:rust1.98.1-flutter3.47.7-r4"
+base = "remote-builder:rust1.99.1-flutter3.47.7-r1"
 
 [run]
 workdir = "/work"
@@ -43,5 +43,5 @@ args = []
 testcontainers = true
 
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.1"
 components = ["rustfmt", "clippy", "llvm-tools-preview", "rust-src"]

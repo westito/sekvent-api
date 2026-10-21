@@ -39,7 +39,7 @@ fn the_module_exports_bindings_and_reasons() {
     );
     let source = MapSource::new();
     let app = sekvent::App::builder(&source).build().unwrap();
-    assert!(app.components().is_empty());
+    assert_eq!(app.components(), [] as [&str; 0]);
 }
 
 #[test]
@@ -88,7 +88,10 @@ fn the_module_exports_the_c2_keys() {
     );
     assert_eq!(sekvent::component::DEFAULT_MAX_HOPS, 16);
     assert_eq!(sekvent::component::POLICY_PREFIX, "SEKVENT_POLICY_");
-    assert!(empty(&MapSource::new()).unwrap().grpc_services().is_empty());
+    assert_eq!(
+        empty(&MapSource::new()).unwrap().grpc_services(),
+        [] as [String; 0]
+    );
 }
 
 #[cfg(feature = "component-grpc")]

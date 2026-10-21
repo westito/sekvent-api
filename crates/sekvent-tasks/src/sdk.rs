@@ -390,12 +390,12 @@ checksum = "00"
         let runner = FakeRunner::default();
         let report = status(&runner, &text, true).unwrap();
         assert!(report.contains("from git+--upload-pack="), "{report}");
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.lock"), &text).unwrap();
         assert_eq!(update_hint(&runner, dir.path(), &EnvMap::new()), None);
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
 
         let cmd = ls_remote_command("-x", "master");
         assert_eq!(cmd.args, ["ls-remote", "--", "-x", "refs/heads/master"]);

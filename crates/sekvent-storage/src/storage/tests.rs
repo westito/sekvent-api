@@ -176,7 +176,7 @@ fn presigned_gets_carry_the_response_overrides() {
         )
         .unwrap();
     assert_eq!(get.method, "GET");
-    assert!(get.headers.is_empty());
+    assert_eq!(get.headers, [] as [(String, String); 0]);
     assert!(get.url.starts_with("http://127.0.0.1:9000/files/k?"));
     assert_eq!(
         query_value(&get.url, "response-content-disposition"),

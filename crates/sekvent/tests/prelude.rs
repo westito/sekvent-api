@@ -32,7 +32,7 @@ fn a_config_struct_derives_through_the_prelude() {
 fn errors_and_context_come_from_the_prelude() {
     let error = AppError::not_found("no such order");
     assert_eq!(error.code(), ErrorCode::NotFound);
-    assert!(!CallContext::new().request_id().is_empty());
+    assert_ne!(CallContext::new().request_id(), "");
 }
 
 #[tokio::test]

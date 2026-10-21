@@ -248,7 +248,7 @@ mod tests {
             .unwrap();
         assert_eq!(user.subject(), "user-8");
         assert_eq!(user.tenant(), None);
-        assert!(user.roles().is_empty());
+        assert_eq!(user.roles(), [] as [String; 0]);
 
         let claims = auth
             .verify_headers::<NoClaims>(&headers(&format!("Bearer {plain}")))

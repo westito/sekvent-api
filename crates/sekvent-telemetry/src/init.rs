@@ -390,7 +390,7 @@ mod tests {
                     reason,
                 }) => {
                     assert_eq!(got, origin);
-                    assert!(!reason.is_empty());
+                    assert_ne!(reason, "");
                 }
                 other => panic!("expected an invalid filter, got {other:?}"),
             }

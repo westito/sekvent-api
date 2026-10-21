@@ -99,7 +99,7 @@ async fn ordering_more_than_the_stock_is_out_of_stock(#[case] profile: Profile) 
             "{error:?}"
         );
         assert_eq!(available(&shop.app).await, STOCK);
-        assert!(sent_to(&shop.app, CUSTOMER).await.is_empty());
+        assert_eq!(sent_to(&shop.app, CUSTOMER).await, [] as [Notification; 0]);
     })
     .await;
 }
@@ -168,7 +168,7 @@ async fn a_blocked_customer_is_refused_and_the_reservation_released(#[case] prof
             "{error:?}"
         );
         assert_eq!(available(&shop.app).await, STOCK);
-        assert!(sent_to(&shop.app, BLOCKED_CUSTOMER).await.is_empty());
+        assert_eq!(sent_to(&shop.app, BLOCKED_CUSTOMER).await, [] as [Notification; 0]);
     })
     .await;
 }

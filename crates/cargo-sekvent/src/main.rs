@@ -634,7 +634,7 @@ mod tests {
         else {
             panic!("expected contract emit");
         };
-        assert!(services.is_empty());
+        assert_eq!(services, [] as [String; 0]);
 
         let cli = parse(&[
             "cargo-sekvent",

@@ -1186,6 +1186,6 @@ mod tests {
             Ok(Nothing) => {}
             Err(error) => panic!("{error}"),
         }
-        assert!(Nothing::keys().is_empty());
+        assert_eq!(Nothing::keys(), [] as [KeyInfo; 0]);
     }
 }

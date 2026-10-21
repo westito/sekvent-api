@@ -247,7 +247,7 @@ async fn open_errors_are_trailers_only_and_streams_end_with_trailers() {
 
         let refused = raw_open(service.addr, Some(&bearer), &series("unknown")).await;
         assert_eq!(refused.headers["grpc-status"], "5");
-        assert!(refused.messages.is_empty());
+        assert_eq!(refused.messages, [] as [Bytes; 0]);
         assert!(refused.trailers.is_none());
 
         let feed = control.feed();
@@ -383,7 +383,7 @@ impl Ticker for Flaky {
             && self
                 .0
                 .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     left.checked_sub(1)
                 })
                 .is_ok()
@@ -601,7 +601,7 @@ async fn end_users_are_authenticated_at_the_open() {
         assert_eq!(missing.headers["grpc-status"], "16");
         let status = tonic::Status::from_header_map(&missing.headers).unwrap();
         assert_eq!(status.message(), END_USER_REJECTED_MESSAGE);
-        assert!(missing.messages.is_empty());
+        assert_eq!(missing.messages, [] as [Bytes; 0]);
         assert!(events.opened.try_recv().is_err(), "no handler ran");
 
         // A link token is no session.

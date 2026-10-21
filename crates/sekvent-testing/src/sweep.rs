@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn ids_are_parsed_one_per_line() {
         assert_eq!(parse_ids("abc\n\n  def  \n"), ["abc", "def"]);
-        assert!(parse_ids("").is_empty());
+        assert_eq!(parse_ids(""), [] as [String; 0]);
     }
 
     #[test]

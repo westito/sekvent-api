@@ -122,7 +122,7 @@ mod tests {
         let user = EndUser::new("user-7");
         assert_eq!(user.subject(), "user-7");
         assert_eq!(user.tenant(), None);
-        assert!(user.roles().is_empty());
+        assert_eq!(user.roles(), [] as [String; 0]);
         assert!(!user.has_role("admin"));
 
         let user = user

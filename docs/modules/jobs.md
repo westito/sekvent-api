@@ -363,7 +363,7 @@ impl JobGuard for LockServiceGuard {
 `tokio_util::sync::CancellationToken` in their signatures, and the facade
 re-exports neither, so a crate implementing a guard needs `futures` (0.3) and
 `tokio-util` (0.7) in its own manifest (the workspace pins `futures` 0.3.34
-and `tokio-util` 0.7.19).
+and `tokio-util` 0.7.20).
 
 - `acquire` takes the job for **one run**. For a scheduled or catch-up run
   it must also remember `tick`, so the same tick never runs twice across

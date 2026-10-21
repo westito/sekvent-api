@@ -326,7 +326,7 @@ mod tests {
             StateRejected::Mismatch,
             StateRejected::Replayed,
         ] {
-            assert!(!rejected.to_string().is_empty());
+            assert_ne!(rejected.to_string(), "");
         }
     }
 
@@ -360,7 +360,7 @@ mod tests {
             HeaderValue::from_bytes(b"sso=\xff").unwrap(),
         );
         assert_eq!(cookie_values(&headers, "sso"), ["one", "two"]);
-        assert!(cookie_values(&headers, "missing").is_empty());
+        assert_eq!(cookie_values(&headers, "missing"), [] as [&str; 0]);
     }
 
     #[test]

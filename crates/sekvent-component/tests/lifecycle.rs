@@ -166,7 +166,7 @@ async fn stopping_a_never_started_app_only_marks_it_stopped() {
     .unwrap();
     app.stop(Duration::from_secs(1)).await.unwrap();
     assert_eq!(states(&app), [ComponentState::Stopped; 3]);
-    assert!(recorder.events().is_empty());
+    assert_eq!(recorder.events(), [] as [String; 0]);
     assert_eq!(
         app.start().await.unwrap_err().code(),
         ErrorCode::FailedPrecondition

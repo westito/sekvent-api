@@ -22,7 +22,7 @@ regex = { workspace = true }
 humantime = { workspace = true }
 tempfile = { workspace = true }
 include_dir = "0.7.4"
-toml_edit = "0.25.15"
+toml_edit = "0.25.17"
 semver = "1.0.28"
 which = "8.0.6"
 dirs = "7.0.0"

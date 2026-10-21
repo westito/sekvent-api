@@ -866,7 +866,7 @@ async fn without_the_access_log_ids_and_the_span_stay() {
     let answer = send(&router, get_request("/traced")).await;
     assert_eq!(answer.text(), "traced");
     let id = answer.header("x-request-id").unwrap();
-    assert!(access(&buffer).is_empty());
+    assert_eq!(access(&buffer), [] as [sekvent_telemetry::LogRecord; 0]);
     let handled = buffer
         .snapshot()
         .into_iter()

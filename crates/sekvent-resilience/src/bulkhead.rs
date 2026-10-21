@@ -95,7 +95,7 @@ impl Bulkhead {
         }
         let joined = self
             .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 (queued < self.max_queue).then_some(queued + 1)
             });
         if joined.is_err() {

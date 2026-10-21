@@ -424,7 +424,7 @@ async fn a_broken_embedded_migration_is_a_migrate_error() {
     match &error {
         DbError::Migrate { target, source } => {
             assert_eq!(target, "embedded migrations");
-            assert!(!source.to_string().is_empty());
+            assert_ne!(source.to_string(), "");
         }
         other => panic!("expected a migrate error, got {other:?}"),
     }

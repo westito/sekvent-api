@@ -355,7 +355,7 @@ async fn end_users_reach_components_over_grpc_web() {
             .to_owned();
         assert!(allowed.contains("authorization"), "{allowed}");
         assert!(allowed.contains("x-grpc-web"), "{allowed}");
-        assert!(storefront.seen().is_empty());
+        assert_eq!(storefront.seen(), [] as [Seen; 0]);
 
         // A signed-in end user.
         let reply = grpc_web(shop.addr, RESERVE, Some("Bearer user-7"), &reserve()).await;
@@ -514,7 +514,7 @@ async fn optional_end_users_next_to_links() {
             assert_eq!(reply.grpc.code(), tonic::Code::Unauthenticated);
             assert_ne!(reply.grpc.message(), END_USER_REJECTED_MESSAGE);
         }
-        assert!(storefront.seen().is_empty());
+        assert_eq!(storefront.seen(), [] as [Seen; 0]);
         assert!(!signed_in(track(&shop, Some(link_token.as_str())).await));
         assert_eq!(
             storefront.seen().pop().unwrap().caller,
@@ -549,7 +549,7 @@ async fn bearer_serving_does_not_accept_link_tokens() {
         assert_eq!(error.code(), ErrorCode::Unauthenticated);
         assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
         app.stop(Duration::ZERO).await.unwrap();
-        assert!(storefront.seen().is_empty());
+        assert_eq!(storefront.seen(), [] as [Seen; 0]);
 
         let reply = grpc_web(shop.addr, RESERVE, Some("Bearer user-3"), &reserve()).await;
         assert_eq!(reply.grpc.code(), tonic::Code::Ok, "{:?}", reply.grpc);
@@ -597,5 +597,5 @@ fn end_user_serving_fails_closed_without_an_authenticator() {
         InventoryHandle::install(builder, |_| Ok(Storefront::default()))
     })
     .unwrap();
-    assert!(app.grpc_services().is_empty());
+    assert_eq!(app.grpc_services(), [] as [String; 0]);
 }

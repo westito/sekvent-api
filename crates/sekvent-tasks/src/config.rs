@@ -689,8 +689,8 @@ description = "Seed the dev database"
         );
         assert!(!config.harness.docker_tests);
         assert!(config.tasks.is_empty());
-        assert!(config.contract.roots.is_empty());
-        assert!(config.contract.includes.is_empty());
+        assert_eq!(config.contract.roots, [] as [std::path::PathBuf; 0]);
+        assert_eq!(config.contract.includes, [] as [std::path::PathBuf; 0]);
         assert_eq!(config.contract.baseline, PathBuf::from("contracts"));
         assert!(config.contract.gate);
         assert!(!config.contract.in_gate());

@@ -184,7 +184,7 @@ mod tests {
             "https://github.com/westito/sekvent-api/releases/download/cli-latest/\
              cargo-sekvent-x86_64-unknown-linux-gnu.tar.gz"
         );
-        assert!(!BUILD_TARGET.is_empty());
+        assert_ne!(BUILD_TARGET, "");
     }
 
     #[test]
@@ -431,7 +431,7 @@ mod tests {
         let missing = Err(std::io::Error::other("gone"));
         let error = update_current(&runner, missing, TARGET).unwrap_err();
         assert!(error.to_string().contains("running executable"), "{error}");
-        assert!(runner.calls().is_empty());
+        assert_eq!(runner.calls(), [] as [Cmd; 0]);
 
         let (_dir, exe) = installed_exe();
         update_current(&Release::new(), Ok(exe.clone()), TARGET).unwrap();

@@ -565,7 +565,10 @@ mod tests {
                 ("default_transaction_read_only", "on".to_owned()),
             ]
         );
-        assert!(postgres_session_options(&self::spec("a", "postgres://h/a")).is_empty());
+        assert_eq!(
+            postgres_session_options(&self::spec("a", "postgres://h/a")),
+            [] as [(&str, String); 0]
+        );
     }
 
     #[cfg(feature = "sqlx-postgres")]

@@ -21,7 +21,7 @@ pub const RUST_TOOLCHAIN_TOML: &str = include_str!(concat!(
 ));
 
 /// The builder image projects use; its Rust version matches the toolchain.
-pub const RRB_IMAGE: &str = "remote-builder:rust1.98.1-flutter3.47.2-r2";
+pub const RRB_IMAGE: &str = "remote-builder:rust1.99.1-flutter3.47.7-r1";
 
 /// Rust edition of generated projects.
 pub const EDITION: &str = "2024";

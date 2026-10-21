@@ -120,7 +120,7 @@ async fn calls_and_typed_errors_cross_the_wire() {
         assert_eq!(service.app.binding("inventory"), Some(Binding::Local));
         let (app, inventory) = caller(&service.endpoint(), &[]).await;
         assert_eq!(inventory.binding(), Binding::Grpc);
-        assert!(app.grpc_services().is_empty());
+        assert_eq!(app.grpc_services(), [] as [String; 0]);
 
         let cx = CallContext::new();
         let reply = inventory.reserve(&cx, reserve(2)).await.unwrap();

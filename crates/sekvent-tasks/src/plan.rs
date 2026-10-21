@@ -487,8 +487,11 @@ mod tests {
             feature_args(&Features::Set(FeatureSet::All)),
             ["--all-features"]
         );
-        assert!(feature_args(&Features::Set(FeatureSet::Default)).is_empty());
-        assert!(feature_args(&Features::List(Vec::new())).is_empty());
+        assert_eq!(
+            feature_args(&Features::Set(FeatureSet::Default)),
+            [] as [String; 0]
+        );
+        assert_eq!(feature_args(&Features::List(Vec::new())), [] as [String; 0]);
         assert_eq!(
             feature_args(&Features::List(vec!["a".into(), "b".into()])),
             ["--features", "a,b"]
@@ -783,7 +786,7 @@ mod tests {
         let mut env = EnvMap::new();
         env.insert("SEKVENT_DOCKER_TESTS".into(), "0".into());
         env.insert("RUST_TEST_THREADS".into(), "2".into());
-        assert!(test_env(&config, &env).is_empty());
+        assert_eq!(test_env(&config, &env), [] as [(String, String); 0]);
         assert_eq!(
             test_env(&config, &EnvMap::new()),
             [
@@ -841,7 +844,7 @@ mod tests {
 
     #[test]
     fn without_docker_tests_no_binary_arguments_are_added() {
-        assert!(test_binary_args(false, &[]).is_empty());
+        assert_eq!(test_binary_args(false, &[]), [] as [String; 0]);
         assert_eq!(test_binary_args(false, &["x".into()]), ["x"]);
         assert_eq!(test_binary_args(true, &["--ignored".into()]), ["--ignored"]);
     }

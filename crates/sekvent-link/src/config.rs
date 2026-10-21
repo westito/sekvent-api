@@ -329,7 +329,7 @@ mod tests {
         let config = LinkConfig::from_source(&MapSource::new()).unwrap();
         assert!(config.inbound().is_empty());
         assert_eq!(config.outbound_names().count(), 0);
-        assert!(LinkConfig::keys(&MapSource::new()).is_empty());
+        assert_eq!(LinkConfig::keys(&MapSource::new()), [] as [String; 0]);
     }
 
     #[test]
