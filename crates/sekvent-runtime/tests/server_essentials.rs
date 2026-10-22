@@ -430,6 +430,96 @@ async fn an_any_port_origin_is_an_explicit_list() {
     assert_eq!(refused.header("vary"), Some("origin"));
 }
 
+/// A preflight as a web view sends it before a gRPC-Web call.
+fn grpc_web_preflight(path: &str, origin: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::OPTIONS)
+        .uri(path)
+        .header("origin", origin)
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "content-type,x-grpc-web,x-user-agent,authorization",
+        )
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_listed_custom_scheme_origin_calls_grpc_web() {
+    const CAPACITOR: &str = "capacitor://localhost";
+    const HEALTH: &str = "/api/grpc.health.v1.Health/Check";
+    let unlisted = router(
+        Server::builder()
+            .prefix("/api")
+            .rest(rest())
+            .cors(Cors::origins([ORIGIN]).unwrap()),
+    )
+    .await;
+    let refused = send(&unlisted, grpc_web_preflight(HEALTH, CAPACITOR)).await;
+    assert!(!refused.has_cors_headers(), "{:?}", refused.headers);
+    assert_eq!(refused.status, StatusCode::OK, "the browser blocks it");
+
+    let router = router(
+        Server::builder()
+            .prefix("/api")
+            .rest(rest())
+            .cors(Cors::origins([CAPACITOR, "https://localhost"]).unwrap()),
+    )
+    .await;
+
+    for origin in [CAPACITOR, "Capacitor://LocalHost", "https://localhost"] {
+        let preflight = send(&router, grpc_web_preflight(HEALTH, origin)).await;
+        assert_eq!(preflight.status, StatusCode::OK);
+        assert_eq!(
+            preflight.header("access-control-allow-origin"),
+            Some(origin)
+        );
+        let allowed = preflight.header("access-control-allow-headers").unwrap();
+        for name in [
+            "content-type",
+            "x-grpc-web",
+            "x-user-agent",
+            "authorization",
+        ] {
+            assert!(allowed.contains(name), "{allowed}");
+        }
+        assert_eq!(preflight.header("vary"), Some("origin"));
+
+        let web = send(&router, grpc_web(HEALTH, Some(origin))).await;
+        assert_eq!(web.status, StatusCode::OK);
+        let trailer = b"grpc-status:0";
+        assert!(
+            web.body
+                .windows(trailer.len())
+                .any(|window| window == trailer),
+            "{:?}",
+            web.body
+        );
+        assert_eq!(web.header("access-control-allow-origin"), Some(origin));
+        let exposed = web.header("access-control-expose-headers").unwrap();
+        assert!(exposed.contains("grpc-status"), "{exposed}");
+        assert!(exposed.contains("grpc-message"), "{exposed}");
+        assert_eq!(web.header("vary"), Some("origin"));
+    }
+
+    for origin in ["capacitor://evil", "ionic://localhost", "null"] {
+        let refused = send(&router, grpc_web_preflight(HEALTH, origin)).await;
+        assert!(
+            !refused.has_cors_headers(),
+            "{origin}: {:?}",
+            refused.headers
+        );
+        assert_eq!(refused.header("vary"), Some("origin"));
+        let refused = send(&router, grpc_web(HEALTH, Some(origin))).await;
+        assert!(
+            !refused.has_cors_headers(),
+            "{origin}: {:?}",
+            refused.headers
+        );
+    }
+}
+
 async fn router_with_any_origin() -> Router {
     router(Server::builder().rest(rest()).cors(Cors::any_origin())).await
 }

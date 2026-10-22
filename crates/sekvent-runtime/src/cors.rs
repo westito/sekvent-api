@@ -59,8 +59,9 @@ const MAX_QUOTED: usize = 200;
 /// Cross-origin rules for browsers calling the server (REST and gRPC-Web).
 ///
 /// Built with [`any_origin`](Self::any_origin) or a validated, normalized
-/// origin list ([`origins`](Self::origins), whose entries may leave the port
-/// open with `:*`), or read from configuration
+/// origin list ([`origins`](Self::origins), whose `http(s)` entries may leave
+/// the port open with `:*` and whose custom-scheme entries, such as
+/// `capacitor://localhost`, match exactly), or read from configuration
 /// ([`from_config`](Self::from_config)), then handed to
 /// [`ServerBuilder::cors`](crate::ServerBuilder::cors).
 ///
@@ -111,18 +112,25 @@ impl Cors {
     /// (`http://[0:0::1]` becomes `http://[::1]`; an IPv4-mapped address is
     /// written in hex, `[::ffff:102:304]`, as browsers do).
     ///
-    /// Each entry is `http://` or `https://`, a host and an optional port.
-    /// The port `*` (`http://localhost:*`) matches that scheme and host on
-    /// any port, the default one (no port in `Origin`) included; for a
-    /// development server that picks a fresh port on every run. The host is
-    /// always exact: there are no host wildcards.
+    /// Each entry is a scheme, `://`, a host and an optional port.
+    /// For `http` and `https` the port `*` (`http://localhost:*`) matches
+    /// that scheme and host on any port, the default one (no port in
+    /// `Origin`) included; for a development server that picks a fresh port
+    /// on every run. The host is always exact: there are no host wildcards.
+    ///
+    /// Any other scheme is a custom one, such as `capacitor://localhost`, the
+    /// origin of an app served from a mobile web view. Such an entry matches
+    /// one `Origin` exactly, ignoring ASCII case (`Capacitor://LocalHost`
+    /// matches); it has no default port and never takes the port `*`.
     ///
     /// `INVALID_ARGUMENT` for a path, query, fragment or user info, `*` (use
-    /// [`any_origin`](Self::any_origin)), `null`, another scheme, a
-    /// malformed host or port (a `*` in the host, or a port such as `*x`),
-    /// and for an empty list. The error names the entry by its position,
-    /// counting from 1 (`origin #2`), never by its text, which may hold a
-    /// credential.
+    /// [`any_origin`](Self::any_origin)), `null`, the schemes `file`,
+    /// `data`, `blob`, `javascript` and `about` (their documents send
+    /// `null`) and `ftp`, `ws` and `wss` (they serve no page), a malformed
+    /// scheme, host or port (a `*` in the host, a port such as `*x`, or `*`
+    /// on a custom scheme), and for an empty list. The error names the entry
+    /// by its position, counting from 1 (`origin #2`), never by its text,
+    /// which may hold a credential.
     pub fn origins<I, S>(origins: I) -> Result<Self, AppError>
     where
         I: IntoIterator<Item = S>,
@@ -140,7 +148,8 @@ impl Cors {
     }
 
     /// Read the rules from `<prefix>ORIGINS` (`*` or a comma-separated
-    /// list, entries as in [`origins`](Self::origins), `:*` ports included),
+    /// list, entries as in [`origins`](Self::origins), `:*` ports and
+    /// custom schemes included),
     /// `<prefix>CREDENTIALS` (bool, default false), `<prefix>MAX_AGE`
     /// (duration, default `1h`), `<prefix>ALLOW_HEADERS` and
     /// `<prefix>EXPOSE_HEADERS` (comma-separated, added to the defaults).
@@ -373,13 +382,18 @@ struct OriginList {
     exact: Vec<HeaderValue>,
     /// `scheme://host` of the entries with the port `*`.
     any_port: Vec<String>,
+    /// Custom-scheme origins, lowercase, matched ignoring ASCII case: a web
+    /// view may keep the case of a non-special URL's host.
+    custom: Vec<String>,
 }
 
 impl OriginList {
     fn new(list: &[String]) -> Self {
         let mut split = Self::default();
         for origin in list {
-            if let Some(base) = origin.strip_suffix(ANY_PORT) {
+            if !is_web_origin(origin) {
+                split.custom.push(origin.clone());
+            } else if let Some(base) = origin.strip_suffix(ANY_PORT) {
                 split.any_port.push(base.to_owned());
             } else if let Ok(value) = HeaderValue::from_str(origin) {
                 split.exact.push(value);
@@ -393,6 +407,10 @@ impl OriginList {
         let origin = origin.as_bytes();
         self.exact.iter().any(|listed| listed.as_bytes() == origin)
             || self.any_port.iter().any(|base| on_any_port(base, origin))
+            || self
+                .custom
+                .iter()
+                .any(|listed| listed.as_bytes().eq_ignore_ascii_case(origin))
     }
 }
 
@@ -549,6 +567,22 @@ fn joined<'a>(items: impl Iterator<Item = &'a str>) -> Option<HeaderValue> {
     HeaderValue::from_str(&text).ok()
 }
 
+/// Schemes whose documents have an opaque origin: a browser sends
+/// `Origin: null` for them, never their own text.
+const OPAQUE_SCHEMES: [&str; 5] = ["about", "blob", "data", "file", "javascript"];
+
+/// Special schemes that never serve a page, so never send an `Origin`.
+const NON_PAGE_SCHEMES: [&str; 3] = ["ftp", "ws", "wss"];
+
+const NO_SCHEME: &str = "an origin is a scheme followed by :// and a host";
+const OPAQUE: &str = "file, data, blob, javascript and about URLs have the opaque origin null, which is never allowed";
+const NON_PAGE: &str = "ftp, ws and wss URLs are never a page's origin; use http or https";
+const CUSTOM_ANY_PORT: &str = "only http and https origins may leave the port open with *";
+
+/// The canonical form of one origin entry. `http` and `https` drop their
+/// default port and may end in `:*`; any other scheme (`capacitor://localhost`
+/// for an app's web view) is kept as written, lowercased, with an explicit
+/// port only.
 fn normalize_origin(raw: &str) -> Result<String, &'static str> {
     let origin = raw.trim();
     if origin == "*" {
@@ -557,14 +591,26 @@ fn normalize_origin(raw: &str) -> Result<String, &'static str> {
     if origin.eq_ignore_ascii_case("null") {
         return Err("the opaque origin null is never allowed");
     }
-    let Some((scheme, rest)) = origin.split_once("://") else {
-        return Err("an origin is http:// or https:// followed by a host");
+    let Some((scheme, rest)) = origin
+        .split_once(':')
+        .filter(|(scheme, _)| is_scheme(scheme))
+    else {
+        return Err(NO_SCHEME);
     };
     let scheme = scheme.to_ascii_lowercase();
+    if OPAQUE_SCHEMES.contains(&scheme.as_str()) {
+        return Err(OPAQUE);
+    }
+    if NON_PAGE_SCHEMES.contains(&scheme.as_str()) {
+        return Err(NON_PAGE);
+    }
+    let Some(rest) = rest.strip_prefix("//") else {
+        return Err(NO_SCHEME);
+    };
     let default_port = match scheme.as_str() {
-        "http" => 80,
-        "https" => 443,
-        _ => return Err("only http and https origins are allowed"),
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
     };
     let authority = rest.strip_suffix('/').unwrap_or(rest);
     if authority.contains(['/', '?', '#']) {
@@ -575,13 +621,30 @@ fn normalize_origin(raw: &str) -> Result<String, &'static str> {
     }
     let (host, port) = split_host_port(authority)?;
     if port == Some("*") {
+        if default_port.is_none() {
+            return Err(CUSTOM_ANY_PORT);
+        }
         return Ok(format!("{scheme}://{host}{ANY_PORT}"));
     }
     let port = port.map(parse_port).transpose()?;
-    Ok(match port.filter(|&port| port != default_port) {
+    Ok(match port.filter(|&port| Some(port) != default_port) {
         Some(port) => format!("{scheme}://{host}:{port}"),
         None => format!("{scheme}://{host}"),
     })
+}
+
+/// Whether `scheme` is a URL scheme: a letter, then letters, digits, `+`,
+/// `-` and `.`.
+fn is_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Whether a normalized entry is `http` or `https`, which browsers send in
+/// canonical form and are matched byte for byte.
+fn is_web_origin(origin: &str) -> bool {
+    origin.starts_with("http://") || origin.starts_with("https://")
 }
 
 /// The lowercase host (IPv6 in brackets) and the raw port text, if any.
@@ -1414,5 +1477,195 @@ mod tests {
         let mut none = HeaderMap::new();
         strip_cors_headers(&mut none, true);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn custom_scheme_origins_are_lowercased_and_keep_their_port() {
+        let cors = Cors::origins([
+            "Capacitor://LocalHost",
+            "capacitor://localhost/",
+            " ionic://localhost ",
+            "com.example.app+web-1://Callback:080",
+            "x://[0:0::1]:443",
+            "https://localhost",
+        ])
+        .unwrap();
+        assert_eq!(
+            list(&cors),
+            [
+                "capacitor://localhost",
+                "ionic://localhost",
+                "com.example.app+web-1://callback:80",
+                "x://[::1]:443",
+                "https://localhost",
+            ]
+        );
+        assert!(cors.validate().is_ok());
+    }
+
+    #[test]
+    fn custom_scheme_entries_match_exactly_ignoring_case() {
+        let list = OriginList::new(&[
+            "capacitor://localhost".to_owned(),
+            "app://localhost:8080".to_owned(),
+            "https://localhost".to_owned(),
+        ]);
+        assert_eq!(
+            list.custom,
+            ["capacitor://localhost", "app://localhost:8080"]
+        );
+        assert_eq!(list.exact.len(), 1);
+        assert_eq!(list.any_port, Vec::<String>::new());
+        let matches = |origin: &str| list.matches(&HeaderValue::from_str(origin).unwrap());
+        for allowed in [
+            "capacitor://localhost",
+            "Capacitor://LocalHost",
+            "CAPACITOR://LOCALHOST",
+            "app://localhost:8080",
+            "https://localhost",
+        ] {
+            assert!(matches(allowed), "{allowed}");
+        }
+        for refused in [
+            "capacitor://evil",
+            "capacitor://localhost:8080",
+            "capacitor://localhost/",
+            "capacitor://localhost.evil.example",
+            "capacitor://localhostx",
+            "ionic://localhost",
+            "app://localhost",
+            "app://localhost:80",
+            "http://localhost",
+            "HTTPS://localhost",
+            "null",
+        ] {
+            assert!(!matches(refused), "{refused}");
+        }
+    }
+
+    #[test]
+    fn refused_custom_scheme_entries_are_reported_precisely() {
+        let reason = |raw: &str| normalize_origin(raw).unwrap_err();
+        for (bad, expected) in [
+            ("null", "the opaque origin null is never allowed"),
+            ("*", "* is only allowed alone (Cors::any_origin)"),
+            ("capacitor://localhost:*", CUSTOM_ANY_PORT),
+            ("file://x", OPAQUE),
+            ("FILE:///etc/hosts", OPAQUE),
+            ("data:text/plain,x", OPAQUE),
+            ("blob:https://app.example.com/1", OPAQUE),
+            ("javascript:alert(1)", OPAQUE),
+            ("about:blank", OPAQUE),
+            ("ftp://app.example.com", NON_PAGE),
+            ("ws://app.example.com", NON_PAGE),
+            ("wss://app.example.com", NON_PAGE),
+            (
+                "capacitor://localhost/path",
+                "an origin has no path, query or fragment",
+            ),
+            (
+                "capacitor://localhost?x",
+                "an origin has no path, query or fragment",
+            ),
+            (
+                "capacitor://localhost#x",
+                "an origin has no path, query or fragment",
+            ),
+            ("capacitor://user@localhost", "an origin has no user info"),
+            ("capacitor://", "an origin needs a host"),
+            ("capacitor:localhost", NO_SCHEME),
+            ("capacitor:/localhost", NO_SCHEME),
+            ("1app://localhost", NO_SCHEME),
+            ("ca pacitor://localhost", NO_SCHEME),
+            ("://localhost", NO_SCHEME),
+            ("localhost", NO_SCHEME),
+            (
+                "capacitor://*",
+                "the host must be exact; only the port may be *",
+            ),
+            ("capacitor://localhost:0", BAD_PORT),
+        ] {
+            assert_eq!(reason(bad), expected, "{bad}");
+        }
+    }
+
+    #[test]
+    fn refused_custom_scheme_configuration_names_the_key() {
+        for bad in [
+            "null",
+            "*",
+            "capacitor://localhost:*",
+            "file://x",
+            "data:text/plain,x",
+            "blob:https://app.example.com/1",
+            "javascript:alert(1)",
+            "about:blank",
+            "capacitor://localhost/path",
+            "capacitor://user@localhost",
+            "capacitor://localhost?x",
+        ] {
+            let value = format!("capacitor://localhost,{bad}");
+            let error = read(&[("CORS_ORIGINS", value.as_str())]).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Invalid { key, .. } if key == "CORS_ORIGINS"),
+                "{bad}: {error:?}"
+            );
+            let text = error.to_string();
+            assert!(text.contains("CORS_ORIGINS"), "{bad}: {text}");
+            assert!(text.contains("origin #2 is invalid"), "{bad}: {text}");
+        }
+        let cors = read(&[
+            ("CORS_ORIGINS", "Capacitor://LocalHost, https://localhost"),
+            ("CORS_CREDENTIALS", "true"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(list(&cors), ["capacitor://localhost", "https://localhost"]);
+        assert!(cors.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn custom_scheme_origins_pass_preflights_only_when_listed() {
+        let cors = Cors::origins(["capacitor://localhost", "https://localhost"]).unwrap();
+        for origin in [
+            "capacitor://localhost",
+            "Capacitor://LocalHost",
+            "https://localhost",
+        ] {
+            let response = call(&cors, options("/echo", Some(origin), true)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers();
+            assert_eq!(headers["access-control-allow-origin"], origin);
+            assert!(headers.contains_key("access-control-allow-methods"));
+            assert_eq!(headers["vary"], "origin");
+
+            let request = Request::get("/echo")
+                .header("origin", origin)
+                .body(Body::empty())
+                .unwrap();
+            let response = call(&cors, request).await;
+            let headers = response.headers();
+            assert_eq!(headers["access-control-allow-origin"], origin);
+            assert!(
+                headers["access-control-expose-headers"]
+                    .to_str()
+                    .unwrap()
+                    .contains("grpc-status")
+            );
+            assert_eq!(headers["vary"], "origin");
+        }
+        for origin in ["capacitor://evil", "capacitor://localhost:8080", "null"] {
+            let response = call(&cors, options("/echo", Some(origin), true)).await;
+            assert!(cors_names(&response).is_empty(), "{origin}");
+            assert_eq!(response.headers()["vary"], "origin");
+        }
+
+        let unlisted = Cors::origins(["https://app.example.com"]).unwrap();
+        let response = call(
+            &unlisted,
+            options("/echo", Some("capacitor://localhost"), true),
+        )
+        .await;
+        assert!(cors_names(&response).is_empty(), "{:?}", response.headers());
     }
 }

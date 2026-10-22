@@ -397,7 +397,7 @@ if let Some(cors) = Cors::from_config(&EnvSource, "ORDERS_CORS_")? {
 | Method | Effect |
 |---|---|
 | `Cors::any_origin()` | `Access-Control-Allow-Origin: *` |
-| `Cors::origins(iter)?` | exactly these origins, normalized; an entry `scheme://host:*` allows that scheme and host on any port; `INVALID_ARGUMENT` on a bad entry or an empty list |
+| `Cors::origins(iter)?` | exactly these origins, normalized; an `http(s)://host:*` entry allows that scheme and host on any port; a custom-scheme entry (`capacitor://localhost`) matches exactly; `INVALID_ARGUMENT` on a bad entry or an empty list |
 | `Cors::from_config(source, prefix)?` | `Ok(None)` when `<prefix>ORIGINS` is unset or blank |
 | `Cors::config_keys(prefix)` | every key `from_config` reads, e.g. for an env template |
 | `.allow_credentials(bool)` | cookies and `Authorization` from the browser; needs an origin list |
@@ -421,7 +421,7 @@ Configuration keys (`<prefix>` is yours, e.g. `ORDERS_CORS_`):
 
 | Key | Value | Default |
 |---|---|---|
-| `<prefix>ORIGINS` | `*` or a comma-separated origin list; an entry may end in `:*` for any port (`http://localhost:*`) | unset: CORS off |
+| `<prefix>ORIGINS` | `*` or a comma-separated origin list; an `http(s)` entry may end in `:*` for any port (`http://localhost:*`); custom schemes allowed (`capacitor://localhost`) | unset: CORS off |
 | `<prefix>CREDENTIALS` | bool | `false` |
 | `<prefix>MAX_AGE` | duration (`10m`, `3600`) | `1h` |
 | `<prefix>ALLOW_HEADERS` | comma-separated header names, added to the defaults | — |
@@ -450,6 +450,21 @@ The rules:
   explicit list entry, so it works with `allow_credentials(true)`. Keep
   these entries out of production configuration: any program on that host
   can then answer from some port.
+- **Custom schemes, exact match.** An app that runs in a mobile web view is
+  served from an origin of its own scheme: Capacitor's iOS shell sends
+  `Origin: capacitor://localhost` (its Android shell sends
+  `https://localhost`, an ordinary entry). List such an origin literally,
+  `scheme://host` with an optional numeric port and nothing else:
+  ```text
+  ORDERS_CORS_ORIGINS=https://app.example.com,capacitor://localhost,https://localhost
+  ```
+  The scheme is a letter followed by letters, digits, `+`, `-` and `.`. The
+  entry is stored lowercase and matches one `Origin` exactly, ignoring ASCII
+  case (`Capacitor://LocalHost` matches, since a web view may keep the case
+  of a custom URL's host; `capacitor://evil` and `capacitor://localhost:8080`
+  do not), and the answer echoes the `Origin` as sent. A custom scheme has no
+  default port and never takes the port `*`. It works with
+  `allow_credentials(true)` like any listed entry.
 - **Authoritative.** `access-control-*` headers set by your layers or handlers
   are removed before the server adds its own, so inner code can never widen
   the policy.
@@ -459,11 +474,16 @@ The rules:
   trailing slash, IPv4 hosts in dotted decimal and IPv6 hosts in their
   shortest form (`http://[0:0::1]` becomes `http://[::1]`; IPv4-mapped
   addresses in hex, `[::ffff:102:304]`). Duplicates collapse.
-- **Rejected entries** (`INVALID_ARGUMENT`): anything but `http://` or
-  `https://`, a path, query, fragment or user info, `*` inside a list (use
-  `any_origin`), `null`, a malformed host or port (a `*` in the host as in
-  `http://*:80` or `https://*.example.com`, a port such as `*x`, or anything
-  after `:*`), and an empty list. The
+- **Rejected entries** (`INVALID_ARGUMENT`, or under `<prefix>ORIGINS` from
+  `from_config`): an entry without `scheme://`, a path, query, fragment or
+  user info (`capacitor://localhost/app`, `capacitor://user@localhost`,
+  `capacitor://localhost?x`), `*` inside a list (use `any_origin`), `null`,
+  the schemes `file`, `data`, `blob`, `javascript` and `about` (their
+  documents send `Origin: null`, which is never allowed), `ftp`, `ws` and
+  `wss` (they serve no page), a malformed scheme, host or port (a `*` in the
+  host as in `http://*:80` or `https://*.example.com`, a port such as `*x`,
+  anything after `:*`, or `:*` on a custom scheme as in
+  `capacitor://localhost:*`), and an empty list. The
   error names the entry by position (`origin #2`, counting from 1; blank
   entries in configuration count too), never by its text, which may hold a
   credential.

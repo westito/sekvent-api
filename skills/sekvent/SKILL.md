@@ -185,8 +185,11 @@ let server = builder.bind(config.listen_addr).await?;
 - CORS covers REST and gRPC-Web. Origins are `http(s)://host[:port]`,
   normalized (IPv6 hosts included, e.g. `http://[::1]:8080`); the port `*`
   (`http://localhost:*`) allows that exact host on any port, for dev
-  servers with a fresh port per run, and works with credentials. A path,
-  `*` inside a list or in a host, `null` or an empty list is
+  servers with a fresh port per run, and works with credentials. A
+  custom-scheme origin for a mobile web view (`capacitor://localhost`) is
+  listed literally and matches exactly, ignoring case; it takes no `:*`.
+  A path, `*` inside a list or in a host, `null`, `file:`/`data:`/`blob:`/
+  `javascript:`/`about:`, `ftp`/`ws`/`wss` or an empty list is
   `INVALID_ARGUMENT` naming the key and the entry's index, never its text. Credentials with
   `Cors::any_origin()` fail `bind`.
   Defaults allow `authorization`, `content-type`, `grpc-timeout`,
