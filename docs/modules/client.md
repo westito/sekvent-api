@@ -113,7 +113,8 @@ async fn demo(api_key: Secret) -> Result<(), Box<dyn std::error::Error>> {
   only on transient errors.
 - **`HttpResponse`** is a successful response (`2xx`, or a `3xx` that was
   not followed) with the body already read into memory. Every other status
-  is an `Err(AppError)`.
+  is an `Err(AppError)`, unless the request accepts error statuses (see
+  [reading an upstream's error body](#how-to-read-an-upstreams-error-body)).
 - **Third-party versus sekvent upstreams.** By default an upstream is
   treated as a third party: it sees only the "external" part of the
   context, its error bodies are ignored, and a `401`/`403` from it is this
@@ -149,6 +150,8 @@ impl HttpClientBuilder {
     pub fn clock(self, clock: Arc<dyn Clock>) -> Self;
     pub fn propagate_context(self, propagate: bool) -> Self;
     pub fn sekvent_upstream(self, sekvent: bool) -> Self;
+    pub fn accept_error_status(self, accept: bool) -> Self;
+    pub fn max_response_bytes(self, limit: usize) -> Self;
     pub fn redirects(self, policy: RedirectPolicy) -> Self;
     pub fn build(self) -> Result<HttpClient, BuildError>;
 }
@@ -167,6 +170,8 @@ impl HttpClientBuilder {
 | `clock` | `SystemClock` | Only used to turn a `Retry-After` date into a delay. |
 | `propagate_context` | `true` | See [context propagation](#how-context-propagates). |
 | `sekvent_upstream` | `false` | See [error mapping](#how-upstream-errors-are-mapped). |
+| `accept_error_status` | `false` | Return non-success responses as `Ok`; a request can override it. See [reading an upstream's error body](#how-to-read-an-upstreams-error-body). |
+| `max_response_bytes` | none (unbounded) | Largest body read, in bytes, for every status. Zero is rejected. See [body size](#body-size). |
 | `redirects` | `RedirectPolicy::SameOrigin` | See [redirects](#how-redirects-are-handled). |
 
 `build` fails closed; messages name the setting, never its value (a URL
@@ -176,6 +181,7 @@ may carry credentials):
 |---|---|
 | `InvalidBaseUrl` | `the base URL is not a valid absolute http(s) URL` |
 | `InvalidTimeout { name }` | `the {name} must be longer than zero` (`connect timeout`, `request timeout`, `read timeout`) |
+| `InvalidLimit { name }` | `the {name} must be larger than zero` (`maximum response size`) |
 | `InvalidHeader { name }` | `the default header {name} is invalid` (also `user-agent`) |
 | `Tls(_)` | `the TLS configuration could not be initialised` (e.g. no platform root certificates) |
 | `Backend(_)` | `the HTTP client could not be initialised` |
@@ -321,12 +327,15 @@ impl RequestBuilder {
     pub fn header(self, name: &str, value: &str) -> Self;
     pub fn idempotent(self, idempotent: bool) -> Self;
     pub fn policy(self, policy: Policy) -> Self;
+    pub fn accept_error_status(self, accept: bool) -> Self;
     pub async fn send(self, ctx: &CallContext) -> Result<HttpResponse, AppError>;
     pub async fn send_json<R: DeserializeOwned>(self, ctx: &CallContext) -> Result<R, AppError>;
 }
 
 impl HttpResponse {
     pub fn status(&self) -> StatusCode;
+    pub fn is_error(&self) -> bool;
+    pub fn error_for_status(self) -> Result<HttpResponse, AppError>;
     pub fn headers(&self) -> &HeaderMap;
     pub fn body(&self) -> &Bytes;
     pub fn into_body(self) -> Bytes;
@@ -354,8 +363,10 @@ impl HttpResponse {
   only when the builder calls themselves were fine.
 
 `send` returns the response for `2xx` and for a `3xx` that was not
-followed; every other status is an error (see below). `send_json` is `send`
-followed by `HttpResponse::json`.
+followed; every other status is an error (see below) unless error statuses
+are accepted. `send_json` is `send` followed by `HttpResponse::json`; it
+always fails on a non-success status, even when error statuses are
+accepted, so an error body is never decoded as the success type.
 
 Reading the body:
 
@@ -377,9 +388,77 @@ response body could not be decoded`, `the upstream response body is not
 valid UTF-8`). The JSON error's source describes only the position
 (`JSON data error at line 1 column 7`), never the payload.
 
+### Body size
+
 The whole body is read into memory before `send` returns; there is no
-streaming API and no size cap. Do not point the client at endpoints that
-can return unbounded bodies.
+streaming API. By default there is no size cap either. Set
+`max_response_bytes(limit)` on the client to bound it: a body longer than
+`limit` bytes (after decompression), whether announced by
+`content-length` or found while reading, fails the attempt with `INTERNAL`
+(`the upstream response body is larger than the configured limit`, reason
+`UPSTREAM_BODY_TOO_LARGE`, metadata `upstream_status`). The cap applies to
+every status, so it also bounds an error body you read yourself; the error
+is not transient and is not retried. Without a cap, do not point the client
+at endpoints that can return unbounded bodies.
+
+## How to read an upstream's error body
+
+Some upstreams, payment providers among them, explain a failure only in
+the body of a `4xx`: a declined card, a removed card and refused
+credentials share one status and differ in an error code inside the JSON.
+The default mapping cannot tell them apart, because it never reads an
+untrusted body. Accept error statuses and classify the response yourself:
+
+```rust
+#[derive(Deserialize)]
+struct ProviderErrors {
+    errors: Vec<ProviderError>,
+}
+
+#[derive(Deserialize)]
+struct ProviderError {
+    code: String,
+}
+
+let response = payments
+    .post("/charges")
+    .json(&charge)
+    .accept_error_status(true)
+    .send(&ctx)
+    .await?;
+if response.status() == StatusCode::BAD_REQUEST {
+    let body: ProviderErrors = response.json()?;
+    if body.errors.iter().any(|error| error.code == "card_declined") {
+        return Err(AppError::failed_precondition("the card was declined"));
+    }
+}
+// Anything else: the standard mapping, as without the opt-in.
+let response = response.error_for_status()?;
+```
+
+- `accept_error_status(true)` on a request, or on the client builder as the
+  default for every request (a request's own setting wins), makes `send`
+  return a response of any status as `Ok(HttpResponse)`, with status,
+  headers and body intact.
+- `HttpResponse::is_error` is `true` for a status other than `2xx`/`3xx`.
+- `HttpResponse::error_for_status` returns the response unchanged when it
+  is not an error, and otherwise the `AppError` the client would have
+  returned without the opt-in: the same code, message, reason, metadata
+  and `Retry-After` (a date is measured from when the response arrived), a
+  `sekvent_upstream(true)` peer's envelope adopted as usual. The body never
+  reaches it.
+- **The resilience policy is unaffected.** Each attempt is still judged by
+  the status-mapped error: a transient status (`408`, `429`, `502`, `503`,
+  `504`) of an idempotent request is retried exactly as without the
+  opt-in, and `send` returns the response of the last attempt; the retry
+  budget and the breaker count the same successes and failures. A `401`
+  still triggers the single bearer refresh first. Transport failures,
+  timeouts, cancellation and an oversized body (see [body size](#body-size))
+  remain errors.
+- Only the caller sees the body. It is not logged, and `Debug` of the
+  response shows only status and length. Treat it as untrusted input: parse
+  it into a type, set `max_response_bytes`, and never copy its text into
+  your own error messages.
 
 ## How redirects are handled
 
@@ -862,6 +941,7 @@ follows redirects to other hosts.
 | Path off the base origin, bad path | `INVALID_ARGUMENT` | none | `the request path must stay on the base URL's host`, `the request path is not a valid URL` |
 | Bad header, bad content type | `INVALID_ARGUMENT` | none | `invalid request header`, `invalid content type` |
 | Body serialization | `INTERNAL` | none | `the request body could not be serialized` |
+| Body over `max_response_bytes` | `INTERNAL` | `UPSTREAM_BODY_TOO_LARGE` (metadata `upstream_status`) | `the upstream response body is larger than the configured limit` |
 | Response decoding | `INTERNAL` | none | `the upstream response body could not be decoded`, `… is not valid UTF-8` |
 
 The reasons are plain strings; the crate exports no constants for them.
@@ -955,8 +1035,12 @@ See [testing.md](testing.md) for containers and `await_until!`.
   a key per outbound request.
 - **Check `3xx` responses.** A redirect that leaves the origin, or the
   sixth one, is returned as `Ok` with the `3xx` status.
-- **Bodies are unbounded and buffered.** Only call endpoints whose response
-  size you trust.
+- **Bodies are buffered, and unbounded unless you set
+  `max_response_bytes`.** Set it for endpoints whose response size you do
+  not control, and always when you read error bodies with
+  `accept_error_status`.
+- **An accepted error body is untrusted input.** Parse it into a type and
+  decide from its fields; do not log it or pass its text to your callers.
 - **Never put secrets in the URL path.** The path goes into the debug span
   (the query does not), and upstreams and proxies log URLs. Use
   `bearer_token`, `basic_auth` or a default header.

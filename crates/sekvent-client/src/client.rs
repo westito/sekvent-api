@@ -3,15 +3,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use bytes::BytesMut;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Method, StatusCode};
 use reqwest::Url;
 use sekvent_config::Secret;
 use sekvent_context::{CallContext, Clock, SystemClock};
-use sekvent_error::AppError;
+use sekvent_error::{AppError, ErrorCode};
 use sekvent_resilience::{Policy, RetryPolicy, Timeout};
 
 use crate::mapping::{map_status, map_transport_error};
+use crate::response::AcceptedResponse;
 use crate::{BearerSource, HttpResponse, RequestBuilder};
 
 /// Most redirects [`RedirectPolicy::SameOrigin`] follows for one request.
@@ -81,6 +83,12 @@ pub enum BuildError {
         /// The setting, e.g. `request timeout`.
         name: &'static str,
     },
+    /// A size limit is zero, which would fail every response with a body.
+    #[error("the {name} must be larger than zero")]
+    InvalidLimit {
+        /// The setting, e.g. `maximum response size`.
+        name: &'static str,
+    },
     /// A default header name or value is invalid.
     #[error("the default header {name} is invalid")]
     InvalidHeader {
@@ -118,6 +126,8 @@ pub(crate) struct Inner {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) propagate_context: bool,
     pub(crate) sekvent_upstream: bool,
+    pub(crate) accept_error_status: bool,
+    pub(crate) max_response_bytes: Option<usize>,
 }
 
 /// An outbound HTTP client. Cheap to clone; clones share the connection
@@ -205,7 +215,9 @@ impl HttpClient {
     }
 
     /// One attempt: send, re-authenticate once on `401` when a bearer source
-    /// is configured, read the body and map failures.
+    /// is configured, read the body and map failures. With
+    /// `accept_error_status`, a status-mapped error carries the response as
+    /// its source ([`AcceptedResponse`]).
     pub(crate) async fn attempt(
         &self,
         ctx: &CallContext,
@@ -213,6 +225,7 @@ impl HttpClient {
         url: &Url,
         headers: &HeaderMap,
         body: Option<&Bytes>,
+        accept_error_status: bool,
     ) -> Result<HttpResponse, AppError> {
         let mut headers = headers.clone();
         if self.inner.propagate_context {
@@ -233,17 +246,34 @@ impl HttpClient {
         let status = response.status();
         tracing::Span::current().record("status", status.as_u16());
         let response_headers = response.headers().clone();
-        let bytes = response.bytes().await.map_err(map_transport_error)?;
+        let bytes = read_body(response, self.inner.max_response_bytes).await?;
+        let received_at = self.inner.clock.now();
         if status.is_success() || status.is_redirection() {
-            Ok(HttpResponse::new(status, response_headers, bytes))
-        } else {
-            Err(map_status(
+            return Ok(HttpResponse::new(
                 status,
-                &response_headers,
-                &bytes,
-                self.inner.clock.now(),
+                response_headers,
+                bytes,
+                received_at,
                 self.inner.sekvent_upstream,
-            ))
+            ));
+        }
+        let error = map_status(
+            status,
+            &response_headers,
+            &bytes,
+            received_at,
+            self.inner.sekvent_upstream,
+        );
+        if accept_error_status {
+            Err(error.with_source(AcceptedResponse(HttpResponse::new(
+                status,
+                response_headers,
+                bytes,
+                received_at,
+                self.inner.sekvent_upstream,
+            ))))
+        } else {
+            Err(error)
         }
     }
 
@@ -278,6 +308,39 @@ impl HttpClient {
     }
 }
 
+/// Read the whole body, failing once it grows past `limit` bytes.
+async fn read_body(
+    mut response: reqwest::Response,
+    limit: Option<usize>,
+) -> Result<Bytes, AppError> {
+    let Some(limit) = limit else {
+        return response.bytes().await.map_err(map_transport_error);
+    };
+    let status = response.status();
+    let too_large = || {
+        AppError::new(
+            ErrorCode::Internal,
+            "the upstream response body is larger than the configured limit",
+        )
+        .with_reason("UPSTREAM_BODY_TOO_LARGE")
+        .with_metadata("upstream_status", status.as_u16().to_string())
+    };
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > u64::try_from(limit).unwrap_or(u64::MAX))
+    {
+        return Err(too_large());
+    }
+    let mut body = BytesMut::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_transport_error)? {
+        if chunk.len() > limit - body.len() {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
 /// `min(request timeout, time left before the deadline)`.
 fn effective_timeout(configured: Option<Duration>, ctx: &CallContext) -> Option<Duration> {
     match (configured, sekvent_resilience::remaining(ctx)) {
@@ -299,6 +362,8 @@ pub struct HttpClientBuilder {
     clock: Arc<dyn Clock>,
     propagate_context: bool,
     sekvent_upstream: bool,
+    accept_error_status: bool,
+    max_response_bytes: Option<usize>,
     redirects: RedirectPolicy,
 }
 
@@ -309,6 +374,8 @@ impl fmt::Debug for HttpClientBuilder {
             .field("request_timeout", &self.request_timeout)
             .field("read_timeout", &self.read_timeout)
             .field("sekvent_upstream", &self.sekvent_upstream)
+            .field("accept_error_status", &self.accept_error_status)
+            .field("max_response_bytes", &self.max_response_bytes)
             .field("redirects", &self.redirects)
             .finish_non_exhaustive()
     }
@@ -328,6 +395,8 @@ impl Default for HttpClientBuilder {
             clock: Arc::new(SystemClock),
             propagate_context: true,
             sekvent_upstream: false,
+            accept_error_status: false,
+            max_response_bytes: None,
             redirects: RedirectPolicy::SameOrigin,
         }
     }
@@ -443,6 +512,25 @@ impl HttpClientBuilder {
         self.sekvent_upstream = sekvent;
         self
     }
+    /// Return responses with a status other than `2xx`/`3xx` as
+    /// `Ok(HttpResponse)` instead of an `AppError` (off by default), for
+    /// upstreams whose error bodies the caller must read itself. A request
+    /// can override it with [`RequestBuilder::accept_error_status`]; see
+    /// there for how retries and the breaker treat such responses.
+    #[must_use]
+    pub fn accept_error_status(mut self, accept: bool) -> Self {
+        self.accept_error_status = accept;
+        self
+    }
+    /// The largest response body, in bytes, the client reads (unbounded by
+    /// default). A larger body fails the attempt with `INTERNAL`
+    /// (`UPSTREAM_BODY_TOO_LARGE`) before it is read further, whatever its
+    /// status. Zero is rejected.
+    #[must_use]
+    pub fn max_response_bytes(mut self, limit: usize) -> Self {
+        self.max_response_bytes = Some(limit);
+        self
+    }
     /// Which redirects to follow (default [`RedirectPolicy::SameOrigin`]).
     #[must_use]
     pub fn redirects(mut self, policy: RedirectPolicy) -> Self {
@@ -461,6 +549,11 @@ impl HttpClientBuilder {
             if timeout.is_some_and(|timeout| timeout.is_zero()) {
                 return Err(BuildError::InvalidTimeout { name });
             }
+        }
+        if self.max_response_bytes == Some(0) {
+            return Err(BuildError::InvalidLimit {
+                name: "maximum response size",
+            });
         }
 
         let mut headers = HeaderMap::new();
@@ -506,6 +599,8 @@ impl HttpClientBuilder {
                 clock: self.clock,
                 propagate_context: self.propagate_context,
                 sekvent_upstream: self.sekvent_upstream,
+                accept_error_status: self.accept_error_status,
+                max_response_bytes: self.max_response_bytes,
             }),
         })
     }
@@ -527,8 +622,6 @@ pub(crate) fn parse_base_url(raw: &str) -> Result<Url, BuildError> {
 
 #[cfg(test)]
 mod tests {
-    use sekvent_error::ErrorCode;
-
     use super::*;
 
     #[test]

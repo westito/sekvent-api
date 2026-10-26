@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::Instrument;
 
+use crate::response::AcceptedResponse;
 use crate::{HttpClient, HttpResponse};
 
 /// A request being built. Nothing is sent until [`RequestBuilder::send`].
@@ -28,6 +29,7 @@ pub struct RequestBuilder {
     body: Option<Bytes>,
     idempotent: bool,
     policy: Option<Policy>,
+    accept_error_status: Option<bool>,
     error: Option<AppError>,
 }
 
@@ -37,6 +39,7 @@ impl fmt::Debug for RequestBuilder {
             .field("method", &self.method)
             .field("path", &self.url.as_ref().map(Url::path).ok())
             .field("idempotent", &self.idempotent)
+            .field("accept_error_status", &self.accept_error_status)
             .finish_non_exhaustive()
     }
 }
@@ -61,6 +64,7 @@ impl RequestBuilder {
             body: None,
             idempotent,
             policy: None,
+            accept_error_status: None,
             error: None,
         }
     }
@@ -150,8 +154,28 @@ impl RequestBuilder {
         self
     }
 
-    /// Send the request under the policy and return a successful response;
-    /// any non-success status is an `AppError`.
+    /// Return a response with a status other than `2xx`/`3xx` as
+    /// `Ok(HttpResponse)` instead of an `AppError`, overriding the client's
+    /// [`HttpClientBuilder::accept_error_status`](crate::HttpClientBuilder::accept_error_status).
+    /// Use it when the upstream's error body says what went wrong; check
+    /// [`HttpResponse::is_error`] and fall back to the standard mapping
+    /// with [`HttpResponse::error_for_status`].
+    ///
+    /// The policy still sees the status-mapped error: a transient status
+    /// (`408`, `429`, `502`, `503`, `504`) of an idempotent request is
+    /// retried as without this setting, the breaker counts the same
+    /// failures, and the response of the last attempt is returned.
+    /// Transport failures, timeouts, cancellation and a body over the size
+    /// limit stay errors.
+    #[must_use]
+    pub fn accept_error_status(mut self, accept: bool) -> Self {
+        self.accept_error_status = Some(accept);
+        self
+    }
+
+    /// Send the request under the policy and return the response. A status
+    /// other than `2xx`/`3xx` is an `AppError` unless error statuses are
+    /// accepted ([`RequestBuilder::accept_error_status`]).
     pub async fn send(self, ctx: &CallContext) -> Result<HttpResponse, AppError> {
         if let Some(error) = self.error {
             return Err(error);
@@ -168,13 +192,20 @@ impl RequestBuilder {
         let started = Instant::now();
         let client = &self.client;
         let policy = self.policy.as_ref().unwrap_or(&client.inner.policy);
+        let accept_error_status = self
+            .accept_error_status
+            .unwrap_or(client.inner.accept_error_status);
         let (method, headers, body) = (&self.method, &self.headers, self.body.as_ref());
         let result = policy
             .call(ctx, self.idempotent, || {
-                client.attempt(ctx, method, &url, headers, body)
+                client.attempt(ctx, method, &url, headers, body, accept_error_status)
             })
             .instrument(span.clone())
             .await;
+        let result = result.or_else(|error| match AcceptedResponse::carried_by(&error) {
+            Some(response) => Ok(response.clone()),
+            None => Err(error),
+        });
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         span.record("elapsed_ms", elapsed_ms);
         match &result {
@@ -186,9 +217,11 @@ impl RequestBuilder {
         result
     }
 
-    /// [`RequestBuilder::send`], then decode the body as JSON.
+    /// [`RequestBuilder::send`], then decode the body as JSON. A status
+    /// other than `2xx`/`3xx` is always an `AppError` here, even when error
+    /// statuses are accepted, so an error body is never decoded as `R`.
     pub async fn send_json<R: DeserializeOwned>(self, ctx: &CallContext) -> Result<R, AppError> {
-        self.send(ctx).await?.json()
+        self.send(ctx).await?.error_for_status()?.json()
     }
 }
 

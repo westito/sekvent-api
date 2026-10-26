@@ -699,3 +699,201 @@ fn invalid_base_urls_are_rejected() {
         assert!(matches!(error, BuildError::InvalidBaseUrl), "{bad}");
     }
 }
+
+/// A route answering `/status/{code}` with that status, a JSON error body
+/// that names the failure, and an extra header.
+fn provider_errors() -> Router {
+    Router::new().route(
+        "/status/{code}",
+        any(|Path(code): Path<u16>| async move {
+            (
+                StatusCode::from_u16(code).unwrap(),
+                [("x-upstream-trace", format!("t-{code}"))],
+                Json(json!({ "errors": [{ "code": format!("code_{code}"), "detail": "SECRET" }] })),
+            )
+        }),
+    )
+}
+
+#[tokio::test]
+async fn accepted_error_statuses_return_the_response() {
+    let base = serve(provider_errors()).await;
+    let client = plain_client(&base);
+    let ctx = CallContext::new();
+    for (status, code) in [
+        (400, ErrorCode::InvalidArgument),
+        (404, ErrorCode::NotFound),
+        (500, ErrorCode::Internal),
+    ] {
+        let path = format!("/status/{status}");
+        let response = client
+            .post(&path)
+            .accept_error_status(true)
+            .send(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        assert!(response.is_error());
+        assert_eq!(
+            header_text(response.headers(), "x-upstream-trace"),
+            Some(format!("t-{status}"))
+        );
+        let body: Value = response.json().unwrap();
+        assert_eq!(body["errors"][0]["code"], format!("code_{status}"));
+        assert!(!format!("{response:?}").contains("SECRET"));
+
+        let mapped = response.error_for_status().unwrap_err();
+        let default = client.post(&path).send(&ctx).await.unwrap_err();
+        assert_eq!(default.code(), code, "HTTP {status} without the opt-in");
+        assert_eq!(mapped.code(), default.code());
+        assert_eq!(mapped.message(), default.message());
+        assert_eq!(mapped.reason(), default.reason());
+        assert_eq!(mapped.metadata(), default.metadata());
+        assert!(!format!("{mapped:?}").contains("SECRET"));
+    }
+
+    let ok = client
+        .get("/status/201")
+        .accept_error_status(true)
+        .send(&ctx)
+        .await
+        .unwrap();
+    assert!(!ok.is_error());
+    assert_eq!(ok.error_for_status().unwrap().status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn the_client_default_can_accept_error_statuses() {
+    let base = serve(provider_errors()).await;
+    let client = HttpClient::builder()
+        .base_url(&base)
+        .policy(Policy::new("test"))
+        .accept_error_status(true)
+        .build()
+        .unwrap();
+    let ctx = CallContext::new();
+    let response = client.get("/status/409").send(&ctx).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let overridden = client
+        .get("/status/409")
+        .accept_error_status(false)
+        .send(&ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(overridden.code(), ErrorCode::AlreadyExists);
+
+    let decoded = client
+        .get("/status/404")
+        .send_json::<Value>(&ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        decoded.code(),
+        ErrorCode::NotFound,
+        "send_json never decodes an error body as the success type"
+    );
+}
+
+#[tokio::test]
+async fn accepted_statuses_are_retried_like_errors() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let router = Router::new()
+        .route(
+            "/flaky",
+            any(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                async move { (StatusCode::SERVICE_UNAVAILABLE, format!("attempt {n}")) }
+            }),
+        )
+        .route(
+            "/rejected",
+            any(|| async { (StatusCode::BAD_REQUEST, "declined") }),
+        );
+    let base = serve(router).await;
+    let client = HttpClient::builder()
+        .base_url(&base)
+        .policy(fast_retries())
+        .accept_error_status(true)
+        .build()
+        .unwrap();
+    let ctx = CallContext::new();
+
+    let last = client.get("/flaky").send(&ctx).await.unwrap();
+    assert_eq!(last.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(hits.swap(0, Ordering::SeqCst), 3, "GET is retried");
+    assert_eq!(
+        last.text().unwrap(),
+        "attempt 3",
+        "the last attempt's response"
+    );
+
+    let once = client.post("/flaky").send(&ctx).await.unwrap();
+    assert_eq!(once.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(hits.swap(0, Ordering::SeqCst), 1, "POST is not retried");
+
+    let rejected = client.get("/rejected").send(&ctx).await.unwrap();
+    assert_eq!(rejected.text().unwrap(), "declined");
+
+    let refused = plain_client("http://127.0.0.1:1")
+        .get("/")
+        .accept_error_status(true)
+        .send(&ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code(),
+        ErrorCode::Unavailable,
+        "transport failures stay errors"
+    );
+}
+
+#[tokio::test]
+async fn response_bodies_can_be_capped() {
+    let router = Router::new()
+        .route(
+            "/big",
+            get(|| async { (StatusCode::BAD_REQUEST, "x".repeat(4096)) }),
+        )
+        .route("/small", get(|| async { "x".repeat(1024) }))
+        .route(
+            "/streamed",
+            get(|| async {
+                let chunks = (0..8).map(|_| Ok::<_, std::io::Error>("x".repeat(512)));
+                axum::body::Body::from_stream(futures::stream::iter(chunks))
+            }),
+        );
+    let base = serve(router).await;
+    let client = HttpClient::builder()
+        .base_url(&base)
+        .policy(Policy::new("test"))
+        .max_response_bytes(1024)
+        .build()
+        .unwrap();
+    let ctx = CallContext::new();
+
+    let small = client.get("/small").send(&ctx).await.unwrap();
+    assert_eq!(small.body().len(), 1024);
+    for path in ["/big", "/streamed"] {
+        let error = client
+            .get(path)
+            .accept_error_status(true)
+            .send(&ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Internal, "{path}");
+        assert_eq!(error.reason(), Some("UPSTREAM_BODY_TOO_LARGE"), "{path}");
+    }
+
+    let error = HttpClient::builder()
+        .max_response_bytes(0)
+        .build()
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BuildError::InvalidLimit {
+            name: "maximum response size"
+        }
+    ));
+}

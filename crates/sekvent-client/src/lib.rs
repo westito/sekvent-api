@@ -19,7 +19,10 @@
 //!   internal source chain). Sekvent JSON error bodies are adopted only from
 //!   upstreams declared with
 //!   [`HttpClientBuilder::sekvent_upstream`]; otherwise a `401`/`403`
-//!   means this service's credentials were refused and maps to `INTERNAL`;
+//!   means this service's credentials were refused and maps to `INTERNAL`.
+//!   A caller that must read an upstream's error body opts in with
+//!   [`RequestBuilder::accept_error_status`] and gets the response instead;
+//!   [`HttpClientBuilder::max_response_bytes`] bounds what is read;
 //! - redirects followed only within the original origin
 //!   ([`RedirectPolicy`]), so credentials and identity headers never reach
 //!   another host;

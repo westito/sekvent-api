@@ -241,6 +241,21 @@ async fn a_401_invalidates_and_retries_once() {
     );
     assert_eq!(server.token_hits.load(Ordering::SeqCst), 4);
     assert_eq!(server.api_hits.load(Ordering::SeqCst), 5);
+
+    creds.invalidate();
+    let refused = client
+        .post("/secure")
+        .accept_error_status(true)
+        .send(&ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        StatusCode::UNAUTHORIZED,
+        "an accepted 401 is returned after the same single re-authentication"
+    );
+    assert_eq!(server.token_hits.load(Ordering::SeqCst), 6);
+    assert_eq!(server.api_hits.load(Ordering::SeqCst), 7);
 }
 
 #[tokio::test]
