@@ -54,6 +54,9 @@ runtime-vfs = ["runtime", "sekvent-runtime/vfs"]
 # sekvent-runtime: `Embedded`, static files compiled in with rust-embed.
 runtime-vfs-embed = ["runtime-vfs", "sekvent-runtime/vfs-embed"]
 
+# sekvent-resilience: `ClientLimitLayer`, per-client limits on axum routes.
+resilience-http = ["resilience", "sekvent-resilience/http"]
+
 # sekvent-auth adapters.
 auth-axum = ["auth", "sekvent-auth/axum"]
 auth-tonic = ["auth", "sekvent-auth/tonic"]
@@ -98,6 +101,7 @@ full = [
     "runtime-cron",
     "runtime-vfs",
     "runtime-vfs-embed",
+    "resilience-http",
     "auth-axum",
     "auth-tonic",
     "auth-tokio",

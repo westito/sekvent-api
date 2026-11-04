@@ -33,6 +33,7 @@ speed and flakes: the `rust-testing` skill.
 | File downloads (safe headers, type sniffing, filenames) | `runtime` (`Download`) | default |
 | A built frontend (SPA) served from the binary next to the API | `runtime::vfs` (`StaticSite`, `Directory`, `Embedded`; `ServerBuilder::site`) | `runtime-vfs`; `runtime-vfs-embed` for files compiled in |
 | Timeout, retry, rate gate, bulkhead, breaker, backoff, TTL cache | `resilience` | `resilience` |
+| Per-client rate limits (by client address or end user) on public methods and REST routes | `resilience::{KeyedRateLimiter, ClientLimiter, ClientLimitLayer}`; component `CLIENT_*` policy fields; `runtime::ClientAddrPolicy` behind proxies | `resilience`; `resilience-http` for the axum layer |
 | Password hashing (argon2id, bcrypt), JWT, login | `auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` (async hashing) |
 | Browser sign-in with an external account (OAuth 2.0 code flow, Bitbucket Cloud) | `sso` | `sso` |
 | Service-to-service tokens | `link` | `link`; `link-axum`, `link-tonic` |

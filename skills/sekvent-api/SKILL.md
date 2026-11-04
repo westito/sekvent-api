@@ -50,7 +50,7 @@ can describe APIs the project does not have yet.
 | Browser uploads/downloads via S3-compatible storage (presigned URLs), keys, MinIO tests | `docs/modules/storage.md` |
 | Service-to-service tokens | `docs/modules/link.md` |
 | Call an upstream HTTP API (retries, OAuth 2.0, context propagation) | `docs/modules/client.md` |
-| Retry, breaker, bulkhead, rate gate, timeout, TTL cache | `docs/modules/resilience.md` |
+| Retry, breaker, bulkhead, rate gate, per-client rate limits, timeout, TTL cache | `docs/modules/resilience.md` |
 | Components (trait + proto contract, App builder, bindings, split topology) | `docs/modules/components.md`, concepts in `docs/component-model.md` |
 | Stream live updates to a browser or service (server-streaming `#[call(stream)]`, `CallStream`, lifetime, drain, HTTP/2 keep-alive) | `docs/modules/components.md` ("How to stream replies"), `docs/modules/server.md` ("Keep long streams alive") |
 | `build.rs` protobuf codegen without `protoc` | `docs/modules/proto-build.md` |
@@ -139,6 +139,7 @@ this shape; read it before restructuring.
 | Outbound HTTP | `client` |
 | File uploads/downloads (S3, MinIO, presigned URLs) | `storage` |
 | Retry, breaker, TTL cache | `resilience` |
+| Per-client rate limit on axum routes (`ClientLimitLayer`) | `resilience-http` |
 | Service-to-service tokens | `link` (+ `link-axum` / `link-tonic`) |
 | Components | `component` (+ `component-grpc` for the gRPC binding, also for serving streams; `runtime-grpc-web` for browsers) |
 

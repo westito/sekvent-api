@@ -46,6 +46,7 @@
 //! | `SEKVENT_COMPONENT_<C>_<M>_<FIELD>` | resilience field of method `M` |
 //! | `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME` | lifetime of the streams of every streaming method of `C` (default 15 minutes; known only when `C` has one) |
 //! | `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` | lifetime of the streams of streaming method `M` |
+//! | `SEKVENT_COMPONENT_<C>_<M>_CLIENT_RATE`, `_CLIENT_BURST`, `_CLIENT_KEY`, `_CLIENT_MAX_KEYS` | per-client limit of `M` served over gRPC (also in named policies, not at component level) |
 //!
 //! Fields are those of `sekvent_resilience::PolicySpec` except `RATE_LIMIT_*`:
 //! `TIMEOUT` (caller side, and serving side for gRPC-served calls), the
@@ -56,6 +57,17 @@
 //! breaker on), `#[call]` attribute, named policy, component keys, method
 //! keys. The key set does not depend on the binding. Without the `grpc`
 //! feature, `grpc` parses but is not available.
+//!
+//! The `CLIENT_*` fields limit each client of a method served over gRPC
+//! with a token bucket: `CLIENT_RATE` (`<permits>/<period>`, such as
+//! `5/1m`; required by the others), `CLIENT_BURST` (default the permits),
+//! `CLIENT_KEY` (`client_addr`, the default, `end_user` or
+//! `end_user_or_client_addr`) and `CLIENT_MAX_KEYS` (default 100 000).
+//! A named policy's buckets are shared by every method using it, unless the
+//! method sets `CLIENT_*` keys of its own. A refused call gets
+//! `RESOURCE_EXHAUSTED` / `CLIENT_RATE_LIMITED` with `retry_after`;
+//! in-process calls are never limited. [`App::client_limiter`] hands the
+//! buckets to a REST route.
 //!
 //! # Calls
 //!

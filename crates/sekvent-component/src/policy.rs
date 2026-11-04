@@ -1,13 +1,16 @@
 //! Resilience policies of components: the layering of 4.3 (framework
 //! default, attribute, named policy, component keys, method keys) over
-//! [`PolicySpec`], per method and per component.
+//! [`PolicySpec`], per method and per component, and the per-client limits
+//! of served methods (`CLIENT_*`, named policy and method keys only).
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use sekvent_config::__private::opt_duration_value;
+use sekvent_config::__private::{opt_duration_value, opt_value};
 use sekvent_config::{ConfigError, ConfigSource};
-use sekvent_resilience::{PolicyError, PolicySpec, RetryBudget, RetryPolicy};
+use sekvent_resilience::{
+    ClientKey, ClientLimiter, KeyedLimit, PolicyError, PolicySpec, RetryBudget, RetryPolicy,
+};
 
 use crate::config::{self, key};
 use crate::server::MethodPolicy;
@@ -50,6 +53,19 @@ pub(crate) const COMPONENT_ONLY_FIELDS: &[&str] = &[
     "BREAKER_PERMITTED_IN_HALF_OPEN",
 ];
 
+/// The per-client limit of a served method: accepted at method level and
+/// in named policies (one set of buckets per named policy, shared by every
+/// method that uses it), not at component level.
+pub(crate) const CLIENT_FIELDS: &[&str] = &[
+    "CLIENT_RATE",
+    "CLIENT_BURST",
+    "CLIENT_KEY",
+    "CLIENT_MAX_KEYS",
+];
+
+const CLIENT_RATE_EXPECTED: &str = "<permits>/<period>, such as 5/1m or 100/1s";
+const CLIENT_KEY_EXPECTED: &str = "one of client_addr, end_user, end_user_or_client_addr";
+
 /// Default retry budget: tokens earned per success, and retries always
 /// allowed per second.
 const BUDGET_RATIO: f64 = 0.2;
@@ -58,6 +74,122 @@ const BUDGET_MIN_PER_SEC: u32 = 10;
 /// Every component-level field: method fields, then component-only ones.
 pub(crate) fn component_fields() -> impl Iterator<Item = &'static str> {
     METHOD_FIELDS.iter().chain(COMPONENT_ONLY_FIELDS).copied()
+}
+
+/// Every field of a named policy.
+fn named_fields() -> impl Iterator<Item = &'static str> {
+    component_fields().chain(CLIENT_FIELDS.iter().copied())
+}
+
+/// The `CLIENT_*` fields read at one level; `None` where unset.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ClientSpec {
+    rate: Option<KeyedLimit>,
+    burst: Option<u32>,
+    key: Option<ClientKey>,
+    max_keys: Option<usize>,
+}
+
+impl ClientSpec {
+    /// The fields under `prefix`; `None` after recording a malformed one.
+    fn read(source: &dyn ConfigSource, prefix: &str, errors: &mut Vec<BuildError>) -> Option<Self> {
+        let before = errors.len();
+        let field = |suffix: &str| format!("{prefix}{suffix}");
+        let malformed = |key: &str, expected: &str| ConfigError::Malformed {
+            key: source.describe(key),
+            expected: expected.to_owned(),
+        };
+        let rate_key = field("CLIENT_RATE");
+        let rate = source.get(&rate_key).and_then(|raw| {
+            KeyedLimit::parse_rate(&raw).or_else(|| {
+                errors.push(malformed(&rate_key, CLIENT_RATE_EXPECTED).into());
+                None
+            })
+        });
+        let key_key = field("CLIENT_KEY");
+        let key = source.get(&key_key).and_then(|raw| {
+            ClientKey::parse(raw.trim()).or_else(|| {
+                errors.push(malformed(&key_key, CLIENT_KEY_EXPECTED).into());
+                None
+            })
+        });
+        let mut number = |suffix: &str| -> Option<u64> {
+            opt_value::<u64>(source, &field(suffix))
+                .map_err(|error| errors.push(error.into()))
+                .ok()
+                .flatten()
+        };
+        let burst = number("CLIENT_BURST").map(|burst| u32::try_from(burst).unwrap_or(u32::MAX));
+        let max_keys =
+            number("CLIENT_MAX_KEYS").map(|keys| usize::try_from(keys).unwrap_or(usize::MAX));
+        (errors.len() == before).then_some(Self {
+            rate,
+            burst,
+            key,
+            max_keys,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// These fields over `base`.
+    fn over(&self, base: &Self) -> Self {
+        Self {
+            rate: self.rate.or(base.rate),
+            burst: self.burst.or(base.burst),
+            key: self.key.or(base.key),
+            max_keys: self.max_keys.or(base.max_keys),
+        }
+    }
+
+    /// The limiter these fields describe (`None` without any), its errors
+    /// recorded under `prefix`: another field needs `CLIENT_RATE`, and the
+    /// values must make a valid [`KeyedLimit`].
+    fn build(
+        &self,
+        source: &dyn ConfigSource,
+        prefix: &str,
+        errors: &mut Vec<BuildError>,
+    ) -> Result<Option<ClientLimiter>, Recorded> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let Some(mut limit) = self.rate else {
+            errors.push(
+                ConfigError::Invalid {
+                    key: source.describe(&format!("{prefix}CLIENT_RATE")),
+                    reason: format!("is required when another {prefix}CLIENT_* key is set"),
+                }
+                .into(),
+            );
+            return Err(Recorded);
+        };
+        if let Some(burst) = self.burst {
+            limit = limit.with_burst(burst);
+        }
+        if let Some(max_keys) = self.max_keys {
+            limit = limit.with_max_keys(max_keys);
+        }
+        let key = self.key.unwrap_or(ClientKey::ClientAddr);
+        match ClientLimiter::new(limit, key) {
+            Ok(limiter) => Ok(Some(limiter)),
+            Err(error) => {
+                check(source, &format!("{prefix}CLIENT_"), Err(error), errors);
+                Err(Recorded)
+            }
+        }
+    }
+}
+
+/// What one named policy (or no reference) contributes to a method.
+#[derive(Debug, Clone, Default)]
+struct NamedLayer {
+    spec: PolicySpec,
+    client: ClientSpec,
+    /// Built once per named policy and shared by its methods.
+    limiter: Option<ClientLimiter>,
 }
 
 /// The resolved policies of one component.
@@ -156,7 +288,7 @@ fn policy_prefix(name: &str) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct NamedPolicies {
     /// `None` for a policy that has no key or failed to read.
-    specs: BTreeMap<String, Option<PolicySpec>>,
+    specs: BTreeMap<String, Option<NamedLayer>>,
 }
 
 impl NamedPolicies {
@@ -169,9 +301,9 @@ impl NamedPolicies {
         name: &str,
         reference: &str,
         errors: &mut Vec<BuildError>,
-    ) -> Option<&PolicySpec> {
+    ) -> Option<&NamedLayer> {
         let prefix = policy_prefix(name);
-        if !component_fields().any(|field| source.get(&format!("{prefix}{field}")).is_some()) {
+        if !named_fields().any(|field| source.get(&format!("{prefix}{field}")).is_some()) {
             errors.push(
                 ConfigError::Invalid {
                     key: source.describe(reference),
@@ -184,15 +316,18 @@ impl NamedPolicies {
         }
         self.specs
             .entry(name.to_owned())
-            .or_insert_with(|| match PolicySpec::from_config(source, &prefix) {
-                Ok(mut spec) => {
+            .or_insert_with(|| {
+                let spec = from_config(source, &prefix, errors).map(|mut spec| {
                     strip_rate_limit(&mut spec);
-                    Some(spec)
-                }
-                Err(error) => {
-                    errors.push(error.into());
-                    None
-                }
+                    spec
+                });
+                let client = ClientSpec::read(source, &prefix, errors)?;
+                let limiter = client.build(source, &prefix, errors).ok()?;
+                Some(NamedLayer {
+                    spec: spec?,
+                    client,
+                    limiter,
+                })
             })
             .as_ref()
     }
@@ -205,7 +340,7 @@ impl NamedPolicies {
             .keys()
             .flat_map(|name| {
                 let prefix = policy_prefix(name);
-                component_fields().map(move |field| format!("{prefix}{field}"))
+                named_fields().map(move |field| format!("{prefix}{field}"))
             })
             .collect();
         config::check_unknown(source, POLICY_PREFIX, &known)
@@ -234,7 +369,7 @@ pub(crate) fn resolve(
         Ok(Some(name)) => named
             .get(source, &name, &component_reference, errors)
             .cloned(),
-        Ok(None) => Some(PolicySpec::default()),
+        Ok(None) => Some(NamedLayer::default()),
         Err(error) => {
             errors.push(error.into());
             None
@@ -256,56 +391,45 @@ pub(crate) fn resolve(
             &key(&[component, method.name(), STREAM_MAX_LIFETIME]),
             method.is_stream(),
             errors,
-        );
+        )
+        .and_then(|own| component_lifetime.map(|inherited| own.or(inherited)));
         let prefix = format!("{}_", key(&[component, method.name()]));
-        let own_method = from_config(source, &prefix, errors).map(|mut spec| {
-            strip_rate_limit(&mut spec);
-            strip_component_only(&mut spec);
-            spec
-        });
-        let reference = key(&[component, method.name(), POLICY]);
-        let method_named = match read_name(source, &reference) {
-            Ok(Some(name)) => match named.get(source, &name, &reference, errors) {
-                Some(spec) if has_component_only(spec) => {
-                    errors.push(
-                        ConfigError::Invalid {
-                            key: source.describe(&reference),
-                            reason: format!(
-                                "policy {name} sets component-only fields (retry budget or \
-                                 breaker); reference it from {component_reference} instead"
-                            ),
-                        }
-                        .into(),
-                    );
-                    None
-                }
-                spec => spec.cloned(),
-            },
-            Ok(None) => component_named.clone(),
-            Err(error) => {
-                errors.push(error.into());
-                None
-            }
-        };
-        if let (Some(own), Some(named_layer), Some(own_method), Ok(lifetime), Ok(inherited)) = (
-            &own,
-            &method_named,
-            &own_method,
-            lifetime,
-            component_lifetime,
-        ) {
-            let spec =
-                PolicySpec::resolve([&framework, &attribute(method), named_layer, own, own_method]);
+        let (own_method, own_client) = method_keys(source, &prefix, errors);
+        let method_named = method_layer(
+            source,
+            &key(&[component, method.name(), POLICY]),
+            &component_reference,
+            component_named.as_ref(),
+            named,
+            errors,
+        );
+        let client = method_client(
+            source,
+            &prefix,
+            method_named.as_ref(),
+            own_client.as_ref(),
+            errors,
+        );
+        if let (Some(own), Some(named_layer), Some(own_method), Ok(lifetime), Ok(client)) =
+            (&own, &method_named, &own_method, lifetime, client)
+        {
+            let spec = PolicySpec::resolve([
+                &framework,
+                &attribute(method),
+                &named_layer.spec,
+                own,
+                own_method,
+            ]);
             check(source, &prefix, method_checks(&spec), errors);
             methods.push(MethodPolicy {
                 timeout: spec.timeout,
                 spec,
                 max_lifetime: method.is_stream().then(|| {
                     lifetime
-                        .or(inherited)
                         .or(method.max_lifetime())
                         .unwrap_or(DEFAULT_STREAM_MAX_LIFETIME)
                 }),
+                client,
             });
         }
     }
@@ -313,7 +437,7 @@ pub(crate) fn resolve(
     let (Some(own), Some(component_named)) = (own, component_named) else {
         return None;
     };
-    let spec = PolicySpec::resolve([&framework, &component_named, &own]);
+    let spec = PolicySpec::resolve([&framework, &component_named.spec, &own]);
     check(
         source,
         &component_prefix,
@@ -324,6 +448,73 @@ pub(crate) fn resolve(
         methods,
         component: spec,
     })
+}
+
+/// The named layer of one method: the policy its `reference` key names
+/// (refused when it sets component-only fields), else the component's
+/// (`inherited`); `None` after recording a problem.
+fn method_layer(
+    source: &dyn ConfigSource,
+    reference: &str,
+    component_reference: &str,
+    inherited: Option<&NamedLayer>,
+    named: &mut NamedPolicies,
+    errors: &mut Vec<BuildError>,
+) -> Option<NamedLayer> {
+    match read_name(source, reference) {
+        Ok(Some(name)) => match named.get(source, &name, reference, errors) {
+            Some(layer) if has_component_only(&layer.spec) => {
+                errors.push(
+                    ConfigError::Invalid {
+                        key: source.describe(reference),
+                        reason: format!(
+                            "policy {name} sets component-only fields (retry budget or \
+                             breaker); reference it from {component_reference} instead"
+                        ),
+                    }
+                    .into(),
+                );
+                None
+            }
+            layer => layer.cloned(),
+        },
+        Ok(None) => inherited.cloned(),
+        Err(error) => {
+            errors.push(error.into());
+            None
+        }
+    }
+}
+
+/// The policy fields and the `CLIENT_*` fields a method sets itself; each
+/// `None` after recording a problem.
+fn method_keys(
+    source: &dyn ConfigSource,
+    prefix: &str,
+    errors: &mut Vec<BuildError>,
+) -> (Option<PolicySpec>, Option<ClientSpec>) {
+    let spec = from_config(source, prefix, errors).map(|mut spec| {
+        strip_rate_limit(&mut spec);
+        strip_component_only(&mut spec);
+        spec
+    });
+    (spec, ClientSpec::read(source, prefix, errors))
+}
+
+/// The per-client limiter of one method. Without keys of its own a method
+/// shares its named policy's buckets; with any, it gets buckets of its own.
+fn method_client(
+    source: &dyn ConfigSource,
+    prefix: &str,
+    named: Option<&NamedLayer>,
+    own: Option<&ClientSpec>,
+    errors: &mut Vec<BuildError>,
+) -> Result<Option<ClientLimiter>, Recorded> {
+    match (named, own) {
+        (Some(layer), Some(own)) if own.is_empty() => Ok(layer.limiter.clone()),
+        (Some(layer), Some(own)) => own.over(&layer.client).build(source, prefix, errors),
+        _ => Err(Recorded),
+    }
 }
 
 /// A problem already recorded in the build errors.
@@ -453,6 +644,179 @@ mod tests {
             assert!(PolicySpec::CONFIG_KEYS.contains(&field), "{field}");
         }
         assert!(!component_fields().any(|field| field.starts_with("RATE_LIMIT")));
+    }
+
+    fn malformed_keys(errors: &[BuildError]) -> Vec<String> {
+        errors
+            .iter()
+            .filter_map(|error| match error {
+                BuildError::Config(ConfigError::Malformed { key, .. }) => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn client_limiters(resolved: &ComponentPolicies) -> Vec<Option<ClientLimiter>> {
+        resolved
+            .methods
+            .iter()
+            .map(|method| method.client.clone())
+            .collect()
+    }
+
+    #[test]
+    fn methods_have_no_client_limit_by_default() {
+        let resolved = resolve_pairs(&[]).unwrap();
+        assert_eq!(client_limiters(&resolved), [None, None]);
+    }
+
+    #[test]
+    fn a_method_reads_its_client_limit() {
+        let resolved = resolve_pairs(&[
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_RATE", "5/1m"),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_BURST", "2"),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_KEY", "end_user"),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_MAX_KEYS", "10"),
+            ("SEKVENT_COMPONENT_INVENTORY_RELEASE_CLIENT_RATE", "100/1s"),
+        ])
+        .unwrap();
+        let [Some(reserve), Some(release)] =
+            <[_; 2]>::try_from(client_limiters(&resolved)).unwrap()
+        else {
+            panic!("both methods are limited");
+        };
+        let limit = reserve.limiter().limit();
+        assert_eq!((limit.rate, limit.per), (5, Duration::from_mins(1)));
+        assert_eq!((limit.burst, limit.max_keys), (2, 10));
+        assert_eq!(reserve.key(), ClientKey::EndUser);
+        let defaults = release.limiter().limit();
+        assert_eq!(defaults.burst, 100, "the burst defaults to the permits");
+        assert_eq!(defaults.max_keys, sekvent_resilience::DEFAULT_MAX_KEYS);
+        assert_eq!(release.key(), ClientKey::ClientAddr);
+        assert_ne!(reserve, release);
+    }
+
+    #[test]
+    fn a_named_policy_shares_its_buckets() {
+        let resolved = resolve_pairs(&[
+            ("SEKVENT_POLICY_PUBLIC_CLIENT_RATE", "5/1m"),
+            (
+                "SEKVENT_POLICY_PUBLIC_CLIENT_KEY",
+                "end_user_or_client_addr",
+            ),
+            ("SEKVENT_COMPONENT_INVENTORY_POLICY", "public"),
+        ])
+        .unwrap();
+        let limiters = client_limiters(&resolved);
+        let shared = limiters[0].clone().expect("inherited from the component");
+        assert_eq!(limiters[1].as_ref(), Some(&shared), "one set of buckets");
+        assert_eq!(shared.key(), ClientKey::EndUserOrClientAddr);
+
+        let referenced = resolve_pairs(&[
+            ("SEKVENT_POLICY_ORDERS_CLIENT_RATE", "5/1m"),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_POLICY", "orders"),
+            ("SEKVENT_COMPONENT_INVENTORY_RELEASE_POLICY", "orders"),
+        ])
+        .unwrap();
+        let limiters = client_limiters(&referenced);
+        assert!(limiters[0].is_some());
+        assert_eq!(limiters[0], limiters[1]);
+    }
+
+    #[test]
+    fn method_keys_over_a_named_policy_get_their_own_buckets() {
+        let resolved = resolve_pairs(&[
+            ("SEKVENT_POLICY_ORDERS_CLIENT_RATE", "5/1m"),
+            ("SEKVENT_POLICY_ORDERS_CLIENT_MAX_KEYS", "50"),
+            ("SEKVENT_COMPONENT_INVENTORY_POLICY", "orders"),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_BURST", "1"),
+        ])
+        .unwrap();
+        let limiters = client_limiters(&resolved);
+        let own = limiters[0].clone().unwrap();
+        let shared = limiters[1].clone().unwrap();
+        assert_ne!(own, shared);
+        let limit = own.limiter().limit();
+        assert_eq!((limit.rate, limit.burst, limit.max_keys), (5, 1, 50));
+    }
+
+    #[test]
+    fn bad_client_limits_name_their_keys() {
+        let errors = resolve_pairs(&[
+            (
+                "SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_RATE",
+                "5 per minute",
+            ),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_KEY", "ip"),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_BURST", "-1"),
+            (
+                "SEKVENT_COMPONENT_INVENTORY_RELEASE_CLIENT_MAX_KEYS",
+                "lots",
+            ),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            malformed_keys(&errors),
+            [
+                "SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_RATE",
+                "SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_KEY",
+                "SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_BURST",
+                "SEKVENT_COMPONENT_INVENTORY_RELEASE_CLIENT_MAX_KEYS",
+            ]
+        );
+
+        let errors = resolve_pairs(&[
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_RATE", "0/1m"),
+            ("SEKVENT_COMPONENT_INVENTORY_RELEASE_CLIENT_BURST", "3"),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            invalid_keys(&errors),
+            [
+                "SEKVENT_COMPONENT_INVENTORY_RESERVE_CLIENT_*",
+                "SEKVENT_COMPONENT_INVENTORY_RELEASE_CLIENT_RATE",
+            ],
+            "{errors:?}"
+        );
+        let text: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(text[0].contains("keyed_limit.rate"), "{text:?}");
+
+        let errors = resolve_pairs(&[
+            ("SEKVENT_POLICY_ORDERS_CLIENT_RATE", "5/0s"),
+            ("SEKVENT_COMPONENT_INVENTORY_POLICY", "orders"),
+        ])
+        .unwrap_err();
+        assert_eq!(invalid_keys(&errors), ["SEKVENT_POLICY_ORDERS_CLIENT_*"]);
+        assert!(errors[0].to_string().contains("keyed_limit.per"));
+    }
+
+    #[test]
+    fn a_policy_of_client_fields_only_is_a_policy() {
+        let resolved = resolve_pairs(&[
+            ("SEKVENT_POLICY_ORDERS_CLIENT_RATE", "5/1m"),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_POLICY", "orders"),
+        ])
+        .unwrap();
+        assert!(resolved.methods[0].client.is_some());
+        assert!(resolved.methods[1].client.is_none());
+
+        let errors = resolve_pairs(&[
+            ("SEKVENT_POLICY_ORDERS_CLIENT_RATE", "5/1m"),
+            ("SEKVENT_POLICY_ORDERS_CLIENT_RATES", "5/1m"),
+            ("SEKVENT_POLICY_ORDERS_RATE_LIMIT_PERMITS", "5"),
+            ("SEKVENT_COMPONENT_INVENTORY_RESERVE_POLICY", "orders"),
+        ])
+        .unwrap_err();
+        let [BuildError::Config(ConfigError::UnknownKeys { keys, .. })] = errors.as_slice() else {
+            panic!("{errors:?}");
+        };
+        assert_eq!(
+            keys,
+            &[
+                "SEKVENT_POLICY_ORDERS_CLIENT_RATES",
+                "SEKVENT_POLICY_ORDERS_RATE_LIMIT_PERMITS"
+            ]
+        );
     }
 
     #[test]

@@ -8,7 +8,13 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# `ClientLimitLayer`: a `ClientLimiter` in front of axum routes.
+http = ["dep:axum", "sekvent-error/http"]
+
 [dependencies]
+axum = { workspace = true, optional = true }
 sekvent-error = { workspace = true }
 sekvent-context = { workspace = true }
 sekvent-config = { workspace = true }
@@ -22,6 +28,7 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+sekvent-resilience = { path = ".", features = ["http"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }

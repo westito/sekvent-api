@@ -31,6 +31,7 @@ futures = { workspace = true }
 tower = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
+ipnet = { workspace = true }
 hyper-util = { workspace = true, features = ["server-graceful", "service"] }
 tonic = { workspace = true }
 tonic-web = { workspace = true, optional = true }

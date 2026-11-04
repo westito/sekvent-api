@@ -11,6 +11,7 @@ mod clock;
 mod end_user;
 pub mod headers;
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,19 @@ impl ServiceIdentity {
     }
 }
 
+/// The address of the client a server resolved for a request, from the TCP
+/// peer and, behind trusted proxies, a forwarding header.
+///
+/// The server puts it into the request extensions next to the
+/// [`CallContext`]. It is what the transport says, before any trusted link
+/// forwards the address of its own visitor
+/// ([`CallContext::client_addr`] is the address that applies to the call).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientAddr(
+    /// The client's address.
+    pub IpAddr,
+);
+
 /// The context of one logical call.
 ///
 /// The direct caller is either a service ([`caller`](Self::caller)) or an
@@ -69,6 +83,7 @@ pub struct CallContext {
     key_received: bool,
     traceparent: Option<String>,
     hops: u32,
+    client_addr: Option<IpAddr>,
 }
 
 impl Default for CallContext {
@@ -93,6 +108,7 @@ impl CallContext {
             key_received: false,
             traceparent: None,
             hops: 0,
+            client_addr: None,
         }
     }
 
@@ -193,6 +209,15 @@ impl CallContext {
         self
     }
 
+    /// Set the address of the client the call is made for: the edge
+    /// server's resolved client, or the visitor a trusted link calls on
+    /// behalf of.
+    #[must_use]
+    pub fn with_client_addr(mut self, addr: IpAddr) -> Self {
+        self.client_addr = Some(addr);
+        self
+    }
+
     /// Request id.
     pub fn request_id(&self) -> &str {
         &self.request_id
@@ -257,11 +282,16 @@ impl CallContext {
     pub fn hops(&self) -> u32 {
         self.hops
     }
+    /// The address of the client the call is made for, if known. It is
+    /// personal data: use it for limits and abuse checks, never log it.
+    pub fn client_addr(&self) -> Option<IpAddr> {
+        self.client_addr
+    }
 
     /// A child for an outbound call: same identity, deadline and hop count, a
     /// child cancellation token, and the caller and end user cleared (the
-    /// callee learns its caller from authentication, not from us; subject
-    /// and tenant stay). The idempotency key is kept
+    /// callee learns its caller from authentication, not from us; subject,
+    /// tenant and client address stay). The idempotency key is kept
     /// only when it was set for this call, not received with it.
     #[must_use]
     pub fn child(&self) -> Self {
@@ -277,11 +307,12 @@ impl CallContext {
             key_received: false,
             traceparent: self.traceparent.clone(),
             hops: self.hops,
+            client_addr: self.client_addr,
         }
     }
 
     /// A context for work queued beyond this call's lifetime: subject,
-    /// tenant, trace and hop count are kept; deadline, cancellation, caller
+    /// tenant, client address, trace and hop count are kept; deadline, cancellation, caller
     /// and end user are not.
     #[must_use]
     pub fn detached(&self) -> Self {
@@ -297,16 +328,18 @@ impl CallContext {
             key_received: self.key_received,
             traceparent: self.traceparent.clone(),
             hops: self.hops,
+            client_addr: self.client_addr,
         }
     }
 
-    /// Drop `subject` and `tenant` unless the caller is a trusted link or an
-    /// authenticated end user.
+    /// Drop `subject`, `tenant` and the client address unless the caller is
+    /// a trusted link or an authenticated end user.
     #[must_use]
     pub fn sanitize_for_caller(mut self) -> Self {
         if self.end_user.is_none() && !self.caller.as_ref().is_some_and(|caller| caller.trusted) {
             self.subject = None;
             self.tenant = None;
+            self.client_addr = None;
         }
         self
     }
@@ -325,7 +358,10 @@ mod tests {
             .with_idempotency_key("order-42")
             .with_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
             .with_hops(3)
+            .with_client_addr(CLIENT)
     }
+
+    const CLIENT: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
 
     #[test]
     fn identities_record_whether_the_caller_is_trusted() {
@@ -354,6 +390,7 @@ mod tests {
         assert_eq!(ctx.idempotency_key(), None);
         assert_eq!(ctx.traceparent(), None);
         assert_eq!(ctx.hops(), 0);
+        assert_eq!(ctx.client_addr(), None);
     }
 
     #[test]
@@ -369,6 +406,7 @@ mod tests {
             Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         );
         assert_eq!(ctx.hops(), 3);
+        assert_eq!(ctx.client_addr(), Some(CLIENT));
         assert_eq!(ctx.with_hops(0).hops(), 0, "the hop count is replaced");
     }
 
@@ -447,6 +485,7 @@ mod tests {
         assert_eq!(child.idempotency_key(), parent.idempotency_key());
         assert_eq!(child.traceparent(), parent.traceparent());
         assert_eq!(child.hops(), 3);
+        assert_eq!(child.client_addr(), Some(CLIENT));
     }
 
     #[test]
@@ -506,6 +545,7 @@ mod tests {
         assert_eq!(detached.idempotency_key(), Some("order-42"));
         assert_eq!(detached.traceparent(), parent.traceparent());
         assert_eq!(detached.hops(), 3);
+        assert_eq!(detached.client_addr(), Some(CLIENT));
     }
 
     #[test]
@@ -513,12 +553,14 @@ mod tests {
         let trusted = populated().sanitize_for_caller();
         assert_eq!(trusted.subject(), Some("user-7"));
         assert_eq!(trusted.tenant(), Some("tenant-a"));
+        assert_eq!(trusted.client_addr(), Some(CLIENT));
 
         let untrusted = populated()
             .with_caller(ServiceIdentity::untrusted("orders"))
             .sanitize_for_caller();
         assert_eq!(untrusted.subject(), None);
         assert_eq!(untrusted.tenant(), None);
+        assert_eq!(untrusted.client_addr(), None);
         assert_eq!(untrusted.idempotency_key(), Some("order-42"));
 
         let anonymous = CallContext::new()
@@ -542,6 +584,7 @@ mod tests {
         let kept = ctx.clone().sanitize_for_caller();
         assert_eq!(kept.subject(), Some("user-9"));
         assert_eq!(kept.tenant(), Some("tenant-b"));
+        assert_eq!(kept.client_addr(), Some(CLIENT));
 
         let tenantless = populated().with_end_user(EndUser::new("user-9"));
         assert_eq!(

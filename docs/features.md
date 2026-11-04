@@ -38,7 +38,7 @@ example an `-api` crate that only declares a component contract).
 | `context` | `sekvent::context` (`CallContext`, `Clock`, headers) | `sekvent-context` | [context](modules/context.md) |
 | `telemetry` | `sekvent::telemetry` (init, access log, request id) | `sekvent-telemetry` | [telemetry](modules/telemetry.md) |
 | `runtime` | `sekvent::runtime` (lifecycle, health, server, jobs, downloads) | `sekvent-runtime` | [runtime](modules/runtime.md), [server](modules/server.md), [jobs](modules/jobs.md) |
-| `resilience` | `sekvent::resilience` (retry, breaker, rate gate, TTL cache) | `sekvent-resilience` | [resilience](modules/resilience.md) |
+| `resilience` | `sekvent::resilience` (retry, breaker, rate gate, per-client rate limiter, TTL cache) | `sekvent-resilience` | [resilience](modules/resilience.md) |
 | `auth` | `sekvent::auth` (passwords, JWT, login) | `sekvent-auth` | [auth](modules/auth.md) |
 | `sso` | `sekvent::sso` (browser single sign-on, Bitbucket Cloud) | `sekvent-sso` | [sso](modules/sso.md) |
 | `link` | `sekvent::link` (service-to-service tokens) | `sekvent-link` | [link](modules/link.md) |
@@ -59,6 +59,7 @@ example an `-api` crate that only declares a component contract).
 | `runtime-cron` | `runtime` | `JobSpec::cron` schedules (UTC) |
 | `runtime-vfs` | `runtime` | `sekvent::runtime::vfs`: `Vfs`, `Directory`, `StaticSite` and `ServerBuilder::site`, a built frontend served next to the API ([server](modules/server.md#serve-a-bundled-frontend)) |
 | `runtime-vfs-embed` | `runtime-vfs` | `Embedded`, files compiled into the binary with `rust-embed` (re-exported, so no dependency of your own) |
+| `resilience-http` | `resilience` | `ClientLimitLayer`: a per-client rate limit in front of axum routes, sharing a served component method's buckets ([resilience](modules/resilience.md#put-it-in-front-of-rest-routes-clientlimitlayer)) |
 | `auth-axum` | `auth` | Bearer-token extractor for axum |
 | `auth-tonic` | `auth` | Bearer-token interceptor for tonic |
 | `auth-tokio` | `auth` | `hash_async`, `verify_async`, `authenticate_async` on tokio's blocking pool |

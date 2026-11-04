@@ -3,8 +3,8 @@
 `sekvent::context` carries what one logical call needs to know through every
 handler, client and queued job: the request id, the deadline, cancellation,
 the authenticated caller (a service or an end user), the end-user subject
-and tenant, the idempotency key, the W3C `traceparent` and the component hop
-count. It also defines how
+and tenant, the client address, the idempotency key, the W3C `traceparent`
+and the component hop count. It also defines how
 that context travels as HTTP/gRPC headers (with separate rules for sekvent
 peers and third-party APIs) and the injectable `Clock` that time-dependent
 code should use instead of `SystemTime::now()`.
@@ -14,7 +14,7 @@ code should use instead of `SystemTime::now()`.
 | | |
 |---|---|
 | Facade feature | `context` (on by default) |
-| Module | `use sekvent::context::{CallContext, ServiceIdentity, EndUser, Clock, SystemClock, ManualClock};` |
+| Module | `use sekvent::context::{CallContext, ClientAddr, ServiceIdentity, EndUser, Clock, SystemClock, ManualClock};` |
 | Header codec | `sekvent::context::headers` |
 | Prelude | `CallContext` |
 | Internal crate | `sekvent-context` (no features; depends on `http`, `tokio`, `tokio-util`, `uuid`) |
@@ -63,6 +63,7 @@ extensions), and [component](components.md) handles pass it along.
 | idempotency key | `idempotency_key()`, `outbound_idempotency_key()` | Names one operation; forwarded only when set for this call. |
 | traceparent | `traceparent()` | W3C trace context. |
 | hops | `hops() -> u32` | How many component calls led to this one (0 at the edge); a guard against call cycles. |
+| client address | `client_addr() -> Option<IpAddr>` | The address of the client the call is made for: the edge server resolves it (TCP peer, or the client behind trusted proxies), and a trusted link may forward its own visitor's. Personal data: for limits and abuse checks, never logged. |
 
 `ServiceIdentity { name: String, trusted: bool }` is the authenticated
 caller. Build it with `ServiceIdentity::trusted("billing")` (may assert
@@ -135,15 +136,16 @@ Builders (all `#[must_use]`, consuming `self`):
 | `with_idempotency_key(k)` | Set this call's own key (it will be forwarded). |
 | `with_traceparent(tp)` | Set the trace context. |
 | `with_hops(n)` | Replace the hop count. |
+| `with_client_addr(IpAddr)` | Set the client address. |
 
 Derivations:
 
 | Method | Keeps | Drops / changes |
 |---|---|---|
-| `child()` | request id, deadline, subject, tenant, traceparent, hops, an own idempotency key | caller and end user cleared (the callee learns its caller from authentication); cancellation becomes a **child token** (cancelling the parent cancels the child, not the reverse); a received idempotency key is not kept |
-| `detached()` | request id, subject, tenant, traceparent, hops, idempotency key (in the same received/own state) | no deadline, a fresh cancellation token, no caller, no end user |
+| `child()` | request id, deadline, subject, tenant, client address, traceparent, hops, an own idempotency key | caller and end user cleared (the callee learns its caller from authentication); cancellation becomes a **child token** (cancelling the parent cancels the child, not the reverse); a received idempotency key is not kept |
+| `detached()` | request id, subject, tenant, client address, traceparent, hops, idempotency key (in the same received/own state) | no deadline, a fresh cancellation token, no caller, no end user |
 | `into_inbound()` | everything | marks a present idempotency key as *received*: still readable, no longer forwarded |
-| `sanitize_for_caller()` | everything else | drops subject and tenant unless the caller is a trusted `ServiceIdentity` or an end user is set |
+| `sanitize_for_caller()` | everything else | drops subject, tenant and the client address unless the caller is a trusted `ServiceIdentity` or an end user is set |
 
 Because `child()` keeps subject and tenant but drops the end user, a
 component that a handler calls on an end user's behalf sees them exactly as
@@ -270,6 +272,7 @@ Header names (constants in `sekvent::context::headers`):
 | `TENANT` | `x-sekvent-tenant` | 1–255 visible ASCII; kept **only for a trusted caller** |
 | `IDEMPOTENCY_KEY` | `idempotency-key` | 1–255 visible ASCII; otherwise dropped |
 | `HOPS` | `x-sekvent-hops` | 1–4 ASCII digits from any caller; otherwise 0 |
+| `CLIENT_ADDR` | `x-sekvent-client-addr` | one IPv4 or IPv6 address, no port or brackets; kept **only for a trusted caller** |
 
 Anything that fails validation is dropped (or, for the request id,
 replaced), never rejected, so a sloppy client is still served.
@@ -280,8 +283,8 @@ Functions:
 |---|---|---|
 | `from_headers(&HeaderMap, caller: Option<ServiceIdentity>) -> CallContext` | inbound | Building the server-side context. Applies the validation above, sets the caller, runs `sanitize_for_caller()` and `into_inbound()`. |
 | `inject(&CallContext, &mut HeaderMap)` | outbound, peer | Re-encoding the whole context for the callee of a component call. **Replaces** existing values and **removes** a header for a field the context does not carry (hops 0 counts as absent), so a reused header map never leaks a previous call's values. Writes only an own idempotency key. An expired deadline is sent as `1n`. |
-| `propagate(&CallContext, &mut HeaderMap)` | outbound, peer | A request to another sekvent service. Writes request id, `traceparent`, subject, tenant and hops (> 0) only where **the caller left the header unset**; never removes; never writes the idempotency key. `grpc-timeout` is the one exception: a caller value longer than the time left (or unparsable) is replaced by the remaining time. |
-| `propagate_external(&CallContext, &mut HeaderMap)` | outbound, third party | A third-party API. Only request id, `traceparent` and `grpc-timeout`, under the same rules as `propagate`. Never subject, tenant, hops or the idempotency key. |
+| `propagate(&CallContext, &mut HeaderMap)` | outbound, peer | A request to another sekvent service. Writes request id, `traceparent`, subject, tenant, the client address and hops (> 0) only where **the caller left the header unset**; never removes; never writes the idempotency key. `grpc-timeout` is the one exception: a caller value longer than the time left (or unparsable) is replaced by the remaining time. |
+| `propagate_external(&CallContext, &mut HeaderMap)` | outbound, third party | A third-party API. Only request id, `traceparent` and `grpc-timeout`, under the same rules as `propagate`. Never subject, tenant, the client address, hops or the idempotency key. |
 | `encode_grpc_timeout(Duration) -> String` | | At most 8 digits in the finest unit that fits, truncated (never rounded up); zero becomes `1n`; capped at `99999999H`. |
 | `parse_grpc_timeout(&str) -> Option<Duration>` | | The inverse; rejects signs, decimals, spaces, lowercase `s` and more than 8 digits. |
 
@@ -295,6 +298,19 @@ headers::propagate_external(&ctx, &mut outbound); // to a payment provider: id, 
 
 The [client](client.md) applies `propagate` or `propagate_external` for you,
 and the component gRPC binding uses `inject` / `from_headers`.
+
+The client address follows the subject's trust rule. The [server](server.md#resolve-the-client-address)
+sets it on every inbound context from the connection (and also puts the
+transport's address into the request extensions as `ClientAddr`); a
+trusted link's `x-sekvent-client-addr` replaces it in the context, so a
+server-rendered frontend that calls with its link token can name the
+visitor it renders for:
+
+```rust
+// in the frontend, per page view
+let cx = CallContext::new().with_client_addr(visitor_ip);
+catalog.quote(&cx, request).await?; // the catalog's per-client limit counts the visitor
+```
 
 ## How to inject time (`Clock`)
 
@@ -377,9 +393,13 @@ rejected. Handlers map an expired deadline or cancellation to
 - Never build an `EndUser` from unverified request data. Let the App's
   end-user authenticator check a credential and the component serving
   boundary call `with_end_user`.
-- `CallContext` derives `Debug`, which includes subject, tenant and the end
-  user (its extensions as a count only); avoid logging the whole context
-  where those are sensitive.
+- `CallContext` derives `Debug`, which includes subject, tenant, the client
+  address and the end user (its extensions as a count only); avoid logging
+  the whole context where those are sensitive. The access log never records
+  the client address.
+- Never set `with_client_addr` from a request header yourself: the server
+  resolves it, and trusts forwarding headers only from the proxies you
+  configure (`ClientAddrPolicy`).
 
 ## See also
 

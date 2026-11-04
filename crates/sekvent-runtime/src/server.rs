@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, MatchedPath};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, MatchedPath};
 use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::Route;
@@ -21,7 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use hyper_util::service::TowerToHyperService;
-use sekvent_context::{CallContext, ServiceIdentity, headers};
+use sekvent_context::{CallContext, ClientAddr, ServiceIdentity, headers};
 use sekvent_error::AppError;
 use sekvent_telemetry::access_log::{AccessLogLayer, RouteTemplate};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,7 +33,7 @@ use tonic::service::Routes;
 use tower::ServiceExt;
 use tower::util::MapRequestLayer;
 
-use crate::{Cors, HealthRegistry, HealthVisibility, UnitContext};
+use crate::{ClientAddrPolicy, Cors, HealthRegistry, HealthVisibility, UnitContext};
 
 /// Establishes who is calling from the request head, typically by checking a
 /// service token. `None` means an anonymous (untrusted) caller.
@@ -116,6 +116,7 @@ pub struct ServerBuilder {
     max_connections: Option<usize>,
     http2_keep_alive: Option<Http2KeepAlive>,
     cors: Option<Cors>,
+    client_addr: ClientAddrPolicy,
     rest_body_limit: usize,
     layers: Vec<ServerLayer>,
     access_log: bool,
@@ -136,6 +137,7 @@ impl fmt::Debug for ServerBuilder {
             .field("max_connections", &self.max_connections)
             .field("http2_keep_alive", &self.http2_keep_alive)
             .field("cors", &self.cors)
+            .field("client_addr", &self.client_addr)
             .field("rest_body_limit", &self.rest_body_limit)
             .field("layers", &self.layers.len())
             .field("access_log", &self.access_log)
@@ -303,6 +305,20 @@ impl ServerBuilder {
         self
     }
 
+    /// How the client address of a request is told (default
+    /// [`ClientAddrPolicy::peer`]). The server puts it into every request's
+    /// [`CallContext`] ([`CallContext::client_addr`]) and, as
+    /// [`ClientAddr`], into its extensions; the TCP peer is there too, as
+    /// axum's `ConnectInfo<SocketAddr>`. A trusted caller's
+    /// `x-sekvent-client-addr` header wins in the call context (the visitor
+    /// a server-rendered frontend calls for); `ClientAddr` stays the
+    /// transport's. [`bind`](Self::bind) runs [`ClientAddrPolicy::validate`].
+    #[must_use]
+    pub fn client_addr(mut self, policy: ClientAddrPolicy) -> Self {
+        self.client_addr = policy;
+        self
+    }
+
     /// Largest body REST extractors accept unless a route sets its own
     /// `axum::extract::DefaultBodyLimit` (default 2 MiB, axum's own
     /// default). Must be positive. gRPC limits are per service (see
@@ -405,6 +421,7 @@ impl ServerBuilder {
                     max_connections: self.max_connections,
                     http2_keep_alive: self.http2_keep_alive,
                     cors: self.cors,
+                    client_addr: Arc::new(self.client_addr),
                     rest_body_limit: self.rest_body_limit,
                     layers: self.layers,
                     access_log: self.access_log,
@@ -478,6 +495,7 @@ impl ServerBuilder {
         if let Some(cors) = &self.cors {
             cors.validate()?;
         }
+        self.client_addr.validate()?;
         Ok(())
     }
 }
@@ -515,6 +533,7 @@ struct ServerConfig {
     max_connections: Option<usize>,
     http2_keep_alive: Option<Http2KeepAlive>,
     cors: Option<Cors>,
+    client_addr: Arc<ClientAddrPolicy>,
     rest_body_limit: usize,
     layers: Vec<ServerLayer>,
     access_log: bool,
@@ -651,6 +670,7 @@ impl Server {
             max_connections: Some(10_000),
             http2_keep_alive: None,
             cors: None,
+            client_addr: ClientAddrPolicy::peer(),
             rest_body_limit: DEFAULT_REST_BODY_LIMIT,
             layers: Vec::new(),
             access_log: true,
@@ -672,7 +692,9 @@ impl Server {
     /// 2. CORS, when configured;
     /// 3. the health endpoints (`/livez`, `/readyz`, `/healthz` and
     ///    `grpc.health.v1.Health`, also under the prefix), or else
-    /// 4. the call context (its request id is the one above), the
+    /// 4. the call context (its request id is the one above, its client
+    ///    address resolved from the `ConnectInfo<SocketAddr>` the serve loop
+    ///    adds to every request), the
     ///    application layers, then the prefix strip and the split between
     ///    gRPC (by content type) and the REST routes with their body limit;
     ///    outside the prefix, native gRPC at the root (by content type) and
@@ -712,8 +734,9 @@ impl Server {
             services = layer(services);
         }
         let authenticator = config.authenticator.clone();
+        let client_addr = Arc::clone(&config.client_addr);
         services = services.layer(MapRequestLayer::new(move |request: Request<Body>| {
-            attach_context(request, authenticator.as_ref())
+            attach_context(request, authenticator.as_ref(), &client_addr)
         }));
         let health_routes = if config.health_routes {
             health
@@ -811,11 +834,15 @@ impl Server {
             let error = match accepted {
                 Ok(stream) => {
                     accept_errors.recovered(addr);
+                    let peer = stream.peer_addr().ok();
                     connections.spawn(serve_connection(
                         stream,
                         Accepted {
                             builder: Arc::clone(&builder),
-                            service: TowerToHyperService::new(app.clone()),
+                            service: TowerToHyperService::new(WithPeer {
+                                inner: app.clone(),
+                                peer,
+                            }),
                             watcher: graceful.watcher(),
                             first_byte: config.header_read_timeout,
                             silent: silent.clone(),
@@ -972,7 +999,7 @@ impl AcceptErrors {
 /// Everything one accepted connection needs to be served.
 struct Accepted {
     builder: Arc<auto::Builder<TokioExecutor>>,
-    service: TowerToHyperService<Router>,
+    service: TowerToHyperService<WithPeer>,
     watcher: Watcher,
     first_byte: Option<Duration>,
     silent: CancellationToken,
@@ -1012,10 +1039,56 @@ async fn serve_connection(stream: TcpStream, accepted: Accepted) {
     }
 }
 
-fn attach_context(request: Request<Body>, authenticator: Option<&Authenticator>) -> Request<Body> {
+/// Adds the connection's TCP peer to every request as axum's
+/// `ConnectInfo<SocketAddr>`.
+#[derive(Clone)]
+struct WithPeer {
+    inner: Router,
+    peer: Option<SocketAddr>,
+}
+
+impl<B> tower::Service<Request<B>> for WithPeer
+where
+    Router: tower::Service<Request<B>, Response = Response, Error = Infallible>,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = <Router as tower::Service<Request<B>>>::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        <Router as tower::Service<Request<B>>>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, mut request: Request<B>) -> Self::Future {
+        if let Some(peer) = self.peer {
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
+        self.inner.call(request)
+    }
+}
+
+/// The call context of a request: its headers, the caller the
+/// authenticator names and the client address `policy` resolves from the
+/// TCP peer (none without one). A trusted caller's client address header
+/// wins in the context; the extensions get the resolved [`ClientAddr`].
+fn attach_context(
+    request: Request<Body>,
+    authenticator: Option<&Authenticator>,
+    policy: &ClientAddrPolicy,
+) -> Request<Body> {
     let (mut parts, body) = request.into_parts();
     let caller = authenticator.and_then(|authenticate| authenticate(&parts));
-    let ctx = headers::from_headers(&parts.headers, caller);
+    let mut ctx = headers::from_headers(&parts.headers, caller);
+    let resolved = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| policy.resolve(peer.ip(), &parts.headers));
+    if let Some(addr) = resolved {
+        parts.extensions.insert(ClientAddr(addr));
+        if ctx.client_addr().is_none() {
+            ctx = ctx.with_client_addr(addr);
+        }
+    }
     parts.extensions.insert(ctx);
     Request::from_parts(parts, body)
 }

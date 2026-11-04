@@ -11,7 +11,7 @@
 //! | [`context`] | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
 //! | [`telemetry`] | `sekvent-telemetry` | `telemetry` (default) | tracing init, log buffer, request ids, access log, `truncate_for_log` |
 //! | [`runtime`] | `sekvent-runtime` | `runtime` (default) | staged lifecycle, supervision, health, the combined server (CORS, limits, layers, access log), jobs, downloads, static sites |
-//! | [`resilience`] | `sekvent-resilience` | `resilience` | backoff, retry budget, rate gate, timeout, bulkhead, breaker, TTL cache |
+//! | [`resilience`] | `sekvent-resilience` | `resilience` | backoff, retry budget, rate gate, per-client rate limiter, timeout, bulkhead, breaker, TTL cache |
 //! | [`auth`] | `sekvent-auth` | `auth` | argon2id and bcrypt password hashing, JWT with injected time, login helper |
 //! | [`link`] | `sekvent-link` | `link` | service-to-service tokens, middleware, interceptors |
 //! | [`client`] | `sekvent-client` | `client` | outbound HTTP with policy, context propagation, OAuth 2.0 |
@@ -35,6 +35,8 @@
 //!   (`ServerBuilder::site`).
 //! - `runtime-vfs-embed`: `runtime::vfs::Embedded`, files compiled into the
 //!   binary with the re-exported `rust-embed`.
+//! - `resilience-http`: `resilience::ClientLimitLayer`, a per-client rate
+//!   limit in front of axum routes.
 //! - `auth-axum`, `auth-tonic`: bearer extractors, interceptors, role guards.
 //! - `auth-tokio`: password hashing and verification on tokio's blocking
 //!   pool (`hash_async`, `verify_async`, `authenticate_async`).

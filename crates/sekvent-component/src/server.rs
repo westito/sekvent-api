@@ -12,7 +12,7 @@ use std::time::Duration;
 use futures::Stream;
 use sekvent_context::CallContext;
 use sekvent_error::AppError;
-use sekvent_resilience::{Bulkhead, BulkheadPermit, PolicySpec, Timeout};
+use sekvent_resilience::{Bulkhead, BulkheadPermit, ClientLimiter, PolicySpec, Timeout};
 use tokio::sync::Notify;
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFutureOwned};
@@ -32,6 +32,9 @@ pub(crate) struct MethodPolicy {
     /// The configured stream lifetime; `Some` exactly for streaming
     /// methods.
     pub(crate) max_lifetime: Option<Duration>,
+    /// The per-client limit of calls served over gRPC (`CLIENT_*`); one
+    /// named policy's limiter is shared by every method using it.
+    pub(crate) client: Option<ClientLimiter>,
 }
 
 /// The gate of one installed component and, when it runs in this process,
@@ -51,6 +54,7 @@ struct MethodRuntime {
     timeout: Option<Duration>,
     bulkhead: Option<Bulkhead>,
     max_lifetime: Option<Duration>,
+    client: Option<ClientLimiter>,
 }
 
 #[derive(Debug)]
@@ -128,6 +132,7 @@ impl Server {
                     policy.spec.build_bulkhead().ok().flatten()
                 },
                 max_lifetime: if remote { None } else { policy.max_lifetime },
+                client: if remote { None } else { policy.client.clone() },
             })
             .collect();
         Self {
@@ -150,6 +155,14 @@ impl Server {
     /// The resolved timeout of method `method`; `None` for an unknown index.
     pub(crate) fn timeout(&self, method: usize) -> Option<Duration> {
         self.methods.get(method).and_then(|runtime| runtime.timeout)
+    }
+
+    /// The per-client limiter of method `method`, when it has one and runs
+    /// in this process.
+    pub(crate) fn client_limiter(&self, method: usize) -> Option<&ClientLimiter> {
+        self.methods
+            .get(method)
+            .and_then(|runtime| runtime.client.as_ref())
     }
 
     pub(crate) fn state(&self) -> ComponentState {
@@ -683,6 +696,7 @@ mod tests {
             timeout,
             spec,
             max_lifetime: None,
+            client: None,
         }
     }
 

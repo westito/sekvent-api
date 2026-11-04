@@ -86,6 +86,7 @@ A typical service:
 | [design/p8-service-essentials.md](design/p8-service-essentials.md) | Specification of server essentials, probes, password schemes, jobs, leases, HTTP helpers |
 | [design/storage.md](design/storage.md) | Specification of object storage: own SigV4 signer on rustls/ring, presigned uploads and downloads, two endpoints, the MinIO test image |
 | [design/static-site.md](design/static-site.md) | Specification of serving a built frontend: the virtual filesystem, path normalization, `StaticSite`, server routing |
+| [design/client-limits.md](design/client-limits.md) | Client addresses behind proxies and their propagation, the keyed rate limiter, per-client limits of served component methods and REST routes |
 | [examples/shop](../examples/shop/README.md) | Three components (orders, inventory, notifications) in monolith and split topologies |
 
 The pages under `modules/` describe how to use the current code; the design

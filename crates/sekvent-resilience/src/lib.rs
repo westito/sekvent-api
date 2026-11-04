@@ -9,6 +9,10 @@
 //! - [`RetryBudget`] and [`RetryPolicy`]: bounded, budgeted retries of
 //!   transient failures of idempotent operations.
 //! - [`RateGate`]: at most N calls per rolling window, shared process-wide.
+//! - [`KeyedRateLimiter`]: a token bucket per key (client address, end
+//!   user) with bounded memory; [`ClientLimiter`] keys it from the call
+//!   context, and [`ClientLimitLayer`] (feature `http`) puts it in front of
+//!   axum routes.
 //! - [`Timeout`]: a per-attempt timeout that never outlives the call deadline.
 //! - [`Bulkhead`]: a concurrency cap with an optional bounded wait queue.
 //! - [`CircuitBreaker`]: stops calling an unhealthy dependency for a while.
@@ -31,7 +35,10 @@ mod breaker;
 mod budget;
 mod bulkhead;
 mod cache;
+#[cfg(feature = "http")]
+mod client_layer;
 mod error;
+mod keyed;
 mod policy;
 mod rate_gate;
 mod retry;
@@ -52,7 +59,13 @@ pub use breaker::{
 pub use budget::RetryBudget;
 pub use bulkhead::{Bulkhead, BulkheadPermit};
 pub use cache::{TtlCache, TtlCacheBuilder};
+#[cfg(feature = "http")]
+pub use client_layer::{ClientLimitLayer, ClientLimitService};
 pub use error::PolicyError;
+pub use keyed::{
+    CLIENT_RATE_LIMITED, ClientKey, ClientLimiter, DEFAULT_MAX_KEYS, KeyedLimit, KeyedRateLimiter,
+    RateKey, RateLimited,
+};
 pub use policy::Policy;
 pub use rate_gate::RateGate;
 pub use retry::RetryPolicy;

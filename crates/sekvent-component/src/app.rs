@@ -623,6 +623,27 @@ impl App {
             .map(|component| component.server.state())
     }
 
+    /// The per-client limiter of method `method` (its Rust name) of the
+    /// component called `component`: the buckets its serving policy
+    /// (`CLIENT_*`) refuses gRPC calls from, which a REST route over the
+    /// same operation shares through
+    /// `sekvent_resilience::ClientLimitLayer`. `None` when the method has
+    /// no such limit, or the component is not installed or runs in another
+    /// process.
+    pub fn client_limiter(
+        &self,
+        component: &str,
+        method: &str,
+    ) -> Option<sekvent_resilience::ClientLimiter> {
+        let component = self.find(component)?;
+        let index = component
+            .descriptor
+            .methods()
+            .iter()
+            .position(|candidate| candidate.name() == method)?;
+        component.server.client_limiter(index).cloned()
+    }
+
     /// Every component name, in install order.
     pub fn components(&self) -> Vec<&'static str> {
         self.inner

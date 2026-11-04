@@ -179,7 +179,11 @@ impl RetryPolicy {
         attempt: u32,
         error: &AppError,
     ) -> Option<Duration> {
-        if !idempotent || !error.is_transient() || attempt >= self.max_attempts {
+        if !idempotent
+            || !error.is_transient()
+            || error.reason() == Some(crate::CLIENT_RATE_LIMITED)
+            || attempt >= self.max_attempts
+        {
             return None;
         }
         let mut delay = {
@@ -296,6 +300,25 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), ErrorCode::InvalidArgument);
         assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn never_retries_a_client_rate_limit() {
+        let policy = RetryPolicy::new(5, constant(10));
+        let calls = Cell::new(0_u32);
+        let error = policy
+            .retry(&CallContext::new(), true, || {
+                calls.set(calls.get() + 1);
+                async {
+                    Err::<(), _>(AppError::from(crate::RateLimited {
+                        retry_after: Duration::from_millis(5),
+                    }))
+                }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason(), Some(crate::CLIENT_RATE_LIMITED));
+        assert_eq!(calls.get(), 1, "retrying only drains the same bucket");
     }
 
     #[tokio::test(start_paused = true)]

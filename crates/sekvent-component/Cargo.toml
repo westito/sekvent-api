@@ -71,6 +71,9 @@ http-body-util = { workspace = true }
 rstest = { workspace = true }
 # The runtime server with its gRPC-Web translation, for the gRPC-Web tests.
 sekvent-runtime = { path = "../sekvent-runtime", features = ["grpc-web"] }
+# `ClientLimitLayer` on a REST route next to a served method.
+sekvent-resilience = { path = "../sekvent-resilience", features = ["http"] }
+axum = { workspace = true }
 
 [lints]
 workspace = true

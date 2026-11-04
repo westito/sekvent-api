@@ -9,7 +9,8 @@
 //! - `SEKVENT_COMPONENT_MAX_HOPS`: deepest chain of component calls;
 //! - `SEKVENT_COMPONENT_<C>_BINDING`, `_ENDPOINT`, `_LINK`, `_AUTH`, `_SERVE`,
 //!   `_SERVE_AUTH`, `_POLICY` and the component policy fields;
-//! - `SEKVENT_COMPONENT_<C>_<M>_POLICY` and the method policy fields;
+//! - `SEKVENT_COMPONENT_<C>_<M>_POLICY`, the method policy fields and the
+//!   per-client limit (`CLIENT_*`);
 //! - `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME` when `<C>` has a streaming
 //!   method, and `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` for each
 //!   streaming method `<M>`;
@@ -407,6 +408,7 @@ fn known_keys(entries: &[Entry], errors: &mut Vec<BuildError>) -> Vec<String> {
             let owner = format!("method {component}.{}", method.name());
             for suffix in std::iter::once(policy::POLICY)
                 .chain(policy::METHOD_FIELDS.iter().copied())
+                .chain(policy::CLIENT_FIELDS.iter().copied())
                 .chain(method.is_stream().then_some(policy::STREAM_MAX_LIFETIME))
             {
                 claim(key(&[component, method.name(), suffix]), &owner);
@@ -895,7 +897,7 @@ mod tests {
             expected.push(format!("SEKVENT_COMPONENT_NOTES_{suffix}"));
         }
         expected.push("SEKVENT_COMPONENT_NOTES_ADD_POLICY".to_owned());
-        for field in policy::METHOD_FIELDS {
+        for field in policy::METHOD_FIELDS.iter().chain(policy::CLIENT_FIELDS) {
             expected.push(format!("SEKVENT_COMPONENT_NOTES_ADD_{field}"));
         }
         assert_eq!(known, expected);
@@ -903,6 +905,8 @@ mod tests {
         assert!(known.contains(&"SEKVENT_COMPONENT_NOTES_BREAKER_WINDOW".to_owned()));
         assert!(!known.contains(&"SEKVENT_COMPONENT_NOTES_ADD_BREAKER_WINDOW".to_owned()));
         assert!(!known.contains(&"SEKVENT_COMPONENT_NOTES_RATE_LIMIT_PERMITS".to_owned()));
+        assert!(known.contains(&"SEKVENT_COMPONENT_NOTES_ADD_CLIENT_RATE".to_owned()));
+        assert!(!known.contains(&"SEKVENT_COMPONENT_NOTES_CLIENT_RATE".to_owned()));
     }
 
     #[test]

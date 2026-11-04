@@ -24,7 +24,7 @@ sqlx 0.9, sea-orm 2.0 and sea-query 1.0.
 | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
 | `sekvent-telemetry` | `telemetry` (default) | Tracing init, log ring buffer, request ids, access log, `truncate_for_log` |
 | `sekvent-runtime` | `runtime` (default); `runtime-grpc-web`, `runtime-cron`, `runtime-vfs`, `runtime-vfs-embed` | Staged lifecycle, supervision, health, one listener for gRPC, gRPC-Web and REST with CORS, body limits, global layers and an access log; interval, cron and manual jobs; file downloads; a bundled frontend served next to the API |
-| `sekvent-resilience` | `resilience` | Backoff, retry budget, rate gate, timeout, bulkhead, circuit breaker, a TTL cache with single flight |
+| `sekvent-resilience` | `resilience`; `resilience-http` | Backoff, retry budget, rate gate, per-client rate limiter (with a tower layer for axum routes), timeout, bulkhead, circuit breaker, a TTL cache with single flight |
 | `sekvent-auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` | argon2id and bcrypt password schemes, JWT with injected time, login helper, async hashing helpers |
 | `sekvent-link` | `link`; `link-axum`, `link-tonic` | Service-to-service tokens, middleware, interceptors |
 | `sekvent-client` | `client` | Outbound HTTP (reqwest, rustls) with policies, context propagation, OAuth 2.0 client credentials |

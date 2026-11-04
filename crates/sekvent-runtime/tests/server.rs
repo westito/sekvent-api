@@ -14,7 +14,10 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use prost::Message;
 use sekvent_context::ServiceIdentity;
-use sekvent_runtime::{Cors, Ctx, Runtime, Server, Stage, UnitExit, UnitPolicy};
+use sekvent_runtime::{
+    ClientAddrPolicy, Cors, Ctx, ForwardedHeader, IpNet, Runtime, Server, Stage, UnitExit,
+    UnitPolicy,
+};
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
@@ -316,4 +319,106 @@ async fn a_rejecting_layer_leaves_the_grpc_health_check_alone() {
     tokio::time::timeout(Duration::from_secs(30), run)
         .await
         .expect("the exchange finished within 30 s");
+}
+
+fn client_addr_echo() -> Router {
+    Router::new().route(
+        "/addr",
+        get(
+            |Ctx(ctx): Ctx,
+             axum::Extension(sekvent_context::ClientAddr(seen)): axum::Extension<
+                sekvent_context::ClientAddr,
+            >| async move {
+                format!(
+                    "{}|{seen}",
+                    ctx.client_addr()
+                        .map_or_else(|| "-".to_owned(), |addr| addr.to_string())
+                )
+            },
+        ),
+    )
+}
+
+#[tokio::test]
+async fn the_client_address_is_resolved_from_the_peer_and_trusted_proxies() {
+    let run = async {
+        let serve = |policy: ClientAddrPolicy| async move {
+            let server = Server::builder()
+                .rest(client_addr_echo())
+                .client_addr(policy)
+                .authenticator(|parts: &Parts| {
+                    parts
+                        .headers
+                        .contains_key("x-test-link")
+                        .then(|| ServiceIdentity::trusted("frontend"))
+                })
+                .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
+            let addr = server.local_addr();
+            let handle = Runtime::builder()
+                .without_signals()
+                .unit(
+                    "api",
+                    Stage::Ingress,
+                    UnitPolicy::Critical,
+                    server.into_unit(),
+                )
+                .build()
+                .unwrap()
+                .start()
+                .await
+                .unwrap();
+            (addr, handle)
+        };
+        let http: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+        let ask = |addr: SocketAddr, headers: &[(&'static str, &'static str)]| {
+            let mut request = Request::get(format!("http://{addr}/addr"));
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let http = http.clone();
+            async move {
+                let response = http
+                    .request(request.body(Full::new(Bytes::new())).unwrap())
+                    .await
+                    .unwrap();
+                text(response).await.1
+            }
+        };
+
+        let (peer_only, handle) = serve(ClientAddrPolicy::peer()).await;
+        let forged = [("x-forwarded-for", "203.0.113.9")];
+        assert_eq!(ask(peer_only, &forged).await, "127.0.0.1|127.0.0.1");
+        let visitor = [
+            ("x-test-link", "1"),
+            ("x-sekvent-client-addr", "198.51.100.7"),
+        ];
+        assert_eq!(
+            ask(peer_only, &visitor).await,
+            "198.51.100.7|127.0.0.1",
+            "a trusted link names its visitor in the context only"
+        );
+        let untrusted = [("x-sekvent-client-addr", "198.51.100.7")];
+        assert_eq!(ask(peer_only, &untrusted).await, "127.0.0.1|127.0.0.1");
+        handle.shutdown();
+        handle.wait().await.unwrap();
+
+        let loopback: IpNet = "127.0.0.0/8".parse().unwrap();
+        let (proxied, handle) = serve(ClientAddrPolicy::behind_proxies(
+            vec![loopback],
+            ForwardedHeader::XForwardedFor,
+        ))
+        .await;
+        let chain = [("x-forwarded-for", "192.0.2.1, 203.0.113.9, 127.0.0.2")];
+        assert_eq!(ask(proxied, &chain).await, "203.0.113.9|203.0.113.9");
+        let malformed = [("x-forwarded-for", "nonsense")];
+        assert_eq!(ask(proxied, &malformed).await, "127.0.0.1|127.0.0.1");
+        drop(http);
+        handle.shutdown();
+        handle.wait().await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("the exchanges finished within 30 s");
 }

@@ -108,8 +108,9 @@ anything below it (while gRPC health is on). Anything else fails `bind` with
 4. Everything else:
    1. the **call context**: the `Authenticator` (if any) identifies the
       caller from the request head, then the `CallContext` is decoded from
-      the headers and put into the request extensions (its request id is the
-      one from step 1);
+      the headers, given the [client address](#resolve-the-client-address)
+      and put into the request extensions (its request id is the one from
+      step 1);
    2. your **application layers** (`ServerBuilder::layer`), the last one
       added outermost;
    3. the **prefix strip** and the split between gRPC (by content type) and
@@ -236,7 +237,8 @@ async fn get_order(&self, request: tonic::Request<GetOrderRequest>) -> Result<to
 ```
 
 The context carries the request id, the deadline from `grpc-timeout`, the
-`traceparent`, the idempotency key, the hop count and, only from a trusted
+`traceparent`, the idempotency key, the hop count, the
+[client address](#resolve-the-client-address) and, only from a trusted
 caller, the end-user subject and tenant. See [Call context](context.md) for
 the header rules.
 
@@ -281,6 +283,58 @@ For tests, any closure works:
     parts.headers.contains_key("x-test-link").then(|| ServiceIdentity::trusted("billing"))
 })
 ```
+
+### Resolve the client address
+
+Every request's `CallContext` gets the address of its client
+(`ctx.client_addr()`), and the request extensions get it as
+`sekvent::context::ClientAddr` (the TCP peer is there too, as axum's
+`ConnectInfo<SocketAddr>`). Per-client limits key by it
+([Components](components.md#how-to-limit-each-client-of-a-served-method),
+[Resilience](resilience.md#how-to-limit-each-client-keyedratelimiter)).
+
+```rust
+use sekvent::runtime::{ClientAddrPolicy, ForwardedHeader, IpNet};
+
+// The TCP peer (the default).
+let server = Server::builder().client_addr(ClientAddrPolicy::peer());
+
+// Behind a load balancer in 10.0.0.0/8 that appends to X-Forwarded-For.
+let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse()?];
+let server = Server::builder()
+    .client_addr(ClientAddrPolicy::behind_proxies(trusted, ForwardedHeader::XForwardedFor));
+
+// From configuration: TRUSTED_PROXIES and CLIENT_ADDR_HEADER.
+let server = Server::builder().client_addr(ClientAddrPolicy::from_config(&EnvSource, "")?);
+```
+
+- `behind_proxies(trusted, header)`: when the TCP peer is in `trusted`,
+  the header's addresses are walked from the right, skipping trusted ones;
+  the first untrusted address is the client (all trusted: the leftmost).
+  A peer outside `trusted` is the client and its header is ignored, so a
+  client cannot forge its address by sending the header itself. A missing
+  or malformed header (where it is read) leaves the peer.
+- `ForwardedHeader::XForwardedFor` (`client, proxy1, proxy2`),
+  `Forwarded` (RFC 7239, the `for=` parameter, `"[v6]:port"` included),
+  `XRealIp` (one address; repeated, it is malformed) or `Named(name)` (a
+  list like `X-Forwarded-For`, such as a CDN's own header). Ports are
+  accepted and dropped.
+- IPv4-mapped IPv6 addresses (a dual-stack socket) count as IPv4.
+- `bind` refuses `behind_proxies` with an empty `trusted` list.
+- `from_config(source, prefix)` reads `<prefix>TRUSTED_PROXIES`
+  (comma-separated networks or single addresses: `10.0.0.0/8, 192.0.2.1,
+  2001:db8::/32`) and `<prefix>CLIENT_ADDR_HEADER` (`x-forwarded-for`, the
+  default, `forwarded`, `x-real-ip` or another header name). Without
+  `TRUSTED_PROXIES` the policy is `peer()`, and a `CLIENT_ADDR_HEADER` on
+  its own is an error. Every problem is reported at once, naming its key
+  and the position of an invalid network, never the value. Pick a prefix
+  of your own: `SEKVENT_` keys are reserved for the framework.
+  `ClientAddrPolicy::config_keys(prefix)` lists the keys.
+- A trusted [link](link.md) caller's `x-sekvent-client-addr` header
+  replaces the resolved address **in the context** (the visitor a
+  server-rendered frontend calls for); `ClientAddr` in the extensions stays
+  what the transport says. Anyone else's header is ignored.
+- The address is personal data: the access log never records it.
 
 ### Add application layers
 
@@ -835,13 +889,16 @@ implementation never sees an unsafe path.
 `server.router(&health)` returns the complete `axum::Router` (every layer
 above, health included) for serving it yourself or testing without a
 socket. Pass the runtime's registry (`builder.health()`) so health reflects
-the lifecycle.
+the lifecycle. The client address is resolved from axum's
+`ConnectInfo<SocketAddr>` extension: serve the router with
+`into_make_service_with_connect_info::<SocketAddr>()` (or insert
+`ConnectInfo` in a test request), or contexts carry no client address.
 
 ## Errors and defaults at a glance
 
 | Situation | Result |
 |---|---|
-| invalid prefix, zero header timeout, connection limit 0 or too large, zero body limit, zero keep-alive interval or timeout, invalid CORS | `bind`/`from_listener`: `INVALID_ARGUMENT` |
+| invalid prefix, zero header timeout, connection limit 0 or too large, zero body limit, zero keep-alive interval or timeout, invalid CORS, `behind_proxies` without a trusted network | `bind`/`from_listener`: `INVALID_ARGUMENT` |
 | `grpc_routes` twice, or after `add_service` | `bind`/`from_listener`: `INVALID_ARGUMENT`, `gRPC routes were given more than once; use add_service to add more` |
 | `site(..)` without a prefix, or twice | `bind`/`from_listener`: `INVALID_ARGUMENT` |
 | address in use | `bind`: `UNAVAILABLE`, `could not listen on <addr>` |
@@ -854,7 +911,8 @@ Builder defaults: no prefix, `grpc_at_root(true)`, `grpc_web(true)`,
 `health_routes(true)`, `grpc_health(true)`, `HealthVisibility::Minimal`, no
 authenticator, `header_read_timeout(Some(30 s))`,
 `max_connections(Some(10_000))`, `http2_keep_alive(None)`, no CORS,
-`rest_body_limit(2 MiB)`, no layers, `access_log(true)`.
+`client_addr(ClientAddrPolicy::peer())`, `rest_body_limit(2 MiB)`, no
+layers, `access_log(true)`.
 
 ## Testing
 

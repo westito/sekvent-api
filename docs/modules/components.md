@@ -946,14 +946,20 @@ Everything is still decided from the request head before the body is read:
    `UNIMPLEMENTED` / `UNKNOWN_METHOD`. Under the bearer modes routing comes
    before the end-user authenticator, so an unknown path never costs a
    token verification.
-3. **Context.** It is decoded from the headers and the deadline narrowed by
-   the method's timeout.
-4. **End user.** When the mode includes `bearer`, no link matched and the
+3. **Context.** It is decoded from the headers (with the
+   [client address](server.md#resolve-the-client-address) the server
+   resolved, unless a trusted link named its visitor) and the deadline
+   narrowed by the method's timeout.
+4. **Client limit by address.** A method with a `CLIENT_KEY=client_addr`
+   limit ([below](#how-to-limit-each-client-of-a-served-method)) takes a
+   permit here, so a flood is refused before any token is verified.
+5. **End user.** When the mode includes `bearer`, no link matched and the
    method is not anonymous, the authenticator runs, except for an
    `optional_end_user` method called without an `Authorization` header,
    which runs with no end user. On success the context carries the end
    user.
-5. **Hop limit**, gate, bulkhead, method timeout and handler, exactly as
+6. **Client limit by end user** (`end_user`, `end_user_or_client_addr`).
+7. **Hop limit**, gate, bulkhead, method timeout and handler, exactly as
    for a link caller.
 
 ### Mount the routes for browsers
@@ -992,6 +998,74 @@ let server = Server::builder()
   `CallContext` the server stored there if you want to reuse that decision.
 - Global layers (`ServerBuilder::layer`) wrap component calls too; see
   [Pitfalls and security](#pitfalls-and-security).
+
+## How to limit each client of a served method
+
+A public method (a storefront's `PlaceOrder`, a sign-in that mails a code)
+needs a limit per client, not per process. The `CLIENT_*` fields give a
+served method a token bucket per client
+([`KeyedRateLimiter`](resilience.md#how-to-limit-each-client-keyedratelimiter)):
+
+```sh
+SEKVENT_COMPONENT_CHECKOUT_PLACE_ORDER_POLICY=orders
+SEKVENT_POLICY_ORDERS_CLIENT_RATE=5/1m          # 5 per minute
+SEKVENT_POLICY_ORDERS_CLIENT_BURST=2            # at most 2 at once
+SEKVENT_COMPONENT_ACCOUNTS_SEND_CODE_CLIENT_RATE=3/10m
+SEKVENT_COMPONENT_ACCOUNTS_SEND_CODE_CLIENT_KEY=client_addr
+```
+
+| Field | Values | Default |
+|---|---|---|
+| `CLIENT_RATE` | `<permits>/<period>`: `5/1m`, `100/1s`, `1000/1h` (humantime or whole seconds). Required when another `CLIENT_*` field is set. | off |
+| `CLIENT_BURST` | permits taken at once, at least 1 | the permits of `CLIENT_RATE` |
+| `CLIENT_KEY` | `client_addr` (the [resolved client address](server.md#resolve-the-client-address), IPv6 by its /64), `end_user` (the authenticated end user, or the subject a trusted link asserts), `end_user_or_client_addr` | `client_addr` |
+| `CLIENT_MAX_KEYS` | the most clients tracked; beyond it the one unused for longest is forgotten | 100 000 |
+
+- **Levels.** Method keys (`SEKVENT_COMPONENT_<C>_<M>_CLIENT_*`) and named
+  policies (`SEKVENT_POLICY_<N>_CLIENT_*`), referenced from a method's or
+  the component's `_POLICY`. Not at component level: there they are
+  unknown keys. A policy of `CLIENT_*` fields alone is a valid policy.
+- **Shared buckets.** One set of buckets per named policy, shared by every
+  method that uses it, so `orders` above limits a client across all its
+  methods together. A method that sets `CLIENT_*` keys of its own on top
+  gets buckets of its own (its keys over the policy's).
+- **Where it runs.** On the serving side only, after routing and context
+  decoding: a `client_addr` limit before the end-user authenticator, an
+  `end_user*` limit right after it ([serving order](#serving-order-for-end-users)).
+  A refused call gets `RESOURCE_EXHAUSTED` / `CLIENT_RATE_LIMITED` with
+  `retry_after` and `component`/`method` metadata; its body is not read
+  and the handler never runs. `grpc` callers never retry it, and their
+  breaker does not count it.
+- **Fail closed.** A call without a key (no client address; no end user
+  for `end_user`) counts against one shared unknown bucket.
+- **In-process calls are never limited**, under `local` and
+  `local-serialized` alike: the limit protects the network edge.
+- **Links.** A link caller counts as its own address, unless it is
+  trusted and forwards its visitor's (`CallContext::with_client_addr`, sent
+  as `x-sekvent-client-addr`): a server-rendered frontend that calls with
+  its link token can keep its visitors apart. An untrusted link's header
+  is ignored.
+- `RATE_LIMIT_*` (a process-wide rate gate) stays refused for components.
+
+**The same buckets over REST.** `app.client_limiter(component, method)`
+returns the `ClientLimiter` of a method's serving policy (`None` when it
+has none, or runs in another process). Put it in front of a REST route
+with `ClientLimitLayer` (facade feature `resilience-http`), and the REST
+facade and gRPC callers drain the same buckets:
+
+```rust
+use sekvent::resilience::ClientLimitLayer;
+
+let mut rest = Router::new().route("/checkout/orders", post(place_order));
+if let Some(limiter) = app.client_limiter("checkout", "place_order") {
+    rest = rest.layer(ClientLimitLayer::new(limiter));
+}
+let server = Server::builder().rest(rest).grpc_routes(app.grpc_routes());
+```
+
+The layer answers a refused request `429` with `Retry-After`. It keys by
+the `CallContext` the server put into the request extensions, so it sees
+the same client address as the gRPC path.
 
 ## How to stream replies (`#[call(stream)]`)
 
@@ -1219,12 +1293,13 @@ lowest precedence to the highest:
 | `RETRY_BUDGET_RATIO` (default 0.2), `RETRY_BUDGET_MIN_PER_SEC` (default 10) | component, named | One budget per remote component, shared by its methods. |
 | `BREAKER_ENABLED`, `BREAKER_FAILURE_RATE`, `BREAKER_WINDOW`, `BREAKER_MIN_CALLS`, `BREAKER_WAIT_IN_OPEN`, `BREAKER_PERMITTED_IN_HALF_OPEN` | component, named | One breaker per remote component. Streams count their opens only. |
 | `STREAM_MAX_LIFETIME` | method, component (not named) | The serving side, where the component runs: the lifetime of a streaming method's streams. Known only for streaming methods, and at component level only for components that have one. |
+| `CLIENT_RATE`, `CLIENT_BURST`, `CLIENT_KEY`, `CLIENT_MAX_KEYS` | method, named | The serving side, for calls served over gRPC: a token bucket per client. See [Limit each client](#how-to-limit-each-client-of-a-served-method). |
 
 The value formats and the meaning of each field are documented in
 [resilience](resilience.md). Additional rules:
 
 - `RATE_LIMIT_*` keys are not accepted for components; they fail as
-  unknown keys.
+  unknown keys. Use the per-client `CLIENT_*` fields.
 - A component-only field (budget, breaker) at method level is unknown.
   Referencing a named policy that sets one from a method's `_POLICY` key
   is rejected.
@@ -1294,6 +1369,7 @@ requires them.
 | `SEKVENT_COMPONENT_<C>_POLICY`, `SEKVENT_COMPONENT_<C>_<M>_POLICY` | a policy name | — |
 | `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME`, `SEKVENT_COMPONENT_<C>_<M>_STREAM_MAX_LIFETIME` | humantime (`15m`, `2h`) or whole seconds, above zero; streaming methods only | the `max_lifetime` attribute, else 15 minutes |
 | `SEKVENT_COMPONENT_<C>_<FIELD>`, `SEKVENT_COMPONENT_<C>_<M>_<FIELD>` | resilience fields, as in the previous section | attribute and framework defaults |
+| `SEKVENT_COMPONENT_<C>_<M>_CLIENT_RATE`, `_CLIENT_BURST`, `_CLIENT_KEY`, `_CLIENT_MAX_KEYS` | the per-client limit of a served method (also in named policies) | off |
 | `SEKVENT_POLICY_<NAME>_<FIELD>` | named policy fields | — |
 | `SEKVENT_LINK_OUTBOUND_<LINK>`, `SEKVENT_LINK_INBOUND_<CALLER>`, `SEKVENT_LINK_TRUSTED` | see [link](link.md) | — |
 
@@ -1372,6 +1448,7 @@ metadata the server sent.
 | `STOPPED` | `COMPONENT_STOPPED` | `UNAVAILABLE` | Called after `stop` (and a stream opened then) |
 | `STREAM_EXPIRED` | `STREAM_EXPIRED` | `UNAVAILABLE` | A stream reached its lifetime; metadata `max_lifetime_ms`. Reopen at once |
 | `BULKHEAD_FULL` | `BULKHEAD_FULL` | `RESOURCE_EXHAUSTED` | The method's bulkhead is full |
+| `sekvent::resilience::CLIENT_RATE_LIMITED` | `CLIENT_RATE_LIMITED` | `RESOURCE_EXHAUSTED` | The caller's bucket of the method's `CLIENT_*` limit is empty; `retry_after` set. Never retried, never counted by the breaker |
 | `CIRCUIT_OPEN` | `CIRCUIT_OPEN` | `UNAVAILABLE` | The remote component's breaker is open |
 | `UNREACHABLE` | `COMPONENT_UNREACHABLE` | `UNAVAILABLE` | A transport failure (connection refused, reset) |
 | `METHOD_TIMEOUT` | `METHOD_TIMEOUT` | `DEADLINE_EXCEEDED` | The method timeout fired while the caller had time |

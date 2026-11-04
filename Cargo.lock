@@ -4254,6 +4254,7 @@ dependencies = [
 name = "sekvent-resilience"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "futures",
  "http",
  "humantime",
@@ -4261,6 +4262,7 @@ dependencies = [
  "sekvent-config",
  "sekvent-context",
  "sekvent-error",
+ "sekvent-resilience",
  "serde",
  "serde_json",
  "tokio",
@@ -4283,6 +4285,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "ipnet",
  "mime_guess",
  "percent-encoding",
  "prost",

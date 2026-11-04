@@ -158,6 +158,7 @@ line. The `sekvent` skill has the recipes with real API names.
 | list endpoints building filters and pagination by hand | `sekvent::db::list` (`ListParams`, column filters) with sea-orm; pools via `PoolSpec` / `PoolRegistry` |
 | reqwest wrappers with retry loops, token caches | `sekvent::client::HttpClient` with a `PolicySpec`; `client::oauth2::ClientCredentials` for OAuth 2.0 |
 | semaphores or token buckets guarding an upstream quota | `sekvent::resilience::RateGate`; timeouts, bulkheads and breakers from the same module |
+| per-IP or per-user request limiters (`governor`, `tower_governor`, a `DashMap` of buckets), `X-Forwarded-For` parsing | `sekvent::resilience::{KeyedRateLimiter, ClientLimitLayer}`, component `CLIENT_*` fields, and `sekvent::runtime::ClientAddrPolicy` for the client address |
 | `tonic-build`/`prost-build` calls in `build.rs` | `sekvent_proto_build::ProtoBuild` (`messages_only` / `services_only` for split proto crates) |
 | custom lifecycle, signal handling, health routes | `Runtime::builder()` units and `Server::builder()`; `/livez`, `/readyz`, `/healthz` and `grpc.health.v1` come built in |
 | a hand-written server-streaming tonic service (live updates, `watch`/`broadcast` fan-out, polling endpoints a browser hits) | a `#[call(stream)]` component method returning `CallStream` (`rpc X(A) returns (stream B)` in the contract): auth, deadlines, drain at shutdown, lifetime and gRPC-Web come with it; carry a cursor in the request if clients must resume |

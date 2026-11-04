@@ -1,6 +1,6 @@
 # Resilience
 
-`sekvent::resilience` (crate `sekvent-resilience`) holds the building blocks for calling a dependency that may be slow, overloaded or down: exponential backoff with jitter, bounded retries paid for by a shared retry budget, a rolling-window rate gate, a deadline-aware timeout, a bulkhead (concurrency cap), a circuit breaker, a `Policy` that composes all of them in a fixed order, a `PolicySpec` that builds a policy from configuration, a tower layer, and a small TTL cache with single flight and stale-if-error. Everything works on `AppError` and `CallContext`, not on a transport, so one policy serves the HTTP client, gRPC clients, database calls or any other async operation. `Policy::call` respects the caller's deadline and cancellation from start to finish; used on their own, the primitives each cover only part of that (see [Deadlines and cancellation](#concepts) below).
+`sekvent::resilience` (crate `sekvent-resilience`) holds the building blocks for calling a dependency that may be slow, overloaded or down: exponential backoff with jitter, bounded retries paid for by a shared retry budget, a rolling-window rate gate, a per-client rate limiter (a token bucket per client address or end user), a deadline-aware timeout, a bulkhead (concurrency cap), a circuit breaker, a `Policy` that composes all of them in a fixed order, a `PolicySpec` that builds a policy from configuration, a tower layer, and a small TTL cache with single flight and stale-if-error. Everything works on `AppError` and `CallContext`, not on a transport, so one policy serves the HTTP client, gRPC clients, database calls or any other async operation. `Policy::call` respects the caller's deadline and cancellation from start to finish; used on their own, the primitives each cover only part of that (see [Deadlines and cancellation](#concepts) below).
 
 ## Enable it
 
@@ -12,6 +12,8 @@ sekvent-api = { git = "https://github.com/westito/sekvent-api", branch = "master
 ```rust
 use sekvent::resilience::{Policy, PolicySpec, RetryPolicy, TtlCache};
 ```
+
+`ClientLimitLayer` (a per-client limit in front of axum routes) needs the facade feature `resilience-http` (crate feature `http`).
 
 The default facade features (`config`, `error`, `context`, …) stay on, so `sekvent::config::EnvSource`, `sekvent::error::AppError` and `sekvent::context::CallContext` are available next to it. `features = ["full"]` also includes `resilience`.
 
@@ -243,6 +245,62 @@ if gate.try_acquire() { /* a permit was free and nobody was queued */ }
 | `permits()`, `window()` | Accessors. |
 
 The gate remembers the time of each grant inside the window, so memory grows with `permits`.
+
+## How to limit each client (KeyedRateLimiter)
+
+`RateGate` protects a dependency with one quota for the whole process. `KeyedRateLimiter` protects *you* from each client: one token bucket per key (a client address or an end user), refused at once rather than queued. It is what a served component method's `CLIENT_*` policy uses ([components.md](components.md#how-to-limit-each-client-of-a-served-method)).
+
+```rust
+use std::time::Duration;
+use sekvent::resilience::{KeyedLimit, KeyedRateLimiter, RateKey};
+
+// 5 per minute, up to 2 at once, for at most 50 000 clients.
+let limiter = KeyedRateLimiter::new(
+    KeyedLimit::new(5, Duration::from_mins(1)).with_burst(2).with_max_keys(50_000),
+)?;
+match limiter.try_acquire(&RateKey::ip(client_ip)) {
+    Ok(()) => { /* serve */ }
+    Err(limited) => { /* refuse; retry after limited.retry_after */ }
+}
+limiter.try_acquire_n(&RateKey::subject("user-7"), 3)?; // weighted: three permits or none
+```
+
+| Item | Meaning |
+|---|---|
+| `KeyedLimit::new(rate, per)` | `rate` permits earned per `per`; `burst` defaults to `rate`, `max_keys` to `DEFAULT_MAX_KEYS` (100 000), `idle_ttl` to `per`. `with_burst`, `with_max_keys`, `with_idle_ttl` change them. The fields are public. |
+| `KeyedLimit::parse_rate("5/1m")` | The configuration form `<permits>/<period>` (humantime or bare seconds); `None` if malformed. |
+| `KeyedRateLimiter::new(limit) -> Result<_, PolicyError>` | `rate`, `burst`, `max_keys` at least 1 (`keyed_limit.rate`, `.burst`, `.max_keys`); `per` above zero and, like `idle_ttl`, at most 366 days (`keyed_limit.per`, `.idle_ttl`); an empty bucket must fill within 3660 days (`keyed_limit.burst`). |
+| `try_acquire(&key)`, `try_acquire_n(&key, n)` | `Ok(())`, or `Err(RateLimited { retry_after })`: the time until `n` permits are back. Zero permits always succeed; more than `burst` never do (`retry_after` is the time an empty bucket takes to fill). A refusal takes nothing. |
+| `RateKey::ip(IpAddr)` | IPv4 as itself (IPv4-mapped IPv6 too); **IPv6 by its /64**, the block one subscriber usually holds, so rotating through a prefix does not escape the limit. |
+| `RateKey::subject(&str)`, `RateKey::unknown()` | An end user; the one shared bucket of calls without a key. `Debug` never shows the address or subject. |
+| `len()`, `is_empty()`, `limit()` | Keys tracked now; the shape. |
+
+- **Bounded memory.** A bucket is dropped once it is full again and unused for `idle_ttl` (a full bucket is the same as none), and at `max_keys` a new key evicts the one unused for longest. The limiter never fails for being full. Each key costs one instant and its key (the bucket is kept as the time it is full again, the generic cell rate algorithm), and no timer runs.
+- **Time** is tokio's clock: tests run with `start_paused = true` and `tokio::time::advance`.
+- `AppError::from(RateLimited)` is `RESOURCE_EXHAUSTED`, reason `CLIENT_RATE_LIMITED` (the constant `CLIENT_RATE_LIMITED`), with `retry_after`. Unlike other `RESOURCE_EXHAUSTED` errors, `RetryPolicy` never retries it and a breaker's default classifier does not count it: retrying only drains the same bucket, and one flooding client must not open a circuit for everyone else.
+
+`ClientLimiter` keys a limiter from a `CallContext`, by a `ClientKey`:
+
+| `ClientKey` | Config form | Bucket |
+|---|---|---|
+| `ClientAddr` | `client_addr` | `ctx.client_addr()` ([server.md](server.md#resolve-the-client-address)) |
+| `EndUser` | `end_user` | `ctx.subject()`: the authenticated end user's, or the one a trusted link asserts |
+| `EndUserOrClientAddr` | `end_user_or_client_addr` | the subject when there is one, else the client address |
+
+A context without the key counts against the shared unknown bucket, so a client cannot escape the limit by hiding its key (fail closed). `ClientLimiter::new(limit, key)`, `check(&ctx) -> Result<(), AppError>`, `key()`, `limiter()`. Clones share their buckets and compare equal.
+
+### Put it in front of REST routes (ClientLimitLayer)
+
+```rust
+use sekvent::resilience::{ClientKey, ClientLimitLayer, ClientLimiter, KeyedLimit};
+
+let limiter = ClientLimiter::new(KeyedLimit::new(10, Duration::from_secs(1)), ClientKey::ClientAddr)?;
+let routes = Router::new()
+    .route("/sign-in/code", post(send_code))
+    .layer(ClientLimitLayer::new(limiter));
+```
+
+The layer reads the `CallContext` the [server](server.md) stores in the request extensions (without one: the unknown bucket) and answers a refused request `429` with `Retry-After` and the error body, without calling the inner service. To make a REST facade over a served component method drain the method's buckets, pass `app.client_limiter("checkout", "place_order")` instead of a new limiter ([components.md](components.md#how-to-limit-each-client-of-a-served-method)).
 
 ## How to bound a call's duration (Timeout)
 
@@ -622,7 +680,7 @@ Retries, the rate gate, timeouts and the bulkhead always use tokio's clock direc
 
 `from_config` checks every key and reports all problems at once: one `ConfigError` for a single bad key, or `ConfigError::Multiple`. Unparsable values give `Malformed`, and out-of-range values give `Invalid`. Messages name the key and never the value. Problems that involve several fields, or limits only the builders know, surface from `build` as a `PolicyError` instead. Its `parameter()` is a dotted name such as `backoff.max`, not the environment key.
 
-Components read the same field grammar under their own keys (`SEKVENT_COMPONENT_<C>_…`, `SEKVENT_POLICY_<N>_…`) with their own defaults and rules. For example, there a method `TIMEOUT` bounds the whole call, and `RATE_LIMIT_*` is not accepted. See [components.md](components.md).
+Components read the same field grammar under their own keys (`SEKVENT_COMPONENT_<C>_…`, `SEKVENT_POLICY_<N>_…`) with their own defaults and rules. For example, there a method `TIMEOUT` bounds the whole call, and `RATE_LIMIT_*` is not accepted; the per-client `CLIENT_*` fields take its place. See [components.md](components.md).
 
 ## Errors and reasons emitted by this crate
 
@@ -634,6 +692,7 @@ Components read the same field grammar under their own keys (`SEKVENT_COMPONENT_
 | `Timeout::call` alone with a deadline already passed | `DEADLINE_EXCEEDED` | metadata `timeout_ms = "0"` | none |
 | `RateGate::acquire_within`, no permit before the deadline | `RESOURCE_EXHAUSTED` | none | when the next permit frees up |
 | `RateGate::acquire_within`, deadline passed while queued | `DEADLINE_EXCEEDED` | none | none |
+| `AppError::from(RateLimited)`, `ClientLimiter::check`, `ClientLimitLayer` (`429`) | `RESOURCE_EXHAUSTED` | reason `CLIENT_RATE_LIMITED` | when the bucket has the permits again |
 | `Bulkhead`, full, queue full or wait elapsed | `RESOURCE_EXHAUSTED` | reason `BULKHEAD_FULL` | the configured hint (default 1 s) |
 | `Bulkhead`, deadline passed while queued | `DEADLINE_EXCEEDED` | none | none |
 | `CircuitBreaker` open | `UNAVAILABLE` | reason `CIRCUIT_OPEN`, metadata `breaker` | remaining open time |
@@ -641,9 +700,9 @@ Components read the same field grammar under their own keys (`SEKVENT_COMPONENT_
 | `RetryPolicy` | The last attempt's error, unchanged | | |
 | `TtlCache` waiters | The loader's error, rebuilt with `AppError::from_wire` | | |
 
-The reasons are plain string values; the crate exports no constants for them. Construction problems are `PolicyError` (with `parameter()`, `reason()` and a `Display` of `invalid resilience parameter <parameter>: <reason>`), never `AppError`. The parameter names are:
+The reasons are plain string values; the crate exports a constant only for `CLIENT_RATE_LIMITED`. Construction problems are `PolicyError` (with `parameter()`, `reason()` and a `Display` of `invalid resilience parameter <parameter>: <reason>`), never `AppError`. The parameter names are:
 
-`backoff.jitter`, `backoff.multiplier`, `backoff.max`, `retry.max_attempts`, `retry_budget.ratio`, `rate_gate.permits`, `rate_gate.window`, `bulkhead.max_concurrent`, `bulkhead.queue_timeout`, `breaker.window`, `breaker.failure_rate`, `breaker.min_calls`, `breaker.wait_in_open`, `breaker.permitted_in_half_open`, `timeout`, `cache.ttl`, `cache.max_entries`.
+`backoff.jitter`, `backoff.multiplier`, `backoff.max`, `retry.max_attempts`, `retry_budget.ratio`, `rate_gate.permits`, `rate_gate.window`, `keyed_limit.rate`, `keyed_limit.per`, `keyed_limit.burst`, `keyed_limit.max_keys`, `keyed_limit.idle_ttl`, `bulkhead.max_concurrent`, `bulkhead.queue_timeout`, `breaker.window`, `breaker.failure_rate`, `breaker.min_calls`, `breaker.wait_in_open`, `breaker.permitted_in_half_open`, `timeout`, `cache.ttl`, `cache.max_entries`.
 
 ## Testing tips
 
@@ -701,6 +760,7 @@ assert_eq!(breaker.state(), BreakerState::HalfOpen);
 - **Backoff bounds interact.** Setting `RETRY_INITIAL_BACKOFF` above 5 s without `RETRY_MAX_BACKOFF` fails at build with `backoff.max`, because the default cap is 5 s.
 - **`BREAKER_WINDOW=30` means 30 calls**, not 30 seconds; write `30s` for a time window. Every other duration key reads bare integers as seconds.
 - **Misspelt keys are ignored** by `from_config`. Check them against `PolicySpec::CONFIG_KEYS` if that matters. The serde form rejects unknown fields.
+- **Per-client limits key on what the server resolved.** Behind a proxy, configure `ClientAddrPolicy::behind_proxies` ([server.md](server.md#resolve-the-client-address)), or every client shares the proxy's bucket. Never key a limiter on a header you read yourself.
 - **Overload rejections are retryable upstream.** Rate-gate and bulkhead rejections are `RESOURCE_EXHAUSTED`, which is transient and carries `retry_after`. A caller further up may retry them, and a caller's breaker counts them as failures of this service. That is intended for an overloaded service, but keep the hints realistic.
 - **Long `retry_after` hints are not waited out.** A hint above `max_retry_after` returns the error immediately. Raise `RETRY_MAX_RETRY_AFTER` only if parking the caller is acceptable.
 - **`CircuitBreaker::call` cannot tell the caller's fault from the dependency's.** Prefer a `Policy`, or the manual permit with `release()` for caller-side cancellation and deadlines.

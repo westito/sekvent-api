@@ -48,6 +48,7 @@
 
 #![forbid(unsafe_code)]
 
+mod client_addr;
 mod cors;
 mod download;
 mod health;
@@ -63,6 +64,7 @@ mod unit;
 #[cfg(feature = "vfs")]
 pub mod vfs;
 
+pub use client_addr::{ClientAddrPolicy, ForwardedHeader, IpNet};
 pub use cors::Cors;
 pub use download::{
     CacheControl, Disposition, Download, content_disposition, sanitize_filename, sniff_content_type,

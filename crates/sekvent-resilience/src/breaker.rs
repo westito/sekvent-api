@@ -181,7 +181,9 @@ pub struct BreakerMetrics {
 ///   reopens the circuit, all of them succeeding closes it.
 ///
 /// Only errors for which the classifier returns `true` are failures; by
-/// default that is [`ErrorCode::trips_breaker`](sekvent_error::ErrorCode::trips_breaker).
+/// default that is [`ErrorCode::trips_breaker`](sekvent_error::ErrorCode::trips_breaker),
+/// except a per-client rate limit ([`CLIENT_RATE_LIMITED`](crate::CLIENT_RATE_LIMITED)):
+/// one flooding client must not open the circuit for everyone else.
 /// Other errors mean the dependency answered, so they count as successes.
 pub struct CircuitBreaker {
     name: String,
@@ -475,7 +477,9 @@ impl CircuitBreaker {
             wait_in_open: config.wait_in_open,
             permitted_in_half_open: config.permitted_in_half_open,
             clock: Arc::new(TokioClock::new()),
-            classifier: Arc::new(|error: &AppError| error.code().trips_breaker()),
+            classifier: Arc::new(|error: &AppError| {
+                error.code().trips_breaker() && error.reason() != Some(crate::CLIENT_RATE_LIMITED)
+            }),
             hook: None,
             rejected: AtomicU64::new(0),
             inner: Mutex::new(Inner {
@@ -840,6 +844,21 @@ mod tests {
         assert_eq!(h.breaker.state(), BreakerState::Closed);
         let metrics = h.breaker.metrics();
         assert_eq!((metrics.calls, metrics.failures), (10, 0));
+    }
+
+    #[test]
+    fn a_client_rate_limit_is_not_a_failure() {
+        let h = harness(config());
+        for _ in 0..10 {
+            h.breaker
+                .acquire()
+                .unwrap()
+                .record::<()>(&Err(AppError::from(crate::RateLimited {
+                    retry_after: secs(1),
+                })));
+        }
+        assert_eq!(h.breaker.state(), BreakerState::Closed);
+        assert_eq!(h.breaker.metrics().failures, 0);
     }
 
     #[test]

@@ -501,11 +501,13 @@ mod tests {
                 timeout: None,
                 spec: spec.clone(),
                 max_lifetime: None,
+                client: None,
             },
             MethodPolicy {
                 timeout: None,
                 spec,
                 max_lifetime: None,
+                client: None,
             },
         ];
         RemoteClient::new(INVENTORY, channel(), None, &policies, component)

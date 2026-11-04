@@ -3,8 +3,8 @@
 //! Inbound values are validated before they are trusted with anything: a
 //! request id or key must be visible ASCII without spaces and of bounded
 //! length, a `traceparent` must have the W3C version-00 shape, and
-//! `subject`/`tenant` survive only when the authenticated caller is a trusted
-//! link. The component call depth ([`HOPS`]) is read from any caller: it is
+//! `subject`/`tenant` and the client address survive only when the
+//! authenticated caller is a trusted link. The component call depth ([`HOPS`]) is read from any caller: it is
 //! a safety net against call cycles, not identity. Anything that fails validation is dropped (or, for the request id,
 //! replaced) rather than rejected, so a sloppy client still gets served.
 
@@ -28,6 +28,9 @@ pub const TENANT: &str = "x-sekvent-tenant";
 pub const IDEMPOTENCY_KEY: &str = "idempotency-key";
 /// Component call depth.
 pub const HOPS: &str = "x-sekvent-hops";
+/// The address of the client a call is made for, honoured only from
+/// trusted links.
+pub const CLIENT_ADDR: &str = "x-sekvent-client-addr";
 
 /// Longest accepted request id.
 const MAX_REQUEST_ID_LEN: usize = 128;
@@ -39,6 +42,8 @@ const MAX_TIMEOUT_DIGITS: usize = 8;
 const MAX_TIMEOUT_VALUE: u128 = 99_999_999;
 /// Most digits a hop count may carry.
 const MAX_HOPS_DIGITS: usize = 4;
+/// Longest textual IP address (an IPv6 address with an embedded IPv4 one).
+const MAX_ADDR_LEN: usize = 45;
 
 /// `grpc-timeout` units from finest to coarsest, with their size in nanoseconds.
 const TIMEOUT_UNITS: [(char, u128); 6] = [
@@ -53,7 +58,8 @@ const TIMEOUT_UNITS: [(char, u128); 6] = [
 /// Build a server-side context from inbound headers.
 ///
 /// `caller` is the identity established by authentication (or `None`).
-/// Untrusted callers' `subject`/`tenant` headers are ignored. A missing or
+/// Untrusted callers' `subject`/`tenant` and client address headers are
+/// ignored. A missing or
 /// malformed request id is replaced by a fresh one; a malformed
 /// `grpc-timeout` is ignored. The hop count is read from any caller as one
 /// to four ASCII digits; anything else leaves it at 0.
@@ -87,6 +93,9 @@ pub fn from_headers(headers: &HeaderMap, caller: Option<ServiceIdentity>) -> Cal
     if let Some(hops) = header_str(headers, HOPS).and_then(parse_hops) {
         ctx = ctx.with_hops(hops);
     }
+    if let Some(addr) = token(headers, CLIENT_ADDR, MAX_ADDR_LEN).and_then(|v| v.parse().ok()) {
+        ctx = ctx.with_client_addr(addr);
+    }
     if let Some(caller) = caller {
         ctx = ctx.with_caller(caller);
     }
@@ -118,13 +127,15 @@ pub fn inject(ctx: &CallContext, headers: &mut HeaderMap) {
     set(headers, IDEMPOTENCY_KEY, ctx.outbound_idempotency_key());
     let hops = encode_hops(ctx.hops());
     set(headers, HOPS, hops.as_deref());
+    let addr = ctx.client_addr().map(|addr| addr.to_string());
+    set(headers, CLIENT_ADDR, addr.as_deref());
 }
 
 /// Add the context to the headers of an outbound request without touching
 /// what the caller set.
 ///
-/// Request id, `traceparent`, subject, tenant and a hop count above 0 are
-/// written only when the caller has not set that header; nothing is ever removed. The one
+/// Request id, `traceparent`, subject, tenant, the client address and a hop
+/// count above 0 are written only when the caller has not set that header; nothing is ever removed. The one
 /// exception is `grpc-timeout`: a caller value longer than the time this
 /// context has left (or one that does not parse) is replaced by the
 /// remaining time, because a callee must never get more time than its
@@ -140,6 +151,8 @@ pub fn propagate(ctx: &CallContext, headers: &mut HeaderMap) {
     set_if_absent(headers, TENANT, ctx.tenant());
     let hops = encode_hops(ctx.hops());
     set_if_absent(headers, HOPS, hops.as_deref());
+    let addr = ctx.client_addr().map(|addr| addr.to_string());
+    set_if_absent(headers, CLIENT_ADDR, addr.as_deref());
 }
 
 /// Add the part of the context a third-party service may see to the
@@ -147,8 +160,8 @@ pub fn propagate(ctx: &CallContext, headers: &mut HeaderMap) {
 /// remaining deadline as `grpc-timeout`, under the same rules as
 /// [`propagate`] (the caller's headers win, `grpc-timeout` only narrows).
 ///
-/// Nothing sekvent-internal is written: no subject or tenant, no hop count
-/// and no idempotency key. Those mean something only to a sekvent peer that
+/// Nothing sekvent-internal is written: no subject or tenant, no client
+/// address, no hop count and no idempotency key. Those mean something only to a sekvent peer that
 /// authenticates this service as a link.
 pub fn propagate_external(ctx: &CallContext, headers: &mut HeaderMap) {
     set_if_absent(headers, REQUEST_ID, Some(ctx.request_id()));
@@ -662,6 +675,58 @@ mod tests {
         propagate_external(&CallContext::new(), &mut unbounded);
         assert!(unbounded.get(GRPC_TIMEOUT).is_none());
         assert!(unbounded.get(TRACEPARENT).is_none());
+    }
+
+    #[test]
+    fn the_client_address_is_honoured_only_from_a_trusted_caller() {
+        let v4 = headers(&[(CLIENT_ADDR, "203.0.113.9")]);
+        let trusted = from_headers(&v4, Some(ServiceIdentity::trusted("frontend")));
+        assert_eq!(trusted.client_addr(), Some("203.0.113.9".parse().unwrap()));
+        for caller in [None, Some(ServiceIdentity::untrusted("web"))] {
+            assert_eq!(from_headers(&v4, caller).client_addr(), None);
+        }
+        let v6 = headers(&[(CLIENT_ADDR, "2001:db8::7")]);
+        let trusted = from_headers(&v6, Some(ServiceIdentity::trusted("frontend")));
+        assert_eq!(trusted.client_addr(), Some("2001:db8::7".parse().unwrap()));
+        for bad in [
+            "",
+            "localhost",
+            "203.0.113.9:80",
+            "[2001:db8::7]",
+            "1.2.3",
+            "0000:0000:0000:0000:0000:ffff:203.000.113.009",
+        ] {
+            let ctx = from_headers(
+                &headers(&[(CLIENT_ADDR, bad)]),
+                Some(ServiceIdentity::trusted("frontend")),
+            );
+            assert_eq!(ctx.client_addr(), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_client_address_travels_to_sekvent_peers_only() {
+        let addr: std::net::IpAddr = "2001:db8::7".parse().unwrap();
+        let ctx = CallContext::new().with_client_addr(addr);
+        let mut injected = headers(&[(CLIENT_ADDR, "198.51.100.1")]);
+        inject(&ctx, &mut injected);
+        assert_eq!(injected[CLIENT_ADDR], "2001:db8::7");
+        inject(&CallContext::new(), &mut injected);
+        assert!(
+            injected.get(CLIENT_ADDR).is_none(),
+            "a stale value is removed"
+        );
+
+        let mut propagated = HeaderMap::new();
+        propagate(&ctx, &mut propagated);
+        assert_eq!(propagated[CLIENT_ADDR], "2001:db8::7");
+        let mut theirs = headers(&[(CLIENT_ADDR, "198.51.100.1")]);
+        propagate(&ctx, &mut theirs);
+        assert_eq!(theirs[CLIENT_ADDR], "198.51.100.1");
+
+        let mut external = HeaderMap::new();
+        propagate_external(&ctx, &mut external);
+        assert!(external.get(CLIENT_ADDR).is_none());
     }
 
     #[test]

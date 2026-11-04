@@ -14,6 +14,11 @@
 //! check, and an optional-end-user method skips it only for a request
 //! without an `Authorization` header.
 //!
+//! A method's per-client limit (`CLIENT_*`) runs once the route and the
+//! context are known: keyed by the client address, before the end-user
+//! authenticator, so a flood is refused cheaply; keyed by the end user,
+//! right after it. A refused call never reaches the body or the handler.
+//!
 //! A streaming method's `TIMEOUT` does not narrow the context: it bounds
 //! the open (the end user, the body, the handler's open) together with the
 //! caller's deadline. The response headers go out once the stream is open,
@@ -26,7 +31,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use sekvent_context::{CallContext, ServiceIdentity, headers};
+use sekvent_context::{CallContext, ClientAddr, ServiceIdentity, headers};
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_link::TokenMap;
 use sekvent_telemetry::access_log::MessageCount;
@@ -138,12 +143,18 @@ impl Served {
         }
     }
 
-    /// Everything decided from the request headers alone, before the body
-    /// is read and before an end user is authenticated: the link, the
-    /// route, the context and its deadline (the method's timeout narrows
-    /// it, or bounds the open of a stream), and whether the end-user
-    /// authenticator must run.
-    fn prepare(&self, path: &str, wire_headers: &http::HeaderMap) -> Result<Prepared, AppError> {
+    /// Everything decided from the request head alone, before the body is
+    /// read and before an end user is authenticated: the link, the route,
+    /// the context (with the transport's client address unless a trusted
+    /// link named its visitor) and its deadline (the method's timeout
+    /// narrows it, or bounds the open of a stream), and whether the
+    /// end-user authenticator must run.
+    fn prepare(
+        &self,
+        path: &str,
+        wire_headers: &http::HeaderMap,
+        client_addr: Option<ClientAddr>,
+    ) -> Result<Prepared, AppError> {
         let descriptor = self.descriptor();
         let caller = self.link(wire_headers)?;
         let Some(method) = self.method_of(path) else {
@@ -161,6 +172,9 @@ impl Served {
             && (!declared.is_optional_end_user()
                 || wire_headers.contains_key(http::header::AUTHORIZATION));
         let mut cx = headers::from_headers(wire_headers, caller);
+        if let (None, Some(ClientAddr(addr))) = (cx.client_addr(), client_addr) {
+            cx = cx.with_client_addr(addr);
+        }
         let timeout = self
             .server
             .timeout(method)
@@ -216,6 +230,23 @@ impl Served {
                 .with_reason(reasons::HANDLER_PANICKED),
                 method,
             )),
+        }
+    }
+
+    /// Take a permit from the method's per-client limiter, if it has one
+    /// whose key is (`after_end_user`) or is not known only after
+    /// end-user authentication.
+    fn check_client(
+        &self,
+        method: usize,
+        cx: &CallContext,
+        after_end_user: bool,
+    ) -> Result<(), AppError> {
+        match self.server.client_limiter(method) {
+            Some(limiter) if limiter.key().needs_end_user() == after_end_user => limiter
+                .check(cx)
+                .map_err(|error| tag(self.descriptor(), error, method)),
+            _ => Ok(()),
         }
     }
 
@@ -397,7 +428,11 @@ where
                 .and_then(|method| descriptor.methods().get(method))
                 .map_or("?", |method| method.name()),
         );
-        let prepared = served.prepare(path, request.headers());
+        let prepared = served.prepare(
+            path,
+            request.headers(),
+            request.extensions().get::<ClientAddr>().copied(),
+        );
         Box::pin(
             async move {
                 let Prepared {
@@ -409,6 +444,9 @@ where
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(error_response(error)),
                 };
+                if let Err(error) = served.check_client(method, &cx, false) {
+                    return Ok(error_response(error));
+                }
                 let (head, body) = request.into_parts();
                 if end_user {
                     cx = match served.authenticate(method, cx, &head, open_deadline).await {
@@ -416,7 +454,10 @@ where
                         Err(error) => return Ok(error_response(error)),
                     };
                 }
-                if let Err(error) = served.check_hops(method, &cx) {
+                if let Err(error) = served
+                    .check_client(method, &cx, true)
+                    .and_then(|()| served.check_hops(method, &cx))
+                {
                     return Ok(error_response(error));
                 }
                 let request = http::Request::from_parts(head, body);
@@ -677,29 +718,29 @@ mod tests {
     fn authentication_comes_before_the_method_lookup() {
         let served = authenticated(None);
         let error = served
-            .prepare("/shop.v1.Inventory/Stock", &http::HeaderMap::new())
+            .prepare("/shop.v1.Inventory/Stock", &http::HeaderMap::new(), None)
             .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Unauthenticated);
         let error = served
-            .prepare("/shop.v1.Inventory/Stock", &bearer(TOKEN))
+            .prepare("/shop.v1.Inventory/Stock", &bearer(TOKEN), None)
             .unwrap_err();
         assert_eq!(error.code(), ErrorCode::Unimplemented);
         assert_eq!(error.reason(), Some(reasons::UNKNOWN_METHOD));
-        let error = served.prepare(RESERVE, &bearer("wrong")).unwrap_err();
+        let error = served.prepare(RESERVE, &bearer("wrong"), None).unwrap_err();
         assert_eq!(error.code(), ErrorCode::Unauthenticated);
         // Anonymous methods still need the link under link-only serving.
         let error = served
-            .prepare("/shop.v1.Inventory/Release", &http::HeaderMap::new())
+            .prepare("/shop.v1.Inventory/Release", &http::HeaderMap::new(), None)
             .unwrap_err();
         assert_eq!(error.message(), sekvent_link::REJECTED_MESSAGE);
         // So do optional-end-user methods, with or without a credential.
         for wire in [http::HeaderMap::new(), bearer("user-1")] {
-            let error = served.prepare(TRACK, &wire).unwrap_err();
+            let error = served.prepare(TRACK, &wire, None).unwrap_err();
             assert_eq!(error.message(), sekvent_link::REJECTED_MESSAGE);
         }
-        let prepared = served.prepare(TRACK, &bearer(TOKEN)).unwrap();
+        let prepared = served.prepare(TRACK, &bearer(TOKEN), None).unwrap();
         assert!(!prepared.end_user);
-        let prepared = served.prepare(RESERVE, &bearer(TOKEN)).unwrap();
+        let prepared = served.prepare(RESERVE, &bearer(TOKEN), None).unwrap();
         assert_eq!(prepared.method, 0);
         assert!(!prepared.end_user);
         assert_eq!(
@@ -713,7 +754,7 @@ mod tests {
         let served = authenticated(Some(Duration::from_secs(2)));
         let mut wire = bearer(TOKEN);
         wire.insert(headers::HOPS, "2".parse().unwrap());
-        let prepared = served.prepare(RESERVE, &wire).unwrap();
+        let prepared = served.prepare(RESERVE, &wire, None).unwrap();
         let error = served
             .check_hops(prepared.method, &prepared.cx)
             .unwrap_err();
@@ -721,7 +762,7 @@ mod tests {
         assert_eq!(error.metadata()["method"], "reserve");
 
         let before = std::time::Instant::now();
-        let prepared = served.prepare(RESERVE, &bearer(TOKEN)).unwrap();
+        let prepared = served.prepare(RESERVE, &bearer(TOKEN), None).unwrap();
         served.check_hops(prepared.method, &prepared.cx).unwrap();
         let cx = prepared.cx;
         let deadline = cx.deadline().unwrap();
@@ -851,7 +892,7 @@ mod tests {
         path: &str,
         wire: http::HeaderMap,
     ) -> Result<Prepared, AppError> {
-        let mut prepared = served.prepare(path, &wire)?;
+        let mut prepared = served.prepare(path, &wire, None)?;
         if prepared.end_user {
             prepared.cx = served
                 .authenticate(
@@ -1018,7 +1059,7 @@ mod tests {
         assert_eq!(error.metadata()["component"], "inventory");
 
         let unbounded = end_user_served(false, None);
-        let prepared = unbounded.prepare(RESERVE, &bearer("user-1")).unwrap();
+        let prepared = unbounded.prepare(RESERVE, &bearer("user-1"), None).unwrap();
         let cx = served
             .authenticate(prepared.method, prepared.cx, &head(bearer("user-1")), None)
             .await
