@@ -388,6 +388,49 @@ mod tests {
         mounted.stop(Duration::from_secs(1)).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn a_call_authorizer_decides_every_call_by_method() {
+        use sekvent::component::{CallAuthorizer, CallTarget, ComponentHandle};
+
+        fn read_only(target: CallTarget, cx: &CallContext) -> Result<(), AppError> {
+            if target.component().name() == "notes" && cx.subject() == Some("guest") {
+                return Err(
+                    AppError::permission_denied("guests may not take notes").with_reason("GUEST")
+                );
+            }
+            Ok(())
+        }
+        read_only.validate(EchoHandle::DESCRIPTOR).unwrap();
+
+        let source = MapSource::new();
+        let mut builder = App::builder(&source);
+        builder.call_authorizer(read_only).unwrap();
+        EchoHandle::install(&mut builder, |_deps| Ok(EchoService)).unwrap();
+        NotesHandle::install(&mut builder, |_deps| Ok(NotesService)).unwrap();
+        let built = builder.build().unwrap();
+        built.start().await.unwrap();
+
+        let guest = CallContext::new().with_subject("guest");
+        let echo = built.handle::<EchoHandle>().unwrap();
+        let request = PingRequest {
+            text: "hello".to_owned(),
+        };
+        assert_eq!(echo.ping(&guest, request).await.unwrap().text, "hello");
+        let notes = built.handle::<NotesHandle>().unwrap();
+        let error = notes.add(&guest, "hello".to_owned()).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+        assert_eq!(error.reason(), Some("GUEST"));
+        assert_eq!(
+            notes
+                .add(&CallContext::new(), "hi".to_owned())
+                .await
+                .unwrap(),
+            2
+        );
+
+        built.stop(Duration::from_secs(1)).await.unwrap();
+    }
+
     #[test]
     fn a_local_only_component_cannot_be_served() {
         let source = MapSource::new()

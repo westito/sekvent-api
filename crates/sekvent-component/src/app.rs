@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 
 use crate::__private::Dispatch;
+use crate::authorizer::CallAuthorizer;
 use crate::config::{self, Entry, Resolved, Settings};
 use crate::end_user::EndUserAuthenticator;
 use crate::lifecycle::LifecycleDyn;
@@ -85,6 +86,7 @@ pub struct AppBuilder<'a> {
     installs: Vec<Install>,
     resources: HashMap<TypeId, Resource>,
     end_user: Option<Arc<dyn EndUserAuthenticator>>,
+    authorizer: Option<Arc<dyn CallAuthorizer>>,
 }
 
 impl AppBuilder<'_> {
@@ -125,6 +127,23 @@ impl AppBuilder<'_> {
         Ok(())
     }
 
+    /// Register the App's call authorizer, asked about every call a
+    /// component of this process serves, under every binding. One per App;
+    /// a second is [`BuildError::DuplicateCallAuthorizer`].
+    ///
+    /// [`build`](Self::build) calls its
+    /// [`validate`](CallAuthorizer::validate) for every installed component
+    /// that has an implementation and reports its refusals
+    /// ([`BuildError::CallAuthorizerRefused`]) with the configuration
+    /// errors, before any factory runs.
+    pub fn call_authorizer(&mut self, authorizer: impl CallAuthorizer) -> Result<(), BuildError> {
+        if self.authorizer.is_some() {
+            return Err(BuildError::DuplicateCallAuthorizer);
+        }
+        self.authorizer = Some(Arc::new(authorizer));
+        Ok(())
+    }
+
     /// Record a component; duplicates (by handle type or by name) are
     /// rejected at once, everything else is checked in [`build`](Self::build).
     pub(crate) fn install<H: ComponentHandle>(
@@ -154,19 +173,11 @@ impl AppBuilder<'_> {
     /// the factories of the components that run in this process, in install
     /// order.
     ///
-    /// Every configuration problem is reported at once, and no factory runs
-    /// unless the configuration is clean. The first factory error stops the
-    /// build.
+    /// Every configuration problem and every refusal of the call
+    /// authorizer is reported at once, and no factory runs unless all is
+    /// clean. The first factory error stops the build.
     pub fn build(self) -> Result<App, BuildError> {
-        let entries: Vec<Entry> = self
-            .installs
-            .iter()
-            .map(|install| Entry {
-                descriptor: install.descriptor,
-                remote: install.factory.is_none(),
-            })
-            .collect();
-        let settings = config::resolve_with(self.source, &entries, self.end_user.is_some())?;
+        let settings = self.settings()?;
         let installed: Vec<(TypeId, &'static ComponentDescriptor)> = self
             .installs
             .iter()
@@ -186,7 +197,14 @@ impl AppBuilder<'_> {
             let descriptor = install.descriptor;
             let name = descriptor.name();
             let remote = resolved.binding == Binding::Grpc;
-            let server = Arc::new(Server::new(descriptor, &resolved.policies, remote));
+            let authorizer = if remote {
+                None
+            } else {
+                self.authorizer.clone()
+            };
+            let server = Arc::new(
+                Server::new(descriptor, &resolved.policies, remote).with_authorizer(authorizer),
+            );
             let link = Link::new(resolved.binding, Arc::clone(&server), settings.max_hops);
             let built = if remote {
                 let link = remotes.attach(link, descriptor, resolved)?;
@@ -260,6 +278,50 @@ impl AppBuilder<'_> {
                 serial: Mutex::new(()),
             }),
         })
+    }
+}
+
+impl AppBuilder<'_> {
+    /// The resolved configuration, or every configuration error and every
+    /// refusal of the call authorizer.
+    fn settings(&self) -> Result<config::Settings, BuildError> {
+        let entries: Vec<Entry> = self
+            .installs
+            .iter()
+            .map(|install| Entry {
+                descriptor: install.descriptor,
+                remote: install.factory.is_none(),
+            })
+            .collect();
+        let refused = BuildError::combine(self.validate_authorizer());
+        match (
+            config::resolve_with(self.source, &entries, self.end_user.is_some()),
+            refused,
+        ) {
+            (Ok(settings), None) => Ok(settings),
+            (Ok(_), Some(refused)) => Err(refused),
+            (Err(error), refused) => Err(error.and(refused)),
+        }
+    }
+
+    /// Ask the call authorizer to validate every installed component that
+    /// has an implementation; its refusals, in install order.
+    fn validate_authorizer(&self) -> Vec<BuildError> {
+        let Some(authorizer) = &self.authorizer else {
+            return Vec::new();
+        };
+        self.installs
+            .iter()
+            .filter(|install| install.factory.is_some())
+            .filter_map(|install| {
+                authorizer.validate(install.descriptor).err().map(|source| {
+                    BuildError::CallAuthorizerRefused {
+                        component: install.descriptor.name().to_owned(),
+                        source,
+                    }
+                })
+            })
+            .collect()
     }
 }
 
@@ -454,6 +516,7 @@ impl fmt::Debug for AppBuilder<'_> {
             .field("components", &components)
             .field("resources", &resources)
             .field("end_user_authenticator", &self.end_user.is_some())
+            .field("call_authorizer", &self.authorizer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -593,6 +656,7 @@ impl App {
             installs: Vec::new(),
             resources: HashMap::new(),
             end_user: None,
+            authorizer: None,
         }
     }
 

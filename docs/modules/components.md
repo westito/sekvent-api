@@ -433,7 +433,8 @@ pub fn install(app: &mut AppBuilder<'_>, options: ShopOptions) -> Result<(), Bui
 | `<C>Handle::install_remote` | `fn install_remote(app: &mut AppBuilder<'_>) -> Result<(), BuildError>` | `remote_only` components only. |
 | `AppBuilder::provide` | `fn provide<T: Clone + Send + Sync + 'static>(&mut self, value: T) -> Result<(), BuildError>` | Shared resources (pools, clients, a `Clock`). A second value of the same type is `DuplicateResource`. |
 | `AppBuilder::end_user_authenticator` | `fn end_user_authenticator(&mut self, authenticator: impl EndUserAuthenticator) -> Result<(), BuildError>` | The App's one end-user authenticator, for components served with `SERVE_AUTH=bearer` or `link,bearer`. A second one is `DuplicateEndUserAuthenticator`. Available without `component-grpc`. See [How to serve components to end users](#how-to-serve-components-to-end-users-browsers-apps). |
-| `AppBuilder::build` | `fn build(self) -> Result<App, BuildError>` | Validates all configuration, then runs the factories in install order. |
+| `AppBuilder::call_authorizer` | `fn call_authorizer(&mut self, authorizer: impl CallAuthorizer) -> Result<(), BuildError>` | The App's one call authorizer, asked about every call a component of this process serves, under every binding. A second one is `DuplicateCallAuthorizer`. Available without `component-grpc`. See [How to authorize calls per method](#how-to-authorize-calls-per-method). |
+| `AppBuilder::build` | `fn build(self) -> Result<App, BuildError>` | Validates all configuration (and lets the call authorizer validate every component), then runs the factories in install order. |
 | `Deps::handle` | `fn handle<H: ComponentHandle>(&self) -> Result<H, AppError>` | Only components installed **before** this one. Otherwise `FAILED_PRECONDITION`, naming both components. |
 | `Deps::resource` | `fn resource<T: Clone + Send + Sync + 'static>(&self) -> Result<T, AppError>` | `FAILED_PRECONDITION`, naming the type, when nothing was provided. |
 | `Deps::config` | `fn config(&self) -> &dyn ConfigSource` | The source the App is built from. |
@@ -447,8 +448,9 @@ The build runs in two phases:
    components or methods, bindings that are unavailable or do not fit the
    mode, a missing endpoint or link token, a component served with
    end-user authentication while no end-user authenticator is registered,
-   and two exposed components with one gRPC service name. All problems
-   come back together, as one
+   and two exposed components with one gRPC service name; with a
+   [call authorizer](#how-to-authorize-calls-per-method), its `validate`
+   refusals too. All problems come back together, as one
    `BuildError` or `BuildError::Multiple`. Messages name keys and
    components, never values. No factory runs unless the configuration is
    clean.
@@ -641,7 +643,8 @@ let server = Server::builder()
   the headers (trailers are never trusted) and the deadline narrowed by the
   method's timeout. Under the bearer modes the end user is authenticated
   next ([below](#serving-order-for-end-users)). Then the hop limit is
-  checked and the call passes the component's gate and bulkhead.
+  checked, the [call authorizer](#how-to-authorize-calls-per-method) (if
+  any) decides, and the call passes the component's gate and bulkhead.
 - Requests are capped at 4 MiB, and so is each item of a served stream (a
   larger item ends the stream with `OUT_OF_RANGE`). A handler panic, or a
   producer panic in a stream, answers `INTERNAL` / `HANDLER_PANICKED`, and
@@ -959,8 +962,11 @@ Everything is still decided from the request head before the body is read:
    which runs with no end user. On success the context carries the end
    user.
 6. **Client limit by end user** (`end_user`, `end_user_or_client_addr`).
-7. **Hop limit**, gate, bulkhead, method timeout and handler, exactly as
-   for a link caller.
+7. **Hop limit.**
+8. **Call authorizer**, when one is registered
+   ([below](#how-to-authorize-calls-per-method)).
+9. Gate, bulkhead, method timeout and handler, exactly as for a link
+   caller.
 
 ### Mount the routes for browsers
 
@@ -998,6 +1004,94 @@ let server = Server::builder()
   `CallContext` the server stored there if you want to reuse that decision.
 - Global layers (`ServerBuilder::layer`) wrap component calls too; see
   [Pitfalls and security](#pitfalls-and-security).
+
+## How to authorize calls per method
+
+A policy that depends on the method ("machine principals may call the
+read methods of `inventory` only with the scope `inventory:r`") belongs in
+one place, not in every handler. Register a `CallAuthorizer`: the App asks
+it about every call a component of this process serves, with the
+`CallTarget` (component and method descriptors) and the context the handler
+will see.
+
+```rust
+use sekvent::component::{CallTarget, ComponentDescriptor};
+
+fn policy(target: CallTarget, cx: &CallContext) -> Result<(), AppError> {
+    let Some(user) = cx.end_user() else {
+        // Links, anonymous and in-process callers are asked too.
+        return Ok(());
+    };
+    let area = target.component().name();
+    let scope = if target.method().is_idempotent() { "r" } else { "w" };
+    if user.has_role(&format!("{area}:{scope}")) {
+        Ok(())
+    } else {
+        Err(AppError::permission_denied(format!("this needs the scope {area}:{scope}"))
+            .with_reason("SCOPE_MISSING")
+            .with_metadata("scope", format!("{area}:{scope}")))
+    }
+}
+
+builder.call_authorizer(policy)?;
+```
+
+Any `Fn(CallTarget, &CallContext) -> Result<(), AppError> + Send + Sync`
+is an authorizer. Implement the trait by hand to also check, at build time,
+that the policy covers every installed component:
+
+```rust
+struct Table(HashMap<&'static str, Rules>);
+
+impl CallAuthorizer for Table {
+    fn authorize(&self, target: CallTarget, cx: &CallContext) -> Result<(), AppError> {
+        self.0[target.component().name()].check(target.method(), cx)
+    }
+
+    fn validate(&self, component: &'static ComponentDescriptor) -> Result<(), AppError> {
+        if self.0.contains_key(component.name()) {
+            Ok(())
+        } else {
+            Err(AppError::failed_precondition("no rules for this component"))
+        }
+    }
+}
+```
+
+- **Where it runs.** On the serving side only, under every binding, for
+  unary calls and stream opens:
+  - served over gRPC and gRPC-Web: after authentication (link or end user),
+    the client limits and the hop limit, before the body is read and before
+    the gate;
+  - `local`: in the caller's task, before the gate;
+  - `local-serialized`: in the serving task, before the gate;
+  - the caller side of a component bound `grpc` never asks; the process
+    serving it does. Calls made on an implementation directly, not through
+    a handle, are never asked.
+- **What it sees.** Exactly the handler's context. Under the local bindings
+  that is the trusted caller `local` with the forwarded subject and tenant
+  and no end user (the callee context is narrowed); key such calls on the
+  subject or allow them. A nested call is asked again at the nested
+  component.
+- **Every caller is asked.** Link callers, `#[call(anonymous)]` methods,
+  `optional_end_user` calls without credentials and in-process calls all
+  reach it. A policy that concerns only end users must allow the rest
+  explicitly.
+- **The answer.** `Ok(())` runs the call. An `Err` is returned to the caller
+  unchanged: no `component` or `method` metadata is added and the code is
+  not normalised, so a browser receives exactly the code, message, reason
+  and metadata you chose. Use `PERMISSION_DENIED` (or `UNAUTHENTICATED`). A
+  denial takes no admission or bulkhead permit and does not count against
+  the breaker.
+- **Synchronous.** Decide from the target and the context alone; no I/O.
+  Load policies before building, or share them through a lock-free cell.
+- **Panics** are answered like a handler panic: `INTERNAL`
+  (`HANDLER_PANICKED`) over gRPC, `INTERNAL` under `local-serialized`, and
+  propagated to the caller under `local`.
+- **At build.** `validate` runs once for every installed component that has
+  an implementation (whatever its binding; never for `install_remote`).
+  Its refusals (`BuildError::CallAuthorizerRefused`) are reported together
+  with the configuration errors, and no factory runs.
 
 ## How to limit each client of a served method
 
@@ -1467,11 +1561,13 @@ also when it passes in the middle of a stream. Cancellation gives
 `UNAUTHENTICATED` with no reason. A rejected end user gets
 `UNAUTHENTICATED` with `invalid or expired credentials` and no reason; other
 end-user authenticator errors pass through unchanged
-([details](#what-a-rejected-end-user-sees)).
+([details](#what-a-rejected-end-user-sees)). A call authorizer's error is
+the answer unchanged, too; its panic is `INTERNAL` / `HANDLER_PANICKED`.
 
 The `BuildError` variants are `DuplicateInstall`, `DuplicateResource`,
 `DuplicateEndUserAuthenticator`, `EndUserAuthenticatorMissing { component,
-key }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
+key }`, `DuplicateCallAuthorizer`, `CallAuthorizerRefused { component,
+source }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
 `RemoteOnly`, `RemoteOnlyUnbound`, `NotServable`, `Factory` and `Multiple`
 (flat, never nested). The enum is `#[non_exhaustive]`.
 

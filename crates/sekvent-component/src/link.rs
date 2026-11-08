@@ -692,8 +692,8 @@ fn callee_context(cx: &CallContext, method_deadline: Option<Instant>) -> CallCon
 }
 
 /// `local`: the serving side around the implementation, in the caller's
-/// task. A typed error is turned into its `AppError` form, so both bindings
-/// hand the caller the same value.
+/// task: the call authorizer, then the gate. A typed error is turned into
+/// its `AppError` form, so both bindings hand the caller the same value.
 async fn run_local<D, Req, Rep, E, L, Fut>(
     server: &Server,
     method: usize,
@@ -708,8 +708,10 @@ where
     L: FnOnce(Arc<D>, CallContext, Req) -> Fut,
     Fut: Future<Output = Result<Rep, E>>,
 {
+    let callee = callee.into_inbound();
+    server.authorize(method, &callee)?;
     match server
-        .run(method, callee.into_inbound(), move |cx| local(imp, cx, req))
+        .run(method, callee, move |cx| local(imp, cx, req))
         .await
     {
         Ok(Ok(reply)) => Ok(reply),
@@ -751,6 +753,9 @@ where
             if let Some(deadline) = deadline {
                 cx = cx.with_deadline(deadline);
             }
+            serving
+                .authorize(method, &cx)
+                .map_err(|error| wire::encode_error(&error))?;
             match serving
                 .run(method, cx, move |cx| dispatch.dispatch(method, cx, body))
                 .await
@@ -801,8 +806,8 @@ where
 }
 
 /// `local`: the serving side's open around the implementation, in the
-/// caller's task. Typed errors are turned into their `AppError` form, so
-/// every binding hands the caller the same values.
+/// caller's task, after the call authorizer. Typed errors are turned into
+/// their `AppError` form, so every binding hands the caller the same values.
 async fn open_local<D, Req, Item, E, EI, L, Fut>(
     link: &Link,
     method: usize,
@@ -819,10 +824,12 @@ where
     L: FnOnce(Arc<D>, CallContext, Req) -> Fut,
     Fut: Future<Output = Result<CallStream<Item, EI>, E>>,
 {
+    let callee = callee.into_inbound();
+    link.server.authorize(method, &callee)?;
     link.server
         .open_stream(
             method,
-            callee.into_inbound(),
+            callee,
             None,
             link.binding.as_str(),
             move |cx| async move {
@@ -872,6 +879,10 @@ where
                     .with_cancel(cancel);
             if let Some(deadline) = deadline {
                 cx = cx.with_deadline(deadline);
+            }
+            if let Err(error) = serving.authorize(method, &cx) {
+                drop(opened_tx.send(Err(wire::encode_error(&error))));
+                return;
             }
             let opened = serving
                 .open_stream(

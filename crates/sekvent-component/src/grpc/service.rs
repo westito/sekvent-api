@@ -19,6 +19,10 @@
 //! authenticator, so a flood is refused cheaply; keyed by the end user,
 //! right after it. A refused call never reaches the body or the handler.
 //!
+//! The App's call authorizer runs last among these head-only checks, after
+//! the hop limit, with the context the handler will see; its error is the
+//! answer, unchanged, and its panic is answered like a handler's.
+//!
 //! A streaming method's `TIMEOUT` does not narrow the context: it bounds
 //! the open (the end user, the body, the handler's open) together with the
 //! caller's deadline. The response headers go out once the stream is open,
@@ -262,6 +266,28 @@ impl Served {
         Ok(())
     }
 
+    /// The App's call authorizer, with its panic caught; its error is
+    /// returned unchanged.
+    fn check_authorized(&self, method: usize, cx: &CallContext) -> Result<(), AppError> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.server.authorize(method, cx)
+        }))
+        .unwrap_or_else(|_payload| {
+            Err(tag(
+                self.descriptor(),
+                AppError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "the call authorizer of component {} panicked",
+                        self.descriptor().name()
+                    ),
+                )
+                .with_reason(reasons::HANDLER_PANICKED),
+                method,
+            ))
+        })
+    }
+
     /// Open one prepared stream through the gate: the open within the open
     /// bound, a panic of the open or of the producer caught, an open error
     /// passing [`from_handler`]. Item errors cross untouched.
@@ -457,6 +483,7 @@ where
                 if let Err(error) = served
                     .check_client(method, &cx, true)
                     .and_then(|()| served.check_hops(method, &cx))
+                    .and_then(|()| served.check_authorized(method, &cx))
                 {
                     return Ok(error_response(error));
                 }
@@ -1075,6 +1102,190 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cx.end_user(), None);
+    }
+
+    /// What the authorizer saw of one call.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Asked {
+        method: &'static str,
+        caller: Option<String>,
+        end_user: Option<String>,
+        buyer: bool,
+        subject: Option<String>,
+    }
+
+    type Log = Arc<std::sync::Mutex<Vec<Asked>>>;
+
+    /// Records every call; refuses `reserve` for end users with
+    /// `PERMISSION_DENIED`, panics for the subject `panic`, allows the rest.
+    fn recording() -> (Arc<dyn crate::CallAuthorizer>, Log) {
+        let log = Log::default();
+        let seen = Arc::clone(&log);
+        let authorizer = move |target: crate::CallTarget, cx: &CallContext| {
+            assert!(cx.subject() != Some("user-panic"), "secret policy");
+            seen.lock().unwrap().push(Asked {
+                method: target.method().name(),
+                caller: cx.caller().map(|caller| caller.name.clone()),
+                end_user: cx.end_user().map(|user| user.subject().to_owned()),
+                buyer: cx.end_user().is_some_and(|user| user.has_role("buyer")),
+                subject: cx.subject().map(str::to_owned),
+            });
+            if target.method().name() == "reserve" && cx.end_user().is_some() {
+                return Err(AppError::permission_denied("buyers may not reserve")
+                    .with_reason("ROLE_MISSING")
+                    .with_metadata("role", "admin"));
+            }
+            Ok(())
+        };
+        (Arc::new(authorizer), log)
+    }
+
+    fn guarded(link: bool, max_hops: u32, authorizer: Arc<dyn crate::CallAuthorizer>) -> Served {
+        let inbound = link.then(|| {
+            Arc::new(TokenMap::new([InboundLink::trusted("shop", Secret::new(TOKEN))]).unwrap())
+        });
+        let gate = Server::new(
+            INVENTORY,
+            &[
+                MethodPolicy::default(),
+                MethodPolicy::default(),
+                MethodPolicy::default(),
+            ],
+            false,
+        )
+        .with_authorizer(Some(authorizer));
+        assert!(gate.open());
+        let sessions: Arc<dyn EndUserAuthenticator> = Arc::new(Sessions);
+        Served::new(Arc::new(gate), Arc::new(Echo), inbound, max_hops).with_end_user(Some(sessions))
+    }
+
+    /// A request body that never yields a frame.
+    struct NeverArrives;
+
+    impl http_body::Body for NeverArrives {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+            Poll::Pending
+        }
+    }
+
+    /// The `grpc-status` `served` answers a request to `path` with `wire`
+    /// headers and a body that never arrives.
+    async fn status_of(served: &Arc<Served>, path: &str, wire: http::HeaderMap) -> String {
+        let mut request = http::Request::new(NeverArrives);
+        *request.uri_mut() = path.parse().unwrap();
+        *request.headers_mut() = wire;
+        let call = tower::Service::call(&mut ComponentService(Arc::clone(served)), request);
+        let response = tokio::time::timeout(Duration::from_secs(30), call)
+            .await
+            .expect("answered without the body")
+            .unwrap();
+        response.headers()["grpc-status"]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn the_call_authorizer_runs_after_authentication_and_before_the_body() {
+        let (authorizer, log) = recording();
+        let served = Arc::new(guarded(true, 1, authorizer));
+
+        // An end user refused by role: answered before the body arrives.
+        assert_eq!(status_of(&served, RESERVE, bearer("user-7")).await, "7");
+        assert_eq!(
+            log.lock().unwrap().pop(),
+            Some(Asked {
+                method: "reserve",
+                caller: None,
+                end_user: Some("user-7".into()),
+                buyer: true,
+                subject: Some("user-7".into()),
+            })
+        );
+
+        // A rejected end user, an unknown path and the hop limit never ask.
+        assert_eq!(status_of(&served, RESERVE, bearer("forged")).await, "16");
+        assert_eq!(
+            status_of(&served, "/shop.v1.Inventory/Stock", bearer("user-7")).await,
+            "12"
+        );
+        let mut deep = bearer(TOKEN);
+        deep.insert(headers::HOPS, "2".parse().unwrap());
+        assert_eq!(status_of(&served, RESERVE, deep).await, "9");
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_call_authorizer_sees_anonymous_optional_and_link_callers() {
+        let (authorizer, log) = recording();
+        let served = guarded(true, 16, authorizer);
+        let decide = |path: &str, wire: http::HeaderMap| {
+            let served = &served;
+            let path = path.to_owned();
+            async move {
+                let prepared = admit(served, &path, wire).await?;
+                served.check_authorized(prepared.method, &prepared.cx)
+            }
+        };
+
+        decide("/shop.v1.Inventory/Release", http::HeaderMap::new())
+            .await
+            .unwrap();
+        decide(TRACK, http::HeaderMap::new()).await.unwrap();
+        let mut link = bearer(TOKEN);
+        link.insert(headers::SUBJECT, "user-3".parse().unwrap());
+        decide(RESERVE, link).await.unwrap();
+        let denied = decide(RESERVE, bearer("user-1")).await.unwrap_err();
+        assert_eq!(denied.code(), ErrorCode::PermissionDenied);
+        assert_eq!(denied.reason(), Some("ROLE_MISSING"));
+        assert_eq!(denied.metadata().len(), 1, "never tagged: {denied:?}");
+        assert_eq!(denied.metadata()["role"], "admin");
+
+        let asked = log.lock().unwrap().clone();
+        let who: Vec<_> = asked
+            .iter()
+            .map(|asked| {
+                (
+                    asked.method,
+                    asked.caller.as_deref(),
+                    asked.end_user.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            who,
+            [
+                ("release", None, None),
+                ("track", None, None),
+                ("reserve", Some("shop"), None),
+                ("reserve", None, Some("user-1")),
+            ]
+        );
+        assert_eq!(asked[2].subject.as_deref(), Some("user-3"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_call_authorizer_is_internal_without_its_payload() {
+        let (authorizer, _log) = recording();
+        let served = Arc::new(guarded(false, 16, authorizer));
+        assert_eq!(
+            status_of(&served, RESERVE, bearer("user-panic")).await,
+            "13"
+        );
+        let prepared = admit(&served, RESERVE, bearer("user-panic")).await.unwrap();
+        let error = served
+            .check_authorized(prepared.method, &prepared.cx)
+            .unwrap_err();
+        assert_eq!(error.reason(), Some(reasons::HANDLER_PANICKED));
+        assert!(!error.message().contains("secret"), "{}", error.message());
+        assert_eq!(error.metadata()["method"], "reserve");
+        assert_eq!(served.server.in_flight(), 0);
     }
 
     #[test]

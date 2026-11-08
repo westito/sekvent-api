@@ -14,7 +14,7 @@ use http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN};
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 use sekvent_component::{
-    AppError, BuildError, CallContext, END_USER_REJECTED_MESSAGE, EndUser, ErrorCode,
+    AppError, BuildError, CallContext, CallTarget, END_USER_REJECTED_MESSAGE, EndUser, ErrorCode,
 };
 use sekvent_config::MapSource;
 use sekvent_context::ServiceIdentity;
@@ -190,6 +190,18 @@ impl Shop {
 }
 
 async fn serve(serve_auth: &str, storefront: Storefront) -> Shop {
+    serve_guarded(serve_auth, storefront, None).await
+}
+
+/// A call authorizer given as a plain function.
+type Policy = fn(CallTarget, &CallContext) -> Result<(), AppError>;
+
+/// [`serve`], with `authorizer` as the App's call authorizer.
+async fn serve_guarded(
+    serve_auth: &str,
+    storefront: Storefront,
+    authorizer: Option<Policy>,
+) -> Shop {
     let keys: MapSource = [
         ("SEKVENT_COMPONENT_INVENTORY_SERVE", "grpc"),
         ("SEKVENT_COMPONENT_INVENTORY_SERVE_AUTH", serve_auth),
@@ -202,6 +214,9 @@ async fn serve(serve_auth: &str, storefront: Storefront) -> Shop {
     .collect();
     let app = build_with(&keys, move |builder| {
         builder.end_user_authenticator(sessions)?;
+        if let Some(authorizer) = authorizer {
+            builder.call_authorizer(authorizer)?;
+        }
         let tracker = storefront.clone();
         TrackerHandle::install(builder, move |_| Ok(tracker))?;
         InventoryHandle::install(builder, move |_| Ok(storefront))
@@ -598,4 +613,58 @@ fn end_user_serving_fails_closed_without_an_authenticator() {
     })
     .unwrap();
     assert_eq!(app.grpc_services(), [] as [String; 0]);
+}
+
+/// Reserving needs the `stock-keeper` role; everything else is allowed.
+fn stock_keepers_reserve(target: CallTarget, cx: &CallContext) -> Result<(), AppError> {
+    let reserving = target.component().name() == "inventory" && target.method().name() == "reserve";
+    match cx.end_user() {
+        Some(user) if reserving && !user.has_role("stock-keeper") => Err(
+            AppError::permission_denied("reserving needs the stock-keeper role")
+                .with_reason("ROLE_MISSING")
+                .with_metadata("role", "stock-keeper"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+#[tokio::test]
+async fn a_role_based_denial_reaches_the_browser_unchanged() {
+    guarded(async {
+        let storefront = Storefront::default();
+        let shop = serve_guarded("bearer", storefront.clone(), Some(stock_keepers_reserve)).await;
+
+        let reply = grpc_web(shop.addr, RESERVE, Some("Bearer user-1"), &reserve()).await;
+        assert_eq!(reply.status, http::StatusCode::OK);
+        assert_eq!(
+            reply.grpc.code(),
+            tonic::Code::PermissionDenied,
+            "{:?}",
+            reply.grpc
+        );
+        assert!(reply.message.is_none());
+        let error = AppError::from(reply.grpc);
+        assert_eq!(error.code(), ErrorCode::PermissionDenied);
+        assert_eq!(error.message(), "reserving needs the stock-keeper role");
+        assert_eq!(error.reason(), Some("ROLE_MISSING"));
+        assert_eq!(error.metadata()["role"], "stock-keeper");
+        assert!(!error.metadata().contains_key("component"), "{error:?}");
+        assert!(storefront.seen().is_empty(), "the handler never ran");
+
+        // Other methods are allowed, and the anonymous one is asked too.
+        let reply = grpc_web(
+            shop.addr,
+            RELEASE,
+            None,
+            &ReleaseRequest {
+                reservation_id: "res-o1".into(),
+            },
+        )
+        .await;
+        assert_eq!(reply.grpc.code(), tonic::Code::Ok, "{:?}", reply.grpc);
+        assert_eq!(storefront.seen().len(), 1);
+
+        shop.stop().await;
+    })
+    .await;
 }

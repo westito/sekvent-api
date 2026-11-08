@@ -132,6 +132,17 @@ pub enum BuildError {
     /// A second end-user authenticator was registered.
     #[error("an end-user authenticator is registered twice")]
     DuplicateEndUserAuthenticator,
+    /// A second call authorizer was registered.
+    #[error("a call authorizer is registered twice")]
+    DuplicateCallAuthorizer,
+    /// The call authorizer's `validate` refused an installed component.
+    #[error("the call authorizer refuses component {component}: {source}")]
+    CallAuthorizerRefused {
+        /// The component name.
+        component: String,
+        /// The authorizer's error.
+        source: AppError,
+    },
     /// A factory returned an error.
     #[error("component {component} failed to build: {source}")]
     Factory {
@@ -158,6 +169,18 @@ impl BuildError {
             0 | 1 => flat.pop(),
             _ => Some(Self::Multiple(flat)),
         }
+    }
+
+    /// This error together with `other`, flattened like
+    /// [`combine`](Self::combine).
+    pub(crate) fn and(self, other: Option<BuildError>) -> BuildError {
+        let Some(other) = other else {
+            return self;
+        };
+        let mut flat = Vec::new();
+        flatten_into(&mut flat, self);
+        flatten_into(&mut flat, other);
+        Self::Multiple(flat)
     }
 }
 
@@ -236,6 +259,20 @@ mod tests {
     }
 
     #[test]
+    fn and_joins_two_errors_flat() {
+        let alone = duplicate("a").and(None);
+        assert!(matches!(alone, BuildError::DuplicateInstall { .. }));
+        let joined = duplicate("a").and(Some(BuildError::Multiple(vec![
+            duplicate("b"),
+            duplicate("c"),
+        ])));
+        let BuildError::Multiple(items) = joined else {
+            panic!("expected Multiple");
+        };
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
     fn messages() {
         let cases: Vec<(BuildError, &str)> = vec![
             (
@@ -311,6 +348,18 @@ mod tests {
             (
                 BuildError::DuplicateEndUserAuthenticator,
                 "an end-user authenticator is registered twice",
+            ),
+            (
+                BuildError::DuplicateCallAuthorizer,
+                "a call authorizer is registered twice",
+            ),
+            (
+                BuildError::CallAuthorizerRefused {
+                    component: "orders".into(),
+                    source: AppError::failed_precondition("no rule for orders"),
+                },
+                "the call authorizer refuses component orders: FAILED_PRECONDITION: \
+                 no rule for orders",
             ),
             (
                 BuildError::Multiple(vec![duplicate("a"), duplicate("b")]),

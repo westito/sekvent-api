@@ -70,7 +70,7 @@ fn a_resource_type_is_provided_once() {
     NotesHandle::install(&mut builder, |_| Ok(Counter::plain())).unwrap();
     assert_eq!(
         format!("{builder:?}"),
-        r#"AppBuilder { components: ["notes"], resources: ["alloc::string::String", "u32"], end_user_authenticator: false, .. }"#
+        r#"AppBuilder { components: ["notes"], resources: ["alloc::string::String", "u32"], end_user_authenticator: false, call_authorizer: false, .. }"#
     );
 }
 
@@ -333,5 +333,138 @@ fn a_malformed_default_binding_is_reported() {
         error.to_string(),
         "configuration key SEKVENT_COMPONENT_BINDING is malformed: expected one of local, \
          local-serialized, grpc"
+    );
+}
+
+/// An authorizer that records the components it validates and refuses
+/// those named in `refuse`.
+struct Validating {
+    validated: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    refuse: &'static [&'static str],
+}
+
+impl sekvent_component::CallAuthorizer for Validating {
+    fn authorize(
+        &self,
+        _target: sekvent_component::CallTarget,
+        _cx: &sekvent_component::CallContext,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn validate(
+        &self,
+        component: &'static sekvent_component::ComponentDescriptor,
+    ) -> Result<(), AppError> {
+        self.validated.lock().unwrap().push(component.name());
+        if self.refuse.contains(&component.name()) {
+            return Err(AppError::failed_precondition("no rule for this component"));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_second_call_authorizer_is_refused() {
+    let config = MapSource::new();
+    let mut builder = App::builder(&config);
+    let allow = |_: sekvent_component::CallTarget, _: &sekvent_component::CallContext| Ok(());
+    builder.call_authorizer(allow).unwrap();
+    let again = builder.call_authorizer(allow);
+    assert!(
+        matches!(again, Err(BuildError::DuplicateCallAuthorizer)),
+        "{again:?}"
+    );
+    assert!(format!("{builder:?}").contains("call_authorizer: true"));
+}
+
+#[test]
+fn the_call_authorizer_validates_every_component_with_an_implementation() {
+    let validated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let authorizer = Validating {
+        validated: Arc::clone(&validated),
+        refuse: &[],
+    };
+    let config: MapSource = [
+        ("SEKVENT_COMPONENT_LEDGER_BINDING", "grpc"),
+        ("SEKVENT_COMPONENT_LEDGER_ENDPOINT", "http://127.0.0.1:1"),
+        ("SEKVENT_COMPONENT_LEDGER_AUTH", "none"),
+    ]
+    .into_iter()
+    .collect();
+    build_with(&config, move |builder| {
+        builder.call_authorizer(authorizer)?;
+        InventoryHandle::install(builder, |_| Ok(FakeInventory::stock(1)))?;
+        LedgerHandle::install_remote(builder)?;
+        NotesHandle::install(builder, |_| Ok(Counter::plain()))
+    })
+    .unwrap();
+    assert_eq!(
+        *validated.lock().unwrap(),
+        ["inventory", "notes"],
+        "once each, never a remote-only component"
+    );
+}
+
+#[test]
+fn call_authorizer_refusals_are_reported_with_configuration_errors_and_no_factory_runs() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let (first, second) = (Arc::clone(&ran), Arc::clone(&ran));
+    let validated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let authorizer = Validating {
+        validated: Arc::clone(&validated),
+        refuse: &["inventory", "notes"],
+    };
+    let config: MapSource = [("SEKVENT_COMPONENT_INVENTORY_TIMEOUT", "whenever")]
+        .into_iter()
+        .collect();
+    let install = move |builder: &mut sekvent_component::AppBuilder<'_>| {
+        builder.call_authorizer(authorizer)?;
+        InventoryHandle::install(builder, move |_| {
+            first.store(true, Ordering::SeqCst);
+            Ok(FakeInventory::stock(1))
+        })?;
+        NotesHandle::install(builder, move |_| {
+            second.store(true, Ordering::SeqCst);
+            Ok(Counter::plain())
+        })
+    };
+    let errors = all(build_with(&config, install).unwrap_err());
+    assert!(!ran.load(Ordering::SeqCst));
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    assert!(matches!(
+        &errors[0],
+        BuildError::Config(ConfigError::Malformed { .. })
+    ));
+    let refused: Vec<_> = errors[1..]
+        .iter()
+        .map(|error| match error {
+            BuildError::CallAuthorizerRefused { component, source } => {
+                assert_eq!(source.code(), ErrorCode::FailedPrecondition);
+                component.as_str()
+            }
+            other => panic!("expected a refusal, got {other}"),
+        })
+        .collect();
+    assert_eq!(refused, ["inventory", "notes"]);
+
+    // Refusals alone fail the build too.
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ran);
+    let error = build_with(&MapSource::new(), move |builder| {
+        builder.call_authorizer(Validating {
+            validated: Arc::default(),
+            refuse: &["inventory"],
+        })?;
+        InventoryHandle::install(builder, move |_| {
+            flag.store(true, Ordering::SeqCst);
+            Ok(FakeInventory::stock(1))
+        })
+    })
+    .unwrap_err();
+    assert!(!ran.load(Ordering::SeqCst));
+    assert!(
+        matches!(&error, BuildError::CallAuthorizerRefused { component, .. } if component == "inventory"),
+        "{error}"
     );
 }

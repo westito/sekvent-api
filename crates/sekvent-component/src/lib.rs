@@ -118,6 +118,16 @@
 //! end-user authentication, never link authentication; methods marked
 //! `#[call(optional_end_user)]` skip it only for a request without an
 //! `Authorization` header and otherwise authenticate the end user as usual.
+//!
+//! # Authorizing calls
+//!
+//! [`AppBuilder::call_authorizer`] registers the App's one
+//! [`CallAuthorizer`]: a synchronous check of every call a component of
+//! this process serves, keyed by [`CallTarget`] (component and method) and
+//! given the context the handler will see. It runs under every binding and
+//! for every caller (end users, links, anonymous and in-process callers),
+//! after authentication and the hop limit and before the gate; under gRPC
+//! before the body is read. Its error is the caller's answer, unchanged.
 
 #![forbid(unsafe_code)]
 
@@ -125,6 +135,7 @@
 extern crate self as sekvent_component;
 
 mod app;
+mod authorizer;
 mod binding;
 mod config;
 mod contract;
@@ -147,6 +158,7 @@ pub mod __private;
 pub mod reasons;
 
 pub use app::{App, AppBuilder, ComponentState, Deps};
+pub use authorizer::{CallAuthorizer, CallTarget};
 pub use binding::{Binding, ComponentMode};
 pub use descriptor::{ComponentDescriptor, ComponentHandle, MethodDescriptor, MethodKind};
 pub use end_user::{END_USER_REJECTED_MESSAGE, EndUserAuthenticator};

@@ -251,10 +251,16 @@ Everything is still decided from the request head before the body is read
    tenant headers sent by the client were already dropped in step 4 (the
    client is not a trusted link), so an end user cannot assert another
    identity.
-6. **Hop limit**, then the gate, bulkhead, method timeout and handler,
-   exactly as for a link caller.
+6. **Hop limit.**
+7. **Call authorizer.** The App's
+   [`CallAuthorizer`](call-authorizer.md), when one is registered, decides
+   from the method and the context (end user, roles, link caller); its
+   error is the answer, unchanged. It runs for link, anonymous and
+   in-process callers too.
+8. The gate, bulkhead, method timeout and handler, exactly as for a link
+   caller.
 
-`anonymous` waives step 5 only. It never waives link authentication: under
+`anonymous` waives step 5 only (the call authorizer still runs). It never waives link authentication: under
 `link` an anonymous method still requires a link token, and under local
 bindings it has no effect. A component that must stay closed to the public
 therefore cannot be opened by the attribute alone; the operator has to

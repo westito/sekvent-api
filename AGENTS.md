@@ -108,6 +108,7 @@ Specs: `docs/component-model.md` (overview), `docs/design/component-c1.md`
 (local bindings, lifecycle), `docs/design/component-c2.md` (gRPC, contracts),
 `docs/design/component-end-user.md` (serving to end users;
 `docs/design/end-user-extensions.md` for typed `EndUser` extensions),
+`docs/design/call-authorizer.md` (per-method call authorization),
 `docs/design/component-streaming.md` (server-streaming methods),
 `docs/design/p8-service-essentials.md` (jobs, leases).
 Milestones C1, C2 and C4 are done (C4: jobs in `sekvent-runtime`, leases in
@@ -158,6 +159,11 @@ tooling) are not started.
   fail-closed (a bearer mode without it is a build error) and head-only
   (it runs before the body is read). `#[call(anonymous)]` waives only
   end-user authentication, never link authentication.
+- The App's one `CallAuthorizer` (`docs/design/call-authorizer.md`) is
+  asked synchronously about every call a component serves, under every
+  binding and for every caller, after the hop limit and before the gate
+  (under gRPC before the body); its error is the answer, unchanged. The
+  caller side of a `grpc` binding never asks.
 - `cargo sekvent contract emit` writes baselines (format 2) into the tree:
   run it on the Mac, like other in-tree codegen, and commit the JSON.
   `contract check` runs in-process (protox, no `protoc`, no build) and is

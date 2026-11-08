@@ -11,14 +11,14 @@ use std::time::Duration;
 
 use futures::Stream;
 use sekvent_context::CallContext;
-use sekvent_error::AppError;
+use sekvent_error::{AppError, ErrorCode};
 use sekvent_resilience::{Bulkhead, BulkheadPermit, ClientLimiter, PolicySpec, Timeout};
 use tokio::sync::Notify;
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFutureOwned};
 
 use crate::stream::CallStream;
-use crate::{ComponentDescriptor, ComponentState, reasons};
+use crate::{CallAuthorizer, CallTarget, ComponentDescriptor, ComponentState, reasons};
 
 /// The resolved policy of one method.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -38,8 +38,7 @@ pub(crate) struct MethodPolicy {
 }
 
 /// The gate of one installed component and, when it runs in this process,
-/// its serving-side bulkheads.
-#[derive(Debug)]
+/// its serving-side bulkheads and the App's call authorizer.
 pub(crate) struct Server {
     descriptor: &'static ComponentDescriptor,
     gate: Gate,
@@ -47,6 +46,20 @@ pub(crate) struct Server {
     /// The caller side's gate of a component served by another process:
     /// no bulkheads, no stream lifetimes, no stream events.
     remote: bool,
+    /// The App's call authorizer; never set on a `remote` gate.
+    authorizer: Option<Arc<dyn CallAuthorizer>>,
+}
+
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server")
+            .field("descriptor", &self.descriptor)
+            .field("gate", &self.gate)
+            .field("methods", &self.methods)
+            .field("remote", &self.remote)
+            .field("authorizer", &self.authorizer.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -145,7 +158,37 @@ impl Server {
             },
             methods,
             remote,
+            authorizer: None,
         }
+    }
+
+    /// Ask `authorizer` about every call this component serves.
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Option<Arc<dyn CallAuthorizer>>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
+    /// The App's call authorizer's answer for method `method` called with
+    /// `cx`: `Ok` without one, its error unchanged otherwise. An unknown
+    /// method index is refused with `INTERNAL`.
+    pub(crate) fn authorize(&self, method: usize, cx: &CallContext) -> Result<(), AppError> {
+        let Some(authorizer) = &self.authorizer else {
+            return Ok(());
+        };
+        let Some(target) = CallTarget::new(self.descriptor, method) else {
+            return Err(self.tag(
+                AppError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "component {} has no method {method} to authorize",
+                        self.descriptor.name()
+                    ),
+                ),
+                method,
+            ));
+        };
+        authorizer.authorize(target, cx)
     }
 
     pub(crate) fn descriptor(&self) -> &'static ComponentDescriptor {
@@ -1327,5 +1370,31 @@ mod tests {
         call.await.unwrap().unwrap();
         assert!(waiter.await.unwrap());
         assert_eq!(server.in_flight(), 0);
+    }
+
+    #[test]
+    fn the_authorizer_decides_known_methods_only() {
+        let open = server(None);
+        open.authorize(0, &CallContext::new())
+            .expect("no authorizer allows");
+        assert!(format!("{open:?}").contains("authorizer: false"));
+
+        let guarded = server(None).with_authorizer(Some(Arc::new(
+            |target: CallTarget, _cx: &CallContext| {
+                if target.method().name() == "release" {
+                    Ok(())
+                } else {
+                    Err(AppError::permission_denied("no").with_reason("DENIED"))
+                }
+            },
+        )));
+        assert!(format!("{guarded:?}").contains("authorizer: true"));
+        guarded.authorize(1, &CallContext::new()).unwrap();
+        let denied = guarded.authorize(0, &CallContext::new()).unwrap_err();
+        assert_eq!(denied.code(), ErrorCode::PermissionDenied);
+        assert!(denied.metadata().is_empty(), "the answer is not tagged");
+        let unknown = guarded.authorize(9, &CallContext::new()).unwrap_err();
+        assert_eq!(unknown.code(), ErrorCode::Internal);
+        assert_eq!(unknown.metadata()["component"], "inventory");
     }
 }
