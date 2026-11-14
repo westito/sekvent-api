@@ -221,7 +221,11 @@ produce units:
   RuntimeBuilder) -> RuntimeBuilder`, so `let builder = app.register(builder);`),
   in `Stage::Components`; see [Components](components.md). It also watches
   the builder's `shutdown_trigger()` and calls `app.close_streams()` as
-  soon as shutdown begins.
+  soon as shutdown begins. A further App on the same runtime registers with
+  `app.register_as(name, builder)` under a unit name of its own
+  ([Components](components.md#a-second-app-on-one-runtime)); the unit is
+  `components` for `register`, and `build` fails with `INVALID_ARGUMENT` for
+  a name used twice or an empty one.
 
 A factory that captures state clones it per run:
 

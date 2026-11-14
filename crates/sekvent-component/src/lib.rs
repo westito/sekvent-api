@@ -119,6 +119,19 @@
 //! `#[call(optional_end_user)]` skip it only for a request without an
 //! `Authorization` header and otherwise authenticate the end user as usual.
 //!
+//! # Request scope
+//!
+//! [`AppBuilder::scope_resolver`] registers the App's one [`ScopeResolver`]:
+//! it resolves a [`RequestScope`] (the tenant and typed values such as the
+//! tenant's database) from the request head of every call served over gRPC
+//! that no link token authenticated, before the end-user authenticator.
+//! Handlers read it with [`CallContext::scope`] and [`CallContext::scoped`];
+//! its tenant becomes [`CallContext::tenant`], no header can replace it, and
+//! an end user who does not name that tenant is refused
+//! ([`admit_end_user`]). Link
+//! callers and in-process calls get no scope. REST routes run the same
+//! resolver with [`App::resolve_scope`].
+//!
 //! # Authorizing calls
 //!
 //! [`AppBuilder::call_authorizer`] registers the App's one
@@ -149,6 +162,7 @@ mod link;
 mod policy;
 #[cfg(feature = "runtime")]
 mod runtime;
+mod scope;
 mod server;
 mod stream;
 mod wire;
@@ -161,10 +175,11 @@ pub use app::{App, AppBuilder, ComponentState, Deps};
 pub use authorizer::{CallAuthorizer, CallTarget};
 pub use binding::{Binding, ComponentMode};
 pub use descriptor::{ComponentDescriptor, ComponentHandle, MethodDescriptor, MethodKind};
-pub use end_user::{END_USER_REJECTED_MESSAGE, EndUserAuthenticator};
+pub use end_user::{END_USER_REJECTED_MESSAGE, EndUserAuthenticator, EndUserRejection};
 pub use error::{BuildError, ComponentError};
 pub use lifecycle::Lifecycle;
-pub use sekvent_context::{CallContext, EndUser};
+pub use scope::{ScopeResolver, admit_end_user};
+pub use sekvent_context::{CallContext, EndUser, RequestScope};
 pub use sekvent_error::{AppError, ErrorCode};
 /// `#[component(...)]` on a trait, and `#[derive(ComponentError)]` on an
 /// error enum.

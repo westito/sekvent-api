@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sekvent_config::ConfigSource;
+use sekvent_context::CallContext;
 use sekvent_error::AppError;
 use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
@@ -19,6 +20,7 @@ use crate::config::{self, Entry, Resolved, Settings};
 use crate::end_user::EndUserAuthenticator;
 use crate::lifecycle::LifecycleDyn;
 use crate::link::Link;
+use crate::scope::ScopeResolver;
 use crate::server::Server;
 use crate::{Binding, BuildError, ComponentDescriptor, ComponentHandle, reasons};
 
@@ -87,6 +89,7 @@ pub struct AppBuilder<'a> {
     resources: HashMap<TypeId, Resource>,
     end_user: Option<Arc<dyn EndUserAuthenticator>>,
     authorizer: Option<Arc<dyn CallAuthorizer>>,
+    scope: Option<Arc<dyn ScopeResolver>>,
 }
 
 impl AppBuilder<'_> {
@@ -141,6 +144,18 @@ impl AppBuilder<'_> {
             return Err(BuildError::DuplicateCallAuthorizer);
         }
         self.authorizer = Some(Arc::new(authorizer));
+        Ok(())
+    }
+
+    /// Register the App's scope resolver, run for every call a component of
+    /// this App serves over gRPC that no link token authenticated, before
+    /// the end-user authenticator, and by [`App::resolve_scope`]. One per
+    /// App; a second is [`BuildError::DuplicateScopeResolver`].
+    pub fn scope_resolver(&mut self, resolver: impl ScopeResolver) -> Result<(), BuildError> {
+        if self.scope.is_some() {
+            return Err(BuildError::DuplicateScopeResolver);
+        }
+        self.scope = Some(Arc::new(resolver));
         Ok(())
     }
 
@@ -250,6 +265,7 @@ impl AppBuilder<'_> {
                     &server,
                     built.dispatch.clone(),
                     self.end_user.as_ref(),
+                    self.scope.as_ref(),
                 )?);
             }
             handles.push(Some(built.handle));
@@ -276,6 +292,7 @@ impl AppBuilder<'_> {
                 mounted: AtomicBool::new(false),
                 phase: watch::Sender::new(Phase::Built),
                 serial: Mutex::new(()),
+                scope: self.scope,
             }),
         })
     }
@@ -442,6 +459,7 @@ fn expose(
     server: &Arc<Server>,
     dispatch: Option<Arc<dyn Dispatch>>,
     end_user: Option<&Arc<dyn EndUserAuthenticator>>,
+    scope: Option<&Arc<dyn ScopeResolver>>,
 ) -> Result<Exposed, BuildError> {
     let Some(dispatch) = dispatch else {
         return Err(BuildError::NotServable {
@@ -475,7 +493,8 @@ fn expose(
                 inbound,
                 settings.max_hops,
             )
-            .with_end_user(end_user),
+            .with_end_user(end_user)
+            .with_scope_resolver(scope.cloned()),
         ),
     })
 }
@@ -489,6 +508,7 @@ fn expose(
     _server: &Arc<Server>,
     _dispatch: Option<Arc<dyn Dispatch>>,
     _end_user: Option<&Arc<dyn EndUserAuthenticator>>,
+    _scope: Option<&Arc<dyn ScopeResolver>>,
 ) -> Result<Exposed, BuildError> {
     Ok(Exposed {
         component: descriptor.name(),
@@ -517,6 +537,7 @@ impl fmt::Debug for AppBuilder<'_> {
             .field("resources", &resources)
             .field("end_user_authenticator", &self.end_user.is_some())
             .field("call_authorizer", &self.authorizer.is_some())
+            .field("scope_resolver", &self.scope.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -640,6 +661,8 @@ struct Inner {
     /// runs alongside the start sequence and every started component is
     /// stopped exactly once.
     serial: Mutex<()>,
+    /// The scope resolver, for [`App::resolve_scope`].
+    scope: Option<Arc<dyn ScopeResolver>>,
 }
 
 /// A built set of components. Cheap to clone; clones share everything.
@@ -657,6 +680,7 @@ impl App {
             resources: HashMap::new(),
             end_user: None,
             authorizer: None,
+            scope: None,
         }
     }
 
@@ -736,6 +760,57 @@ impl App {
     pub fn grpc_routes(&self) -> tonic::service::Routes {
         self.inner.mounted.store(true, Ordering::SeqCst);
         crate::grpc::service::routes(self.inner.exposed.iter().map(|exposed| &exposed.served))
+    }
+
+    /// Run the App's [`ScopeResolver`] for a request served outside the
+    /// component service (a REST route) and attach its scope to `cx`
+    /// ([`CallContext::with_scope`]): the scope's tenant becomes the
+    /// context's, and the scope lives as long as the returned context and
+    /// its clones.
+    ///
+    /// `cx` is returned unchanged when it names a service caller or the App
+    /// has no resolver. Otherwise the resolver runs within `cx`'s deadline
+    /// (`DEADLINE_EXCEEDED`, "the call deadline was exceeded", once it has
+    /// passed, without running it when it already had) and its error is
+    /// returned unchanged; a panic propagates. A scope whose tenant fails
+    /// [`is_valid_tenant`](sekvent_context::headers::is_valid_tenant) is
+    /// `INTERNAL` with
+    /// [`SCOPE_TENANT_INVALID`](crate::reasons::SCOPE_TENANT_INVALID).
+    ///
+    /// When `cx` already has an [end user](CallContext::end_user) (the route
+    /// authenticated first), the tenant rule of
+    /// [`admit_end_user`](crate::admit_end_user) applies to that user: a
+    /// scope that names a tenant the user does not name is refused with
+    /// the constant `UNAUTHENTICATED` answer.
+    ///
+    /// It does not put the scope into `request`'s extensions and does not
+    /// authenticate an end user: a route that authenticates after resolving
+    /// applies the tenant rule with [`admit_end_user`](crate::admit_end_user).
+    pub async fn resolve_scope(
+        &self,
+        request: &http::request::Parts,
+        cx: CallContext,
+    ) -> Result<CallContext, AppError> {
+        let Some(resolver) = &self.inner.scope else {
+            return Ok(cx);
+        };
+        if cx.caller().is_some() {
+            return Ok(cx);
+        }
+        let expired = || AppError::deadline_exceeded("the call deadline was exceeded");
+        let bound = cx.deadline().map(Instant::from_std);
+        if bound.is_some_and(|bound| bound <= Instant::now()) {
+            return Err(expired());
+        }
+        let scope =
+            crate::scope::resolve_within(resolver.as_ref(), request, &cx, bound, expired).await?;
+        let scope = crate::scope::checked(scope)?;
+        if let Some(user) = cx.end_user()
+            && !crate::scope::admits(Some(&scope), user)
+        {
+            return Err(crate::scope::refused());
+        }
+        Ok(cx.with_scope(scope))
     }
 
     /// Run every component's `on_start` hook in install order, opening each

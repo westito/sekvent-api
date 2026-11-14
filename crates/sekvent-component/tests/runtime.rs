@@ -247,3 +247,76 @@ fn a_serialized_call_is_cancelled_when_its_serving_runtime_shuts_down() {
     driver.block_on(app.stop(Duration::ZERO)).unwrap();
     assert_eq!(app.state("inventory"), Some(ComponentState::Stopped));
 }
+
+#[tokio::test]
+async fn two_apps_run_on_one_runtime_under_their_own_unit_names() {
+    let recorder = Recorder::default();
+    let public = hooked(&recorder, false, false);
+    let admin = {
+        let hooks = Hooks::new("admin", &recorder);
+        build_with(&source(Binding::Local, &[]), |builder| {
+            InventoryHandle::install_with_lifecycle(builder, move |_| {
+                Ok(HookedInventory {
+                    inner: FakeInventory::stock(5),
+                    hooks,
+                })
+            })
+        })
+        .unwrap()
+    };
+    let handle = public
+        .register(admin.register_as("admin-components", Runtime::builder().without_signals()))
+        .build()
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    assert!(handle.health().is_ready());
+    for (app, remaining) in [(&public, 9), (&admin, 4)] {
+        let reply = app
+            .handle::<InventoryHandle>()
+            .unwrap()
+            .reserve(&CallContext::new(), reserve())
+            .await
+            .unwrap();
+        assert_eq!(reply.remaining, remaining);
+    }
+
+    handle.shutdown();
+    let report = handle.wait().await.unwrap();
+    for name in ["components", "admin-components"] {
+        let unit = report.unit(name).unwrap();
+        assert_eq!(unit.stage, Stage::Components, "{name}");
+        assert_eq!(unit.exit, UnitExit::Completed, "{name}");
+    }
+    assert_eq!(public.state("inventory"), Some(ComponentState::Stopped));
+    assert_eq!(admin.state("inventory"), Some(ComponentState::Stopped));
+    let mut events = recorder.events();
+    events.sort();
+    assert_eq!(
+        events,
+        [
+            "start admin",
+            "start inventory",
+            "stop admin",
+            "stop inventory"
+        ],
+        "each hook once, in no order between the Apps"
+    );
+}
+
+#[tokio::test]
+async fn a_unit_name_used_twice_fails_the_runtime_build() {
+    let first = build_inventory(Binding::Local, &[], FakeInventory::stock(1)).unwrap();
+    let second = build_inventory(Binding::Local, &[], FakeInventory::stock(1)).unwrap();
+    let twice = first.register(second.register(Runtime::builder().without_signals()));
+    let named =
+        first.register(second.register_as("components", Runtime::builder().without_signals()));
+    for builder in [twice, named] {
+        let Err(error) = builder.build() else {
+            panic!("a name used twice must fail the build");
+        };
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.message(), "unit components is registered twice");
+    }
+}

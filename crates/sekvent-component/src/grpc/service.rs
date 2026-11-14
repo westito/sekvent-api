@@ -19,6 +19,14 @@
 //! authenticator, so a flood is refused cheaply; keyed by the end user,
 //! right after it. A refused call never reaches the body or the handler.
 //!
+//! The App's scope resolver runs for every call no link token authenticated,
+//! after the address-keyed limit and before the end-user authenticator: its
+//! scope goes into the head's extensions (where the authenticator finds it)
+//! and into the context. When the scope names a tenant, a user who does not
+//! name the same one is refused like a bad credential. The call's
+//! cancellation guard exists from the resolver on, and an expired call
+//! never reaches it.
+//!
 //! The App's call authorizer runs last among these head-only checks, after
 //! the hop limit, with the context the handler will see; its error is the
 //! answer, unchanged, and its panic is answered like a handler's.
@@ -35,7 +43,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use sekvent_context::{CallContext, ClientAddr, ServiceIdentity, headers};
+use sekvent_context::{CallContext, ClientAddr, RequestScope, ServiceIdentity, headers};
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_link::TokenMap;
 use sekvent_telemetry::access_log::MessageCount;
@@ -49,6 +57,7 @@ use super::codec::BytesCodec;
 use crate::__private::{BoxFuture, Dispatch};
 use crate::end_user::{EndUserAuthenticator, rejection};
 use crate::link::{DOWNSTREAM, depth_exceeded};
+use crate::scope::{ScopeResolver, admit_end_user};
 use crate::server::{Server, tag};
 use crate::stream::CallStream;
 use crate::wire::{CatchPanic, CatchPanicStream, Panicked};
@@ -74,6 +83,8 @@ pub(crate) struct Served {
     /// The end-user authenticator; `None` unless `SERVE_AUTH` includes
     /// `bearer`.
     end_user: Option<Arc<dyn EndUserAuthenticator>>,
+    /// The App's scope resolver, whatever `SERVE_AUTH` says.
+    scope: Option<Arc<dyn ScopeResolver>>,
     max_hops: u32,
     /// `/<service>/`, the path prefix of every method.
     prefix: String,
@@ -85,6 +96,7 @@ impl std::fmt::Debug for Served {
             .field("component", &self.descriptor().name())
             .field("authenticated", &self.inbound.is_some())
             .field("end_user", &self.end_user.is_some())
+            .field("scope_resolver", &self.scope.is_some())
             .field("max_hops", &self.max_hops)
             .finish_non_exhaustive()
     }
@@ -103,6 +115,7 @@ impl Served {
             dispatch,
             inbound,
             end_user: None,
+            scope: None,
             max_hops,
             prefix,
         }
@@ -115,6 +128,13 @@ impl Served {
         authenticator: Option<Arc<dyn EndUserAuthenticator>>,
     ) -> Self {
         self.end_user = authenticator;
+        self
+    }
+
+    /// Resolve the request scope of calls no link authenticated with
+    /// `resolver`.
+    pub(crate) fn with_scope_resolver(mut self, resolver: Option<Arc<dyn ScopeResolver>>) -> Self {
+        self.scope = resolver;
         self
     }
 
@@ -197,9 +217,63 @@ impl Served {
         })
     }
 
+    /// Run the scope resolver on the request head within the call's
+    /// deadline (and a stream's `open_deadline`), never once it has passed,
+    /// check the scope's tenant, put the scope into the head's extensions
+    /// and attach it to the context. Without a resolver the context is
+    /// returned unchanged; the resolver's error is returned unchanged.
+    async fn resolve_scope(
+        &self,
+        method: usize,
+        cx: CallContext,
+        head: &mut http::request::Parts,
+        open_deadline: Option<Instant>,
+    ) -> Result<CallContext, AppError> {
+        let Some(resolver) = &self.scope else {
+            return Ok(cx);
+        };
+        let bound = open_bound(&cx, open_deadline);
+        if bound.is_some_and(|bound| bound <= Instant::now()) {
+            return Err(deadline_exceeded(self.descriptor(), method));
+        }
+        let request: &http::request::Parts = head;
+        let context = &cx;
+        // Deferred into the caught poll, so a sync closure that panics is
+        // caught too.
+        let attempt = CatchPanic::new(async move { resolver.resolve(request, context).await });
+        let outcome = match bound {
+            Some(bound) => tokio::time::timeout_at(bound, attempt)
+                .await
+                .map_err(|_elapsed| deadline_exceeded(self.descriptor(), method))?,
+            None => attempt.await,
+        };
+        match outcome {
+            Ok(Ok(scope)) => {
+                let scope = crate::scope::checked(scope)
+                    .map_err(|error| tag(self.descriptor(), error, method))?;
+                head.extensions.insert::<RequestScope>(scope.clone());
+                Ok(cx.with_scope(scope))
+            }
+            Ok(Err(error)) => Err(error),
+            Err(Panicked) => Err(tag(
+                self.descriptor(),
+                AppError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "the scope resolver of component {} panicked",
+                        self.descriptor().name()
+                    ),
+                )
+                .with_reason(reasons::HANDLER_PANICKED),
+                method,
+            )),
+        }
+    }
+
     /// Run the end-user authenticator on the request head within the
     /// call's deadline (and a stream's `open_deadline`), and make the end
-    /// user the context's caller.
+    /// user the context's caller, refusing one who does not name the
+    /// scope's tenant.
     async fn authenticate(
         &self,
         method: usize,
@@ -220,7 +294,7 @@ impl Served {
             None => attempt.await,
         };
         match outcome {
-            Ok(Ok(user)) => Ok(cx.with_end_user(user)),
+            Ok(Ok(user)) => admit_end_user(cx, user),
             Ok(Err(error)) => Err(rejection(error)),
             Err(Panicked) => Err(tag(
                 self.descriptor(),
@@ -473,7 +547,21 @@ where
                 if let Err(error) = served.check_client(method, &cx, false) {
                     return Ok(error_response(error));
                 }
-                let (head, body) = request.into_parts();
+                // Cancels the call's token when the client resets the stream
+                // and this future is dropped, or when the deadline passes,
+                // from the scope resolver on: work it spawned with the token
+                // ends with the call.
+                let guard = cx.cancel_token().clone().drop_guard();
+                let (mut head, body) = request.into_parts();
+                if cx.caller().is_none() {
+                    cx = match served
+                        .resolve_scope(method, cx, &mut head, open_deadline)
+                        .await
+                    {
+                        Ok(cx) => cx,
+                        Err(error) => return Ok(error_response(error)),
+                    };
+                }
                 if end_user {
                     cx = match served.authenticate(method, cx, &head, open_deadline).await {
                         Ok(cx) => cx,
@@ -489,11 +577,10 @@ where
                 }
                 let request = http::Request::from_parts(head, body);
                 if descriptor.methods()[method].is_stream() {
-                    return Ok(serve_stream(served, method, cx, open_deadline, request).await);
+                    return Ok(
+                        serve_stream(served, method, cx, open_deadline, request, guard).await,
+                    );
                 }
-                // Cancels the call's token when the client resets the stream
-                // and this future is dropped, or when the deadline passes.
-                let guard = cx.cancel_token().clone().drop_guard();
                 let remaining = sekvent_resilience::remaining(&cx);
                 let mut grpc = Grpc::new(BytesCodec).max_decoding_message_size(MAX_MESSAGE_SIZE);
                 let call = grpc.unary(Unary { served, method, cx }, request);
@@ -516,22 +603,23 @@ where
 
 /// Serve one prepared stream: open it within the open bound (a trailers-only
 /// `DEADLINE_EXCEEDED` when it passes), then hand its items to tonic as
-/// they come, counted in the response's [`MessageCount`]. A drop guard
-/// cancels the call's token if the response future is dropped during the
-/// open; after it, the stream's own guard does when hyper drops the body.
+/// they come, counted in the response's [`MessageCount`]. `guard`, the
+/// call's drop guard, cancels the call's token if the response future is
+/// dropped during the open or the open bound passes; after the open, the
+/// stream's own guard does when hyper drops the body.
 async fn serve_stream<B>(
     served: Arc<Served>,
     method: usize,
     cx: CallContext,
     open_deadline: Option<Instant>,
     request: http::Request<B>,
+    guard: tokio_util::sync::DropGuard,
 ) -> http::Response<Body>
 where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
 {
     let descriptor = served.descriptor();
-    let guard = cx.cancel_token().clone().drop_guard();
     let bound = open_bound(&cx, open_deadline);
     let count = MessageCount::new();
     let mut grpc = Grpc::new(BytesCodec)
@@ -863,9 +951,12 @@ mod tests {
         assert!(!converted.metadata().contains_key(DOWNSTREAM_REASON));
     }
 
-    /// Accepts `Bearer user-<n>`, fails `UNAVAILABLE` for `Bearer down`,
-    /// panics for `Bearer panic`, never answers for `Bearer hang`, and
-    /// rejects anything else with a detailed message.
+    /// Accepts `Bearer user-<n>` (tenant `t-1`), `Bearer anyone` (no
+    /// tenant) and `Bearer probe` (subject `saw-<the scope's tenant>` and
+    /// that tenant, as found in the head's extensions), fails `UNAVAILABLE` for
+    /// `Bearer down`, rejects `Bearer ended` with [`SESSION_ENDED`], panics
+    /// for `Bearer panic`, never answers for `Bearer hang`, and rejects
+    /// anything else with a detailed message.
     struct Sessions;
 
     impl EndUserAuthenticator for Sessions {
@@ -880,9 +971,24 @@ mod tests {
                 .and_then(|value| value.strip_prefix("Bearer "))
                 .map(str::to_owned);
             assert!(token.as_deref() != Some("panic-now"), "sync panic");
+            let scoped = request
+                .extensions
+                .get::<RequestScope>()
+                .map(|scope| scope.tenant().map(str::to_owned));
             Box::pin(async move {
                 match token.as_deref() {
                     Some("down") => Err(AppError::unavailable("sessions are down")),
+                    Some("ended") => Err(AppError::from(SESSION_ENDED)
+                        .with_metadata("session", "7f3a")
+                        .with_reason("SESSION_7F3A")),
+                    Some("anyone") => Ok(EndUser::new("anyone")),
+                    Some("probe") => Ok(match scoped {
+                        None => EndUser::new("saw-nothing"),
+                        Some(None) => EndUser::new("saw-none"),
+                        Some(Some(tenant)) => {
+                            EndUser::new(format!("saw-{tenant}")).with_tenant(tenant)
+                        }
+                    }),
                     Some("panic") => panic!("secret token"),
                     Some("hang") => std::future::pending().await,
                     Some(user) if user.starts_with("user-") => Ok(EndUser::new(user)
@@ -913,21 +1019,37 @@ mod tests {
         request.into_parts().0
     }
 
-    /// `prepare` and, when it asks for one, the end user.
+    /// The head of a request to `path`.
+    fn head_at(path: &str, wire: http::HeaderMap) -> http::request::Parts {
+        let mut request = http::Request::new(());
+        *request.uri_mut() = path.parse().unwrap();
+        *request.headers_mut() = wire;
+        request.into_parts().0
+    }
+
+    /// `prepare`, the scope when no link authenticated the call and, when
+    /// `prepare` asks for one, the end user: the serving order up to the
+    /// end user.
     async fn admit(
         served: &Served,
         path: &str,
         wire: http::HeaderMap,
     ) -> Result<Prepared, AppError> {
         let mut prepared = served.prepare(path, &wire, None)?;
-        if prepared.end_user {
+        let mut head = head_at(path, wire);
+        if prepared.cx.caller().is_none() {
             prepared.cx = served
-                .authenticate(
+                .resolve_scope(
                     prepared.method,
                     prepared.cx,
-                    &head(wire),
+                    &mut head,
                     prepared.open_deadline,
                 )
+                .await?;
+        }
+        if prepared.end_user {
+            prepared.cx = served
+                .authenticate(prepared.method, prepared.cx, &head, prepared.open_deadline)
                 .await?;
         }
         Ok(prepared)
@@ -1286,6 +1408,813 @@ mod tests {
         assert!(!error.message().contains("secret"), "{}", error.message());
         assert_eq!(error.metadata()["method"], "reserve");
         assert_eq!(served.server.in_flight(), 0);
+    }
+
+    const SESSION_ENDED: crate::EndUserRejection =
+        crate::EndUserRejection::new("SESSION_ENDED").with_domain("accounts");
+
+    const RELEASE: &str = "/shop.v1.Inventory/Release";
+    const WATCH_METHODS: &[MethodDescriptor] =
+        &[MethodDescriptor::call("watch", "Watch").with_stream()];
+    const WATCHER: &ComponentDescriptor =
+        &ComponentDescriptor::new("watcher", "Watcher", WATCH_METHODS).with_package("shop.v1");
+    const WATCH: &str = "/shop.v1.Watcher/Watch";
+
+    /// The site a scope was resolved for.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Site(&'static str);
+
+    /// Signals from `Drop` once the last clone of a [`Held`] is gone.
+    struct Tracker(tokio::sync::watch::Sender<bool>);
+
+    impl Drop for Tracker {
+        fn drop(&mut self) {
+            self.0.send_replace(true);
+        }
+    }
+
+    /// A scope value whose release is observable.
+    #[derive(Clone)]
+    struct Held(#[allow(dead_code)] Arc<Tracker>);
+
+    /// Resolves the scope from the `host` header: `a.test` is tenant `t-1`,
+    /// `b.test` tenant `t-2`, `none.test` a scope without a tenant,
+    /// `route.test` tenant `t-1` for `Reserve` only, `held.test` tenant
+    /// `t-1` with a [`Held`], `locked.test` an `UNAUTHENTICATED` of its own,
+    /// `bad.test` the tenant `t 1` (not a valid tenant); `hang.test` never
+    /// answers, `panic.test` and `panic-now.test` panic, anything else is
+    /// `NOT_FOUND`.
+    #[derive(Default)]
+    struct Hosts {
+        /// The path of every request it was asked about.
+        seen: std::sync::Mutex<Vec<String>>,
+        /// The cancellation token of every call it was asked about, as a
+        /// resolver that spawns work with it keeps it.
+        tokens: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>,
+        /// Per `held.test` scope, whether its value was released.
+        held: std::sync::Mutex<Vec<tokio::sync::watch::Receiver<bool>>>,
+    }
+
+    impl Hosts {
+        fn seen(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        fn token(&self, index: usize) -> tokio_util::sync::CancellationToken {
+            self.tokens.lock().unwrap()[index].clone()
+        }
+
+        fn released(&self, index: usize) -> bool {
+            *self.held.lock().unwrap()[index].borrow()
+        }
+
+        fn scope_of(&self, path: &str, host: Option<&str>) -> Result<RequestScope, AppError> {
+            match host {
+                Some("a.test") => Ok(RequestScope::new()
+                    .with_tenant("t-1")
+                    .with_extension(Site("a"))),
+                Some("b.test") => Ok(RequestScope::new()
+                    .with_tenant("t-2")
+                    .with_extension(Site("b"))),
+                Some("none.test") => Ok(RequestScope::new().with_extension(Site("none"))),
+                Some("route.test") if path == RESERVE => Ok(RequestScope::new().with_tenant("t-1")),
+                Some("route.test") => Ok(RequestScope::new()),
+                Some("held.test") => {
+                    let (tx, rx) = tokio::sync::watch::channel(false);
+                    self.held.lock().unwrap().push(rx);
+                    Ok(RequestScope::new()
+                        .with_tenant("t-1")
+                        .with_extension(Held(Arc::new(Tracker(tx)))))
+                }
+                Some("locked.test") => {
+                    Err(AppError::unauthenticated("this site is locked").with_reason("SITE_LOCKED"))
+                }
+                Some("bad.test") => Ok(RequestScope::new().with_tenant("t 1")),
+                _ => Err(AppError::not_found("unknown site")
+                    .with_reason("SITE_UNKNOWN")
+                    .with_metadata("site", "unknown")),
+            }
+        }
+    }
+
+    impl ScopeResolver for Hosts {
+        fn resolve<'a>(
+            &'a self,
+            request: &'a http::request::Parts,
+            cx: &'a CallContext,
+        ) -> BoxFuture<'a, Result<RequestScope, AppError>> {
+            let path = request.uri.path();
+            self.seen.lock().unwrap().push(path.to_owned());
+            self.tokens.lock().unwrap().push(cx.cancel_token().clone());
+            let host = request
+                .headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok());
+            assert!(host != Some("panic-now.test"), "sync panic");
+            let scope = self.scope_of(path, host);
+            let host = host.map(str::to_owned);
+            Box::pin(async move {
+                match host.as_deref() {
+                    Some("hang.test") => std::future::pending().await,
+                    Some("panic.test") => panic!("secret site"),
+                    _ => scope,
+                }
+            })
+        }
+    }
+
+    /// What a handler or the authorizer saw of its context.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Saw {
+        tenant: Option<String>,
+        site: Option<Site>,
+        scoped: bool,
+    }
+
+    impl Saw {
+        fn of(cx: &CallContext) -> Self {
+            Self {
+                tenant: cx.tenant().map(str::to_owned),
+                site: cx.scoped::<Site>().cloned(),
+                scoped: cx.scope().is_some(),
+            }
+        }
+
+        fn new(tenant: Option<&str>, site: Option<&'static str>, scoped: bool) -> Self {
+            Self {
+                tenant: tenant.map(str::to_owned),
+                site: site.map(Site),
+                scoped,
+            }
+        }
+    }
+
+    /// Records what each handler saw. A unary body `park` waits for
+    /// `finish` after signalling `entered`; a stream yields `one`, then
+    /// `two` once `finish` is signalled. Neither keeps its context.
+    #[derive(Default)]
+    struct Probe {
+        saw: std::sync::Mutex<Vec<Saw>>,
+        entered: tokio::sync::Notify,
+        finish: tokio::sync::Notify,
+    }
+
+    impl Probe {
+        fn saw(&self) -> Vec<Saw> {
+            self.saw.lock().unwrap().clone()
+        }
+    }
+
+    struct Probed(Arc<Probe>);
+
+    impl Dispatch for Probed {
+        fn dispatch(
+            &self,
+            _method: usize,
+            cx: CallContext,
+            body: Bytes,
+        ) -> BoxFuture<'static, Result<Bytes, AppError>> {
+            self.0.saw.lock().unwrap().push(Saw::of(&cx));
+            drop(cx);
+            let probe = Arc::clone(&self.0);
+            Box::pin(async move {
+                if &body[..] == b"park" {
+                    probe.entered.notify_one();
+                    probe.finish.notified().await;
+                }
+                Ok(body)
+            })
+        }
+
+        fn dispatch_stream(
+            &self,
+            _method: usize,
+            cx: CallContext,
+            _body: Bytes,
+        ) -> BoxFuture<'static, Result<CallStream<Bytes, AppError>, AppError>> {
+            self.0.saw.lock().unwrap().push(Saw::of(&cx));
+            drop(cx);
+            let probe = Arc::clone(&self.0);
+            let first = futures::stream::once(async { Ok(Bytes::from_static(b"one")) });
+            let second = futures::stream::once(async move {
+                probe.finish.notified().await;
+                Ok(Bytes::from_static(b"two"))
+            });
+            Box::pin(async move { Ok(CallStream::new(futures::StreamExt::chain(first, second))) })
+        }
+    }
+
+    /// How a scoped component is served.
+    #[derive(Default)]
+    struct Setup {
+        link: bool,
+        bearer: bool,
+        timeout: Option<Duration>,
+        client: Option<sekvent_resilience::ClientLimiter>,
+        authorizer: Option<Arc<dyn crate::CallAuthorizer>>,
+    }
+
+    impl Setup {
+        fn bearer() -> Self {
+            Self {
+                bearer: true,
+                ..Self::default()
+            }
+        }
+
+        fn serve(
+            self,
+            descriptor: &'static ComponentDescriptor,
+            hosts: &Arc<Hosts>,
+            probe: &Arc<Probe>,
+        ) -> Arc<Served> {
+            let policy = MethodPolicy {
+                timeout: self.timeout,
+                client: self.client,
+                ..MethodPolicy::default()
+            };
+            let policies = vec![policy; descriptor.methods().len()];
+            let gate = Server::new(descriptor, &policies, false).with_authorizer(self.authorizer);
+            assert!(gate.open());
+            let inbound = self.link.then(|| {
+                Arc::new(TokenMap::new([InboundLink::trusted("shop", Secret::new(TOKEN))]).unwrap())
+            });
+            let sessions: Option<Arc<dyn EndUserAuthenticator>> = if self.bearer {
+                Some(Arc::new(Sessions))
+            } else {
+                None
+            };
+            let hosts: Arc<Hosts> = Arc::clone(hosts);
+            let resolver: Arc<dyn ScopeResolver> = hosts;
+            Arc::new(
+                Served::new(
+                    Arc::new(gate),
+                    Arc::new(Probed(Arc::clone(probe))),
+                    inbound,
+                    16,
+                )
+                .with_end_user(sessions)
+                .with_scope_resolver(Some(resolver)),
+            )
+        }
+    }
+
+    fn fixtures() -> (Arc<Hosts>, Arc<Probe>) {
+        (Arc::new(Hosts::default()), Arc::new(Probe::default()))
+    }
+
+    /// `wire` with the `host` header set.
+    fn hosted(host: &str, mut wire: http::HeaderMap) -> http::HeaderMap {
+        wire.insert(http::header::HOST, host.parse().unwrap());
+        wire
+    }
+
+    /// One gRPC message frame.
+    fn framed(message: &'static [u8]) -> http_body_util::Full<Bytes> {
+        let mut frame = vec![0_u8];
+        frame.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(message);
+        http_body_util::Full::new(Bytes::from(frame))
+    }
+
+    /// A request to `path` with `wire` headers and `body`.
+    fn request<B>(path: &str, wire: http::HeaderMap, body: B) -> http::Request<B> {
+        let mut request = http::Request::new(body);
+        *request.uri_mut() = path.parse().unwrap();
+        *request.headers_mut() = wire;
+        request
+    }
+
+    /// `served`'s response to `request`, within 30 s.
+    async fn respond<B>(served: &Arc<Served>, request: http::Request<B>) -> http::Response<Body>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    {
+        let call = tower::Service::call(&mut ComponentService(Arc::clone(served)), request);
+        tokio::time::timeout(Duration::from_secs(30), call)
+            .await
+            .expect("answered")
+            .unwrap()
+    }
+
+    /// The next frame of a response body, within 30 s.
+    async fn next_frame(
+        body: &mut Body,
+    ) -> Option<Result<http_body::Frame<Bytes>, <Body as http_body::Body>::Error>> {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            http_body_util::BodyExt::frame(body),
+        )
+        .await
+        .expect("a frame")
+    }
+
+    /// The `grpc-status` of a trailers-only answer; `None` when the call
+    /// went on to the handler.
+    fn early_status(response: &http::Response<Body>) -> Option<&str> {
+        response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn the_resolver_runs_for_every_caller_no_link_authenticated() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+
+        let prepared = admit(&served, RESERVE, hosted("a.test", bearer("user-1")))
+            .await
+            .unwrap();
+        assert_eq!(
+            Saw::of(&prepared.cx),
+            Saw::new(Some("t-1"), Some("a"), true)
+        );
+        assert_eq!(prepared.cx.end_user().map(EndUser::subject), Some("user-1"));
+
+        let prepared = admit(&served, RELEASE, hosted("a.test", http::HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            Saw::of(&prepared.cx),
+            Saw::new(Some("t-1"), Some("a"), true)
+        );
+        assert_eq!(prepared.cx.end_user(), None, "anonymous");
+
+        let prepared = admit(&served, TRACK, hosted("a.test", http::HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            Saw::of(&prepared.cx),
+            Saw::new(Some("t-1"), Some("a"), true)
+        );
+        assert_eq!(prepared.cx.end_user(), None, "optional, no header");
+        let prepared = admit(&served, TRACK, hosted("a.test", bearer("user-2")))
+            .await
+            .unwrap();
+        assert_eq!(
+            Saw::of(&prepared.cx),
+            Saw::new(Some("t-1"), Some("a"), true)
+        );
+        assert_eq!(prepared.cx.end_user().map(EndUser::subject), Some("user-2"));
+        assert_eq!(hosts.seen(), 4);
+        assert_eq!(hosts.seen.lock().unwrap()[0], RESERVE, "the routed path");
+
+        // Under `SERVE_AUTH=none` too.
+        let (hosts, probe) = fixtures();
+        let open = Setup::default().serve(INVENTORY, &hosts, &probe);
+        let prepared = admit(&open, RESERVE, hosted("b.test", http::HeaderMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(
+            Saw::of(&prepared.cx),
+            Saw::new(Some("t-2"), Some("b"), true)
+        );
+        assert!(format!("{open:?}").contains("scope_resolver: true"));
+    }
+
+    #[tokio::test]
+    async fn the_resolver_never_runs_for_a_link_caller_or_an_unknown_path() {
+        for with_bearer in [false, true] {
+            let (hosts, probe) = fixtures();
+            let served = Setup {
+                link: true,
+                bearer: with_bearer,
+                ..Setup::default()
+            }
+            .serve(INVENTORY, &hosts, &probe);
+            let wire = hosted("a.test", bearer(TOKEN));
+            let response = respond(&served, request(RESERVE, wire, framed(b""))).await;
+            assert_eq!(early_status(&response), None, "served");
+            assert_eq!(probe.saw(), [Saw::new(None, None, false)]);
+            assert_eq!(hosts.seen(), 0, "link, bearer: {with_bearer}");
+        }
+
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        let stock = hosted("a.test", bearer("user-1"));
+        assert_eq!(
+            status_of(&served, "/shop.v1.Inventory/Stock", stock).await,
+            "12"
+        );
+        assert_eq!(hosts.seen(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_resolver_runs_after_the_address_limit() {
+        let (hosts, probe) = fixtures();
+        let limiter = sekvent_resilience::ClientLimiter::new(
+            sekvent_resilience::KeyedLimit::new(1, Duration::from_mins(1)),
+            sekvent_resilience::ClientKey::ClientAddr,
+        )
+        .unwrap();
+        let served = Setup {
+            client: Some(limiter),
+            ..Setup::default()
+        }
+        .serve(INVENTORY, &hosts, &probe);
+        let from = |addr: [u8; 4]| {
+            let mut request = request(
+                RELEASE,
+                hosted("a.test", http::HeaderMap::new()),
+                framed(b""),
+            );
+            request
+                .extensions_mut()
+                .insert(ClientAddr(std::net::IpAddr::from(addr)));
+            request
+        };
+        let first = respond(&served, from([192, 0, 2, 1])).await;
+        assert_eq!(early_status(&first), None);
+        let refused = respond(&served, from([192, 0, 2, 1])).await;
+        assert_eq!(early_status(&refused), Some("8"));
+        assert_eq!(hosts.seen(), 1, "a refused flood costs no resolution");
+    }
+
+    #[tokio::test]
+    async fn the_authenticator_finds_the_scope_in_the_head() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        for (host, subject) in [("a.test", "saw-t-1"), ("none.test", "saw-none")] {
+            let prepared = admit(&served, RESERVE, hosted(host, bearer("probe")))
+                .await
+                .unwrap();
+            assert_eq!(prepared.cx.end_user().map(EndUser::subject), Some(subject));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_handler_and_the_authorizer_see_the_scope() {
+        let (hosts, probe) = fixtures();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let authorizer =
+            move |_target: crate::CallTarget, cx: &CallContext| -> Result<(), AppError> {
+                seen.lock().unwrap().push(Saw::of(cx));
+                Ok(())
+            };
+        let served = Setup {
+            bearer: true,
+            authorizer: Some(Arc::new(authorizer)),
+            ..Setup::default()
+        }
+        .serve(INVENTORY, &hosts, &probe);
+        for (path, wire) in [
+            (RESERVE, bearer("user-1")),
+            (RELEASE, http::HeaderMap::new()),
+        ] {
+            let response =
+                respond(&served, request(path, hosted("a.test", wire), framed(b""))).await;
+            assert_eq!(early_status(&response), None);
+        }
+        let expected = Saw::new(Some("t-1"), Some("a"), true);
+        assert_eq!(probe.saw(), [expected.clone(), expected.clone()]);
+        assert_eq!(asked.lock().unwrap().clone(), [expected.clone(), expected]);
+    }
+
+    #[tokio::test]
+    async fn a_client_tenant_header_never_replaces_the_scope() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        let forged = |mut wire: http::HeaderMap| {
+            wire.insert(headers::TENANT, "t-forged".parse().unwrap());
+            wire
+        };
+        for (path, wire) in [
+            (RELEASE, http::HeaderMap::new()),
+            (RESERVE, bearer("user-1")),
+        ] {
+            let prepared = admit(&served, path, hosted("a.test", forged(wire)))
+                .await
+                .unwrap();
+            assert_eq!(prepared.cx.tenant(), Some("t-1"), "{path}");
+        }
+        // Without a tenant in the scope the header is dropped all the same.
+        let prepared = admit(
+            &served,
+            RELEASE,
+            hosted("none.test", forged(http::HeaderMap::new())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.cx.tenant(), None);
+        assert!(prepared.cx.scope().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_resolver_error_is_the_answer_unchanged() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        let error = admit(&served, RELEASE, hosted("c.test", http::HeaderMap::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NotFound);
+        assert_eq!(error.message(), "unknown site");
+        assert_eq!(error.reason(), Some("SITE_UNKNOWN"));
+        assert_eq!(error.metadata().len(), 1, "never tagged: {error:?}");
+        assert_eq!(error.metadata()["site"], "unknown");
+
+        // Its own UNAUTHENTICATED is not flattened.
+        let error = admit(&served, RESERVE, hosted("locked.test", bearer("user-1")))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unauthenticated);
+        assert_eq!(error.message(), "this site is locked");
+        assert_eq!(error.reason(), Some("SITE_LOCKED"));
+
+        // Answered before the body, and the handler never runs.
+        let wire = hosted("c.test", http::HeaderMap::new());
+        assert_eq!(status_of(&served, RELEASE, wire).await, "5");
+        assert_eq!(probe.saw(), [] as [Saw; 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_resolver_runs_within_the_deadline_or_the_open_bound() {
+        let (hosts, probe) = fixtures();
+        let served = Setup {
+            timeout: Some(Duration::from_millis(50)),
+            ..Setup::default()
+        }
+        .serve(INVENTORY, &hosts, &probe);
+        let error = admit(
+            &served,
+            RESERVE,
+            hosted("hang.test", http::HeaderMap::new()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(error.message(), "the call deadline was exceeded");
+        assert_eq!(error.metadata()["method"], "reserve");
+
+        let watcher = Setup {
+            timeout: Some(Duration::from_millis(50)),
+            ..Setup::default()
+        }
+        .serve(WATCHER, &hosts, &probe);
+        let error = admit(&watcher, WATCH, hosted("hang.test", http::HeaderMap::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert_eq!(error.metadata()["method"], "watch");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_resolver_is_internal_without_its_payload() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::default().serve(INVENTORY, &hosts, &probe);
+        for host in ["panic.test", "panic-now.test"] {
+            let error = admit(&served, RESERVE, hosted(host, http::HeaderMap::new()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Internal);
+            assert_eq!(error.reason(), Some(reasons::HANDLER_PANICKED));
+            assert_eq!(
+                error.message(),
+                "the scope resolver of component inventory panicked"
+            );
+            assert_eq!(error.metadata()["method"], "reserve");
+        }
+        assert_eq!(served.server.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_end_user_must_belong_to_the_scopes_tenant() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        for (host, token, tenant) in [
+            ("none.test", "user-1", Some("t-1")),
+            ("none.test", "anyone", None),
+            ("a.test", "user-1", Some("t-1")),
+        ] {
+            let prepared = admit(&served, RESERVE, hosted(host, bearer(token)))
+                .await
+                .unwrap();
+            assert_eq!(prepared.cx.tenant(), tenant, "{host} {token}");
+            assert_eq!(
+                prepared.cx.end_user().and_then(EndUser::tenant),
+                if token == "user-1" { Some("t-1") } else { None }
+            );
+        }
+
+        // A user of `t-1` on a site of `t-2`, or a user without a tenant on
+        // a site of `t-1`: the answer to a bad token, even from an
+        // authenticator that shows reasons for other refusals.
+        for (host, token) in [("b.test", "user-1"), ("a.test", "anyone")] {
+            for path in [RESERVE, TRACK] {
+                let error = admit(&served, path, hosted(host, bearer(token)))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), ErrorCode::Unauthenticated, "{host} {token}");
+                assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+                assert_eq!(error.reason(), None);
+                assert_eq!(error.domain(), None);
+                assert!(error.metadata().is_empty());
+            }
+            let wire = hosted(host, bearer(token));
+            assert_eq!(status_of(&served, RESERVE, wire).await, "16");
+        }
+        assert_eq!(probe.saw(), [] as [Saw; 0]);
+    }
+
+    #[tokio::test]
+    async fn a_resolver_may_scope_by_route() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        let prepared = admit(&served, RESERVE, hosted("route.test", bearer("user-1")))
+            .await
+            .unwrap();
+        assert_eq!(prepared.cx.tenant(), Some("t-1"));
+        // The scope that route names a tenant, so a user without one is refused.
+        let error = admit(&served, RESERVE, hosted("route.test", bearer("anyone")))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unauthenticated);
+        let prepared = admit(
+            &served,
+            RELEASE,
+            hosted("route.test", http::HeaderMap::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(Saw::of(&prepared.cx), Saw::new(None, None, true));
+    }
+
+    #[tokio::test]
+    async fn a_unary_call_keeps_the_scope_until_the_handler_returned() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::default().serve(INVENTORY, &hosts, &probe);
+        let call = {
+            let served = Arc::clone(&served);
+            let request = request(
+                RELEASE,
+                hosted("held.test", http::HeaderMap::new()),
+                framed(b"park"),
+            );
+            tokio::spawn(async move { respond(&served, request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), probe.entered.notified())
+            .await
+            .expect("the handler runs");
+        assert!(!hosts.released(0), "held while the handler is parked");
+        probe.finish.notify_one();
+        let response = call.await.unwrap();
+        assert_eq!(early_status(&response), None);
+        drop(response);
+        assert!(hosts.released(0), "released once the call returned");
+        assert!(
+            !hosts.token(0).is_cancelled(),
+            "a served call is not cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_keeps_the_scope_until_the_response_ended() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::default().serve(WATCHER, &hosts, &probe);
+        let response = respond(
+            &served,
+            request(
+                WATCH,
+                hosted("held.test", http::HeaderMap::new()),
+                framed(b""),
+            ),
+        )
+        .await;
+        assert_eq!(early_status(&response), None, "the stream opened");
+        assert_eq!(probe.saw(), [Saw::new(Some("t-1"), None, true)]);
+        assert!(!hosts.released(0), "kept after the open returned");
+
+        let mut body = response.into_body();
+        let first = next_frame(&mut body).await.unwrap().unwrap();
+        assert!(first.is_data());
+        assert!(!hosts.released(0), "kept while the stream runs");
+        assert!(
+            !hosts.token(0).is_cancelled(),
+            "the open handed the stream over without cancelling it"
+        );
+
+        probe.finish.notify_one();
+        while let Some(frame) = next_frame(&mut body).await {
+            frame.unwrap();
+        }
+        assert!(hosts.released(0), "released once the stream ended");
+    }
+
+    #[tokio::test]
+    async fn an_end_user_rejection_shows_its_reason_and_domain() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        for path in [RESERVE, TRACK] {
+            let error = admit(&served, path, hosted("a.test", bearer("ended")))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unauthenticated);
+            assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+            assert_eq!(error.reason(), Some("SESSION_ENDED"));
+            assert_eq!(error.domain(), Some("accounts"));
+            assert!(error.metadata().is_empty(), "{error:?}");
+            let wire = hosted("a.test", bearer("ended"));
+            assert_eq!(status_of(&served, path, wire).await, "16");
+        }
+        assert_eq!(probe.saw(), [] as [Saw; 0], "the handler never ran");
+    }
+
+    #[tokio::test]
+    async fn an_expired_call_never_reaches_the_resolver() {
+        let (hosts, probe) = fixtures();
+        let inventory = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        let watcher = Setup::bearer().serve(WATCHER, &hosts, &probe);
+        for (served, path, method) in [
+            (&inventory, RESERVE, "reserve"),
+            (&inventory, RELEASE, "release"),
+            (&watcher, WATCH, "watch"),
+        ] {
+            for host in ["a.test", "c.test"] {
+                let mut wire = hosted(host, bearer("user-1"));
+                wire.insert(headers::GRPC_TIMEOUT, "0n".parse().unwrap());
+                let error = admit(served, path, wire).await.unwrap_err();
+                assert_eq!(error.code(), ErrorCode::DeadlineExceeded, "{path} {host}");
+                assert_eq!(error.message(), "the call deadline was exceeded");
+                assert_eq!(error.metadata()["method"], method);
+            }
+        }
+        let mut wire = hosted("c.test", http::HeaderMap::new());
+        wire.insert(headers::GRPC_TIMEOUT, "0n".parse().unwrap());
+        assert_eq!(status_of(&inventory, RELEASE, wire).await, "4");
+        assert_eq!(hosts.seen(), 0, "never asked");
+        assert_eq!(probe.saw(), [] as [Saw; 0]);
+    }
+
+    #[tokio::test]
+    async fn a_scope_with_an_invalid_tenant_is_internal() {
+        let (hosts, probe) = fixtures();
+        let served = Setup::bearer().serve(INVENTORY, &hosts, &probe);
+        for (path, wire, method) in [
+            (RELEASE, http::HeaderMap::new(), "release"),
+            (RESERVE, bearer("user-1"), "reserve"),
+        ] {
+            let error = admit(&served, path, hosted("bad.test", wire))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Internal, "{path}");
+            assert_eq!(error.reason(), Some(reasons::SCOPE_TENANT_INVALID));
+            assert_eq!(
+                error.message(),
+                "the scope resolver returned an invalid tenant"
+            );
+            assert_eq!(error.metadata()["method"], method);
+        }
+        let wire = hosted("bad.test", http::HeaderMap::new());
+        assert_eq!(status_of(&served, RELEASE, wire).await, "13");
+        assert_eq!(probe.saw(), [] as [Saw; 0]);
+    }
+
+    #[tokio::test]
+    async fn a_call_dropped_during_resolution_cancels_its_token() {
+        let (hosts, probe) = fixtures();
+        let inventory = Setup::default().serve(INVENTORY, &hosts, &probe);
+        let watcher = Setup::default().serve(WATCHER, &hosts, &probe);
+        for (index, (served, path)) in [(&inventory, RELEASE), (&watcher, WATCH)]
+            .into_iter()
+            .enumerate()
+        {
+            let request = request(
+                path,
+                hosted("hang.test", http::HeaderMap::new()),
+                framed(b""),
+            );
+            let mut call = tower::Service::call(&mut ComponentService(Arc::clone(served)), request);
+            assert!(futures::poll!(&mut call).is_pending(), "{path}");
+            let token = hosts.token(index);
+            assert!(!token.is_cancelled(), "{path}: resolving");
+            // As hyper drops it when the client goes away.
+            drop(call);
+            assert!(token.is_cancelled(), "{path}");
+        }
+        assert_eq!(probe.saw(), [] as [Saw; 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resolution_past_the_deadline_cancels_its_token() {
+        let (hosts, probe) = fixtures();
+        let bounded = || Setup {
+            timeout: Some(Duration::from_millis(50)),
+            ..Setup::default()
+        };
+        let inventory = bounded().serve(INVENTORY, &hosts, &probe);
+        let watcher = bounded().serve(WATCHER, &hosts, &probe);
+        for (index, (served, path)) in [(&inventory, RELEASE), (&watcher, WATCH)]
+            .into_iter()
+            .enumerate()
+        {
+            let wire = hosted("hang.test", http::HeaderMap::new());
+            let response = respond(served, request(path, wire, framed(b""))).await;
+            assert_eq!(early_status(&response), Some("4"), "{path}");
+            assert!(hosts.token(index).is_cancelled(), "{path}");
+        }
+        assert_eq!(probe.saw(), [] as [Saw; 0]);
     }
 
     #[test]

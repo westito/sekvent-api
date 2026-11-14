@@ -1,15 +1,19 @@
-//! HS256 JSON Web Tokens, verified against a caller-supplied time.
+//! JSON Web Tokens, verified against a caller-supplied time: HS256 with a
+//! shared secret ([`JwtKeys`]) and `EdDSA` over Ed25519, signed with a
+//! private key and verified with public keys ([`EdDsaSigningKey`],
+//! [`EdDsaVerificationKeys`]).
 //!
 //! `jsonwebtoken`'s own `exp`/`nbf` checks read the system clock, so they
-//! are switched off: [`JwtKeys::verify`] checks the signature through the
-//! library, then checks `exp`, `nbf` and `iat` itself against the
-//! `now_unix_secs` it is given.
+//! are switched off: [`JwtKeys::verify`] and
+//! [`EdDsaVerificationKeys::verify`] check the signature through the
+//! library, then check `exp`, `nbf` and `iat` themselves against the
+//! `now_unix_secs` they are given.
 //!
 //! Every token carries a `kid` header naming the key that signed it. A
-//! [`JwtKeys`] signs with one key and accepts any of its verification keys,
-//! which is how a key is rotated: add the new key for verification
-//! everywhere, switch signing to it, and drop the old key once the last
-//! token signed with it has expired. Tokens without a `kid` are refused.
+//! verifier accepts any of its keys, which is how a key is rotated: add the
+//! new key for verification everywhere, switch signing to it, and drop the
+//! old key once the last token signed with it has expired. Tokens without a
+//! `kid` are refused, and each verifier accepts its own algorithm only.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -20,6 +24,10 @@ use sekvent_config::Secret;
 use sekvent_error::{AppError, ErrorCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+mod eddsa;
+
+pub use eddsa::{ED25519_KEY_LEN, EdDsaSigningKey, EdDsaVerificationKeys};
 
 /// Minimum length of an HS256 secret, in bytes.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -119,7 +127,8 @@ impl<T> Claims<T> {
     }
 }
 
-/// What [`JwtKeys::verify`] checks beyond the signature.
+/// What [`JwtKeys::verify`] and [`EdDsaVerificationKeys::verify`] check
+/// beyond the signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Validation {
@@ -270,11 +279,7 @@ impl JwtKeys {
     ) -> Result<Self, AppError> {
         let kid = kid.into();
         check_key(&kid, secret)?;
-        if self.verifying.iter().any(|(known, _)| *known == kid) {
-            return Err(AppError::invalid_argument(format!(
-                "JWT key id `{kid}` is configured twice"
-            )));
-        }
+        check_unique_kid(&kid, &self.verifying)?;
         self.verifying
             .push((kid, DecodingKey::from_secret(secret.expose().as_bytes())));
         Ok(self)
@@ -323,36 +328,13 @@ impl JwtKeys {
         now_unix_secs: u64,
         validation: &Validation,
     ) -> Result<Claims<T>, TokenRejected> {
-        let header = jsonwebtoken::decode_header(token).map_err(|_| TokenRejected::Malformed)?;
-        if header.alg != Algorithm::HS256 {
-            return Err(TokenRejected::BadSignature);
-        }
-        let kid = header.kid.ok_or(TokenRejected::UnknownKey)?;
-        let key = self
-            .verifying
-            .iter()
-            .find_map(|(known, key)| (*known == kid).then_some(key))
-            .ok_or(TokenRejected::UnknownKey)?;
-        let claims = jsonwebtoken::decode::<Claims<T>>(token, key, &signature_only())
-            .map_err(|error| match error.kind() {
-                ErrorKind::InvalidSignature | ErrorKind::InvalidAlgorithm => {
-                    TokenRejected::BadSignature
-                }
-                _ => TokenRejected::Malformed,
-            })?
-            .claims;
-        check_times(&claims, now_unix_secs, validation.leeway_secs)?;
-        if let Some(issuer) = &validation.issuer
-            && claims.iss.as_deref() != Some(issuer.as_str())
-        {
-            return Err(TokenRejected::WrongIssuer);
-        }
-        if let Some(audience) = &validation.audience
-            && claims.aud.as_deref() != Some(audience.as_str())
-        {
-            return Err(TokenRejected::WrongAudience);
-        }
-        Ok(claims)
+        verify_with_keys(
+            token,
+            Algorithm::HS256,
+            &self.verifying,
+            now_unix_secs,
+            validation,
+        )
     }
 }
 
@@ -369,9 +351,7 @@ impl fmt::Debug for JwtKeys {
 }
 
 fn check_key(kid: &str, secret: &Secret) -> Result<(), AppError> {
-    if kid.trim().is_empty() {
-        return Err(AppError::invalid_argument("JWT key id must not be blank"));
-    }
+    check_kid(kid)?;
     if secret.expose().len() < MIN_SECRET_LEN {
         return Err(AppError::invalid_argument(format!(
             "JWT key `{kid}` is too short: HS256 needs at least {MIN_SECRET_LEN} bytes"
@@ -380,15 +360,86 @@ fn check_key(kid: &str, secret: &Secret) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Library validation reduced to the signature: no clock, no required claims.
-fn signature_only() -> jsonwebtoken::Validation {
-    let mut validation = jsonwebtoken::Validation::new(Algorithm::HS256);
+/// A key id must not be blank.
+fn check_kid(kid: &str) -> Result<(), AppError> {
+    if kid.trim().is_empty() {
+        return Err(AppError::invalid_argument("JWT key id must not be blank"));
+    }
+    Ok(())
+}
+
+/// A verifier holds each key id once.
+fn check_unique_kid(kid: &str, verifying: &[(String, DecodingKey)]) -> Result<(), AppError> {
+    if verifying.iter().any(|(known, _)| known == kid) {
+        return Err(AppError::invalid_argument(format!(
+            "JWT key id `{kid}` is configured twice"
+        )));
+    }
+    Ok(())
+}
+
+/// The verification both verifiers share: `algorithm` pinned in the header,
+/// a `kid` that names one of `verifying`, the signature, then the times and
+/// the issuer and audience `validation` asks for.
+fn verify_with_keys<T: DeserializeOwned>(
+    token: &str,
+    algorithm: Algorithm,
+    verifying: &[(String, DecodingKey)],
+    now_unix_secs: u64,
+    validation: &Validation,
+) -> Result<Claims<T>, TokenRejected> {
+    let header = jsonwebtoken::decode_header(token).map_err(|_| TokenRejected::Malformed)?;
+    if header.alg != algorithm {
+        return Err(TokenRejected::BadSignature);
+    }
+    let kid = header.kid.ok_or(TokenRejected::UnknownKey)?;
+    let key = verifying
+        .iter()
+        .find_map(|(known, key)| (*known == kid).then_some(key))
+        .ok_or(TokenRejected::UnknownKey)?;
+    let claims = jsonwebtoken::decode::<Claims<T>>(token, key, &signature_only(algorithm))
+        .map_err(|error| match error.kind() {
+            ErrorKind::InvalidSignature | ErrorKind::InvalidAlgorithm => {
+                TokenRejected::BadSignature
+            }
+            _ => TokenRejected::Malformed,
+        })?
+        .claims;
+    check_claims(&claims, now_unix_secs, validation)?;
+    Ok(claims)
+}
+
+/// Library validation reduced to the signature under `algorithm` alone: no
+/// clock, no required claims.
+fn signature_only(algorithm: Algorithm) -> jsonwebtoken::Validation {
+    let mut validation = jsonwebtoken::Validation::new(algorithm);
     validation.required_spec_claims = HashSet::new();
     validation.validate_exp = false;
     validation.validate_nbf = false;
     validation.validate_aud = false;
     validation.leeway = 0;
     validation
+}
+
+/// The checks after the signature: times, then issuer and audience when
+/// `validation` names them.
+fn check_claims<T>(
+    claims: &Claims<T>,
+    now_unix_secs: u64,
+    validation: &Validation,
+) -> Result<(), TokenRejected> {
+    check_times(claims, now_unix_secs, validation.leeway_secs)?;
+    if let Some(issuer) = &validation.issuer
+        && claims.iss.as_deref() != Some(issuer.as_str())
+    {
+        return Err(TokenRejected::WrongIssuer);
+    }
+    if let Some(audience) = &validation.audience
+        && claims.aud.as_deref() != Some(audience.as_str())
+    {
+        return Err(TokenRejected::WrongAudience);
+    }
+    Ok(())
 }
 
 fn check_times<T>(claims: &Claims<T>, now: u64, leeway: u64) -> Result<(), TokenRejected> {

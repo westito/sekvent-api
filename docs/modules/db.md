@@ -34,6 +34,8 @@ Pick a backend and the extras you need:
 | `db-lease` | `lease` | `LeaseStore`, `Lease`, `HeldLease`, `FencingToken`, `LeaseInfo` (needs a sqlx backend) |
 | `db` + `runtime` | `runtime` | `PoolProbe`, `PoolRegistry::probes` (needs a sqlx backend) |
 | `db-lease` + `runtime` | `lease` + `runtime` | `LeaseGuard` for singleton jobs |
+| `db-keyed` | `keyed` | `Keyed`, `KeyedBuilder`, `KeyedRef`, `KeyedStats`: one lazily created value per key, evicted when idle or over capacity, and its `reasons`; with `runtime`, `Keyed::into_unit` |
+| `db-keyed` + `db-sqlx-postgres` | `keyed` + `sqlx-postgres` | `KeyedPools`, `KeyedPoolsBuilder`, `ConnectCandidates`: a Postgres pool per key and the value built on it; with `runtime`, `KeyedPools::into_unit` |
 
 `runtime` is a default facade feature, so probes and `LeaseGuard` are there
 as soon as a sqlx backend (and, for the guard, `db-lease`) is on.
@@ -774,6 +776,233 @@ tokio::select! {
 Both exclude each other and the scheduled `orders-sync` job when they share
 the lease name.
 
+### Keep one pool per key (`KeyedPools`)
+
+`KeyedPools<K, V = PgPool>` keeps one Postgres pool per key (a database per
+tenant, say) on top of [`Keyed`](#cache-any-resource-by-key-keyed), and
+optionally a value built on the pool. The connector turns a key into
+connect options; the pool is created on the first `get` and closed when its
+entry leaves the cache and no reference remains.
+
+Features `db-keyed` and `db-sqlx-postgres`, plus `db-migrate` for the
+migrations in `init`:
+
+```rust
+use sekvent::db::{ConnectCandidates, IntoAppError, KeyedPools, run_embedded_migrations};
+use sekvent::error::AppError;
+use sqlx::migrate::Migrator;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
+
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+let tenants = KeyedPools::builder(move |tenant: TenantId| {
+    let directory = directory.clone();
+    async move {
+        let entry = directory.lookup(&tenant).await?;           // your own store
+        let options = PgConnectOptions::new()
+            .host(&entry.host)
+            .port(entry.port)
+            .database(&entry.database)
+            .username(&entry.role)
+            .ssl_mode(PgSslMode::VerifyFull);
+        // The current password first, the previous one while it rotates.
+        Ok(ConnectCandidates::new(options.clone().password(entry.password.expose()))
+            .or(options.password(entry.previous_password.expose())))
+    }
+})
+.capacity(32)
+.max_connections(4)
+.init(|_tenant, pool| async move {
+    run_embedded_migrations(&pool, &MIGRATOR).await.map_err(AppError::from)
+})
+.build()?;
+
+let pool = tenants.get(&tenant).await?;                       // KeyedRef<PgPool>
+sqlx::query("SELECT 1").execute(&*pool).await.into_app_error()?;
+```
+
+A creation, all of it under `create_timeout`:
+
+1. **The connector** returns `PgConnectOptions` or `ConnectCandidates`; its
+   error is the creation's error, passed through as it is.
+2. **Each candidate in order** gets a pool with `max_connections`, no
+   minimum, `acquire_timeout`, `connection_idle_timeout` and
+   `connection_max_lifetime`, and `connect_with` opens one connection, so
+   wrong credentials fail the creation rather than the first query. **Only
+   a rejected password moves on to the next candidate** (SQLSTATE `28P01`):
+   that is the password in rotation the list exists for. `28000` (a role
+   that may not log in, no matching `pg_hba` rule), an unreachable server, a
+   timeout, a missing database and anything else end the creation at once,
+   so a misconfiguration is not hidden behind a later candidate. A pool
+   that connected with a later candidate logs one `info` event with its
+   position and the number of candidates.
+3. **`init(key, pool)`**, when set: migrations, a session check, anything
+   that must happen before anyone sees the pool.
+4. **`build_value(key, pool)`**, when set, makes the cached value (a
+   repository, a client holding the pool); without it the value is the
+   pool. It runs once per creation, after `init`.
+
+**The fallback happens only at creation.** A warm pool keeps the password
+it connected with: its new connections use the candidate that worked, and
+the connector is not asked again. After rotating a password, `invalidate`
+the key (or let idle eviction recycle the pool) before the old password is
+revoked. With several candidates, connect with `sslmode=verify-full`
+(`PgSslMode::VerifyFull`): the fallback presents each password in turn, so
+the server must be the one you meant before any of them is sent.
+
+A failed connect answers with the generic database message:
+
+| What failed | Code | Reason |
+|---|---|---|
+| the connector, `init`, `build_value` | its own | its own |
+| the server unreachable or not answering in time | `UNAVAILABLE` | none |
+| the password rejected on the last candidate, or `28000` on any | `INTERNAL` | `DB_CREDENTIALS_REJECTED` |
+| a malformed option, a missing database, anything else | `INTERNAL` | none |
+
+The driver's connect error is neither kept nor logged (its text names
+users, hosts and databases). The one `warn` per failed creation carries a
+source like `connect failed: auth (sqlstate 28P01), 2 of 2 candidates
+tried`: the class, the SQLSTATE and the count, which tells a missing
+database (`3D000`) from a rejected password.
+
+**A pool that connected is always closed.** If the creation does not
+publish (an error or panic of `init` or `build_value`, the deadline,
+`close`), the pool is closed with `pool.close()`, counted in
+`stats().retiring` until it ended, even when a hook kept a clone. A
+published value is dropped first and its pool closed after, once it was
+evicted, invalidated or the cache closed and no `KeyedRef` remains. There
+is no `dispose` hook.
+
+The rest is `Keyed`'s: `peek` never creates and is not a use;
+`invalidate(&key)` after a credential change or a restore makes the next
+`get` connect afresh while holders finish on the old pool;
+`evict_idle_older_than(Duration::ZERO)` sheds every pool not in use. With
+`runtime`, `tenants.clone().into_unit()` evicts idle pools every
+`reap_interval` without waiting for their close (a pool waits for its
+checked-out connections), and closes every pool at shutdown; register it
+in `Stage::Infrastructure` with `UnitPolicy::Critical`.
+
+**Size it against the server.** The cache can hold `capacity ×
+max_connections` connections, plus those of retiring pools still
+referenced; keep that, with headroom, under the server's
+`max_connections` for the role. Keep `acquire_timeout` below
+`create_timeout`, or an unreachable server is reported as
+`KEYED_CREATE_TIMEOUT` instead of a connect failure (both `UNAVAILABLE`).
+
+In tests, observe a close with `pool.close_event()` on a clone taken for
+the test, never by polling `is_closed`.
+
+
+### Cache any resource by key (`Keyed`)
+
+`Keyed<K, V>` holds one value per key and creates it on first use: a client
+per region, a connection per tenant, anything expensive to build and cheap
+to share. `get` returns a `KeyedRef<V>`, a counted reference that derefs to
+the value; while one exists the value is *in use* and the cache never
+evicts it.
+
+```rust
+use std::time::Duration;
+use sekvent::db::Keyed;
+
+let clients = Keyed::builder(|region: String| async move { connect(&region).await })
+    .capacity(16)
+    .evict_idle_after(Some(Duration::from_secs(15 * 60)))
+    .dispose(|_region, client| async move { client.shutdown().await })
+    .build()?;
+
+let client = clients.get(&region).await?;      // KeyedRef<Client>
+client.call(request).await?;
+```
+
+What `get` does:
+
+- **Single flight.** Concurrent `get`s of one key share one creation. It
+  runs on a task of its own under `create_timeout`, so dropping a `get`
+  never cancels it: the other waiters still get its outcome, and a value
+  nobody waited for stays warm.
+- **Failures are not cached.** Every waiter gets the caller-visible part of
+  the factory's error (code, message, reason, domain, metadata, retry hint,
+  field violations; never its source), and the next `get` tries again. The
+  deadline is `UNAVAILABLE` / `KEYED_CREATE_TIMEOUT` (the factory's future
+  is dropped), a panic `INTERNAL` / `KEYED_FACTORY_PANICKED` (the payload is
+  never shown). The creation's own task logs the failure once at `warn`
+  with its code, reason and source chain (cut at 2 KiB); the message, the
+  metadata and the key are never logged.
+- **Capacity.** The capacity bounds what the cache holds: warm entries plus
+  entries being created. A new key over it evicts the warm entry nothing
+  refers to with the oldest last use; when every entry is in use or being
+  created the call fails with `RESOURCE_EXHAUSTED` / `KEYED_CAPACITY`. A
+  `get` of a key the cache holds never counts against it.
+
+The other operations:
+
+| Method | Does |
+|---|---|
+| `peek(&key)` | the warm value or `None`; never creates, never waits, and is not a use, so looking at a key on a schedule does not keep it warm |
+| `evict_idle()` | evicts the entries nothing refers to that were idle for `evict_idle_after` (nothing when it is `None`) |
+| `evict_idle_older_than(idle)` | the same with an explicit age; `Duration::ZERO` sheds every entry not in use |
+| `invalidate(&key)` | makes the next `get` create a fresh value (after a credential change or a restore); `true` when there was an entry |
+| `close()` | refuses further `get`s, cancels creations in flight, drops every value and waits for the disposals it can |
+| `stats()` | `KeyedStats`: `capacity`, `warm`, `in_use`, `creating`, `retiring`, and the counters `creations`, `create_failures`, `evictions`, `capacity_refusals` |
+
+Taking a reference with `get` and dropping it both mark the entry used;
+idle time is measured on tokio's clock.
+
+**Generations.** Every creation carries a generation. When `invalidate` or
+`close` removes an entry that is being created, that creation becomes
+stale: it runs to its end (`invalidate` does not cancel it; `close` does),
+it never replaces or removes what now sits under the key, a value it
+returns is disposed unseen and an error it returns is logged and dropped.
+Its waiters look at the key again and get its current value, join its
+current creation or start one.
+
+**The disposal rule.** The `dispose` hook runs exactly once for every value
+a factory returned, on a task of its own, once the cache dropped the value
+and no `KeyedRef` remains; without a hook the value is dropped. A value
+that leaves the cache while referenced (`invalidate`, `close`) *retires*:
+the holders keep using it, and it is disposed when the last reference
+drops. Retiring values are outside the capacity and counted in
+`stats().retiring`, so for a moment two values of one key can exist; size
+anything scarce with headroom for them. `invalidate`, `evict_idle`,
+`evict_idle_older_than` and `close` wait for the disposals they cause, and
+dropping their future never stops one half-way; a capacity eviction, the
+unit's sweep and a dropped last reference do not wait. A panic in the
+hook is logged at `error` and ignored, one while dropping its future is
+ignored too, and the rest of the disposal still runs. A last reference
+dropped on a thread outside any runtime disposes on the runtime the value
+was created on; only once that runtime shut down is the value just
+dropped.
+
+**`close()`** marks the cache closed (`get` fails with `UNAVAILABLE` /
+`KEYED_CLOSED`, `peek` returns `None`), disposes the unreferenced values,
+retires the referenced ones and cancels every creation (its waiters get
+`KEYED_CLOSED`). It returns once no creation task runs and no disposal is
+in progress, without waiting for values still referenced. It has no bound
+of its own: wrap it in `tokio::time::timeout`; giving up leaves the cache
+closed and the tasks finish on their own. It is idempotent.
+
+**The unit.** With `runtime`, `cache.clone().into_unit()` is a runtime unit
+that reports ready at once, evicts the entries idle for `evict_idle_after`
+every `reap_interval`, and on shutdown calls `close()` within nine tenths
+of the time left before the runtime would abort it. Its sweeps do not
+wait for the disposals they start (those run on tracked tasks, which
+`close()` waits for), so one slow disposal never stalls the next sweep. It logs one `warn` when values are still
+referenced, or when the close did not finish in time, and never fails.
+Register it in `Stage::Infrastructure`, which drains after the calls and
+streams that hold references:
+
+```rust
+let builder = Runtime::builder().unit(
+    "region-clients",
+    Stage::Infrastructure,
+    UnitPolicy::Critical,
+    clients.clone().into_unit(),
+);
+```
+
+A closed cache stays closed, so the unit is not meant to restart.
+
 ## Configuration keys
 
 Per pool, under the prefix passed to `PoolSpec::from_config` (`<P>`). For
@@ -800,6 +1029,22 @@ is `ConfigError::Missing`, one that is blank `ConfigError::EmptySecret`.
 
 Leases and probes have no keys: TTL, lease name and table are set in code.
 
+`Keyed` and `KeyedPools` have no keys either; their settings are set on the
+builder, and `build` refuses the values in the last column with
+`INVALID_ARGUMENT` naming the setting:
+
+| Setting | `Keyed` | `KeyedPools` | Refused |
+|---|---|---|---|
+| `capacity` | 64 | 64 | 0 |
+| `evict_idle_after` | `None` (never) | `Some(10 min)` | `Some(0)` |
+| `create_timeout` | 30 s | 30 s | 0 |
+| `reap_interval` | 30 s | 30 s | 0 |
+| `max_connections` | | 5 | 0 |
+| minimum connections | | 0, fixed | |
+| `acquire_timeout` | | 5 s | 0 |
+| `connection_idle_timeout` | | `Some(10 min)` | `Some(0)` |
+| `connection_max_lifetime` | | `Some(30 min)` | `Some(0)` |
+
 ## Errors and reasons
 
 `sekvent::db::reasons`:
@@ -810,6 +1055,10 @@ Leases and probes have no keys: TTL, lease name and table are set in code.
 | `DB_CREDENTIALS_REJECTED` | `INTERNAL` | the server rejected the service's own credentials |
 | `LEASE_LOST` | `ABORTED` | a lease is no longer held under this owner or fence (same value as `sekvent::runtime::reasons::LEASE_LOST`) |
 | `LEASE_SCHEMA_MISSING` | `FAILED_PRECONDITION` | the lease table or a column is missing |
+| `KEYED_CAPACITY` | `RESOURCE_EXHAUSTED` | a keyed cache got a new key while every entry is in use or being created |
+| `KEYED_CREATE_TIMEOUT` | `UNAVAILABLE` | creating a cached value outlived `create_timeout` (a retryable outage, not the caller's deadline) |
+| `KEYED_FACTORY_PANICKED` | `INTERNAL` | the factory panicked |
+| `KEYED_CLOSED` | `UNAVAILABLE` | a `get` after `close`, and the waiters of a creation `close` cancelled |
 
 Startup errors are `DbError` variants: `UnknownPool`, `NotConfigured`,
 `DuplicatePool`, `Connect { pool, reason: ConnectFailure }`,
@@ -835,6 +1084,12 @@ Startup errors are `DbError` variants: `UnknownPool`, `NotConfigured`,
   `expires_at` or `owner` in the table directly.
 - Error classification needs no server for most cases; for grant and
   credential failures, create a restricted user in the test database.
+- Test a `Keyed` cache on tokio's paused clock
+  (`#[tokio::test(start_paused = true)]`): move idle time with
+  `tokio::time::advance`, gate the factory on a oneshot to hold a creation
+  open, and let the `dispose` hook report through a channel. A test on the
+  real clock (anything with a socket) never waits for idleness: it calls
+  `evict_idle_older_than(Duration::ZERO)`.
 
 ## Pitfalls and security
 
@@ -866,6 +1121,34 @@ Startup errors are `DbError` variants: `UnknownPool`, `NotConfigured`,
   in `build.rs`, a changed migration directory does not rebuild the binary.
 - **List allow-lists.** Add only columns the caller may see to `sortable`,
   `filterable` and `prefix_search`.
+- **Hold the `KeyedRef`, not a copy of what is inside.** A value cloned out
+  of the reference is not in use, so the cache may dispose it under you.
+  Work that outlives a call (a spawned task, a stream) takes its own
+  reference.
+- **`invalidate` is not for every request.** Each call during a creation
+  leaves one more stale creation running beside the fresh one.
+- **The capacity is not a hard bound.** Retiring values are outside it;
+  watch `stats().retiring`.
+- **No secrets in a factory's error.** Its source chain is logged (cut, not
+  redacted); keep credentials out of it.
+- **No secrets in a panic message.** The cache never logs a panic's
+  payload, but that covers sekvent's own events only: the process's panic
+  hook (by default, stderr) still prints the message of a panicking
+  factory, hook or key. Never panic with a credential in the message.
+- **Do not clone the pool out of a `KeyedPools` reference.** A cloned
+  `PgPool` keeps nothing in use: the cache may close it under you, and its
+  queries then fail. Keep the `KeyedRef` for as long as you query.
+- **A hook that keeps its pool clone ends that work itself.** A task
+  `init` or `build_value` spawns on the pool outlives neither the pool's
+  close nor, for a value, the value's `Drop`: end it there.
+- **Set every connect option explicitly.** `PgConnectOptions::new()` reads
+  the `PG*` environment variables and `~/.pgpass`; an option you leave out
+  can come from the machine instead of the key.
+- **Never print the options.** `PgConnectOptions` derives `Debug` with the
+  password in it; return options from the connector, never a URL, and keep
+  passwords in `Secret` until you set them.
+- **One `KeyedPools` per process and role.** Two caches over the same
+  databases each hold their own pools and double the connections.
 
 ## See also
 

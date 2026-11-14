@@ -1,7 +1,9 @@
 //! Cross-origin rules for browsers calling the server.
 
+use std::fmt;
 use std::fmt::Write as _;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +17,7 @@ use http::header::{
     ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
     ACCESS_CONTROL_REQUEST_METHOD, ORIGIN, VARY,
 };
+use http::request::Parts;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request};
 use sekvent_config::{ConfigError, ConfigSource};
 use sekvent_error::AppError;
@@ -61,8 +64,10 @@ const MAX_QUOTED: usize = 200;
 /// Built with [`any_origin`](Self::any_origin) or a validated, normalized
 /// origin list ([`origins`](Self::origins), whose `http(s)` entries may leave
 /// the port open with `:*` and whose custom-scheme entries, such as
-/// `capacitor://localhost`, match exactly), or read from configuration
-/// ([`from_config`](Self::from_config)), then handed to
+/// `capacitor://localhost`, match exactly), a function deciding each origin
+/// ([`origin_predicate`](Self::origin_predicate), also next to a list with
+/// [`or_origin_predicate`](Self::or_origin_predicate)), or read from
+/// configuration ([`from_config`](Self::from_config)), then handed to
 /// [`ServerBuilder::cors`](crate::ServerBuilder::cors).
 ///
 /// | Setting | Default |
@@ -76,17 +81,24 @@ const MAX_QUOTED: usize = 200;
 /// A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`)
 /// is answered by the server itself with `200`, before authentication and
 /// handlers; any other `OPTIONS` request reaches the application. A request
-/// without `Origin`, or from an origin outside the list, gets no
-/// `access-control-*` headers at all, so the browser blocks it. A list
-/// answers a listed origin with that origin (never `*`) and adds
+/// without `Origin`, or from an origin that is not allowed, gets no
+/// `access-control-*` headers at all, so the browser keeps the page from
+/// reading the answer; the request itself is still served. A list or a
+/// function answers an allowed origin with that origin (never `*`) and adds
 /// `Vary: Origin` to every response.
 ///
 /// These rules are authoritative: `access-control-*` headers set by
 /// application layers or handlers are removed before the server adds its
 /// own, so an inner layer can never widen them.
+///
+/// Two values are equal when their rules are; a function equals only
+/// itself and its clones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cors {
     origins: Origins,
+    /// Decides the origins the list does not hold; always `None` under
+    /// `Origins::Any`, which never consults it.
+    predicate: Option<OriginPredicate>,
     credentials: bool,
     methods: Vec<Method>,
     allow_headers: Vec<String>,
@@ -100,6 +112,46 @@ enum Origins {
     List(Vec<String>),
 }
 
+/// The signature of an origin function.
+type OriginFn = dyn Fn(&str, &Parts) -> bool + Send + Sync;
+
+/// An origin function, compared by identity so [`Cors`] keeps its derives.
+#[derive(Clone)]
+struct OriginPredicate(Arc<OriginFn>);
+
+impl OriginPredicate {
+    /// Whether `allowed` admits `origin`. `null` (in any case) and an
+    /// `Origin` that is not visible ASCII never reach it; a panic in it
+    /// counts as "not allowed".
+    fn allows(&self, origin: &HeaderValue, head: &Parts) -> bool {
+        let Ok(text) = origin.to_str() else {
+            return false;
+        };
+        if text.trim().eq_ignore_ascii_case("null") {
+            return false;
+        }
+        if let Ok(allowed) = std::panic::catch_unwind(AssertUnwindSafe(|| (self.0)(text, head))) {
+            allowed
+        } else {
+            tracing::error!("the CORS origin function panicked; the origin is not allowed");
+            false
+        }
+    }
+}
+
+impl fmt::Debug for OriginPredicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OriginPredicate(..)")
+    }
+}
+
+impl PartialEq for OriginPredicate {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for OriginPredicate {}
 impl Cors {
     /// Every origin (`Access-Control-Allow-Origin: *`).
     pub fn any_origin() -> Self {
@@ -145,6 +197,65 @@ impl Cors {
             return Err(AppError::invalid_argument(NO_ORIGIN));
         }
         Ok(Self::with_origins(Origins::List(list)))
+    }
+
+    /// Origins decided per request by `allowed`, with no fixed list.
+    ///
+    /// `allowed` gets the `Origin` header's text as the browser sent it (not
+    /// normalized) and the head of the request it came on: for a preflight
+    /// the `OPTIONS` request with its `Access-Control-Request-*` headers.
+    /// The head carries the TCP peer (`ConnectInfo<SocketAddr>`, when the
+    /// server's own listener serves it) but no `CallContext`, and its path
+    /// still has the server's prefix. The
+    /// preflight and the request are decided alike, each by its own call.
+    /// An HTTP/2 request names its host in the URI authority
+    /// (`head.uri.authority()`), not in `Host`: read the URI first, then
+    /// `Host`.
+    ///
+    /// A request without `Origin`, an `Origin` that is not visible ASCII
+    /// and `null` (in any case) never reach `allowed`; the last two are not
+    /// allowed. A panic in `allowed` counts as "not allowed" and is logged
+    /// at `error`, without the origin, but the process panic hook (stderr
+    /// by default) still prints the panic message: never panic with the
+    /// origin or a secret in it, and never on every call, which turns each
+    /// anonymous request into a stderr dump. An allowed origin is echoed
+    /// (never `*`), every answer carries `Vary: Origin`, and
+    /// [`allow_credentials`](Self::allow_credentials) is accepted: the
+    /// function is then the only guard.
+    ///
+    /// Responses vary on `Origin` only. When `allowed` decides on anything
+    /// else in the head (a cookie, the language, the peer address), make
+    /// those responses uncacheable or add a `Vary` for what it reads.
+    ///
+    /// `allowed` runs for every cross-origin request and preflight, before
+    /// authentication, so it must be cheap: compare the whole origin with
+    /// known values (an in-memory snapshot refreshed out of band), never
+    /// `ends_with` or `contains`, which allow look-alike hosts. CORS never
+    /// stops a request from executing; it only decides what a browser page
+    /// may read.
+    pub fn origin_predicate<F>(allowed: F) -> Self
+    where
+        F: Fn(&str, &Parts) -> bool + Send + Sync + 'static,
+    {
+        Self::with_origins(Origins::List(Vec::new())).or_origin_predicate(allowed)
+    }
+
+    /// Also allow the origins `allowed` accepts, next to this list. A
+    /// listed origin never reaches `allowed`. Under
+    /// [`any_origin`](Self::any_origin) it would never be called, so it is
+    /// dropped at once with whatever it captures, and the rules stay equal
+    /// to plain `any_origin`. A later call replaces the function. See
+    /// [`origin_predicate`](Self::origin_predicate) for what it gets.
+    #[must_use]
+    pub fn or_origin_predicate<F>(mut self, allowed: F) -> Self
+    where
+        F: Fn(&str, &Parts) -> bool + Send + Sync + 'static,
+    {
+        self.predicate = match self.origins {
+            Origins::Any => None,
+            Origins::List(_) => Some(OriginPredicate(Arc::new(allowed))),
+        };
+        self
     }
 
     /// Read the rules from `<prefix>ORIGINS` (`*` or a comma-separated
@@ -227,7 +338,7 @@ impl Cors {
     }
 
     /// Whether browsers may send cookies and `Authorization` (default off).
-    /// Needs an origin list.
+    /// Needs an origin list or an origin function.
     #[must_use]
     pub fn allow_credentials(mut self, allowed: bool) -> Self {
         self.credentials = allowed;
@@ -310,6 +421,7 @@ impl Cors {
     fn with_origins(origins: Origins) -> Self {
         Self {
             origins,
+            predicate: None,
             credentials: false,
             methods: vec![
                 Method::GET,
@@ -368,6 +480,8 @@ const ANY_PORT: &str = ":*";
 struct Policy {
     /// `None` for every origin, else the normalized list.
     origins: Option<OriginList>,
+    /// Asked about an origin the list does not hold.
+    predicate: Option<OriginPredicate>,
     credentials: bool,
     methods: Option<HeaderValue>,
     allow_headers: Option<HeaderValue>,
@@ -435,6 +549,7 @@ impl Policy {
         };
         Self {
             origins,
+            predicate: cors.predicate.clone(),
             credentials: cors.credentials,
             methods: joined(cors.methods.iter().map(Method::as_str)),
             allow_headers: joined(cors.allow_headers.iter().map(String::as_str)),
@@ -443,14 +558,20 @@ impl Policy {
         }
     }
 
-    /// The `Access-Control-Allow-Origin` value for a request's `Origin`, or
-    /// `None` when the request may not read the answer.
-    fn allow_origin(&self, origin: Option<&HeaderValue>) -> Option<HeaderValue> {
-        let origin = origin?;
-        match &self.origins {
-            None => Some(HeaderValue::from_static("*")),
-            Some(list) => list.matches(origin).then(|| origin.clone()),
-        }
+    /// The `Access-Control-Allow-Origin` value for the `Origin` of the
+    /// request with head `head`, or `None` when the request may not read the
+    /// answer. The list is asked first, then the function.
+    fn allow_origin(&self, head: &Parts) -> Option<HeaderValue> {
+        let origin = head.headers.get(ORIGIN)?;
+        let Some(list) = &self.origins else {
+            return Some(HeaderValue::from_static("*"));
+        };
+        let allowed = list.matches(origin)
+            || self
+                .predicate
+                .as_ref()
+                .is_some_and(|predicate| predicate.allows(origin, head));
+        allowed.then(|| origin.clone())
     }
 
     /// The answer to a preflight.
@@ -504,21 +625,20 @@ impl Policy {
 /// The CORS middleware: preflights are answered here, everything else
 /// passes through and gets this policy's headers.
 async fn answer(State(policy): State<Arc<Policy>>, request: Request<Body>, next: Next) -> Response {
-    let allowed = policy.allow_origin(request.headers().get(ORIGIN));
-    if is_preflight(&request) {
+    let (head, body) = request.into_parts();
+    let allowed = policy.allow_origin(&head);
+    if is_preflight(&head) {
         return policy.preflight(allowed);
     }
-    let mut response = next.run(request).await;
+    let mut response = next.run(Request::from_parts(head, body)).await;
     policy.decorate(response.headers_mut(), allowed);
     response
 }
 
-fn is_preflight<B>(request: &Request<B>) -> bool {
-    request.method() == Method::OPTIONS
-        && request.headers().contains_key(ORIGIN)
-        && request
-            .headers()
-            .contains_key(ACCESS_CONTROL_REQUEST_METHOD)
+fn is_preflight(head: &Parts) -> bool {
+    head.method == Method::OPTIONS
+        && head.headers.contains_key(ORIGIN)
+        && head.headers.contains_key(ACCESS_CONTROL_REQUEST_METHOD)
 }
 
 /// Remove every `access-control-*` header and the CORS entries of `Vary`
@@ -800,12 +920,20 @@ fn take<T>(errors: &mut Vec<ConfigError>, result: Result<T, ConfigError>) -> Opt
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use axum::body::Body;
     use axum::routing::get;
+    use http::header::HOST;
     use http::{Request, StatusCode};
     use sekvent_config::MapSource;
     use sekvent_error::ErrorCode;
+    use sekvent_telemetry::LogBuffer;
     use tower::ServiceExt;
+    use tracing::Level;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
 
@@ -1667,5 +1795,383 @@ mod tests {
         )
         .await;
         assert!(cors_names(&response).is_empty(), "{:?}", response.headers());
+    }
+
+    // ------------------------------------------------- origin functions
+
+    const TENANT: &str = "https://a.example.com";
+
+    fn get_from(path: &str, origin: &str) -> Request<Body> {
+        Request::get(path)
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A request to `/echo` with a `Host`; an `OPTIONS` one is a preflight.
+    fn on_host(method: &Method, host: &str, origin: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method.clone())
+            .uri("/echo")
+            .header(HOST, host)
+            .header(ORIGIN, origin);
+        if *method == Method::OPTIONS {
+            request = request.header(ACCESS_CONTROL_REQUEST_METHOD, "POST");
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
+    fn header(head: &Parts, name: &HeaderName) -> Option<String> {
+        head.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// An origin function allowing `allowed` only, counting its calls.
+    fn counting(
+        calls: &Arc<AtomicUsize>,
+        allowed: &'static str,
+    ) -> impl Fn(&str, &Parts) -> bool + Send + Sync + 'static {
+        let calls = Arc::clone(calls);
+        move |origin: &str, _: &Parts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            origin == allowed
+        }
+    }
+
+    fn vary(response: &Response) -> Vec<&str> {
+        response
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_origin_function_alone_allows_and_refuses() {
+        let cors = Cors::origin_predicate(|origin, _| origin == TENANT);
+        assert!(cors.validate().is_ok());
+        assert_eq!(list(&cors), [] as [String; 0]);
+
+        let response = call(&cors, get_from("/echo", TENANT)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers["access-control-allow-origin"], TENANT);
+        assert!(
+            headers["access-control-expose-headers"]
+                .to_str()
+                .unwrap()
+                .contains("grpc-status")
+        );
+        assert!(!headers.contains_key("access-control-allow-credentials"));
+        assert_eq!(vary(&response), ["origin"]);
+        assert_eq!(text(response).await, "ok");
+
+        let response = call(&cors, get_from("/echo", "https://b.example.com")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(vary(&response), ["origin"]);
+        assert_eq!(text(response).await, "ok", "the handler still ran");
+
+        let response = call(&cors, options("/echo", Some("https://b.example.com"), true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(vary(&response), ["origin"]);
+        assert_eq!(text(response).await, "", "answered by the layer");
+    }
+
+    #[tokio::test]
+    async fn the_preflight_and_the_request_are_decided_alike_from_their_head() {
+        type Seen = (String, Method, Option<String>, Option<String>);
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let record = Arc::clone(&seen);
+        let cors = Cors::origin_predicate(move |origin, head| {
+            let host = header(head, &HOST);
+            record.lock().unwrap().push((
+                origin.to_owned(),
+                head.method.clone(),
+                header(head, &ACCESS_CONTROL_REQUEST_METHOD),
+                host.clone(),
+            ));
+            origin == TENANT && host.as_deref() == Some("a.example.com")
+        });
+
+        let response = call(&cors, on_host(&Method::OPTIONS, "a.example.com", TENANT)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers["access-control-allow-origin"], TENANT);
+        assert!(headers.contains_key("access-control-allow-methods"));
+        assert!(headers.contains_key("access-control-allow-headers"));
+        assert_eq!(headers["access-control-max-age"], "3600");
+        assert_eq!(vary(&response), ["origin"]);
+        assert_eq!(text(response).await, "", "answered by the layer");
+
+        let response = call(&cors, on_host(&Method::GET, "a.example.com", TENANT)).await;
+        assert_eq!(response.headers()["access-control-allow-origin"], TENANT);
+        assert_eq!(text(response).await, "ok");
+
+        for method in [Method::OPTIONS, Method::GET] {
+            let response = call(&cors, on_host(&method, "b.example.com", TENANT)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(cors_names(&response), [] as [&str; 0], "{method}");
+            assert_eq!(vary(&response), ["origin"]);
+        }
+
+        let seen = seen.lock().unwrap().clone();
+        let entry = |method: Method, preflight: bool, host: &str| {
+            (
+                TENANT.to_owned(),
+                method,
+                preflight.then(|| "POST".to_owned()),
+                Some(host.to_owned()),
+            )
+        };
+        assert_eq!(
+            seen,
+            [
+                entry(Method::OPTIONS, true, "a.example.com"),
+                entry(Method::GET, false, "a.example.com"),
+                entry(Method::OPTIONS, true, "b.example.com"),
+                entry(Method::GET, false, "b.example.com"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listed_origin_never_reaches_the_function() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cors = Cors::origins([
+            "https://app.example.com",
+            "http://localhost:*",
+            "capacitor://localhost",
+        ])
+        .unwrap()
+        .or_origin_predicate(counting(&calls, TENANT));
+        assert!(cors.validate().is_ok());
+        for origin in [
+            "https://app.example.com",
+            "http://localhost:5173",
+            "Capacitor://LocalHost",
+        ] {
+            for request in [
+                get_from("/echo", origin),
+                options("/echo", Some(origin), true),
+            ] {
+                let response = call(&cors, request).await;
+                assert_eq!(response.headers()["access-control-allow-origin"], origin);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "listed origins");
+
+        let response = call(&cors, get_from("/echo", TENANT)).await;
+        assert_eq!(response.headers()["access-control-allow-origin"], TENANT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let response = call(&cors, get_from("/echo", "https://b.example.com")).await;
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(vary(&response), ["origin"]);
+        assert_eq!(text(response).await, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_allowed_origin_is_echoed_as_sent_with_credentials() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let cors = Cors::origin_predicate(move |origin, _| {
+            record.lock().unwrap().push(origin.to_owned());
+            true
+        })
+        .allow_credentials(true);
+        assert!(cors.validate().is_ok());
+
+        let origin = "HTTPS://Tenant.Example.COM:443";
+        for request in [
+            get_from("/echo", origin),
+            options("/echo", Some(origin), true),
+        ] {
+            let response = call(&cors, request).await;
+            let headers = response.headers();
+            assert_eq!(headers["access-control-allow-origin"], origin, "never *");
+            assert_eq!(headers["access-control-allow-credentials"], "true");
+            assert_eq!(vary(&response), ["origin"]);
+        }
+        assert_eq!(*seen.lock().unwrap(), [origin, origin], "not normalized");
+    }
+
+    #[tokio::test]
+    async fn null_non_text_and_missing_origins_never_reach_the_function() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let cors = Cors::origin_predicate(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let origins = [
+            HeaderValue::from_static("null"),
+            HeaderValue::from_static("NULL"),
+            HeaderValue::from_bytes(b"https://\xe9.example.com").unwrap(),
+        ];
+        for origin in origins {
+            let request = Request::get("/echo")
+                .header(ORIGIN, origin.clone())
+                .body(Body::empty())
+                .unwrap();
+            let response = call(&cors, request).await;
+            assert_eq!(cors_names(&response), [] as [&str; 0], "{origin:?}");
+            assert_eq!(vary(&response), ["origin"]);
+            assert_eq!(text(response).await, "ok");
+
+            let preflight = Request::options("/echo")
+                .header(ORIGIN, origin.clone())
+                .header(ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .body(Body::empty())
+                .unwrap();
+            let response = call(&cors, preflight).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(cors_names(&response), [] as [&str; 0], "{origin:?}");
+            assert_eq!(text(response).await, "");
+        }
+
+        let response = call(&cors, Request::get("/echo").body(Body::empty()).unwrap()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(vary(&response), ["origin"]);
+        assert_eq!(text(response).await, "ok", "served, undecorated");
+
+        let response = call(&cors, options("/echo", None, true)).await;
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(text(response).await, "options handled");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_function_refuses_and_logs_without_the_origin() {
+        let buffer = LogBuffer::new(16);
+        let _guard = tracing::subscriber::set_default(Registry::default().with(buffer.layer()));
+        let cors = Cors::origin_predicate(|origin, _| panic!("refusing {origin}"));
+        let origin = "https://secret-tenant.example.com";
+
+        let response = call(&cors, options("/echo", Some(origin), true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(vary(&response), ["origin"]);
+
+        let response = call(&cors, get_from("/echo", origin)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(text(response).await, "ok");
+
+        let errors: Vec<_> = buffer
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.level == Level::ERROR)
+            .collect();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        for record in &errors {
+            assert!(record.message.contains("panicked"), "{record:?}");
+            assert!(
+                !format!("{record:?}").contains("secret-tenant"),
+                "{record:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn any_origin_never_calls_the_function() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cors = Cors::any_origin().or_origin_predicate(counting(&calls, TENANT));
+        assert!(cors.validate().is_ok());
+        for request in [
+            get_from("/echo", TENANT),
+            options("/echo", Some(TENANT), true),
+        ] {
+            let response = call(&cors, request).await;
+            assert_eq!(response.headers()["access-control-allow-origin"], "*");
+            assert!(!response.headers().contains_key(VARY));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let error = cors.allow_credentials(true).validate().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn any_origin_drops_the_function_and_what_it_captures() {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let cors = Cors::any_origin().or_origin_predicate(counting(&captured, TENANT));
+        assert_eq!(Arc::strong_count(&captured), 1, "the function was dropped");
+        assert_eq!(cors, Cors::any_origin());
+        let debug = format!("{cors:?}");
+        assert!(debug.contains("predicate: None"), "{debug}");
+
+        let configured = read(&[("CORS_ORIGINS", "*")])
+            .unwrap()
+            .unwrap()
+            .or_origin_predicate(counting(&captured, TENANT));
+        assert_eq!(Arc::strong_count(&captured), 1);
+        assert_eq!(configured, Cors::any_origin());
+
+        let listed = Cors::origins([TENANT])
+            .unwrap()
+            .or_origin_predicate(counting(&captured, TENANT));
+        assert_eq!(Arc::strong_count(&captured), 2, "a list keeps it");
+        drop(listed);
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    #[tokio::test]
+    async fn inner_cors_headers_are_replaced_under_a_function() {
+        let cors = Cors::origin_predicate(|origin, _| origin == TENANT);
+
+        let response = call(&cors, get_from("/reflect", "https://b.example.com")).await;
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(vary(&response), ["Accept-Encoding", "origin"]);
+        assert_eq!(text(response).await, "reflected");
+
+        let response = call(&cors, get_from("/reflect", TENANT)).await;
+        let headers = response.headers();
+        assert_eq!(headers["access-control-allow-origin"], TENANT);
+        assert!(!headers.contains_key("access-control-allow-credentials"));
+        assert!(!headers.contains_key("access-control-max-age"));
+        assert_eq!(vary(&response), ["Accept-Encoding", "origin"]);
+    }
+
+    #[tokio::test]
+    async fn a_second_function_replaces_the_first() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cors =
+            Cors::origin_predicate(counting(&calls, TENANT)).or_origin_predicate(|_, _| false);
+        let response = call(&cors, get_from("/echo", TENANT)).await;
+        assert_eq!(cors_names(&response), [] as [&str; 0]);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_function_equals_only_itself_and_debug_hides_it() {
+        fn tenant(origin: &str, _: &Parts) -> bool {
+            origin == TENANT
+        }
+        let one = Cors::origin_predicate(tenant);
+        assert!(one.validate().is_ok());
+        assert_eq!(one, one.clone());
+        assert_ne!(
+            one,
+            Cors::origin_predicate(tenant),
+            "two functions never compare equal"
+        );
+        assert_ne!(one, one.clone().max_age(Duration::from_secs(5)));
+        let listed = Cors::origins([TENANT]).unwrap();
+        assert_ne!(listed, listed.clone().or_origin_predicate(tenant));
+
+        let debug = format!("{one:?}");
+        assert!(
+            debug.contains("predicate: Some(OriginPredicate(..))"),
+            "{debug}"
+        );
+        assert!(!debug.contains("0x"), "{debug}");
+        let listed = format!("{listed:?}");
+        assert!(listed.contains("predicate: None"), "{listed}");
     }
 }

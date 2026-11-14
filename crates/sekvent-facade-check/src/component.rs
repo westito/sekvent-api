@@ -188,8 +188,10 @@ pub fn app(source: &dyn ConfigSource) -> Result<App, BuildError> {
 mod tests {
     use std::time::Duration;
 
-    use sekvent::component::Binding;
-    use sekvent::component::reasons;
+    use sekvent::component::{
+        Binding, END_USER_REJECTED_MESSAGE, EndUser, EndUserRejection, RequestScope, ScopeResolver,
+        admit_end_user, reasons,
+    };
     use sekvent::config::MapSource;
 
     use super::*;
@@ -429,6 +431,90 @@ mod tests {
         );
 
         built.stop(Duration::from_secs(1)).await.unwrap();
+    }
+
+    /// A scope resolver that puts every request into one tenant. It is
+    /// generic over the request head, which the facade does not re-export,
+    /// so the check needs no `http` dependency of its own.
+    #[allow(clippy::unnecessary_wraps)]
+    fn acme<P>(_request: &P, _cx: &CallContext) -> Result<RequestScope, AppError> {
+        Ok(RequestScope::new().with_tenant("acme"))
+    }
+
+    /// Compiles only for a [`ScopeResolver`].
+    fn resolver(resolver: impl ScopeResolver) -> impl ScopeResolver {
+        resolver
+    }
+
+    #[tokio::test]
+    async fn a_closure_is_a_scope_resolver_and_a_second_one_is_refused() {
+        let source = MapSource::new();
+        let mut builder = App::builder(&source);
+        builder.scope_resolver(resolver(acme)).unwrap();
+        let error = builder.scope_resolver(acme).unwrap_err();
+        assert!(
+            matches!(error, BuildError::DuplicateScopeResolver),
+            "{error:?}"
+        );
+        EchoHandle::install(&mut builder, |_deps| Ok(EchoService)).unwrap();
+        let built = builder.build().unwrap();
+        built.start().await.unwrap();
+        built.stop(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[test]
+    fn the_request_scope_reaches_the_context() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Site(&'static str);
+
+        let scope = RequestScope::new()
+            .with_tenant("acme")
+            .with_extension(Site("main"));
+        let cx = CallContext::new().with_scope(scope);
+        assert_eq!(cx.tenant(), Some("acme"));
+        assert_eq!(cx.scoped::<Site>(), Some(&Site("main")));
+    }
+
+    #[test]
+    fn admit_end_user_refuses_a_user_of_another_tenant_or_of_none() {
+        let cx = CallContext::new().with_scope(RequestScope::new().with_tenant("acme"));
+
+        let member = admit_end_user(cx.clone(), EndUser::new("u-1").with_tenant("acme")).unwrap();
+        assert_eq!(member.tenant(), Some("acme"));
+        assert_eq!(member.end_user().map(EndUser::subject), Some("u-1"));
+
+        for user in [
+            EndUser::new("u-2").with_tenant("other"),
+            EndUser::new("u-3"),
+        ] {
+            let error = admit_end_user(cx.clone(), user).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unauthenticated);
+            assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+            assert_eq!(error.reason(), None);
+        }
+    }
+
+    #[test]
+    fn a_scope_tenant_is_valid_by_the_header_rule() {
+        assert!(sekvent::context::headers::is_valid_tenant("acme"));
+        assert!(!sekvent::context::headers::is_valid_tenant("ac me"));
+        assert_eq!(
+            reasons::SCOPE_TENANT_INVALID,
+            "SCOPE_TENANT_INVALID",
+            "a wire contract"
+        );
+    }
+
+    #[test]
+    fn an_end_user_rejection_converts_into_an_app_error() {
+        const SESSION_ENDED: EndUserRejection =
+            EndUserRejection::new("SESSION_ENDED").with_domain("accounts");
+
+        let error = AppError::from(SESSION_ENDED);
+        assert_eq!(error.code(), ErrorCode::Unauthenticated);
+        assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+        assert_eq!(error.reason(), Some("SESSION_ENDED"));
+        assert_eq!(error.domain(), Some("accounts"));
     }
 
     #[test]

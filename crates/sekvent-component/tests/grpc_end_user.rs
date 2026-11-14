@@ -14,7 +14,8 @@ use http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN};
 use http_body_util::{BodyExt, Full};
 use prost::Message;
 use sekvent_component::{
-    AppError, BuildError, CallContext, CallTarget, END_USER_REJECTED_MESSAGE, EndUser, ErrorCode,
+    AppError, BuildError, CallContext, CallTarget, END_USER_REJECTED_MESSAGE, EndUser,
+    EndUserRejection, ErrorCode,
 };
 use sekvent_config::MapSource;
 use sekvent_context::ServiceIdentity;
@@ -25,6 +26,7 @@ use support::inventory::{
     Inventory, InventoryError, InventoryHandle, ReleaseReply, ReleaseRequest, ReserveReply,
     ReserveRequest,
 };
+use tonic_types::StatusExt as _;
 use tracking::{TrackReply, TrackRequest, Tracker, TrackerHandle};
 
 const ORIGIN_URL: &str = "https://shop.example";
@@ -159,16 +161,25 @@ impl Tracker for Storefront {
     }
 }
 
-/// Accepts `Bearer user-<n>` session tokens.
+/// What an ended session is refused with: a reason the client may act on.
+const SESSION_ENDED: EndUserRejection =
+    EndUserRejection::new("SESSION_ENDED").with_domain("accounts");
+
+/// Accepts `Bearer user-<n>` session tokens and refuses `Bearer ended`
+/// with [`SESSION_ENDED`].
 fn sessions(request: &http::request::Parts) -> Result<EndUser, AppError> {
-    request
+    let token = request
         .headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|token| token.starts_with("user-"))
-        .map(|token| EndUser::new(token).with_tenant("t-1").with_roles(["buyer"]))
-        .ok_or_else(|| AppError::unauthenticated("unknown session token"))
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match token {
+        Some("ended") => Err(AppError::from(SESSION_ENDED).with_metadata("session", "s-7f3a")),
+        Some(token) if token.starts_with("user-") => {
+            Ok(EndUser::new(token).with_tenant("t-1").with_roles(["buyer"]))
+        }
+        _ => Err(AppError::unauthenticated("unknown session token")),
+    }
 }
 
 /// A started runtime serving the storefront (inventory and tracker) under
@@ -432,6 +443,33 @@ async fn end_users_reach_components_over_grpc_web() {
         assert_eq!(peer.end_user, None);
         assert_eq!(peer.tenant.as_deref(), Some("t-9"));
         app.stop(Duration::ZERO).await.unwrap();
+
+        shop.stop().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_rejection_shows_its_reason_and_domain_over_grpc_web() {
+    guarded(async {
+        let storefront = Storefront::default();
+        let shop = serve("bearer", storefront.clone()).await;
+
+        let ended = grpc_web(shop.addr, RESERVE, Some("Bearer ended"), &reserve()).await;
+        assert_eq!(ended.grpc.code(), tonic::Code::Unauthenticated);
+        assert_eq!(ended.grpc.message(), END_USER_REJECTED_MESSAGE);
+        let info = ended.grpc.get_details_error_info().expect("error details");
+        assert_eq!(info.reason, "SESSION_ENDED");
+        assert_eq!(info.domain, "accounts");
+        assert!(info.metadata.is_empty(), "{:?}", info.metadata);
+        assert!(ended.message.is_none());
+
+        // An ordinary bad token still gets the bare constant answer.
+        let forged = grpc_web(shop.addr, RESERVE, Some("Bearer forged"), &reserve()).await;
+        assert_eq!(forged.grpc.code(), tonic::Code::Unauthenticated);
+        assert_eq!(forged.grpc.message(), END_USER_REJECTED_MESSAGE);
+        assert!(forged.grpc.get_details_error_info().is_none());
+        assert_eq!(storefront.seen(), [] as [Seen; 0]);
 
         shop.stop().await;
     })

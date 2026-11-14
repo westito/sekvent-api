@@ -79,6 +79,9 @@ db-migrate = ["db", "sekvent-db/migrate"]
 db-sea-orm-migrate = ["db", "sekvent-db/sea-orm-migrate"]
 # sekvent-db: leases with fencing tokens; with `runtime`, singleton jobs.
 db-lease = ["db", "sekvent-db/lease"]
+# sekvent-db: a keyed, lazily created, evicting resource cache (`Keyed`);
+# with a Postgres backend `KeyedPools`, with `runtime` its eviction unit.
+db-keyed = ["db", "sekvent-db/keyed"]
 
 full = [
     "config",
@@ -116,6 +119,7 @@ full = [
     "db-migrate",
     "db-sea-orm-migrate",
     "db-lease",
+    "db-keyed",
 ]
 
 [dependencies]

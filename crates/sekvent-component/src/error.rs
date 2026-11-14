@@ -135,6 +135,9 @@ pub enum BuildError {
     /// A second call authorizer was registered.
     #[error("a call authorizer is registered twice")]
     DuplicateCallAuthorizer,
+    /// A second scope resolver was registered.
+    #[error("a scope resolver is registered twice")]
+    DuplicateScopeResolver,
     /// The call authorizer's `validate` refused an installed component.
     #[error("the call authorizer refuses component {component}: {source}")]
     CallAuthorizerRefused {
@@ -273,6 +276,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn messages() {
         let cases: Vec<(BuildError, &str)> = vec![
             (
@@ -352,6 +356,10 @@ mod tests {
             (
                 BuildError::DuplicateCallAuthorizer,
                 "a call authorizer is registered twice",
+            ),
+            (
+                BuildError::DuplicateScopeResolver,
+                "a scope resolver is registered twice",
             ),
             (
                 BuildError::CallAuthorizerRefused {

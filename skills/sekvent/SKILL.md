@@ -35,6 +35,7 @@ speed and flakes: the `rust-testing` skill.
 | Timeout, retry, rate gate, bulkhead, breaker, backoff, TTL cache | `resilience` | `resilience` |
 | Per-client rate limits (by client address or end user) on public methods and REST routes | `resilience::{KeyedRateLimiter, ClientLimiter, ClientLimitLayer}`; component `CLIENT_*` policy fields; `runtime::ClientAddrPolicy` behind proxies | `resilience`; `resilience-http` for the axum layer |
 | Password hashing (argon2id, bcrypt), JWT, login | `auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` (async hashing) |
+| Tokens one service signs and others can only verify (Ed25519) | `auth` (`EdDsaSigningKey`, `EdDsaVerificationKeys`) | `auth` |
 | Browser sign-in with an external account (OAuth 2.0 code flow, Bitbucket Cloud) | `sso` | `sso` |
 | Service-to-service tokens | `link` | `link`; `link-axum`, `link-tonic` |
 | Outbound HTTP, OAuth 2.0 client credentials | `client` | `client` |
@@ -43,7 +44,9 @@ speed and flakes: the `rust-testing` skill.
 | sea-query statements over sqlx (no ORM) | `db::query`, `db::sea_query` | `db-sea-query-postgres`, `db-sea-query-mysql` |
 | Readiness probes per pool | `db` (`PoolRegistry::probes`) | `db` + `runtime` + a sqlx backend |
 | Leases with fencing tokens, singleton jobs | `db` (`LeaseStore`, `LeaseGuard`) | `db-lease` + a sqlx backend; `runtime` for `LeaseGuard` |
+| One value per key, created once, kept while in use, evicted when idle (a Postgres pool per tenant, and what is built on it) | `db` (`Keyed`, `KeyedPools`, `KeyedRef`, `ConnectCandidates`) | `db-keyed`; `db-sqlx-postgres` for `KeyedPools`; `runtime` for `into_unit` |
 | A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; `component-grpc` for the `grpc` binding and serving; `runtime` for `App::register` |
+| A tenant (or another per-request value) resolved from the request head before authentication | `component` (`ScopeResolver`, `AppBuilder::scope_resolver`, `App::resolve_scope`, `admit_end_user`), `context::RequestScope`, `cx.scoped::<T>()` | `component`; `component-grpc` to serve |
 | Postgres/MySQL/MinIO test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` (features `postgres`, `mysql`, `minio`) |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
 
@@ -199,6 +202,19 @@ let server = builder.bind(config.listen_addr).await?;
   `grpc-status-details-bin`, `content-disposition`, `x-request-id`; add to
   them with `.allow_headers(&[..])` / `.expose_headers(&[..])`.
   `Cors::config_keys(prefix)` lists the keys for an env template.
+- Origins known only at run time (one per tenant, say):
+  `Cors::origin_predicate(|origin, head| ..)` decides every request and
+  every preflight with a sync function of the `Origin` text and the request
+  head; `.or_origin_predicate(..)` adds one to a list, which is checked
+  first. Keep it cheap and free of I/O: a function backed by a registry
+  reads an in-memory snapshot that a job refreshes. Compare the whole
+  origin with known values, never with `ends_with` or `contains`. An
+  allowed origin is echoed, never `*`; `null`, an `Origin` that is not text
+  and a panicking function count as not allowed. CORS only decides
+  response headers: a request without `Origin` is served as usual without
+  them, and a request from an origin that is not allowed still reaches its
+  handler. A service that ties origins to tenants checks the origin again
+  where it resolves the tenant.
 - Configured CORS is authoritative: `Access-Control-*` headers set by a
   handler or layer are stripped. Only a real preflight (`OPTIONS` with
   `Origin` and `Access-Control-Request-Method`) is answered by CORS; any
@@ -697,6 +713,76 @@ let runtime = pools
 - Failures are `Down(Rejected("credentials rejected"))`,
   `Down(Rejected("access denied"))` or `Down(Unreachable(..))`; never the
   URL or driver text.
+### A pool per key (`KeyedPools`)
+
+Features `db-keyed` and `db-sqlx-postgres` (`db-migrate` for the migration
+in `init`).
+
+```rust
+use sekvent::db::{ConnectCandidates, KeyedPools, run_embedded_migrations};
+use sqlx::postgres::PgConnectOptions;
+
+let pools = KeyedPools::builder(move |tenant: String| {
+        let directory = directory.clone();
+        async move {
+            let db = directory.database_of(&tenant).await?;        // your lookup
+            let with = |password: &Secret| PgConnectOptions::new()  // options, never a URL string
+                .host(&db.host).port(db.port).database(&db.name)
+                .username(&db.user).password(password.expose());
+            Ok(match &db.previous_password {                        // tried only if the server rejects the first password
+                Some(previous) => ConnectCandidates::new(with(&db.password)).or(with(previous)),
+                None => ConnectCandidates::new(with(&db.password)),
+            })
+        }
+    })
+    .capacity(200)                                      // pools kept at once (default 64)
+    .evict_idle_after(Some(Duration::from_secs(600)))   // unused that long: closed (the default)
+    .max_connections(5)                                 // per pool (default 5); min is always 0
+    .init(|_tenant, pool| async move {                  // before anything else sees the pool
+        run_embedded_migrations(&pool, &MIGRATOR).await.map_err(AppError::from)
+    })
+    .build_value(|tenant, pool| async move {            // optional: cache what you build on the pool
+        Ok(TenantState::new(tenant, pool))              // without it the value is the PgPool
+    })
+    .build()?;
+
+let runtime = Runtime::builder()                        // evicts idle pools, closes all on shutdown
+    .unit("tenant-pools", Stage::Infrastructure, UnitPolicy::Critical, pools.clone().into_unit());
+
+let state = pools.get(&tenant).await?;                  // KeyedRef<TenantState>: never evicted while held
+let orders = state.orders().count().await?;
+```
+
+- Twenty `get`s for a cold key connect and run `init` and `build_value`
+  once; all of them get the same value or the same error. An error is
+  never cached: the next `get` tries again. Creation has one deadline
+  (`create_timeout`, 30 s) that covers the connector, every connect
+  attempt and both hooks; a pool that connected and was not published is
+  closed.
+- A connector may return plain `PgConnectOptions`. With
+  `ConnectCandidates` the next one is tried only after SQLSTATE `28P01`
+  (the server rejected the password); any other failure ends the creation.
+  All rejected: `INTERNAL` / `DB_CREDENTIALS_REJECTED`.
+- At capacity a new key evicts the least recently used value nobody holds;
+  when every value is held the `get` fails with `RESOURCE_EXHAUSTED` /
+  `KEYED_CAPACITY`. `pools.invalidate(&key)` drops the cached value (after
+  a credential change, say); holders keep theirs and its pool closes when
+  the last `KeyedRef` drops. Such values are outside the capacity
+  (`pools.stats().retiring`): leave headroom in the server's connection
+  limit.
+- `pools.peek(&key)` returns a value only if it is warm: it never connects
+  and does not count as a use. `evict_idle_older_than(Duration::ZERO)`
+  closes everything not in use right now.
+- Hold the `KeyedRef` for as long as you use the value (a stream holds it
+  for its life); do not clone the `PgPool` out of it, and give work that
+  outlives the call its own `pools.get(..)`.
+- Set host, port, user, password and database explicitly:
+  `PgConnectOptions::new()` fills what you leave out from `PG*`
+  environment variables. Never `{:?}` the options: their `Debug` shows the
+  password.
+- Anything else per key (a client, a parsed config): `Keyed::builder(|key|
+  async move { .. }).dispose(|key, value| async move { .. }).build()?`.
+
 ### JWT login
 
 ```rust
@@ -729,6 +815,36 @@ account exists (a dummy verify for unknown accounts) and returns the same
 rejection for "no such user" and "wrong password". Do not add an early
 return before it. Bearer guards: `auth-axum` (`Bearer`, `RequireRole`),
 `auth-tonic` (`BearerInterceptor`).
+
+### Tokens between services (EdDSA)
+
+```rust
+use sekvent::auth::{Claims, EdDsaSigningKey, EdDsaVerificationKeys, NoClaims, Validation};
+
+// The issuer holds the private key: a Secret with the PKCS#8 PEM that
+// `openssl genpkey -algorithm ed25519` writes.
+let signing = EdDsaSigningKey::from_pkcs8_pem("2026-11", &config.signing_key)?;
+let now = clock.now_unix_millis() / 1000;
+let token = signing.issue(
+    &Claims::new("billing", now, 60, NoClaims {}).with_issuer("billing").with_audience("orders"),
+)?;
+
+// A verifier holds public keys by key id (two during a rotation) and can never mint.
+let keys = EdDsaVerificationKeys::from_public_key_pem("2026-11", &config.billing_key)?
+    .with_public_key_pem("2026-05", &config.billing_previous_key)?;
+let rules = Validation::new().with_issuer("billing").with_audience("orders").with_leeway(0);
+let claims: Claims<NoClaims> = keys.verify(&token, now, &rules)?;
+```
+
+- The public key is not a secret: `signing.public_key_pem()` prints the
+  PEM to hand to verifiers (`openssl pkey -pubout` gives the same text).
+- Same checks as `JwtKeys`: `kid` required and known, `exp`, `nbf`, `iat`,
+  issuer and audience when asked. The algorithm is pinned: an HS256 token
+  never passes an EdDSA verifier, nor the other way round.
+- A public key of small order or in a non-canonical encoding is refused
+  when it is loaded: a verifier holding one would accept forged tokens.
+- Tests: `EdDsaSigningKey::from_seed("k1", &[7; 32])?` and
+  `.verification_keys()` give a matching pair without key files.
 
 ### Browser single sign-on
 
@@ -993,6 +1109,12 @@ let orders = app.handle::<OrdersHandle>()?;            // for ingress code and t
   runtime the drain gets half the time left before the unit's stop
   deadline, the hooks the rest. Two components with the same gRPC service
   name, or a link named `local`, fail the build.
+- One runtime can run several Apps (a public one and an operator one, each
+  mounted on its own listener). The first registers with
+  `app.register(builder)` (unit `components`), every other with
+  `admin.register_as("admin-components", builder)`. Each App has its own
+  authenticator, authorizer and scope resolver; they start and drain side
+  by side, and a unit name used twice fails `RuntimeBuilder::build`.
 - Per call: a cancelled or expired context is rejected before any work;
   the method timeout is capped by the caller's deadline (`DEADLINE_EXCEEDED`);
   a full bulkhead sheds at once (`RESOURCE_EXHAUSTED`/`BULKHEAD_FULL`, no
@@ -1067,7 +1189,12 @@ if let Some(user) = cx.end_user() {
 - An authenticator `Err` with `UNAUTHENTICATED` reaches the client as
   `UNAUTHENTICATED` / `invalid or expired credentials`, no reason, the same
   for every bad token; any other code passes through unchanged
-  (`UNAVAILABLE` for a down session store).
+  (`UNAVAILABLE` for a down session store). To let a client react to one
+  case, return `Err(EndUserRejection::new("SESSION_ENDED").into())`: the
+  client gets the same code and message plus that reason (and a domain
+  with `.with_domain("accounts")`). Both are `&'static str`, nothing else
+  of the error is sent, and each reason tells every caller one more thing
+  about its credential, so keep them few.
 - `#[call(anonymous)]` (e.g. `sign_in`) waives end-user authentication only,
   never link authentication: under `link` it still needs a link token, under
   local bindings it has no effect, on `local_only` it is a compile error. A
@@ -1284,6 +1411,61 @@ timed scenario as one `async fn(profile)`, call it from a
 only lower time bounds there. Observe external state (health, a closed
 listener) with `await_until!`.
 
+### Request scope (a tenant from the request head)
+
+```rust
+use sekvent::component::{RequestScope, ScopeResolver};
+
+#[derive(Clone)]
+struct TenantDb(sekvent::db::KeyedRef<sqlx::PgPool>);    // a type of your own per value
+
+struct Tenants { hosts: Arc<HostTable>, pools: KeyedPools<String> }
+
+impl ScopeResolver for Tenants {
+    fn resolve<'a>(&'a self, request: &'a http::request::Parts, _cx: &'a CallContext)
+        -> Pin<Box<dyn Future<Output = Result<RequestScope, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            let host = request.uri.host()                                           // HTTP/2
+                .or_else(|| request.headers.get(http::header::HOST)?.to_str().ok()) // HTTP/1.1, may carry a port
+                .ok_or_else(|| AppError::not_found("unknown site"))?;
+            let tenant = self.hosts.tenant_of(host).ok_or_else(|| AppError::not_found("unknown site"))?;
+            let pool = self.pools.get(&tenant).await?;
+            Ok(RequestScope::new().with_tenant(tenant).with_extension(TenantDb(pool)))
+        })
+    }
+}
+
+builder.scope_resolver(Tenants { hosts, pools })?;       // one per App; a second is a build error
+
+// in any served method, anonymous ones included
+let TenantDb(pool) = cx.scoped::<TenantDb>().ok_or_else(|| AppError::internal("no request scope"))?;
+let tenant = cx.tenant();                                // what the scope set
+```
+
+- It runs once per call served over gRPC or gRPC-Web that no link token
+  authenticated, after routing and before the end-user authenticator, on
+  the request head only. The authenticator reads the same scope with
+  `request.extensions.get::<RequestScope>()`.
+- A sync closure `Fn(&Parts, &CallContext) -> Result<RequestScope, AppError>`
+  is a resolver too. Its error is the caller's answer, unchanged.
+- The scope's tenant becomes `cx.tenant()` and no header can replace it;
+  an end user whose own tenant differs is refused like a bad token.
+- The scope lives as long as the call: until a unary handler returned,
+  and until a served stream ended. `cx.child()` and `cx.detached()` keep
+  the tenant and drop the scope, and nothing of it is sent to other
+  services: a component called by another component works from
+  `cx.tenant()`, and work that outlives the call takes its own
+  `pools.get(..)` instead of a value cloned out of the scope.
+- The resolver sees the path (`request.uri.path()`,
+  `/<package>.<Service>/<Rpc>`): return `RequestScope::new()` for methods
+  that must not open a tenant's resources before the caller is authorized
+  (an operator API on the same listener).
+- REST routes hold a clone of the `App`:
+  `let cx = app.resolve_scope(&parts, cx).await?;` runs the same resolver.
+  It does not authenticate and does not touch the request's extensions;
+  after your own authentication `let cx = admit_end_user(cx, user)?;`
+  applies the tenant rule.
+
 ## Pitfalls
 
 - **Secrets in logs.** Never log, `format!`, `Debug`-print or return a
@@ -1340,6 +1522,16 @@ listener) with `await_until!`.
 - **Time and randomness.** Inject `Clock` (`SystemClock` / `ManualClock`)
   and seedable RNGs where behaviour depends on them; JWT and login APIs take
   `now_unix_secs` explicitly.
+- **Request scope.** Resolve the tenant from the request head in the App's
+  `ScopeResolver`, never from a header inside a handler and never from a
+  task-local. Treat `cx.scoped::<T>()` being `None` as an error in methods
+  that need it, and remember that calls from other components and
+  contexts made with `child()` or `detached()` carry no scope, only
+  `cx.tenant()`; work that outlives the call takes its own reference.
+- **Pools per key.** Go through `KeyedPools::get` on every call and hold
+  the `KeyedRef` while working; a `PgPool` cloned out of it may be closed
+  under you. Build `PgConnectOptions` field by field and never print them.
+  `invalidate` is for an operator's action, not for every request.
 - **Tests.** No fixed sleeps: completion signals, `RuntimeHandle::wait`,
   `tokio::time::pause`. Servers bind port 0.
 - **Thin `main`.** Telemetry, config, `serve`; everything else in the

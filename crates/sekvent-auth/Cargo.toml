@@ -23,6 +23,10 @@ sekvent-config = { workspace = true }
 argon2 = { workspace = true }
 bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }
+# PEM bodies of Ed25519 keys, and the public key jsonwebtoken derives.
+base64 = { workspace = true }
+# Wipes private key text and bytes while a key is loaded.
+zeroize = { workspace = true }
 getrandom = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

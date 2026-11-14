@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::Stream;
-use sekvent_context::CallContext;
+use sekvent_context::{CallContext, RequestScope};
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_resilience::{Bulkhead, BulkheadPermit, ClientLimiter, PolicySpec, Timeout};
 use tokio::sync::Notify;
@@ -399,6 +399,9 @@ impl Server {
             .map(|max| draw_lifetime(max, rand::random::<f64>()))
             .and_then(|lifetime| admitted.checked_add(lifetime));
         let caller = cx.deadline().map(Instant::from_std);
+        // Kept until the stream ends: a producer that took what it needed
+        // during the open runs on after this context is gone.
+        let scope = cx.scope().cloned();
         let token = cx.cancel_token().child_token();
         let mut stream_cx = cx.with_cancel(token.clone());
         if let Some(expiry) = expiry {
@@ -441,6 +444,7 @@ impl Server {
         Ok(CallStream::new(ServingStream {
             live: Some(Live {
                 producer,
+                _scope: scope,
                 closing: Box::pin(self.gate.closing.clone().cancelled_owned()),
                 timer: earliest(caller, expiry).map(|at| Box::pin(tokio::time::sleep_until(at))),
                 caller,
@@ -541,9 +545,11 @@ impl Outcome {
 }
 
 /// What a live stream holds; dropped as a whole when it ends, producer
-/// first.
+/// first, then the request scope, before the permit and the admission.
 struct Live<T> {
     producer: CallStream<T, AppError>,
+    /// The request scope of the call that opened the stream.
+    _scope: Option<RequestScope>,
     closing: Pin<Box<WaitForCancellationFutureOwned>>,
     /// Fires at the earlier of the caller's deadline and the expiry.
     timer: Option<Pin<Box<Sleep>>>,
@@ -1201,6 +1207,135 @@ mod tests {
                 .unwrap_err()
         });
         assert_eq!(opening.await.unwrap().reason(), Some(reasons::DRAINING));
+    }
+
+    /// Signals from `Drop` once the last clone of a [`Held`] is gone.
+    struct Tracker(tokio::sync::watch::Sender<bool>);
+
+    impl Drop for Tracker {
+        fn drop(&mut self) {
+            self.0.send_replace(true);
+        }
+    }
+
+    /// A scope extension whose release is observable.
+    #[derive(Clone)]
+    struct Held(Arc<Tracker>);
+
+    /// A context whose scope holds the only [`Held`], and whether it was
+    /// released.
+    fn scoped() -> (CallContext, tokio::sync::watch::Receiver<bool>) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let scope = RequestScope::new().with_extension(Held(Arc::new(Tracker(tx))));
+        (CallContext::new().with_scope(scope), rx)
+    }
+
+    #[tokio::test]
+    async fn a_unary_call_keeps_the_scope_until_the_handler_returned() {
+        let server = Arc::new(server(None));
+        assert!(server.open());
+        let (cx, released) = scoped();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        let running = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                server
+                    .run(1, cx, move |cx| async move {
+                        let held = cx.scoped::<Held>().expect("the handler sees the scope");
+                        assert_eq!(Arc::strong_count(&held.0), 1, "one shared value");
+                        // The handler lets go of its own context at once.
+                        drop(cx);
+                        entered_tx.send(()).unwrap();
+                        finish_rx.await.unwrap();
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        assert!(!*released.borrow(), "held while the handler is parked");
+        finish_tx.send(()).unwrap();
+        running.await.unwrap().unwrap();
+        assert!(*released.borrow(), "released once the handler returned");
+    }
+
+    #[tokio::test]
+    async fn a_stream_keeps_the_scope_until_it_completes() {
+        let server = ticker(None, None);
+        let (cx, released) = scoped();
+        let mut stream = open(&server, cx, vec![Ok(1)], false).await.unwrap();
+        assert!(!*released.borrow(), "not released when the open returned");
+        assert_eq!(stream.next().await.unwrap().unwrap(), 1);
+        assert!(!*released.borrow(), "not released after an item");
+        assert!(stream.next().await.is_none());
+        assert!(*released.borrow(), "released when the stream completed");
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn a_stream_keeps_the_scope_until_its_consumer_drops_it() {
+        let server = ticker(None, None);
+        let (cx, released) = scoped();
+        let mut stream = open(&server, cx, vec![Ok(1)], true).await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), 1);
+        assert!(!*released.borrow());
+        drop(stream);
+        assert!(*released.borrow(), "released when the consumer dropped it");
+    }
+
+    #[tokio::test]
+    async fn a_stream_keeps_the_scope_until_its_streams_are_closed() {
+        let server = ticker(None, None);
+        let (cx, released) = scoped();
+        let mut stream = open(&server, cx, vec![], true).await.unwrap();
+        assert!(!*released.borrow());
+        server.close_streams();
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.reason(), Some(reasons::DRAINING));
+        assert!(*released.borrow(), "released when the streams closed");
+        drop(stream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_keeps_the_scope_until_its_lifetime_expires() {
+        let server = ticker(None, Some(Duration::from_secs(10)));
+        let (cx, released) = scoped();
+        let mut stream = open(&server, cx, vec![], true).await.unwrap();
+        assert!(!*released.borrow());
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.reason(), Some(reasons::STREAM_EXPIRED));
+        assert!(*released.borrow(), "released when the lifetime expired");
+        drop(stream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_keeps_the_scope_until_the_callers_deadline() {
+        let server = ticker(None, None);
+        let (cx, released) = scoped();
+        let deadline = (tokio::time::Instant::now() + Duration::from_secs(2)).into_std();
+        let mut stream = open(&server, cx.with_deadline(deadline), vec![], true)
+            .await
+            .unwrap();
+        assert!(!*released.borrow());
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+        assert!(*released.borrow(), "released when the deadline passed");
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_releases_the_scope_at_once() {
+        let server = ticker(None, None);
+        let (cx, released) = scoped();
+        let error = server
+            .open_stream::<u32, _, _>(0, cx, None, "local", |_| async {
+                Err(AppError::invalid_argument("no such series"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(*released.borrow());
+        assert_eq!(server.in_flight(), 0);
     }
 
     #[tokio::test]

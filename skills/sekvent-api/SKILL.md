@@ -41,17 +41,23 @@ can describe APIs the project does not have yet.
 | Set up logging, JSON logs, the access log, request ids | `docs/modules/telemetry.md` |
 | Structure `main.rs`, stages, units, shutdown, health, probes | `docs/modules/runtime.md` |
 | Serve gRPC, gRPC-Web and REST; CORS; body limits; layers; downloads | `docs/modules/server.md` |
+| Allow CORS origins decided at run time (a function instead of a list) | `docs/modules/server.md` ("Decide origins with a function") |
 | Serve a bundled SPA/frontend (Vite `dist`) from the binary next to the API; the dev proxy setup | `docs/modules/server.md` ("Serve a bundled frontend") |
 | Run interval, cron, manual or singleton jobs | `docs/modules/jobs.md` |
 | Pools, migrations, DB error mapping, list filters, probes, leases | `docs/modules/db.md` |
 | Queries with sea-query (no ORM), embedded `sqlx::migrate!` migrations, mapping a named constraint violation | `docs/modules/db.md` ("Build queries with sea-query", "Embedded migrations") |
+| One Postgres pool (or other resource) per tenant or key: lazy, created once, evicted when idle (`KeyedPools`, `Keyed`) | `docs/modules/db.md` ("Keep one pool per key", "Cache any resource by key") |
 | Passwords (argon2id, bcrypt), login, JWT, roles | `docs/modules/auth.md` |
+| Tokens one service signs and others only verify (EdDSA, Ed25519 keys by `kid`) | `docs/modules/auth.md` ("Sign with a private key, verify with public keys") |
 | Browser single sign-on (OAuth 2.0 code flow, Bitbucket Cloud) | `docs/modules/sso.md` |
 | Browser uploads/downloads via S3-compatible storage (presigned URLs), keys, MinIO tests | `docs/modules/storage.md` |
 | Service-to-service tokens | `docs/modules/link.md` |
 | Call an upstream HTTP API (retries, OAuth 2.0, context propagation) | `docs/modules/client.md` |
 | Retry, breaker, bulkhead, rate gate, per-client rate limits, timeout, TTL cache | `docs/modules/resilience.md` |
 | Components (trait + proto contract, App builder, bindings, split topology) | `docs/modules/components.md`, concepts in `docs/component-model.md` |
+| Resolve the tenant (or another per-request value) from the host or path before authentication and read it in handlers | `docs/modules/components.md` ("How to resolve a request scope"), `docs/modules/context.md` ("Request scope") |
+| Tell a client why its credential was refused (`EndUserRejection`) | `docs/modules/components.md` ("What a rejected end user sees") |
+| Run two Apps on one runtime, each behind its own listener (`App::register_as`) | `docs/modules/components.md` ("Under the runtime") |
 | Stream live updates to a browser or service (server-streaming `#[call(stream)]`, `CallStream`, lifetime, drain, HTTP/2 keep-alive) | `docs/modules/components.md` ("How to stream replies"), `docs/modules/server.md` ("Keep long streams alive") |
 | `build.rs` protobuf codegen without `protoc` | `docs/modules/proto-build.md` |
 | Container-backed DB and MinIO tests, deterministic tests, coverage | `docs/modules/testing.md` |
@@ -134,6 +140,7 @@ this shape; read it before restructuring.
 | sea-orm | `db-sea-orm-postgres` / `db-sea-orm-mysql` (+ `db-sea-orm-migrate`) |
 | sea-query over sqlx, no ORM | `db-sea-query-postgres` / `db-sea-query-mysql` (+ `db-migrate`) |
 | Singleton jobs, leases with fencing | `db-lease` (with `runtime`: `LeaseGuard`) |
+| A pool (or other resource) per key, e.g. per tenant | `db-keyed` (+ `db-sqlx-postgres` for `KeyedPools`) |
 | Passwords, JWT | `auth` (+ `auth-tokio` for hashing off the async threads, `auth-axum` / `auth-tonic` adapters) |
 | Browser single sign-on | `sso` |
 | Outbound HTTP | `client` |

@@ -14,7 +14,7 @@ code should use instead of `SystemTime::now()`.
 | | |
 |---|---|
 | Facade feature | `context` (on by default) |
-| Module | `use sekvent::context::{CallContext, ClientAddr, ServiceIdentity, EndUser, Clock, SystemClock, ManualClock};` |
+| Module | `use sekvent::context::{CallContext, ClientAddr, ServiceIdentity, EndUser, RequestScope, Clock, SystemClock, ManualClock};` |
 | Header codec | `sekvent::context::headers` |
 | Prelude | `CallContext` |
 | Internal crate | `sekvent-context` (no features; depends on `http`, `tokio`, `tokio-util`, `uuid`) |
@@ -64,6 +64,7 @@ extensions), and [component](components.md) handles pass it along.
 | traceparent | `traceparent()` | W3C trace context. |
 | hops | `hops() -> u32` | How many component calls led to this one (0 at the edge); a guard against call cycles. |
 | client address | `client_addr() -> Option<IpAddr>` | The address of the client the call is made for: the edge server resolves it (TCP peer, or the client behind trusted proxies), and a trusted link may forward its own visitor's. Personal data: for limits and abuse checks, never logged. |
+| request scope | `scope() -> Option<&RequestScope>`, `scoped::<T>() -> Option<&T>` | What a serving boundary resolved from the request head before it authenticated the caller: the tenant and typed values such as a tenant's database. Never encoded in headers, never carried by `child()` or `detached()`; see [request scope](#request-scope). |
 
 `ServiceIdentity { name: String, trusted: bool }` is the authenticated
 caller. Build it with `ServiceIdentity::trusted("billing")` (may assert
@@ -119,6 +120,72 @@ let scope: Option<&TokenScope> = cx.end_user().and_then(EndUser::extension::<Tok
 - Equality (`PartialEq`, `Eq`) compares subject, tenant and roles and
   ignores extensions.
 
+### Request scope
+
+A `RequestScope` is what a serving boundary resolved for one request before
+it authenticated the caller: the tenant the request belongs to (from the
+host, say) and typed values its handlers need (that tenant's database). The
+App's `ScopeResolver` builds it ([components](components.md#how-to-resolve-a-request-scope));
+`cx.with_scope(scope)` attaches it.
+
+```rust
+use sekvent::context::RequestScope;
+
+#[derive(Clone)]
+struct TenantDb(String);                         // a type of your own, not String
+
+let scope = RequestScope::new()
+    .with_tenant("tenant-a")
+    .with_extension(TenantDb("pool-a".into()));
+let cx = CallContext::new().with_scope(scope);
+
+assert_eq!(cx.tenant(), Some("tenant-a"));       // a tenant the scope names becomes the context's
+assert!(cx.scoped::<TenantDb>().is_some());      // the scope's extension of that type
+let scope: Option<&RequestScope> = cx.scope();
+```
+
+- `with_tenant(t)` names the tenant. It must pass
+  `headers::is_valid_tenant` (non-empty visible ASCII without spaces, at most
+  255 bytes: the rule an inbound tenant header is held to), or the header
+  codec loses it and a downstream call runs without a tenant; a serving
+  boundary therefore fails a call whose resolved scope names an invalid
+  tenant with `INTERNAL` / `SCOPE_TENANT_INVALID`. `with_extension::<T: Clone + Send +
+  Sync + 'static>(value)` replaces an earlier value of the same type;
+  `tenant()` and `extension::<T>()` read them back (`extension` is `None`
+  when no value of `T` was attached).
+- **Storage.** A scope holds an optional tenant and typed extensions, one
+  value per type, behind a private `Arc`: cloning a scope or a context
+  shares them and never clones a value. A value in a scope lives as long as
+  some clone of the scope does, so a `KeyedRef` kept there keeps its entry in
+  use for that long.
+- `with_scope` replaces an earlier scope. A tenant it names becomes the
+  context's tenant; a scope without a tenant leaves the tenant as it is.
+  After it, `with_end_user` takes the tenant from the scope when the scope
+  names one, otherwise from the user. Neither makes a check: `with_scope`
+  does not look at an end user the context already has, and
+  `with_end_user` does not compare the user's tenant with the scope's.
+  The serving boundaries do: when the scope names a tenant, a user who does
+  not name the same one (another tenant, or none) is refused
+  (`sekvent::component::admit_end_user`, and
+  `sekvent::component::App::resolve_scope` for a context that already has
+  an end user).
+- `sanitize_for_caller()` keeps a tenant the scope names (it came from the
+  serving boundary, not from the caller) and drops one a header carried.
+- `Debug` prints the tenant and the number of extensions
+  (`extensions: 2`), never a value or a type name.
+- **What `child()` and `detached()` keep.** Neither keeps the scope. A
+  callee and a queued job get the tenant, which travels like any tenant, and
+  nothing else of the scope. Work that outlives the call (a spawned task, a
+  job queued with `detached()`) must not carry a value it cloned out of the
+  scope, such as a pool taken from a `KeyedRef`: the reference that kept the
+  value alive is released with the call, and the value may be closed under the
+  work. Such work takes its own reference (`pools.get(tenant)`) and holds it
+  for as long as it runs.
+- **The tenant travels, the extensions do not.** `headers::inject` and
+  `headers::propagate` write the context's tenant as they always did, so a
+  tenant the scope set reaches peers that trust this service's link exactly
+  like an end user's; nothing ever writes an extension, and
+  `from_headers` never produces a scope.
 ## How to build and derive contexts
 
 Builders (all `#[must_use]`, consuming `self`):
@@ -131,21 +198,22 @@ Builders (all `#[must_use]`, consuming `self`):
 | `with_timeout(Duration)` | Deadline relative to now (same narrowing rule); a timeout too large to represent sets nothing. |
 | `with_cancel(CancellationToken)` | Use this token. |
 | `with_caller(ServiceIdentity)` | Set the authenticated caller; clears the end user. |
-| `with_end_user(EndUser)` | The end user is the direct caller: sets subject and tenant from it and clears the caller. |
+| `with_end_user(EndUser)` | The end user is the direct caller: sets the subject from it and clears the caller. The tenant is the scope's when the context has a scope that names one, otherwise the user's. |
 | `with_subject(s)` / `with_tenant(t)` | Set end-user identity. |
 | `with_idempotency_key(k)` | Set this call's own key (it will be forwarded). |
 | `with_traceparent(tp)` | Set the trace context. |
 | `with_hops(n)` | Replace the hop count. |
 | `with_client_addr(IpAddr)` | Set the client address. |
+| `with_scope(RequestScope)` | Attach the [request scope](#request-scope); a tenant it names becomes the context's tenant. A plain setter: it does not check the scope's tenant against an end user already set. |
 
 Derivations:
 
 | Method | Keeps | Drops / changes |
 |---|---|---|
-| `child()` | request id, deadline, subject, tenant, client address, traceparent, hops, an own idempotency key | caller and end user cleared (the callee learns its caller from authentication); cancellation becomes a **child token** (cancelling the parent cancels the child, not the reverse); a received idempotency key is not kept |
-| `detached()` | request id, subject, tenant, client address, traceparent, hops, idempotency key (in the same received/own state) | no deadline, a fresh cancellation token, no caller, no end user |
+| `child()` | request id, deadline, subject, tenant, client address, traceparent, hops, an own idempotency key | caller, end user and request scope cleared (the callee learns its caller from authentication); cancellation becomes a **child token** (cancelling the parent cancels the child, not the reverse); a received idempotency key is not kept |
+| `detached()` | request id, subject, tenant, client address, traceparent, hops, idempotency key (in the same received/own state) | no deadline, a fresh cancellation token, no caller, no end user, no request scope |
 | `into_inbound()` | everything | marks a present idempotency key as *received*: still readable, no longer forwarded |
-| `sanitize_for_caller()` | everything else | drops subject, tenant and the client address unless the caller is a trusted `ServiceIdentity` or an end user is set |
+| `sanitize_for_caller()` | everything else | drops subject, tenant and the client address unless the caller is a trusted `ServiceIdentity` or an end user is set; a tenant the request scope names is kept |
 
 Because `child()` keeps subject and tenant but drops the end user, a
 component that a handler calls on an end user's behalf sees them exactly as
@@ -277,6 +345,10 @@ Header names (constants in `sekvent::context::headers`):
 Anything that fails validation is dropped (or, for the request id,
 replaced), never rejected, so a sloppy client is still served.
 
+The [request scope](#request-scope) is never encoded: only the tenant it set
+(an ordinary context field) is written, and `from_headers` never builds a
+scope.
+
 Functions:
 
 | Function | Direction | Use it for |
@@ -287,6 +359,7 @@ Functions:
 | `propagate_external(&CallContext, &mut HeaderMap)` | outbound, third party | A third-party API. Only request id, `traceparent` and `grpc-timeout`, under the same rules as `propagate`. Never subject, tenant, the client address, hops or the idempotency key. |
 | `encode_grpc_timeout(Duration) -> String` | | At most 8 digits in the finest unit that fits, truncated (never rounded up); zero becomes `1n`; capped at `99999999H`. |
 | `parse_grpc_timeout(&str) -> Option<Duration>` | | The inverse; rejects signs, decimals, spaces, lowercase `s` and more than 8 digits. |
+| `is_valid_tenant(&str) -> bool` | | Whether a tenant passes the `TENANT` rule above (1–255 visible ASCII). A tenant that fails it does not reach a callee: either it cannot be written or the callee's `from_headers` drops it. |
 
 ```rust
 use http::HeaderMap;

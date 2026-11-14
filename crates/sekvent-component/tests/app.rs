@@ -70,7 +70,7 @@ fn a_resource_type_is_provided_once() {
     NotesHandle::install(&mut builder, |_| Ok(Counter::plain())).unwrap();
     assert_eq!(
         format!("{builder:?}"),
-        r#"AppBuilder { components: ["notes"], resources: ["alloc::string::String", "u32"], end_user_authenticator: false, call_authorizer: false, .. }"#
+        r#"AppBuilder { components: ["notes"], resources: ["alloc::string::String", "u32"], end_user_authenticator: false, call_authorizer: false, scope_resolver: false, .. }"#
     );
 }
 
@@ -467,4 +467,221 @@ fn call_authorizer_refusals_are_reported_with_configuration_errors_and_no_factor
         matches!(&error, BuildError::CallAuthorizerRefused { component, .. } if component == "inventory"),
         "{error}"
     );
+}
+
+/// The site a resolved scope belongs to.
+#[derive(Debug, Clone, PartialEq)]
+struct Site(&'static str);
+
+/// Maps the `host` header to a tenant: `a.test` is `t-1`, `open.test` a
+/// scope without a tenant, `bad.test` the tenant `bad tenant` (not a valid
+/// tenant), `slow.test` takes an hour, anything else is `NOT_FOUND`.
+struct Hosts;
+
+impl sekvent_component::ScopeResolver for Hosts {
+    fn resolve<'a>(
+        &'a self,
+        request: &'a http::request::Parts,
+        _cx: &'a sekvent_component::CallContext,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<sekvent_component::RequestScope, AppError>> + Send + 'a>,
+    > {
+        let host = request
+            .headers
+            .get(http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Box::pin(async move {
+            match host.as_deref() {
+                Some("a.test") => Ok(sekvent_component::RequestScope::new()
+                    .with_tenant("t-1")
+                    .with_extension(Site("a"))),
+                Some("open.test") => Ok(sekvent_component::RequestScope::new()),
+                Some("bad.test") => {
+                    Ok(sekvent_component::RequestScope::new().with_tenant("bad tenant"))
+                }
+                Some("slow.test") => {
+                    tokio::time::sleep(std::time::Duration::from_hours(1)).await;
+                    Ok(sekvent_component::RequestScope::new())
+                }
+                _ => Err(AppError::not_found("unknown site").with_reason("SITE_UNKNOWN")),
+            }
+        })
+    }
+}
+
+fn head(host: &str) -> http::request::Parts {
+    http::Request::builder()
+        .uri("/orders")
+        .header(http::header::HOST, host)
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0
+}
+
+fn scoped_app() -> App {
+    build_with(&MapSource::new(), |builder| builder.scope_resolver(Hosts)).unwrap()
+}
+
+#[test]
+fn a_second_scope_resolver_is_refused() {
+    let config = MapSource::new();
+    let mut builder = App::builder(&config);
+    assert!(format!("{builder:?}").contains("scope_resolver: false"));
+    builder.scope_resolver(Hosts).unwrap();
+    let again = builder.scope_resolver(Hosts);
+    assert!(
+        matches!(again, Err(BuildError::DuplicateScopeResolver)),
+        "{again:?}"
+    );
+    assert!(format!("{builder:?}").contains("scope_resolver: true"));
+    assert_eq!(
+        BuildError::DuplicateScopeResolver.to_string(),
+        "a scope resolver is registered twice"
+    );
+}
+
+#[tokio::test]
+async fn resolve_scope_attaches_the_scope_to_a_rest_context() {
+    use sekvent_component::CallContext;
+
+    // Without a resolver the context is unchanged.
+    let plain = App::builder(&MapSource::new()).build().unwrap();
+    let cx = plain
+        .resolve_scope(&head("a.test"), CallContext::new().with_tenant("t-9"))
+        .await
+        .unwrap();
+    assert!(cx.scope().is_none());
+    assert_eq!(cx.tenant(), Some("t-9"));
+
+    // With one, through a clone of the App as a route holds it.
+    let app = scoped_app();
+    let route = app.clone();
+    let parts = head("a.test");
+    let cx = route
+        .resolve_scope(&parts, CallContext::new().with_tenant("t-9"))
+        .await
+        .unwrap();
+    assert_eq!(cx.tenant(), Some("t-1"));
+    assert_eq!(cx.scoped::<Site>(), Some(&Site("a")));
+    assert!(
+        parts
+            .extensions
+            .get::<sekvent_component::RequestScope>()
+            .is_none(),
+        "the request's extensions are left alone"
+    );
+
+    // A service caller gets no scope.
+    let linked = CallContext::new().with_caller(sekvent_context::ServiceIdentity::trusted("shop"));
+    let cx = app.resolve_scope(&head("a.test"), linked).await.unwrap();
+    assert!(cx.scope().is_none());
+    assert_eq!(cx.tenant(), None);
+
+    // The resolver's error, unchanged.
+    let error = app
+        .resolve_scope(&head("c.test"), CallContext::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::NotFound);
+    assert_eq!(error.message(), "unknown site");
+    assert_eq!(error.reason(), Some("SITE_UNKNOWN"));
+    assert!(error.metadata().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn resolve_scope_runs_within_the_deadline() {
+    use sekvent_component::CallContext;
+
+    let app = scoped_app();
+    let cx = CallContext::new().with_timeout(std::time::Duration::from_millis(50));
+    let error = app.resolve_scope(&head("slow.test"), cx).await.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+    assert_eq!(error.message(), "the call deadline was exceeded");
+
+    // A deadline already passed refuses even a resolver that answers at once.
+    let passed = CallContext::new().with_deadline(tokio::time::Instant::now().into_std());
+    let error = app
+        .resolve_scope(&head("a.test"), passed)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
+}
+
+#[tokio::test]
+async fn a_rest_route_applies_the_tenant_rule_with_admit_end_user() {
+    use sekvent_component::{CallContext, END_USER_REJECTED_MESSAGE, EndUser, admit_end_user};
+
+    let app = scoped_app();
+    let cx = app
+        .resolve_scope(&head("a.test"), CallContext::new())
+        .await
+        .unwrap();
+    let stranger = EndUser::new("u-2").with_tenant("t-2");
+
+    // `with_end_user` makes no check: the context keeps the scope's tenant.
+    let unchecked = cx.clone().with_end_user(stranger.clone());
+    assert_eq!(unchecked.tenant(), Some("t-1"));
+
+    let error = admit_end_user(cx.clone(), stranger).unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Unauthenticated);
+    assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+    assert_eq!(error.reason(), None);
+
+    let member = admit_end_user(cx, EndUser::new("u-1").with_tenant("t-1")).unwrap();
+    assert_eq!(member.tenant(), Some("t-1"));
+    assert_eq!(member.end_user().map(EndUser::subject), Some("u-1"));
+}
+
+#[tokio::test]
+async fn resolve_scope_applies_the_tenant_rule_to_an_end_user_already_in_the_context() {
+    use sekvent_component::{CallContext, END_USER_REJECTED_MESSAGE, EndUser};
+
+    let app = scoped_app();
+    // A user of another tenant, or of none, on a site of `t-1`.
+    for user in [
+        EndUser::new("u-2").with_tenant("t-2"),
+        EndUser::new("roamer"),
+    ] {
+        let cx = CallContext::new().with_end_user(user);
+        let error = app.resolve_scope(&head("a.test"), cx).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unauthenticated);
+        assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+        assert_eq!(error.reason(), None);
+        assert!(error.metadata().is_empty());
+    }
+
+    let member = CallContext::new().with_end_user(EndUser::new("u-1").with_tenant("t-1"));
+    let cx = app.resolve_scope(&head("a.test"), member).await.unwrap();
+    assert_eq!(cx.tenant(), Some("t-1"));
+    assert_eq!(cx.end_user().map(EndUser::subject), Some("u-1"));
+    assert_eq!(cx.scoped::<Site>(), Some(&Site("a")));
+
+    // A scope without a tenant admits any user, who keeps their own.
+    let outsider = CallContext::new().with_end_user(EndUser::new("u-2").with_tenant("t-2"));
+    let cx = app
+        .resolve_scope(&head("open.test"), outsider)
+        .await
+        .unwrap();
+    assert_eq!(cx.tenant(), Some("t-2"));
+    assert!(cx.scope().is_some());
+}
+
+#[tokio::test]
+async fn resolve_scope_refuses_a_scope_with_an_invalid_tenant() {
+    use sekvent_component::{CallContext, reasons};
+
+    let app = scoped_app();
+    let error = app
+        .resolve_scope(&head("bad.test"), CallContext::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert_eq!(error.reason(), Some(reasons::SCOPE_TENANT_INVALID));
+    assert_eq!(
+        error.message(),
+        "the scope resolver returned an invalid tenant"
+    );
+    assert!(error.metadata().is_empty());
 }

@@ -452,9 +452,11 @@ if let Some(cors) = Cors::from_config(&EnvSource, "ORDERS_CORS_")? {
 |---|---|
 | `Cors::any_origin()` | `Access-Control-Allow-Origin: *` |
 | `Cors::origins(iter)?` | exactly these origins, normalized; an `http(s)://host:*` entry allows that scheme and host on any port; a custom-scheme entry (`capacitor://localhost`) matches exactly; `INVALID_ARGUMENT` on a bad entry or an empty list |
+| `Cors::origin_predicate(f)` | the origins `f(origin, head)` allows, decided per request, with no list ([below](#decide-origins-with-a-function)) |
+| `.or_origin_predicate(f)` | also the origins `f` allows, after the list; a later call replaces `f`; never called under `any_origin` |
 | `Cors::from_config(source, prefix)?` | `Ok(None)` when `<prefix>ORIGINS` is unset or blank |
 | `Cors::config_keys(prefix)` | every key `from_config` reads, e.g. for an env template |
-| `.allow_credentials(bool)` | cookies and `Authorization` from the browser; needs an origin list |
+| `.allow_credentials(bool)` | cookies and `Authorization` from the browser; needs an origin list or a function |
 | `.methods(&[Method])` | **replaces** the default methods |
 | `.allow_headers(&[&str])` | **adds** to the default request headers |
 | `.expose_headers(&[&str])` | **adds** to the default exposed headers |
@@ -490,11 +492,12 @@ The rules:
   `Access-Control-Request-Method` is answered by the server itself with
   `200`, before the authenticator, your layers and handlers. Any other
   `OPTIONS` request reaches your routes.
-- **Allowed or nothing.** A request without `Origin`, or from an origin not in
-  the list, gets no `access-control-*` headers at all, so the browser blocks
-  it. With an origin list an allowed request gets its own `Origin` back in
-  `Access-Control-Allow-Origin` (never `*`), and every response carries
-  `Vary: origin`.
+- **Allowed or nothing.** A request without `Origin`, or from an origin that
+  is not allowed, gets no `access-control-*` headers at all, so the browser
+  keeps the page from reading the answer; the request itself is still
+  served. With an origin list or a function an allowed request gets its own
+  `Origin` back in `Access-Control-Allow-Origin` (never `*`), and every
+  response carries `Vary: origin`.
 - **Any port, exact host.** An entry whose port is `*` (`http://localhost:*`,
   `http://127.0.0.1:*`, `http://[::1]:*`) matches that scheme and host on
   every port, the scheme's default included (an `Origin` with no port), for
@@ -544,6 +547,96 @@ The rules:
 - `bind` also rejects credentials with `any_origin`, an empty method list,
   the method `*`, and an invalid or `*` header name.
 
+#### Decide origins with a function
+
+When the allowed origins are not a fixed list (one per tenant, added and
+removed while the service runs), pass a function. It is synchronous and gets
+the `Origin` text and the request head:
+
+```rust
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+use http::request::Parts;
+use sekvent::config::EnvSource;
+use sekvent::runtime::Cors;
+
+// Refreshed out of band (a job, a change notification), read here.
+let sites: Arc<RwLock<HashSet<String>>> = Arc::default();
+let snapshot = Arc::clone(&sites);
+let site_origins = move |origin: &str, _head: &Parts| {
+    snapshot.read().is_ok_and(|set| set.contains(origin))
+};
+
+// A list from configuration first, then the function.
+let cors = match Cors::from_config(&EnvSource, "ORDERS_CORS_")? {
+    Some(listed) => listed.or_origin_predicate(site_origins),
+    None => Cors::origin_predicate(site_origins),
+};
+let builder = Server::builder().cors(cors);
+```
+
+| Built with | An `Origin` is allowed when | `Access-Control-Allow-Origin` |
+|---|---|---|
+| `any_origin()` | always | `*` |
+| `origins(list)` | it is listed | the origin |
+| `origin_predicate(f)` | `f(origin, head)` | the origin |
+| `origins(list).or_origin_predicate(f)` | it is listed, else `f(origin, head)` | the origin |
+| `any_origin().or_origin_predicate(f)` | always; `f` is dropped at once, with what it captures | `*` |
+
+- **What `f` sees.** The `Origin` header's text exactly as the browser sent
+  it (not normalized), and the head of the request it came on: for a
+  preflight, the `OPTIONS` request with its `Access-Control-Request-*`
+  headers. CORS runs outside the call context and your layers, so the head
+  has the TCP peer (`ConnectInfo<SocketAddr>` in its extensions, when the
+  server's own listener serves it) and the path with the server's prefix,
+  but no `CallContext`. The preflight and the
+  request that follows are decided the same way, each by its own call.
+- **The requested host.** HTTP/2 requests carry it in the URI authority
+  (`:authority`), not in a `Host` header, so read the URI first and fall
+  back to `Host`:
+
+  ```rust
+  fn requested_host(head: &Parts) -> Option<&str> {
+      head.uri
+          .authority()
+          .map(http::uri::Authority::as_str)
+          .or_else(|| head.headers.get(http::header::HOST)?.to_str().ok())
+  }
+  ```
+
+- **What never reaches `f`.** A listed origin (exact, `:*` port or custom
+  scheme), which is allowed without asking. A request without `Origin`,
+  which is served like any other and gets no CORS headers. `null` in any
+  case and an `Origin` that is not visible ASCII, which are not allowed.
+- **Never panic.** A panic in `f` counts as "not allowed" and sekvent logs
+  it at `error` without the origin, but the process panic hook (by default
+  one that prints to stderr) still prints the panic message. Never panic
+  with the origin, a header or a secret in the message; and an `f` that
+  panics on every call turns each anonymous request into a stderr dump.
+  Return `false` instead.
+- **Nothing is rejected.** As with a list, the decision only sets response
+  headers: a preflight is answered `200` with or without them, every other
+  request runs its handler. An allowed origin is echoed (never `*`) and
+  every answer carries `Vary: origin`. `allow_credentials(true)` is
+  accepted; `f` is then the only guard.
+- **Responses vary on `Origin` only.** When `f` decides on anything else
+  in the head (a cookie, the language, the peer address), a shared cache
+  could serve one client's CORS headers to another: make those responses
+  uncacheable (`Cache-Control: private` or `no-store`) or add your own
+  `Vary` for what `f` reads. The requested host needs neither, since caches
+  key on it already.
+- **Keep it cheap.** `f` runs for every cross-origin request and preflight,
+  before any authentication, so an anonymous client decides how often.
+  Never look anything up there: read an in-memory snapshot (a set behind an
+  `RwLock` or an `ArcSwap`) that a job or a change notification refreshes.
+  A new origin is then allowed once the snapshot has it, a removed one stops
+  being allowed once it is gone; size the refresh to that delay.
+- **Match whole origins.** Compare the full origin with known values (an
+  exact set lookup, or `scheme://host` built from a known host). `ends_with`
+  and `contains` allow look-alike hosts (`https://evil-example.com`,
+  `https://example.com.evil.net`).
+- `Cors` stays `Clone`, `PartialEq` and `Debug`: a function equals only
+  itself and its clones, and `Debug` prints `OriginPredicate(..)`.
 ### Serve health endpoints
 
 | Endpoint | Healthy | Unhealthy |
@@ -979,6 +1072,16 @@ layers, `access_log(true)`.
   end users themselves (`SERVE_AUTH=bearer`).
 - **CORS headers from handlers are discarded** once CORS is configured; set
   extra exposed headers with `expose_headers`.
+- **Credentials with an origin function** are allowed: the answer names one
+  origin, so the function alone decides which sites may send cookies and
+  `Authorization`. Make it as strict as a list.
+- **CORS is not access control.** Its headers keep a browser page from
+  reading an answer, and with a preflight from sending some requests; a
+  request that needs no preflight, and any client that is not a browser,
+  reaches the handler whatever the origin rules say. A service that ties
+  origins to tenants checks the request's `Origin`, when there is one,
+  against the tenant's origins where it resolves the tenant (its scope
+  resolver or authorizer), and refuses a mismatch there.
 - **`Full` health visibility leaks topology** (probe names, version); keep it
   for internal listeners.
 - **Raw body handlers** bypass `rest_body_limit`; bound them yourself.

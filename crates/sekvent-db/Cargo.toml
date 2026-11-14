@@ -45,6 +45,9 @@ sea-orm-migrate = ["sea-orm", "migrate", "dep:sea-orm-migration"]
 serde = ["dep:serde"]
 # Leases with fencing tokens over a sqlx pool (`LeaseStore`); needs a sqlx backend.
 lease = ["dep:tokio", "dep:tokio-util", "dep:uuid"]
+# A keyed, lazily created, evicting resource cache (`Keyed`); with
+# `sqlx-postgres` also `KeyedPools`, with `runtime` its eviction unit.
+keyed = ["dep:tokio"]
 # Readiness probes per pool (`PoolProbe`) and, with `lease`, the singleton
 # job guard (`LeaseGuard`).
 runtime = ["dep:sekvent-runtime", "dep:futures", "dep:tokio"]

@@ -16,6 +16,8 @@
 //! | `runtime` (with a sqlx backend) | `PoolProbe`, `PoolRegistry::probes` for `sekvent-runtime` readiness |
 //! | `lease` (with a sqlx backend) | `LeaseStore`, `Lease`, `HeldLease`: leases with fencing tokens |
 //! | `lease` + `runtime` | `LeaseGuard`: singleton jobs for `sekvent-runtime` |
+//! | `keyed` | [`Keyed`], [`KeyedRef`]: one lazily created value per key, evicted when idle or over capacity; with `runtime` its eviction unit (`Keyed::into_unit`) |
+//! | `keyed` + `sqlx-postgres` | `KeyedPools`, `ConnectCandidates`: a Postgres pool per key; with `runtime` the cache's unit (`into_unit`) |
 //!
 //! # Probes
 //!
@@ -98,8 +100,16 @@ mod probe;
 ))]
 mod lease;
 
+#[cfg(feature = "keyed")]
+mod keyed;
+
 /// Stable `reason` values of the errors this crate returns.
-#[cfg(any(feature = "lease", feature = "sqlx-postgres", feature = "sqlx-mysql"))]
+#[cfg(any(
+    feature = "lease",
+    feature = "keyed",
+    feature = "sqlx-postgres",
+    feature = "sqlx-mysql"
+))]
 pub mod reasons;
 
 pub use error::{ConnectFailure, DbError, public_message};
@@ -116,6 +126,10 @@ pub use error::{classify_db_err, db_err_to_app_error};
 #[cfg(any(feature = "sqlx-postgres", feature = "sqlx-mysql"))]
 pub use registry::{Pool, PoolRegistry};
 
+#[cfg(all(feature = "keyed", feature = "sqlx-postgres"))]
+pub use keyed::{ConnectCandidates, KeyedPools, KeyedPoolsBuilder};
+#[cfg(feature = "keyed")]
+pub use keyed::{Keyed, KeyedBuilder, KeyedRef, KeyedStats};
 #[cfg(all(
     feature = "runtime",
     any(feature = "sqlx-postgres", feature = "sqlx-mysql")

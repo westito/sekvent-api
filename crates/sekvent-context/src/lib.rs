@@ -10,6 +10,7 @@
 mod clock;
 mod end_user;
 pub mod headers;
+mod scope;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use end_user::EndUser;
+pub use scope::RequestScope;
 
 /// Who is calling, as established by service-to-service authentication.
 ///
@@ -84,6 +86,9 @@ pub struct CallContext {
     traceparent: Option<String>,
     hops: u32,
     client_addr: Option<IpAddr>,
+    /// What the serving boundary resolved for the request; never encoded,
+    /// never carried by `child` or `detached`.
+    scope: Option<RequestScope>,
 }
 
 impl Default for CallContext {
@@ -109,6 +114,7 @@ impl CallContext {
             traceparent: None,
             hops: 0,
             client_addr: None,
+            scope: None,
         }
     }
 
@@ -151,13 +157,21 @@ impl CallContext {
         self.end_user = None;
         self
     }
-    /// Make an authenticated end user the direct caller: subject and tenant
-    /// become theirs (a tenant the user has none of is cleared) and the
-    /// service caller is cleared.
+    /// Make an authenticated end user the direct caller: the subject becomes
+    /// theirs and the service caller is cleared. The tenant becomes the
+    /// [scope](Self::scope)'s when the context has a scope that names one,
+    /// otherwise the user's (a tenant the user has none of is cleared).
+    ///
+    /// This makes no check: when the scope names a tenant, a serving
+    /// boundary refuses a user who does not name the same one before it
+    /// calls this.
     #[must_use]
     pub fn with_end_user(mut self, user: EndUser) -> Self {
         self.subject = Some(user.subject().to_owned());
-        self.tenant = user.tenant().map(str::to_owned);
+        self.tenant = match self.scope.as_ref().and_then(RequestScope::tenant) {
+            Some(tenant) => Some(tenant.to_owned()),
+            None => user.tenant().map(str::to_owned),
+        };
         self.caller = None;
         self.end_user = Some(Arc::new(user));
         self
@@ -206,6 +220,25 @@ impl CallContext {
     #[must_use]
     pub fn with_hops(mut self, hops: u32) -> Self {
         self.hops = hops;
+        self
+    }
+
+    /// Attach the [`RequestScope`] a serving boundary resolved for this
+    /// request, replacing an earlier one. A tenant the scope names becomes
+    /// the context's tenant; otherwise the tenant is left as it is.
+    ///
+    /// This is a plain setter: it neither validates the scope's tenant nor
+    /// checks it against an [end user](Self::end_user) the context already
+    /// has, whose own tenant may differ. A serving boundary resolves the
+    /// scope before it admits an end user; a REST route that authenticated
+    /// first resolves through `sekvent_component::App::resolve_scope`,
+    /// which refuses that mismatch.
+    #[must_use]
+    pub fn with_scope(mut self, scope: RequestScope) -> Self {
+        if let Some(tenant) = scope.tenant() {
+            self.tenant = Some(tenant.to_owned());
+        }
+        self.scope = Some(scope);
         self
     }
 
@@ -287,12 +320,26 @@ impl CallContext {
     pub fn client_addr(&self) -> Option<IpAddr> {
         self.client_addr
     }
+    /// The request scope, when a serving boundary resolved one for this
+    /// call; `None` for link callers, in-process calls and contexts made
+    /// with [`child`](Self::child) or [`detached`](Self::detached).
+    pub fn scope(&self) -> Option<&RequestScope> {
+        self.scope.as_ref()
+    }
+    /// The [scope](Self::scope)'s extension of type `T`, if the call has a
+    /// scope holding one.
+    pub fn scoped<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.scope.as_ref().and_then(RequestScope::extension::<T>)
+    }
 
     /// A child for an outbound call: same identity, deadline and hop count, a
     /// child cancellation token, and the caller and end user cleared (the
     /// callee learns its caller from authentication, not from us; subject,
     /// tenant and client address stay). The idempotency key is kept
     /// only when it was set for this call, not received with it.
+    ///
+    /// The [scope](Self::scope) is not kept: a callee gets the tenant and
+    /// nothing else of it.
     #[must_use]
     pub fn child(&self) -> Self {
         Self {
@@ -308,12 +355,18 @@ impl CallContext {
             traceparent: self.traceparent.clone(),
             hops: self.hops,
             client_addr: self.client_addr,
+            scope: None,
         }
     }
 
     /// A context for work queued beyond this call's lifetime: subject,
-    /// tenant, client address, trace and hop count are kept; deadline, cancellation, caller
-    /// and end user are not.
+    /// tenant, client address, trace and hop count are kept; deadline, cancellation, caller,
+    /// end user and [scope](Self::scope) are not.
+    ///
+    /// Work that outlives the call must not carry a value it cloned out of
+    /// the scope (a pool taken from a cache reference, say): the reference
+    /// that kept it alive is released with the call. Such work takes its own
+    /// reference, from the tenant, and holds it while it runs.
     #[must_use]
     pub fn detached(&self) -> Self {
         Self {
@@ -329,16 +382,23 @@ impl CallContext {
             traceparent: self.traceparent.clone(),
             hops: self.hops,
             client_addr: self.client_addr,
+            scope: None,
         }
     }
 
     /// Drop `subject`, `tenant` and the client address unless the caller is
-    /// a trusted link or an authenticated end user.
+    /// a trusted link or an authenticated end user. A tenant the
+    /// [scope](Self::scope) names is kept: it came from the serving
+    /// boundary, not from the caller.
     #[must_use]
     pub fn sanitize_for_caller(mut self) -> Self {
         if self.end_user.is_none() && !self.caller.as_ref().is_some_and(|caller| caller.trusted) {
             self.subject = None;
-            self.tenant = None;
+            self.tenant = self
+                .scope
+                .as_ref()
+                .and_then(RequestScope::tenant)
+                .map(str::to_owned);
             self.client_addr = None;
         }
         self

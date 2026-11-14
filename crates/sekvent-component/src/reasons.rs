@@ -35,6 +35,10 @@ pub const METHOD_TIMEOUT: &str = "METHOD_TIMEOUT";
 /// into `INTERNAL` by the component that saw it, so callers above neither
 /// retry it nor count it against the healthy component in between.
 pub const DOWNSTREAM_FAILURE: &str = "DOWNSTREAM_FAILURE";
+/// The App's scope resolver returned a scope whose tenant fails
+/// `sekvent_context::headers::is_valid_tenant` (`INTERNAL`): a bug in the
+/// resolver; the call is not served.
+pub const SCOPE_TENANT_INVALID: &str = "SCOPE_TENANT_INVALID";
 /// A component method panicked (`INTERNAL`).
 pub const HANDLER_PANICKED: &str = "HANDLER_PANICKED";
 /// The stream reached its maximum lifetime (`UNAVAILABLE`, metadata

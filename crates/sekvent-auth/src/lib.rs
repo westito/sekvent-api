@@ -1,5 +1,9 @@
 //! Password hashing, JWT sessions and login helpers.
 //!
+//! JWTs are HS256 with a shared secret ([`JwtKeys`]) or `EdDSA` over
+//! Ed25519, signed with a private key ([`EdDsaSigningKey`]) and verified
+//! with public keys alone ([`EdDsaVerificationKeys`]).
+//!
 //! The core ([`password`], [`jwt`], [`login`], [`roles`]) is pure: it spawns
 //! nothing, reads no environment and never asks the system for the time.
 //! Every time-dependent check takes `now_unix_secs` as a parameter, so the
@@ -50,7 +54,10 @@ pub mod tonic;
 
 #[cfg(any(feature = "axum", feature = "tonic"))]
 pub use adapter::{BearerAuth, EndUserClaims};
-pub use jwt::{Claims, DEVELOPMENT_SECRET, JwtKeys, NoClaims, TokenRejected, Validation};
+pub use jwt::{
+    Claims, DEVELOPMENT_SECRET, EdDsaSigningKey, EdDsaVerificationKeys, JwtKeys, NoClaims,
+    TokenRejected, Validation,
+};
 #[cfg(feature = "tokio")]
 pub use login::authenticate_async;
 pub use login::{Authenticated, LoginOutcome, LoginRejected, authenticate};

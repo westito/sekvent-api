@@ -8,14 +8,14 @@
 //! |---|---|---|---|
 //! | [`config`] | `sekvent-config` | `config` (default) | `ConfigSource`, `Secret`, readers, `#[derive(EnvConfig)]` |
 //! | [`error`] | `sekvent-error` | `error` (default) | `ErrorCode`, `AppError`, `WireError`; HTTP and gRPC mappings |
-//! | [`context`] | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
+//! | [`context`] | `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `RequestScope`, `Clock`, header codec |
 //! | [`telemetry`] | `sekvent-telemetry` | `telemetry` (default) | tracing init, log buffer, request ids, access log, `truncate_for_log` |
 //! | [`runtime`] | `sekvent-runtime` | `runtime` (default) | staged lifecycle, supervision, health, the combined server (CORS, limits, layers, access log), jobs, downloads, static sites |
 //! | [`resilience`] | `sekvent-resilience` | `resilience` | backoff, retry budget, rate gate, per-client rate limiter, timeout, bulkhead, breaker, TTL cache |
-//! | [`auth`] | `sekvent-auth` | `auth` | argon2id and bcrypt password hashing, JWT with injected time, login helper |
+//! | [`auth`] | `sekvent-auth` | `auth` | argon2id and bcrypt password hashing, HS256 and `EdDSA` JWT with injected time, login helper |
 //! | [`link`] | `sekvent-link` | `link` | service-to-service tokens, middleware, interceptors |
 //! | [`client`] | `sekvent-client` | `client` | outbound HTTP with policy, context propagation, OAuth 2.0 |
-//! | [`db`] | `sekvent-db` | `db` | named pools, migrations, distinct-target check, sea-query execution, list filters, readiness probes, leases |
+//! | [`db`] | `sekvent-db` | `db` | named pools, a pool per key, migrations, distinct-target check, sea-query execution, list filters, readiness probes, leases |
 //! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local, serialized and gRPC bindings |
 //! | [`sso`] | `sekvent-sso` | `sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), one-time handoff codes |
 //! | [`storage`] | `sekvent-storage` | `storage` | S3-compatible object storage: presigned uploads and downloads, head, delete, copy |
@@ -50,6 +50,11 @@
 //!   directory or embedded in the binary.
 //! - `db-lease`: database leases with fencing tokens (`LeaseStore`), on a
 //!   sqlx backend; with `runtime` also `LeaseGuard` for singleton jobs.
+//! - `db-keyed`: a keyed resource cache (`db::Keyed`): one value per key,
+//!   created once however many callers wait, kept while in use, evicted
+//!   when idle or over capacity. On a Postgres backend also
+//!   `db::KeyedPools` (a pool per key and the value built on it); with
+//!   `runtime` its eviction unit.
 //! - `db` and `runtime` together give pool readiness probes
 //!   (`PoolRegistry::probes`) on a sqlx backend.
 //! - `storage` and `runtime` together give the bucket readiness probe

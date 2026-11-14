@@ -41,12 +41,32 @@ impl App {
     /// with `UNAVAILABLE` / `COMPONENT_DRAINING` and new ones are refused,
     /// so ingress drains without waiting on them. Unary calls continue
     /// until the components drain.
+    ///
+    /// A runtime that runs a further App registers it with
+    /// [`register_as`](Self::register_as) under another name.
     #[must_use]
     pub fn register(&self, runtime: RuntimeBuilder) -> RuntimeBuilder {
+        self.register_as(UNIT, runtime)
+    }
+
+    /// [`register`](Self::register), with the unit named `name`, for a
+    /// runtime that runs more than one App (a public one and an operator
+    /// one, each with its own authenticator, authorizer and scope resolver,
+    /// each mounted on its own listener).
+    ///
+    /// The unit is the same in every respect but its name. Names are the
+    /// runtime's business: `RuntimeBuilder::build` fails with
+    /// `INVALID_ARGUMENT` for a name used twice or an empty one. Two Apps
+    /// share nothing but the runtime: their units start and drain side by
+    /// side, in no order between them, each within its own stop window. A
+    /// gRPC service exposed by both is one health entry with two writers:
+    /// expose a service from one App.
+    #[must_use]
+    pub fn register_as(&self, name: impl Into<String>, runtime: RuntimeBuilder) -> RuntimeBuilder {
         let app = self.clone();
         let trigger = runtime.shutdown_trigger();
         runtime.unit(
-            UNIT,
+            name,
             Stage::Components,
             UnitPolicy::Critical,
             move |ctx: UnitContext| {

@@ -21,14 +21,14 @@ sqlx 0.9, sea-orm 2.0 and sea-query 1.0.
 | `sekvent-config` | `config` (default) | `ConfigSource`, `Secret`, readers, `FromConfig`, `#[derive(EnvConfig)]` |
 | `sekvent-macros` | (via `config`, `component`) | Procedural macros (`EnvConfig`, `component`, `ComponentError`) |
 | `sekvent-error` | `error` (default); `error-http`, `error-grpc` | `ErrorCode`, `AppError`, `WireError`; HTTP and gRPC mappings |
-| `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `Clock`, header codec |
+| `sekvent-context` | `context` (default) | `CallContext`, `ServiceIdentity`, `RequestScope`, `Clock`, header codec |
 | `sekvent-telemetry` | `telemetry` (default) | Tracing init, log ring buffer, request ids, access log, `truncate_for_log` |
 | `sekvent-runtime` | `runtime` (default); `runtime-grpc-web`, `runtime-cron`, `runtime-vfs`, `runtime-vfs-embed` | Staged lifecycle, supervision, health, one listener for gRPC, gRPC-Web and REST with CORS, body limits, global layers and an access log; interval, cron and manual jobs; file downloads; a bundled frontend served next to the API |
 | `sekvent-resilience` | `resilience`; `resilience-http` | Backoff, retry budget, rate gate, per-client rate limiter (with a tower layer for axum routes), timeout, bulkhead, circuit breaker, a TTL cache with single flight |
-| `sekvent-auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` | argon2id and bcrypt password schemes, JWT with injected time, login helper, async hashing helpers |
+| `sekvent-auth` | `auth`; `auth-axum`, `auth-tonic`, `auth-tokio` | argon2id and bcrypt password schemes, HS256 and EdDSA JWT with injected time, login helper, async hashing helpers |
 | `sekvent-link` | `link`; `link-axum`, `link-tonic` | Service-to-service tokens, middleware, interceptors |
 | `sekvent-client` | `client` | Outbound HTTP (reqwest, rustls) with policies, context propagation, OAuth 2.0 client credentials |
-| `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-sea-query-postgres`, `db-sea-query-mysql`, `db-migrate`, `db-sea-orm-migrate`, `db-lease` | Named pools, migrations (directory or embedded), distinct-target check, sea-query execution, list filters, readiness probes per pool, leases with fencing tokens for singleton jobs |
+| `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-sea-query-postgres`, `db-sea-query-mysql`, `db-migrate`, `db-sea-orm-migrate`, `db-lease`, `db-keyed` | Named pools, a keyed cache with a pool per key, migrations (directory or embedded), distinct-target check, sea-query execution, list filters, readiness probes per pool, leases with fencing tokens for singleton jobs |
 | `sekvent-sso` | `sso` | Browser single sign-on: OAuth 2.0 authorization code flow with a signed state cookie, a Bitbucket Cloud provider (workspace members only), one-time handoff codes |
 | `sekvent-storage` | `storage` | S3-compatible object storage: presigned browser uploads and downloads, server-side head, delete and copy, a bucket readiness probe; own SigV4 signer on the rustls/ring stack |
 | `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, unary and server-streaming methods, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |

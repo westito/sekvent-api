@@ -3,8 +3,10 @@
 `sekvent::auth` covers end-user authentication inside a service: password
 hashing (argon2id by default, bcrypt for stores shared with applications
 that only read bcrypt), a login check that does not reveal whether an
-account exists, HS256 JSON Web Tokens verified against a time you pass in,
-role checks, and bearer-token guards for axum and tonic. The core is pure:
+account exists, JSON Web Tokens verified against a time you pass in (HS256
+with a shared secret, or EdDSA over Ed25519, signed with a private key and
+verified with public keys), role checks, and bearer-token guards for axum
+and tonic. The core is pure:
 it spawns nothing, reads no environment and never asks the system for the
 time, so the same code runs on servers, in tests with a frozen clock and in
 the browser (`wasm32-unknown-unknown`).
@@ -22,7 +24,7 @@ Service-to-service authentication is a different module: see
 
 | Facade feature | `sekvent-auth` feature | Adds | wasm |
 |---|---|---|---|
-| `auth` | — | `PasswordHasher`, `authenticate`, `JwtKeys`, `Claims`, `Validation`, `HasRoles`, `require_any_role` | yes, with the facade's default features off ([below](#build-for-the-browser)) |
+| `auth` | — | `PasswordHasher`, `authenticate`, `JwtKeys`, `EdDsaSigningKey`, `EdDsaVerificationKeys`, `Claims`, `Validation`, `HasRoles`, `require_any_role` | yes, with the facade's default features off ([below](#build-for-the-browser)) |
 | `auth-axum` | `axum` | `BearerAuth` (with `verify_headers` and `end_user`), `EndUserClaims`, `HasRoles` for `EndUser`, `sekvent::auth::axum::{Bearer, RequireRole, RoleSet}` | no |
 | `auth-tonic` | `tonic` | `BearerAuth` (with `verify_headers` and `end_user`), `EndUserClaims`, `HasRoles` for `EndUser`, `sekvent::auth::tonic::{BearerInterceptor, verified_claims, require_any_role}` | no |
 | `auth-tokio` | `tokio` | `PasswordHasher::hash_async`, `verify_async`, `authenticate_async` | no |
@@ -74,10 +76,17 @@ works because `From<TokenRejected> for AppError` exists.
   cost limits, an empty hash for a single-sign-on-only account) costs a
   dummy verification instead, so it takes as long to reject as a wrong
   password. `authenticate` extends this to unknown accounts.
+- **Two algorithms.** HS256 (`JwtKeys`): one shared secret signs and
+  verifies, so every verifier could also mint tokens. EdDSA over Ed25519
+  (`EdDsaSigningKey`, `EdDsaVerificationKeys`): the issuer alone holds the
+  private key, verifiers hold public keys and cannot mint. Both share
+  `Claims`, `Validation` and `TokenRejected`, and each verifier accepts its
+  own algorithm only.
 - **Injected time.** `jsonwebtoken`'s own expiry checks read the system
-  clock, so they are off: `JwtKeys::verify` checks the signature through the
-  library, then `exp`, `nbf` and `iat` itself against the `now_unix_secs`
-  it is given. The axum and tonic adapters read the time from an injected
+  clock, so they are off: `JwtKeys::verify` and
+  `EdDsaVerificationKeys::verify` check the signature through the library,
+  then `exp`, `nbf` and `iat` themselves against the `now_unix_secs` they
+  are given. The axum and tonic adapters read the time from an injected
   `sekvent::context::Clock`.
 - **One message for every rejection.** A refused token is always
   `UNAUTHENTICATED` with `invalid or expired credentials`; which check
@@ -304,6 +313,109 @@ Every variant has `error_code()` = `UNAUTHENTICATED` and the same
 `user_message()`: `invalid or expired credentials`. Log the variant
 (`Display`), return only the message.
 
+### Sign with a private key, verify with public keys (EdDSA)
+
+Choose EdDSA over HS256 when a verifier must not be able to mint tokens:
+one service issues them, others only accept them. The issuer holds an
+Ed25519 private key; each verifier holds the public key, which is not a
+secret.
+
+```rust
+pub const ED25519_KEY_LEN: usize = 32;          // sekvent::auth::jwt::ED25519_KEY_LEN
+
+impl EdDsaSigningKey {
+    pub fn from_pkcs8_pem(kid: impl Into<String>, pem: &Secret) -> Result<Self, AppError>;
+    pub fn from_seed(kid: impl Into<String>, seed: &[u8; ED25519_KEY_LEN]) -> Result<Self, AppError>;
+    pub fn kid(&self) -> &str;
+    pub fn public_key(&self) -> [u8; ED25519_KEY_LEN];
+    pub fn public_key_pem(&self) -> String;
+    pub fn verification_keys(&self) -> EdDsaVerificationKeys;
+    pub fn issue<T: Serialize>(&self, claims: &Claims<T>) -> Result<String, AppError>;
+}
+
+impl EdDsaVerificationKeys {
+    pub fn from_public_key_pem(kid: impl Into<String>, pem: &str) -> Result<Self, AppError>;
+    pub fn from_public_key(kid: impl Into<String>, key: &[u8; ED25519_KEY_LEN]) -> Result<Self, AppError>;
+    pub fn with_public_key_pem(self, kid: impl Into<String>, pem: &str) -> Result<Self, AppError>;
+    pub fn with_public_key(self, kid: impl Into<String>, key: &[u8; ED25519_KEY_LEN]) -> Result<Self, AppError>;
+    pub fn kids(&self) -> impl Iterator<Item = &str>;
+    pub fn verify<T: DeserializeOwned>(&self, token: &str, now_unix_secs: u64, validation: &Validation)
+        -> Result<Claims<T>, TokenRejected>;
+}
+```
+
+```sh
+openssl genpkey -algorithm ed25519 -out signing.pem    # private key, PKCS#8 PEM: the issuer's Secret
+openssl pkey -in signing.pem -pubout -out public.pem   # public key, SubjectPublicKeyInfo PEM: for verifiers
+```
+
+```rust
+use sekvent::auth::{Claims, EdDsaSigningKey, EdDsaVerificationKeys, NoClaims, Validation};
+
+// The issuer.
+let signing = EdDsaSigningKey::from_pkcs8_pem("2026-11", &config.signing_key)?;
+let now = clock.now_unix_millis() / 1000;
+let token = signing.issue(
+    &Claims::new("billing", now, 60, NoClaims {}).with_issuer("billing").with_audience("orders"),
+)?;
+
+// A verifier: public keys by key id, two during a rotation.
+let keys = EdDsaVerificationKeys::from_public_key_pem("2026-11", &config.billing_key)?
+    .with_public_key_pem("2026-05", &config.billing_previous_key)?;
+let rules = Validation::new().with_issuer("billing").with_audience("orders").with_leeway(0);
+let claims: Claims<NoClaims> = keys.verify(&token, now, &rules)?;
+```
+
+Accepted inputs:
+
+| Input | Accepted |
+|---|---|
+| private key | the PKCS#8 PEM `openssl genpkey -algorithm ed25519` writes, in a `Secret`; or its base64 body alone on one line |
+| public key | the SubjectPublicKeyInfo PEM `openssl pkey -pubout` writes, as plain text; or its base64 body alone; or the raw 32 bytes (`from_public_key`) |
+| seed | 32 bytes (`from_seed`), for tests and for a key you derive |
+
+A PEM must have the expected label lines (`PRIVATE KEY`, `PUBLIC KEY`);
+line ends may be `\n` or `\r\n`, whitespace inside the body is ignored, and
+the body is standard base64 with its padding. The private key must be the
+48-byte Ed25519 PKCS#8 v1 form; an encrypted key, an OpenSSH key, an RSA
+key, a PKCS#8 key that also carries its public half and base64url text are
+refused. sekvent frames the keys itself in fixed buffers, without
+allocating (an oversize body is refused), and wipes the key text and bytes
+it handles, public ones too, since a private key may be pasted where a
+public one belongs; a private key given to a verifier is refused.
+`signing.public_key_pem()` prints the PEM to hand to
+verifiers, the same text `openssl pkey -pubout` writes.
+
+Keys are checked when they are loaded, so a bad one is a startup error:
+a public key that is not canonical, not a point of the curve or of small
+order is refused (see [Errors and reasons](#errors-and-reasons)).
+
+- **Key ids.** Every issued token carries `alg: EdDSA` and the signing
+  key's `kid`. A token without `kid`, or with a `kid` no public key has,
+  is `UnknownKey`. A blank or duplicate `kid` is `INVALID_ARGUMENT`.
+- **Rotation.** Generate a new key pair, add its public key under a new
+  `kid` to every verifier (`with_public_key_pem`), switch the issuer to the
+  new private key, and drop the old public key once its last token has
+  expired.
+- **No empty verifier.** The first key comes with the constructor; a
+  verifier has no way to sign. `Debug` of both types shows key ids only.
+
+`verify` checks in the same order and answers like `JwtKeys::verify`:
+
+| Step | Refusal |
+|---|---|
+| the header does not parse, or names an algorithm the library does not know (`none`) | `Malformed` |
+| the header's `alg` is not `EdDSA` (an HS256 token, any other known algorithm) | `BadSignature` |
+| no `kid`, or a `kid` that names no key | `UnknownKey` |
+| the signature does not verify with that key | `BadSignature` |
+| the claims do not deserialize | `Malformed` |
+| `exp`, `nbf`, `iat` against `now_unix_secs` and the leeway | `Expired`, `NotYetValid` |
+| `Validation::issuer`, `Validation::audience` when set | `WrongIssuer`, `WrongAudience` |
+
+The algorithm is pinned both ways: an HS256 token never passes an EdDSA
+verifier (not even one signed with the public key as the HMAC secret), and
+`JwtKeys::verify` refuses an EdDSA token.
+
 ### Use the development key safely
 
 `JwtKeys::development()` builds keys from the published
@@ -503,7 +615,25 @@ The `axum`, `tonic` and `tokio` features are not wasm-compatible.
 
 None. The module reads no environment: load the JWT secret (a `Secret`),
 key id, token lifetime and hashing parameters through your own config
-struct (see [config](config.md)) and pass them in.
+struct (see [config](config.md)) and pass them in. For EdDSA, the issuer
+reads its private key as a `Secret`; a verifier reads public keys as plain
+text:
+
+```rust
+use sekvent::prelude::*;
+
+#[derive(Debug, EnvConfig)]
+#[config(prefix = "BILLING_")]
+struct IssuerConfig {
+    signing_key: Secret,       // BILLING_SIGNING_KEY: the PKCS#8 PEM or its base64 body
+}
+
+#[derive(Debug, EnvConfig)]
+#[config(prefix = "ORDERS_")]
+struct VerifierConfig {
+    billing_key: String,       // ORDERS_BILLING_KEY: the public key PEM or its base64 body
+}
+```
 
 ## Errors and reasons
 
@@ -517,7 +647,14 @@ struct (see [config](config.md)) and pass them in.
 | `require_any_role` / `RequireRole` | `PERMISSION_DENIED` | — |
 | bcrypt `hash` of a password over 72 bytes | `INVALID_ARGUMENT` | `PASSWORD_TOO_LONG` |
 | bad hasher parameters, short JWT secret, blank or duplicate `kid` | `INVALID_ARGUMENT` | — |
+| EdDSA private key not what [the loader accepts](#sign-with-a-private-key-verify-with-public-keys-eddsa): ``JWT key `<kid>` is not an Ed25519 private key in PKCS#8 PEM`` | `INVALID_ARGUMENT` | — |
+| EdDSA public key not what the loader accepts, not canonical or not a point of the curve: ``JWT key `<kid>` is not an Ed25519 public key`` | `INVALID_ARGUMENT` | — |
+| EdDSA public key of small order: ``JWT key `<kid>` is a weak Ed25519 public key`` | `INVALID_ARGUMENT` | — |
 | a failed `*_async` blocking task | `INTERNAL` | — |
+
+Key errors name the key id, never the key. A weak or non-canonical public
+key is refused when it is loaded because the signature check underneath
+does not refuse it, and a verifier holding one would accept forged tokens.
 
 ## Testing tips
 
@@ -530,6 +667,9 @@ struct (see [config](config.md)) and pass them in.
   and move it with `clock.advance(..)` to expire a token without sleeping.
 - Test JWT secrets must be 32 bytes or more; `JwtKeys::development()` is
   fine in tests (it logs a warning).
+- For EdDSA, `EdDsaSigningKey::from_seed("k1", &[7; 32])?` and
+  `.verification_keys()` give a matching, deterministic key pair without
+  key files.
 - `*_async` helpers need a tokio runtime: `#[tokio::test]`.
 
 ## Pitfalls and security
@@ -549,6 +689,14 @@ struct (see [config](config.md)) and pass them in.
   where possible (`*_async` take `Secret`).
 - **Do not trust `aud`/`iss` unless you ask.** `Validation::new()` accepts
   any issuer and audience; set them when tokens are shared across services.
+- **The EdDSA private key only in a `Secret`**, and only at the issuer.
+  A verifier's configuration holds public keys, never a private key.
+- **A token that must work once.** EdDSA tokens are bearer tokens: give
+  them short lifetimes, and when one must be accepted only once, set a
+  `jti` and have the receiver record the ones it has seen.
+- **`BearerAuth` is HS256 only.** Verify EdDSA tokens with
+  `EdDsaVerificationKeys::verify`, for example in your own end-user
+  authenticator.
 
 ## See also
 
@@ -559,3 +707,4 @@ struct (see [config](config.md)) and pass them in.
 - [Components](components.md#how-to-serve-components-to-end-users-browsers-apps) — serving components to end users with `BearerAuth::end_user`
 - [Design: components served to end users](../design/component-end-user.md)
 - [Design: P8 service essentials](../design/p8-service-essentials.md) — bcrypt and async helpers
+- [Design: building blocks for multi-tenant services](../design/multi-tenant-building-blocks.md) — EdDSA tokens

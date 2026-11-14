@@ -242,6 +242,14 @@ fn token<'a>(headers: &'a HeaderMap, name: &str, max_len: usize) -> Option<&'a s
     header_str(headers, name).filter(|value| is_token(value, max_len))
 }
 
+/// Whether `tenant` is a tenant the header codec carries between services:
+/// non-empty visible ASCII without spaces, at most 255 bytes, the rule
+/// [`from_headers`] applies to an inbound [`TENANT`]. A tenant that fails
+/// it does not reach the callee of an outbound call.
+pub fn is_valid_tenant(tenant: &str) -> bool {
+    is_token(tenant, MAX_VALUE_LEN)
+}
+
 fn is_token(value: &str, max_len: usize) -> bool {
     !value.is_empty() && value.len() <= max_len && value.bytes().all(|b| b.is_ascii_graphic())
 }
@@ -307,6 +315,29 @@ mod tests {
             map.insert(*name, HeaderValue::from_str(value).unwrap());
         }
         map
+    }
+
+    #[test]
+    fn a_valid_tenant_is_one_a_trusted_callee_receives() {
+        let long = "t".repeat(MAX_VALUE_LEN);
+        let too_long = "t".repeat(MAX_VALUE_LEN + 1);
+        for (tenant, valid) in [
+            ("t-1", true),
+            (long.as_str(), true),
+            ("", false),
+            ("t 1", false),
+            ("t\t1", false),
+            ("tenänt", false),
+            (too_long.as_str(), false),
+        ] {
+            assert_eq!(is_valid_tenant(tenant), valid, "{tenant:?}");
+            let sent = CallContext::new().with_tenant(tenant);
+            let mut wire = HeaderMap::new();
+            inject(&sent, &mut wire);
+            let received = from_headers(&wire, Some(ServiceIdentity::trusted("shop")));
+            let expected = valid.then_some(tenant);
+            assert_eq!(received.tenant(), expected, "{tenant:?}");
+        }
     }
 
     #[test]

@@ -35,15 +35,15 @@ example an `-api` crate that only declares a component contract).
 |---|---|---|---|
 | `config` | `sekvent::config` (`EnvConfig`, `Secret`, sources) | `sekvent-config` | [config](modules/config.md) |
 | `error` | `sekvent::error` (`AppError`, `ErrorCode`, `WireError`) | `sekvent-error` | [error](modules/error.md) |
-| `context` | `sekvent::context` (`CallContext`, `Clock`, headers) | `sekvent-context` | [context](modules/context.md) |
+| `context` | `sekvent::context` (`CallContext`, `RequestScope`, `Clock`, headers) | `sekvent-context` | [context](modules/context.md) |
 | `telemetry` | `sekvent::telemetry` (init, access log, request id) | `sekvent-telemetry` | [telemetry](modules/telemetry.md) |
 | `runtime` | `sekvent::runtime` (lifecycle, health, server, jobs, downloads) | `sekvent-runtime` | [runtime](modules/runtime.md), [server](modules/server.md), [jobs](modules/jobs.md) |
 | `resilience` | `sekvent::resilience` (retry, breaker, rate gate, per-client rate limiter, TTL cache) | `sekvent-resilience` | [resilience](modules/resilience.md) |
-| `auth` | `sekvent::auth` (passwords, JWT, login) | `sekvent-auth` | [auth](modules/auth.md) |
+| `auth` | `sekvent::auth` (passwords, HS256 and EdDSA JWT, login) | `sekvent-auth` | [auth](modules/auth.md) |
 | `sso` | `sekvent::sso` (browser single sign-on, Bitbucket Cloud) | `sekvent-sso` | [sso](modules/sso.md) |
 | `link` | `sekvent::link` (service-to-service tokens) | `sekvent-link` | [link](modules/link.md) |
 | `client` | `sekvent::client` (outbound HTTP, OAuth 2.0) | `sekvent-client` | [client](modules/client.md) |
-| `db` | `sekvent::db` (pools, migrations, filters, errors) | `sekvent-db` | [db](modules/db.md) |
+| `db` | `sekvent::db` (pools, a pool per key, migrations, filters, errors) | `sekvent-db` | [db](modules/db.md) |
 | `storage` | `sekvent::storage` (S3-compatible object storage, presigned uploads and downloads) | `sekvent-storage` | [storage](modules/storage.md) |
 | `component` | `sekvent::component` plus `sekvent::{App, ComponentError, component}`; unary and server-streaming methods (`CallStream`) | `sekvent-component` | [components](modules/components.md) |
 
@@ -74,6 +74,7 @@ example an `-api` crate that only declares a component contract).
 | `db-migrate` | `db` | `migrate_on_boot` (a directory) and `run_embedded_migrations` (`sqlx::migrate!`) |
 | `db-sea-orm-migrate` | `db` | `run_sea_orm_migrations` with sea-orm-migration |
 | `db-lease` | `db` | `LeaseStore`, fencing tokens; with `runtime`, `LeaseGuard` for singleton jobs |
+| `db-keyed` | `db` | `Keyed`: one lazily created value per key, shared while in use, evicted when idle or over capacity; with `db-sqlx-postgres` also `KeyedPools`, a Postgres pool per key and the value built on it ([db](modules/db.md#keep-one-pool-per-key-keyedpools)) |
 | `component-grpc` | `component` | The `grpc` binding and serving components over gRPC, unary and server-streaming (`#[call(stream)]`, also to browsers over gRPC-Web) |
 | `full` | everything above | Every module and integration (handy for experiments, not for services) |
 
@@ -85,6 +86,8 @@ Some APIs need two features at once. The facade wires them for you:
 |---|---|---|
 | `db-*` (a backend) | `runtime` (default) | `PoolProbe` and `PoolRegistry::probes()` for readiness |
 | `db-lease` + a backend | `runtime` (default) | `LeaseGuard`, a `JobGuard` that makes a job run on one instance |
+| `db-keyed` | `db-sqlx-postgres` | `KeyedPools`, `KeyedPoolsBuilder` and `ConnectCandidates` |
+| `db-keyed` | `runtime` (default) | `Keyed::into_unit` and `KeyedPools::into_unit`: the unit that evicts idle entries and closes the cache on shutdown |
 | `storage` | `runtime` (default) | `StorageProbe`, a bucket readiness probe |
 | `component` | `runtime` (default) | `App::register`, which runs the components as one runtime unit |
 

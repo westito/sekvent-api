@@ -24,7 +24,7 @@ components: inventory, notifications and orders.
 |---|---|
 | `component` | `#[sekvent::component]`, `#[derive(sekvent::ComponentError)]`, the `App` builder, `CallStream` for server-streaming methods, the `local` and `local-serialized` bindings. Turns on `config`, `error` and `context`. |
 | `component-grpc` | The `grpc` binding and serving components over gRPC (`App::grpc_routes`), unary and server-streaming. Turns on `component`. |
-| `runtime` (with `component`) | `App::register`, which runs the App as one unit of the [runtime](runtime.md). |
+| `runtime` (with `component`) | `App::register`, which runs the App as one unit of the [runtime](runtime.md), and `App::register_as` for a further App on the same runtime ([a second App](#a-second-app-on-one-runtime)). |
 | `runtime-grpc-web` (with `component-grpc`) | gRPC-Web translation on the runtime server, so browsers can call served components ([end users](#how-to-serve-components-to-end-users-browsers-apps)). |
 
 A component is split over two crates. The **`-api` crate** holds the
@@ -569,6 +569,45 @@ app.register(Runtime::builder())
 This is `shop::bind` and `shop::runtime` from the example. See
 [runtime](runtime.md) and [server](server.md).
 
+#### A second App on one runtime
+
+`App::register` names its unit `components`, and the runtime refuses two
+units of one name. A service with two audiences (a public App and an operator
+App, each with its own authenticator, authorizer and scope resolver, each
+mounted on its own listener) registers the further App with
+`App::register_as(name, runtime)`: the same unit under `name`, critical, in
+`Stage::Components`, with the same start, health, stream closing and drain.
+
+```rust
+let public = public_builder.build()?;                   // end users
+let admin = admin_builder.build()?;                     // operators: its own authenticator
+let api = Server::builder().grpc_routes(public.grpc_routes()).bind(public_addr).await?;
+let ops = Server::builder().grpc_routes(admin.grpc_routes()).bind(admin_addr).await?;
+let builder = public.register(Runtime::builder());      // unit `components`
+admin
+    .register_as("admin-components", builder)
+    .unit("api", Stage::Ingress, UnitPolicy::default(), api.into_unit())
+    .unit("ops", Stage::Ingress, UnitPolicy::default(), ops.into_unit())
+    .build()?
+    .run()
+    .await?;
+```
+
+- **Names** are the runtime's business, as for `RuntimeBuilder::unit`:
+  `register_as` checks nothing, and `RuntimeBuilder::build` fails with
+  `INVALID_ARGUMENT` for a name used twice or an empty one.
+- **Two Apps share nothing but the runtime.** Each is built by its own
+  `AppBuilder` and serves through its own `grpc_routes()`. Their units are in
+  the same stage: they start side by side and drain side by side, in no order
+  between them, each within its own stop window. A component of one App
+  reaches a component of the other over a `grpc` binding, like another
+  process.
+- **Health entries are per service name.** A gRPC service exposed by two
+  Apps is one health entry with two writers: expose a service from one App.
+- **Configuration** is read from the `ConfigSource` each builder was given. A
+  component installed in both Apps reads the same `SEKVENT_COMPONENT_<C>_*`
+  keys unless the two builders get different sources.
+
 ## How to choose bindings
 
 Nothing in code chooses a binding. The App builder reads it:
@@ -784,6 +823,15 @@ impl EndUserAuthenticator for SessionAuth {
 builder.end_user_authenticator(SessionAuth { sessions })?;
 ```
 
+- To tell a client why a credential was refused (the session ended, the
+  password must be changed), return `Err(REJECTION.into())` with an
+  [`EndUserRejection`](#tell-the-client-why-enduserrejection); any other
+  `UNAUTHENTICATED` stays the constant answer.
+- When the App has a [scope resolver](#how-to-resolve-a-request-scope), it
+  has run before the authenticator: read its scope with
+  `request.extensions.get::<RequestScope>()`. When the scope names a
+  tenant, a user the authenticator accepts who does not name the same
+  tenant (another one, or none) is refused like a bad credential.
 - One authenticator per App. A second registration fails at once with
   `BuildError::DuplicateEndUserAuthenticator`. If components need
   different rules, look at `request.uri.path()` in the one authenticator.
@@ -928,8 +976,9 @@ async fn track(&self, cx: &CallContext, req: TrackRequest) -> Result<TrackReply,
 
 | The authenticator returns | The caller gets |
 |---|---|
-| `Ok(user)` | The call runs with `cx.end_user() == Some(&user)`. |
-| `Err(e)` with code `UNAUTHENTICATED` | `UNAUTHENTICATED` with the message `invalid or expired credentials` (`END_USER_REJECTED_MESSAGE`), no reason and no metadata. The answer is the same for a missing, malformed, expired or unknown token. |
+| `Ok(user)` | The call runs with `cx.end_user() == Some(&user)`. A user whose tenant differs from the request scope's tenant is refused with the constant answer of the third row, never with a reason. |
+| `Err(e)` with code `UNAUTHENTICATED` whose source is an `EndUserRejection` (`Err(REJECTION.into())`) | `UNAUTHENTICATED` with `invalid or expired credentials`, the rejection's reason, its domain when it has one, and nothing else. |
+| `Err(e)` with any other `UNAUTHENTICATED` | `UNAUTHENTICATED` with the message `invalid or expired credentials` (`END_USER_REJECTED_MESSAGE`), no reason and no metadata. The answer is the same for a missing, malformed, expired or unknown token. |
 | `Err(e)` with any other code | `e` unchanged, for example `UNAVAILABLE` when the session store is down, so a client retries instead of signing the user out. |
 | nothing before the call's deadline | `DEADLINE_EXCEEDED` |
 
@@ -937,6 +986,50 @@ In every rejected case the request body is never read and the handler
 never runs. The same table applies to an `optional_end_user` method called
 with an `Authorization` header; without one the authenticator is not
 consulted.
+
+#### Tell the client why: `EndUserRejection`
+
+The constant answer means a client cannot tell "your session ended, sign in
+again" from "this credential means nothing here". An authenticator can opt in,
+one error at a time, to showing a reason with an `EndUserRejection`, a typed
+value that travels in the error's source (which is never sent anywhere):
+
+```rust
+use sekvent::component::EndUserRejection;
+
+const SESSION_ENDED: EndUserRejection =
+    EndUserRejection::new("SESSION_ENDED").with_domain("accounts");
+
+// in the authenticator
+if session.ended() {
+    return Err(SESSION_ENDED.into());       // UNAUTHENTICATED, END_USER_REJECTED_MESSAGE, this reason and domain
+}
+```
+
+A client matches on the reason (`google.rpc.ErrorInfo.reason` and `domain`
+over gRPC and gRPC-Web, `AppError::reason` through a handle), never on text.
+
+- **The answer is built from the typed value alone.** The serving boundary
+  looks at the error's direct source (causes further down are not searched)
+  and builds a new error from the reason and the domain it finds there.
+  Another message, `with_reason`, `with_metadata`, a retry hint or field
+  violations added after the conversion are not sent. The message is always
+  `END_USER_REJECTED_MESSAGE`.
+- **The reason and the domain are `&'static str`**: constants of the
+  program, so nothing read from the request, the credential or a store can
+  reach the caller through them.
+- **It fails closed.** `with_source(other)` on the converted error replaces
+  the rejection, and the answer is the constant one again. An error with
+  another code is never turned into a rejection.
+- **It applies only to what the end-user authenticator returns**, on
+  mandatory and optional-end-user methods. Not to the
+  [tenant refusal](#the-tenant), not to link rejections, not to a panic or a
+  passed deadline of the authenticator: those keep their answers.
+- **What a reason gives away.** Every reason tells anyone who can present a
+  credential which outcome it met. Use one for a state the holder of a
+  once-valid credential may know (the session ended, the password must be
+  changed), never to tell an unknown user from a wrong password, or a
+  malformed token from one signed by an unknown key.
 
 ### Serving order for end users
 
@@ -956,17 +1049,22 @@ Everything is still decided from the request head before the body is read:
 4. **Client limit by address.** A method with a `CLIENT_KEY=client_addr`
    limit ([below](#how-to-limit-each-client-of-a-served-method)) takes a
    permit here, so a flood is refused before any token is verified.
-5. **End user.** When the mode includes `bearer`, no link matched and the
+5. **Request scope.** When the App has a
+   [scope resolver](#how-to-resolve-a-request-scope) and no link matched
+   (whatever `SERVE_AUTH` says, and for anonymous and optional-end-user
+   methods too), it runs on the request head. Its scope goes into the head's
+   extensions and the context.
+6. **End user.** When the mode includes `bearer`, no link matched and the
    method is not anonymous, the authenticator runs, except for an
    `optional_end_user` method called without an `Authorization` header,
    which runs with no end user. On success the context carries the end
-   user.
-6. **Client limit by end user** (`end_user`, `end_user_or_client_addr`).
-7. **Hop limit.**
-8. **Call authorizer**, when one is registered
+   user, refused when the scope names a tenant the user does not name.
+7. **Client limit by end user** (`end_user`, `end_user_or_client_addr`).
+8. **Hop limit.**
+9. **Call authorizer**, when one is registered
    ([below](#how-to-authorize-calls-per-method)).
-9. Gate, bulkhead, method timeout and handler, exactly as for a link
-   caller.
+10. Gate, bulkhead, method timeout and handler, exactly as for a link
+    caller.
 
 ### Mount the routes for browsers
 
@@ -1003,6 +1101,229 @@ let server = Server::builder()
   receives the request head with its extensions, so it may read the
   `CallContext` the server stored there if you want to reuse that decision.
 - Global layers (`ServerBuilder::layer`) wrap component calls too; see
+  [Pitfalls and security](#pitfalls-and-security).
+
+## How to resolve a request scope
+
+A multi-tenant service needs the tenant, and often one of its resources (the
+tenant's database), before it can tell who the caller is: the host names the
+tenant, and the authenticator may need that tenant's user store. Register one
+**scope resolver** on the App. It reads the request head, before the caller is
+authenticated, and returns a `RequestScope`: the tenant and typed values
+that handlers read back from the context.
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+use sekvent::component::{RequestScope, ScopeResolver};
+
+#[derive(Clone)]
+struct TenantDb(sekvent::db::KeyedRef<sqlx::PgPool>);    // a type of your own per value
+
+struct Tenants { hosts: Arc<HostTable>, pools: KeyedPools<String> }
+
+impl ScopeResolver for Tenants {
+    fn resolve<'a>(&'a self, request: &'a http::request::Parts, _cx: &'a CallContext)
+        -> Pin<Box<dyn Future<Output = Result<RequestScope, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            let host = request.uri.host()                                           // HTTP/2
+                .or_else(|| request.headers.get(http::header::HOST)?.to_str().ok()) // HTTP/1.1, may carry a port
+                .ok_or_else(|| AppError::not_found("unknown site"))?;
+            let tenant = self.hosts.tenant_of(host).ok_or_else(|| AppError::not_found("unknown site"))?;
+            let pool = self.pools.get(&tenant).await?;
+            Ok(RequestScope::new().with_tenant(tenant).with_extension(TenantDb(pool)))
+        })
+    }
+}
+
+builder.scope_resolver(Tenants { hosts, pools })?;       // one per App; a second is a build error
+```
+
+A sync closure `Fn(&http::request::Parts, &CallContext) -> Result<RequestScope, AppError>`
+is a resolver too; implement the trait for resolution that needs I/O, as above.
+`cx` is the context decoded from the head, with the call's deadline.
+
+In a served method, anonymous ones included:
+
+```rust
+let TenantDb(pool) = cx.scoped::<TenantDb>().ok_or_else(|| AppError::internal("no request scope"))?;
+let tenant = cx.tenant();                                // what the scope set
+```
+
+The end-user authenticator reads the same scope from the head it is given:
+
+```rust
+builder.end_user_authenticator(|request: &http::request::Parts| {
+    let scope = request.extensions.get::<RequestScope>();   // None when the App has no resolver
+    // …
+})?;
+```
+
+### Where it runs
+
+| Call | Resolver | `cx.scope()` in the handler |
+|---|---|---|
+| served over gRPC or gRPC-Web, no link token matched: an end user, an `anonymous` method, an `optional_end_user` method with or without a header, any caller under `SERVE_AUTH=none` | runs once | `Some` |
+| served over gRPC to a link caller (`link`, or a matching token under `link,bearer`) | never | `None` |
+| `local`, `local-serialized` | never | `None` |
+| the caller side of `grpc` | never | |
+
+The scope belongs to the request that entered the system and reaches the
+handler that served it, nothing below it, like the end user and its
+extensions. A component called by another component, in the process or over
+a link, sees the tenant (`cx.tenant()`, which travels) and no scope. A
+handler that other components may call treats the scope as a shortcut:
+`cx.scoped::<TenantDb>()`, else `pools.get(tenant)`.
+
+The resolver runs after routing and the address-keyed client limit, so an
+unknown path and a flood from one address never cost a resolution, and
+before the end-user authenticator (see [the serving order](#serving-order-for-end-users)).
+Every later step sees the scope: the authenticator, the client limit by end
+user, the call authorizer and the handler. The body has not been read yet.
+
+| The resolver | The caller gets |
+|---|---|
+| is not registered | the call continues without a scope |
+| returns `Ok(scope)` | the call continues; the scope is in the head's extensions (as `RequestScope`) and in the context |
+| returns `Ok(scope)` whose tenant is not a valid tenant (empty, longer than 255 bytes, or anything but visible ASCII without spaces: `headers::is_valid_tenant`, the rule the header codec carries tenants by) | `INTERNAL` / `SCOPE_TENANT_INVALID`, "the scope resolver returned an invalid tenant"; the tenant is never shown and only its length is logged |
+| returns `Err(e)` | `e` unchanged: no tag, no metadata, no normalisation, also for `UNAUTHENTICATED`. The handler does not run and the body is not read |
+| outlives the call's deadline (for a stream, the open bound) | `DEADLINE_EXCEEDED`, "the call deadline was exceeded" |
+| is reached by a call whose deadline (or open bound) has already passed (`grpc-timeout: 0n`) | not run: `DEADLINE_EXCEEDED`, "the call deadline was exceeded" |
+| panics | `INTERNAL` / `HANDLER_PANICKED`, "the scope resolver of component `<name>` panicked"; the payload is never shown |
+
+The call's cancellation token (`cx.cancel_token()`) is guarded from the
+resolver on: a client that goes away, or a deadline that passes, while the
+resolver runs cancels it, so work the resolver spawned with it ends with the
+call. A stream hands the token over to its own guard once it is open, as
+before.
+
+### The tenant
+
+A tenant header the client sent is dropped before the resolver runs (only a
+trusted link's is kept, and no resolver runs for a link), and nothing reads a
+header into the context afterwards: **a tenant the resolver set cannot be
+replaced by a header**, on an authenticated call or an anonymous one.
+
+After the authenticator accepted a user, the framework applies the tenant
+rule, not each authenticator:
+
+| Scope's tenant | User's tenant | Outcome |
+|---|---|---|
+| none | any | the user's tenant, or none |
+| `S` | none | refused: `UNAUTHENTICATED` with `invalid or expired credentials`, no reason (fail closed: a user without a tenant is not admitted into whatever tenant the host names) |
+| `S` | `S` | the call runs with tenant `S` |
+| `S` | `U` ≠ `S` | refused: `UNAUTHENTICATED` with `invalid or expired credentials`, no reason: the same answer as a bad token, logged at `debug` without either value |
+
+What this guarantees: when the scope names a tenant, a call with an end user
+runs only for a user of that tenant, so `cx.tenant()` and
+`cx.end_user().tenant()` are both `S`. When the scope names none (or there
+is no scope), `cx.tenant()` is the user's tenant. Both hold for the
+component service and for a REST route that goes through
+`App::resolve_scope` and `admit_end_user`; a context built by hand with
+`with_scope` and `with_end_user` is not checked. A credential that is valid
+for another tenant tells its holder nothing; the refusal carries no reason
+even when the authenticator uses an
+[`EndUserRejection`](#what-a-rejected-end-user-sees). An authenticator that
+lets a user act across tenants (an operator) returns that user with the
+scope's tenant (it finds the scope in the head's extensions), or the
+resolver returns an empty scope for the routes such users call.
+
+### How long the scope lives
+
+A value in a scope lives as long as some clone of the scope does, so a
+`KeyedRef` placed there keeps its pool in use that long. The serving
+boundary guarantees this much:
+
+| Call | The scope is released |
+|---|---|
+| unary | after the handler returned, not before |
+| server-streaming | after the stream ended (it completed, failed, expired, was closed or was dropped by the consumer), not when the open returned |
+| REST route through `App::resolve_scope` | when the route drops the context it got back and every clone of it |
+
+A producer that does not capture the context therefore still runs with the
+scope in place. Code that keeps a clone of the context keeps the scope for
+that long too.
+
+### A resolver that looks at the route
+
+The resolver gets the request head, so `request.uri.path()` is the path the
+component service routed on, `/<package>.<Service>/<Rpc>`, without the
+server's prefix. One listener often serves methods that belong to a tenant
+next to methods that do not (an operator API, a sign-up call): return
+`RequestScope::new()` for those, so the resolver never opens a tenant's
+resources for a caller nobody has authorized yet. The call authorizer then
+decides on the context alone.
+
+### REST routes
+
+A REST route does not pass through the component service. It holds a clone
+of the `App` (usually as router state) and asks it for the scope itself:
+
+```rust
+use sekvent::component::admit_end_user;
+
+async fn list_orders(
+    State(app): State<App>,                 // a clone of the App
+    Ctx(cx): Ctx,                           // the context the runtime server attached
+    request: axum::extract::Request,
+) -> Result<Json<Orders>, AppError> {
+    let (parts, _body) = request.into_parts();
+    let cx = app.resolve_scope(&parts, cx).await?;         // tenant and extensions
+    let user = auth.end_user::<Profile>(&parts.headers)?;  // the route's own authentication
+    let cx = admit_end_user(cx, user)?;                    // the tenant rule above
+    // …
+}
+```
+
+- `cx` is returned unchanged when it names a service caller or the App has
+  no resolver. Otherwise the resolver runs within `cx`'s deadline
+  (`DEADLINE_EXCEEDED` once it has passed; it is not run at all when the
+  deadline had already passed) and `cx.with_scope(scope)` is returned. The
+  resolver's error is returned unchanged; a panic propagates like any code
+  of the route. A scope with an invalid tenant is `INTERNAL` /
+  `SCOPE_TENANT_INVALID`, as on the component service.
+- When `cx` already has an end user (the route authenticated before it
+  resolved), the tenant rule applies to that user: a scope that names a
+  tenant the user does not name is refused with `UNAUTHENTICATED` and
+  `invalid or expired credentials`.
+- It does **not** put the scope into `request`'s extensions (a route that
+  wants it there inserts `cx.scope().cloned()` itself) and does **not** run
+  the end-user authenticator: a route that authenticates after resolving
+  calls `admit_end_user`, the function the component service itself calls,
+  so both surfaces apply one rule. It returns `UNAUTHENTICATED` with
+  `invalid or expired credentials` for a user who does not name the
+  scope's tenant; otherwise `cx.with_end_user(user)`. Calling
+  `cx.with_end_user(user)` or `cx.with_scope(scope)` directly skips the
+  check.
+- The scope lives as long as the returned context and its clones; a route
+  that streams its response keeps a clone in the body.
+
+### Pitfalls
+
+- **The host.** HTTP/2 carries it in the URI (`request.uri.host()`),
+  HTTP/1.1 in the `host` header, which may include a port. Behind a proxy the
+  app decides which forwarded header it trusts and takes the tenant from
+  that one only; a client can send any header it likes.
+- **A resolver that opens resources runs before authentication.** Anyone who
+  can reach the listener can make it run: cache what it opens, bound what it
+  costs, and return an empty scope for routes that need no tenant.
+- **The scope is held while the body is read.** It is resolved from the head,
+  before the body is read and before the caller is authenticated, and kept
+  until the handler returned; reading the body has no timeout of its own
+  (only the call's deadline, if the client sent one, or the method's
+  `TIMEOUT`). A resolver that pins expensive per-tenant resources (a
+  `KeyedRef` from a pool cache) on anonymous calls therefore lets an
+  unauthenticated client hold them with a stalled body, or churn them by
+  cycling the `Host` through more tenants than the cache holds. Return an
+  empty scope for anonymous routes that do not need the tenant's resources,
+  put a rate limit by client address in front (`CLIENT_KEY=client_addr`
+  runs before the resolver), and size the cache's capacity for
+  the tenants that are in use at once.
+- **The per-end-user client limit keys on the subject alone.** With a user
+  store per tenant, equal subject ids in different tenants share one
+  budget under `CLIENT_KEY=end_user` (or `end_user_or_client_addr`). Make subjects unique across
+  tenants (prefix them with the tenant) if that matters.
+- **Nothing outlives the call by itself.** See
   [Pitfalls and security](#pitfalls-and-security).
 
 ## How to authorize calls per method
@@ -1553,6 +1874,7 @@ metadata the server sent.
 | `GRPC_NOT_MOUNTED` | `GRPC_NOT_MOUNTED` | `FAILED_PRECONDITION` | `start` with exposed components but no `grpc_routes()` |
 | `DOWNSTREAM_FAILURE` | `DOWNSTREAM_FAILURE` | `INTERNAL` | A transient failure further down the chain |
 | `HANDLER_PANICKED` | `HANDLER_PANICKED` | `INTERNAL` | A method panicked |
+| `SCOPE_TENANT_INVALID` | `SCOPE_TENANT_INVALID` | `INTERNAL` | The scope resolver returned a tenant that is not a valid tenant |
 
 The caller's own deadline gives a plain `DEADLINE_EXCEEDED` with no reason,
 also when it passes in the middle of a stream. Cancellation gives
@@ -1560,13 +1882,19 @@ also when it passes in the middle of a stream. Cancellation gives
 `UNAVAILABLE` / `COMPONENT_UNREACHABLE`; nothing retries it. A rejected link token gives
 `UNAUTHENTICATED` with no reason. A rejected end user gets
 `UNAUTHENTICATED` with `invalid or expired credentials` and no reason; other
-end-user authenticator errors pass through unchanged
-([details](#what-a-rejected-end-user-sees)). A call authorizer's error is
+end-user authenticator errors pass through unchanged; an
+`UNAUTHENTICATED` carries a reason only when the authenticator returned an
+`EndUserRejection`
+([details](#what-a-rejected-end-user-sees)). A scope resolver's error is the
+answer unchanged, a user who does not name the request scope's tenant
+(another one, or none) gets the constant answer, a scope with an invalid
+tenant gets `INTERNAL` / `SCOPE_TENANT_INVALID`, and a resolver that panics
+gets `INTERNAL` / `HANDLER_PANICKED`. A call authorizer's error is
 the answer unchanged, too; its panic is `INTERNAL` / `HANDLER_PANICKED`.
 
 The `BuildError` variants are `DuplicateInstall`, `DuplicateResource`,
-`DuplicateEndUserAuthenticator`, `EndUserAuthenticatorMissing { component,
-key }`, `DuplicateCallAuthorizer`, `CallAuthorizerRefused { component,
+`DuplicateEndUserAuthenticator`, `DuplicateScopeResolver`,
+`EndUserAuthenticatorMissing { component, key }`, `DuplicateCallAuthorizer`, `CallAuthorizerRefused { component,
 source }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
 `RemoteOnly`, `RemoteOnlyUnbound`, `NotServable`, `Factory` and `Multiple`
 (flat, never nested). The enum is `#[non_exhaustive]`.
@@ -1645,6 +1973,17 @@ source }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
   Anyone may call such a method, so `cx.end_user() == None` means "not
   signed in", never "trusted". Decide everything personal from
   `cx.end_user()`, never from a user id in the request message.
+- **A request scope is the request's, not the work's.** A component called
+  by another component, in the process or over a link, sees the tenant and no
+  scope: handle `cx.scoped::<T>()` being `None` (fall back to `cx.tenant()`).
+  Contexts made with `child()` or `detached()` carry no scope either, so work
+  that outlives the call (a spawned task, a queued job) must not carry a
+  value it cloned out of the scope, such as a pool taken from a `KeyedRef`:
+  the reference that kept it alive is released with the call. It takes its
+  own reference (`pools.get(tenant)`) and holds it while it runs.
+- **Resolve the tenant in the resolver, never from a task-local.** A
+  task-local does not follow a spawned task or a call into another component,
+  and a header read in a handler is a header the client chose.
 - **Global layers see component calls.** A `ServerBuilder::layer` that
   rejects requests without its own credentials also rejects link callers
   and anonymous or `optional_end_user` methods served on that listener. Put such a layer on the
