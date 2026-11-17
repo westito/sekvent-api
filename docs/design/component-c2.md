@@ -62,7 +62,7 @@
 |---|---|
 | TLS on component endpoints | `https://` endpoints are a build error naming the key; C2 assumes a private network or a TLS-terminating mesh (decision 3) |
 | Per-component caller allow-lists | every configured inbound link may call every exposed component |
-| Compression, message-size keys, keep-alive keys | a fixed 4 MiB request-message limit when serving, fixed keep-alive |
+| Compression, message-size keys, keep-alive keys | no keys: the served request-message limit is 4 MiB, lowered in code per App ([serve-admission.md](serve-admission.md)); fixed keep-alive |
 | Per-attempt timeouts, rate limits for components | `TIMEOUT` stays the whole call's deadline; `RATE_LIMIT_*` keys are unknown keys |
 | Shared component-wide bulkhead | component keys remain per-method defaults |
 | Several endpoints per component, client-side balancing | one URL per component; a load balancer or DNS in front |
@@ -162,8 +162,11 @@ server-side outcome. A reply that does not decode as `Rep` is `INTERNAL` /
 
 The generic service (`src/grpc/service.rs`) receives
 `http::Request<B>` for any body `B: http_body::Body<Data = Bytes>`.
-Steps 1–3 read only the request headers, so a call is refused before a
-byte of its body is read; request trailers never reach the context.
+Steps 1–3 read only the request headers, so a call they refuse never has
+its body read; request trailers never reach the context. The full serving
+order, with the end-user steps, the serve admission and the bounded request
+read that later came between steps 3 and 4, is
+[serve-admission.md](serve-admission.md) 4.
 
 1. **Route.** The router only reaches the service for an exposed
    component's path prefix; an unknown service path gets tonic's
@@ -191,9 +194,14 @@ byte of its body is read; request trailers never reach the context.
    shown); an error carrying `downstream` metadata becomes `INTERNAL` /
    `DOWNSTREAM_FAILURE` (2.3); every other error crosses unchanged.
 
-The body is decoded inside `tonic::server::Grpc::new(BytesCodec).unary(…)`
-with a 4 MiB message limit, so malformed framing, unsupported compression
-and oversized messages get tonic's standard answers.
+The body is first read whole, bounded in size and time
+([serve-admission.md](serve-admission.md)): the cap counts the bytes of the
+decoded body (for gRPC-Web, after the server's translation), one frame
+header plus `max_message_bytes` (4 MiB by default), so it applies to the
+message as it is on the wire, a compressed payload included. The buffered
+body is then decoded inside `tonic::server::Grpc::new(BytesCodec).unary(…)`,
+so malformed framing, invalid or unsupported compression, several frames
+and trailing data still get tonic's standard answers.
 
 ### 2.5 Interoperability
 

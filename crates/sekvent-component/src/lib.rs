@@ -119,12 +119,23 @@
 //! `#[call(optional_end_user)]` skip it only for a request without an
 //! `Authorization` header and otherwise authenticate the end user as usual.
 //!
+//! Before anything that costs, the App's [`EndUserPrecheck`] (by default
+//! [`BearerShape`]) refuses a call the authenticator would see whose head
+//! carries no well-formed credential. Every call no link token
+//! authenticated then takes a slot of the App's one [`ServeAdmission`]
+//! (`RESOURCE_EXHAUSTED` / [`reasons::ADMISSION_FULL`] when none is left)
+//! and keeps it until it reaches the component's gate. Every request is
+//! read whole, bounded in size and time, before the request scope is
+//! resolved, so neither a slow nor a large body holds what the scope
+//! resolver acquired.
+//!
 //! # Request scope
 //!
 //! [`AppBuilder::scope_resolver`] registers the App's one [`ScopeResolver`]:
 //! it resolves a [`RequestScope`] (the tenant and typed values such as the
 //! tenant's database) from the request head of every call served over gRPC
-//! that no link token authenticated, before the end-user authenticator.
+//! that no link token authenticated, once the call is admitted and its
+//! request read, before the end-user authenticator.
 //! Handlers read it with [`CallContext::scope`] and [`CallContext::scoped`];
 //! its tenant becomes [`CallContext::tenant`], no header can replace it, and
 //! an end user who does not name that tenant is refused
@@ -139,14 +150,15 @@
 //! this process serves, keyed by [`CallTarget`] (component and method) and
 //! given the context the handler will see. It runs under every binding and
 //! for every caller (end users, links, anonymous and in-process callers),
-//! after authentication and the hop limit and before the gate; under gRPC
-//! before the body is read. Its error is the caller's answer, unchanged.
+//! after authentication and the hop limit and before the gate. Its error
+//! is the caller's answer, unchanged.
 
 #![forbid(unsafe_code)]
 
 // Generated code names this crate `::sekvent_component`, inside it too.
 extern crate self as sekvent_component;
 
+mod admission;
 mod app;
 mod authorizer;
 mod binding;
@@ -171,11 +183,14 @@ mod wire;
 pub mod __private;
 pub mod reasons;
 
+pub use admission::ServeAdmission;
 pub use app::{App, AppBuilder, ComponentState, Deps};
 pub use authorizer::{CallAuthorizer, CallTarget};
 pub use binding::{Binding, ComponentMode};
 pub use descriptor::{ComponentDescriptor, ComponentHandle, MethodDescriptor, MethodKind};
-pub use end_user::{END_USER_REJECTED_MESSAGE, EndUserAuthenticator, EndUserRejection};
+pub use end_user::{
+    BearerShape, END_USER_REJECTED_MESSAGE, EndUserAuthenticator, EndUserPrecheck, EndUserRejection,
+};
 pub use error::{BuildError, ComponentError};
 pub use lifecycle::Lifecycle;
 pub use scope::{ScopeResolver, admit_end_user};

@@ -14,7 +14,8 @@ lifecycle), [component-c2.md](../design/component-c2.md) (gRPC and
 contracts), [component-end-user.md](../design/component-end-user.md)
 (serving components to end users) and
 [component-streaming.md](../design/component-streaming.md) (server-streaming
-methods). Most examples here come from
+methods); [serve-admission.md](../design/serve-admission.md) records the
+bounds a call meets before it is authenticated. Most examples here come from
 [`examples/shop`](../../examples/shop), a complete project with three
 components: inventory, notifications and orders.
 
@@ -673,19 +674,25 @@ let server = Server::builder()
   is safe to always mount. If a component is exposed but the routes were
   never taken, `app.start()` fails `FAILED_PRECONDITION` /
   `GRPC_NOT_MOUNTED`.
-- The order on the serving side is fixed, and everything up to the gate is
-  decided from the request **headers** before the body is read. The link
-  token is authenticated first; under `SERVE_AUTH=link` an unauthenticated
-  call gets `UNAUTHENTICATED` even for a method that does not exist. Then
-  exact routing: a path that is not `/<service>/<Rpc>` of a declared method
-  is `UNIMPLEMENTED` / `UNKNOWN_METHOD`. Then the context is decoded from
-  the headers (trailers are never trusted) and the deadline narrowed by the
-  method's timeout. Under the bearer modes the end user is authenticated
-  next ([below](#serving-order-for-end-users)). Then the hop limit is
-  checked, the [call authorizer](#how-to-authorize-calls-per-method) (if
-  any) decides, and the call passes the component's gate and bulkhead.
-- Requests are capped at 4 MiB, and so is each item of a served stream (a
-  larger item ends the stream with `OUT_OF_RANGE`). A handler panic, or a
+- The order on the serving side is fixed, and every caller is decided from
+  the request **headers** (trailers are never trusted). The link token is
+  authenticated first; under `SERVE_AUTH=link` an unauthenticated call gets
+  `UNAUTHENTICATED` even for a method that does not exist. Then exact
+  routing: a path that is not `/<service>/<Rpc>` of a declared method is
+  `UNIMPLEMENTED` / `UNKNOWN_METHOD`. Then the context is decoded from the
+  headers and the deadline narrowed by the method's timeout; the
+  address-keyed client limit and the hop limit are checked from the head
+  alone, before any end-user authentication. For a call no link token
+  authenticated, the end-user precheck and the App's serve admission come
+  next. The request is then read whole, bounded in size and time
+  ([below](#how-to-bound-what-a-call-costs-before-it-is-authenticated)),
+  before the scope resolver and the end-user authenticator run
+  ([serving order](#serving-order-for-end-users)). Then the
+  [call authorizer](#how-to-authorize-calls-per-method) (if any) decides,
+  and the call passes the component's gate and bulkhead.
+- Requests are capped at 4 MiB (`ServeAdmission::with_max_message_bytes`
+  lowers it), and so is each item of a served stream (a larger item ends
+  the stream with `OUT_OF_RANGE`). A handler panic, or a
   producer panic in a stream, answers `INTERNAL` / `HANDLER_PANICKED`, and
   the payload is never shown. A request body that
   does not decode is `INVALID_ARGUMENT` / `MALFORMED_REQUEST`.
@@ -754,8 +761,9 @@ needs at least one `SEKVENT_LINK_INBOUND_<CALLER>`, as before.
 ### Register the end-user authenticator
 
 The authenticator gets the request **head** only (`&http::request::Parts`:
-method, URI, headers, extensions); the body has not been read yet. It
-returns the `EndUser` or an `AppError`. Any sync closure is an
+method, URI, headers, extensions); serve admission has been acquired and the
+bounded request read has completed, followed by scope resolution. The authenticator
+cannot access the buffered body. It returns the `EndUser` or an `AppError`. Any sync closure is an
 authenticator:
 
 ```rust
@@ -1033,7 +1041,9 @@ over gRPC and gRPC-Web, `AppError::reason` through a handle), never on text.
 
 ### Serving order for end users
 
-Everything is still decided from the request head before the body is read:
+The checks that need only the request head come first; the request is then
+read whole, bounded, before anything that may cost (the scope resolver, the
+authenticator) runs:
 
 1. **Link.** When the mode includes `link`, the bearer token is compared
    with the inbound link tokens. A match makes the caller that link, and
@@ -1049,22 +1059,37 @@ Everything is still decided from the request head before the body is read:
 4. **Client limit by address.** A method with a `CLIENT_KEY=client_addr`
    limit ([below](#how-to-limit-each-client-of-a-served-method)) takes a
    permit here, so a flood is refused before any token is verified.
-5. **Request scope.** When the App has a
+5. **Hop limit**, from the head alone: a call over the limit is refused
+   before any end-user authentication.
+6. **End-user precheck.** For exactly the calls step 10 will authenticate,
+   the App's [`EndUserPrecheck`](#how-to-bound-what-a-call-costs-before-it-is-authenticated)
+   (by default `BearerShape`: one `Authorization: Bearer <token68>`)
+   looks at the head. A call without a credential of the right shape is
+   refused here, before it is admitted, read or resolved.
+7. **Serve admission.** A call no link token authenticated takes a slot of
+   the App's one [serve admission](#how-to-bound-what-a-call-costs-before-it-is-authenticated),
+   shared by every component the App serves, and one of its client
+   address's `max_pending_per_client` slots, without waiting; it keeps both
+   until step 12 is done. This is not the gate admission of step 13.
+8. **Request read.** The request body (for a stream, its request message)
+   is read whole, bounded by `max_message_bytes` and the read timeout, and
+   handed to the decoder afterwards.
+9. **Request scope.** When the App has a
    [scope resolver](#how-to-resolve-a-request-scope) and no link matched
    (whatever `SERVE_AUTH` says, and for anonymous and optional-end-user
    methods too), it runs on the request head. Its scope goes into the head's
    extensions and the context.
-6. **End user.** When the mode includes `bearer`, no link matched and the
-   method is not anonymous, the authenticator runs, except for an
-   `optional_end_user` method called without an `Authorization` header,
-   which runs with no end user. On success the context carries the end
-   user, refused when the scope names a tenant the user does not name.
-7. **Client limit by end user** (`end_user`, `end_user_or_client_addr`).
-8. **Hop limit.**
-9. **Call authorizer**, when one is registered
-   ([below](#how-to-authorize-calls-per-method)).
-10. Gate, bulkhead, method timeout and handler, exactly as for a link
-    caller.
+10. **End user.** When the mode includes `bearer`, no link matched and the
+    method is not anonymous, the authenticator runs, except for an
+    `optional_end_user` method called without an `Authorization` header,
+    which runs with no end user. On success the context carries the end
+    user, refused when the scope names a tenant the user does not name.
+11. **Client limit by end user** (`end_user`, `end_user_or_client_addr`).
+12. **Call authorizer**, when one is registered
+    ([below](#how-to-authorize-calls-per-method)).
+13. The serve admission slots are given back; then the gate (its own
+    admission and shedding), bulkhead, method timeout and handler, exactly
+    as for a link caller.
 
 ### Mount the routes for browsers
 
@@ -1175,27 +1200,36 @@ a link, sees the tenant (`cx.tenant()`, which travels) and no scope. A
 handler that other components may call treats the scope as a shortcut:
 `cx.scoped::<TenantDb>()`, else `pools.get(tenant)`.
 
-The resolver runs after routing and the address-keyed client limit, so an
-unknown path and a flood from one address never cost a resolution, and
-before the end-user authenticator (see [the serving order](#serving-order-for-end-users)).
+The resolver runs after routing, the address-keyed client limit, the
+end-user precheck, the serve admission and the request read, so an unknown
+path, a flood from one address, a call without a credential where one is
+required and a request that never arrives whole never cost a resolution;
+and before the end-user authenticator (see [the serving order](#serving-order-for-end-users)).
 Every later step sees the scope: the authenticator, the client limit by end
-user, the call authorizer and the handler. The body has not been read yet.
+user, the call authorizer and the handler. The request has been read whole
+by then, so a slow client cannot hold what the resolver acquired while it
+sends its body.
 
 | The resolver | The caller gets |
 |---|---|
 | is not registered | the call continues without a scope |
 | returns `Ok(scope)` | the call continues; the scope is in the head's extensions (as `RequestScope`) and in the context |
 | returns `Ok(scope)` whose tenant is not a valid tenant (empty, longer than 255 bytes, or anything but visible ASCII without spaces: `headers::is_valid_tenant`, the rule the header codec carries tenants by) | `INTERNAL` / `SCOPE_TENANT_INVALID`, "the scope resolver returned an invalid tenant"; the tenant is never shown and only its length is logged |
-| returns `Err(e)` | `e` unchanged: no tag, no metadata, no normalisation, also for `UNAUTHENTICATED`. The handler does not run and the body is not read |
+| returns `Err(e)` | `e` unchanged: no tag, no metadata, no normalisation, also for `UNAUTHENTICATED`. The handler does not run and the request is not decoded |
 | outlives the call's deadline (for a stream, the open bound) | `DEADLINE_EXCEEDED`, "the call deadline was exceeded" |
 | is reached by a call whose deadline (or open bound) has already passed (`grpc-timeout: 0n`) | not run: `DEADLINE_EXCEEDED`, "the call deadline was exceeded" |
 | panics | `INTERNAL` / `HANDLER_PANICKED`, "the scope resolver of component `<name>` panicked"; the payload is never shown |
 
 The call's cancellation token (`cx.cancel_token()`) is guarded from the
-resolver on: a client that goes away, or a deadline that passes, while the
-resolver runs cancels it, so work the resolver spawned with it ends with the
-call. A stream hands the token over to its own guard once it is open, as
-before.
+request read on: a client that goes away, or a deadline that passes, while
+the request is read or the resolver runs cancels it, so work the resolver
+spawned with it ends with the call. A client that goes away drops the
+resolver's future with everything it holds, and gives the serve admission
+slots back. Work that should finish anyway (a pool many later calls will need)
+belongs on a task of its own, bounded by a budget of its own; the
+[keyed resource cache](db.md#cache-any-resource-by-key-keyed) already finishes a creation when the
+`get` that started it is dropped. A stream hands the token over to its own
+guard once it is open, as before.
 
 ### The tenant
 
@@ -1305,19 +1339,20 @@ async fn list_orders(
   app decides which forwarded header it trusts and takes the tenant from
   that one only; a client can send any header it likes.
 - **A resolver that opens resources runs before authentication.** Anyone who
-  can reach the listener can make it run: cache what it opens, bound what it
-  costs, and return an empty scope for routes that need no tenant.
-- **The scope is held while the body is read.** It is resolved from the head,
-  before the body is read and before the caller is authenticated, and kept
-  until the handler returned; reading the body has no timeout of its own
-  (only the call's deadline, if the client sent one, or the method's
-  `TIMEOUT`). A resolver that pins expensive per-tenant resources (a
-  `KeyedRef` from a pool cache) on anonymous calls therefore lets an
-  unauthenticated client hold them with a stalled body, or churn them by
+  can reach the listener with a well-formed credential (or call an anonymous
+  method) can make it run: cache what it opens, bound what it costs, and
+  return an empty scope for routes that need no tenant.
+- **The scope is held until the handler returned.** It is resolved after the
+  request was read whole, so a stalled body never holds it, but a resolver
+  that pins expensive per-tenant resources (a `KeyedRef` from a pool cache)
+  on anonymous calls still lets an unauthenticated client churn them by
   cycling the `Host` through more tenants than the cache holds. Return an
   empty scope for anonymous routes that do not need the tenant's resources,
   put a rate limit by client address in front (`CLIENT_KEY=client_addr`
-  runs before the resolver), and size the cache's capacity for
+  runs before the resolver), size the
+  [serve admission](#how-to-bound-what-a-call-costs-before-it-is-authenticated)
+  and its per-client cap for what the resolver may hold at once, and size
+  the cache's capacity for
   the tenants that are in use at once.
 - **The per-end-user client limit keys on the subject alone.** With a user
   store per tenant, equal subject ids in different tenants share one
@@ -1382,8 +1417,8 @@ impl CallAuthorizer for Table {
 - **Where it runs.** On the serving side only, under every binding, for
   unary calls and stream opens:
   - served over gRPC and gRPC-Web: after authentication (link or end user),
-    the client limits and the hop limit, before the body is read and before
-    the gate;
+    the client limits, the hop limit and the request read, and before the
+    gate (the serve admission slot is still held while it decides);
   - `local`: in the caller's task, before the gate;
   - `local-serialized`: in the serving task, before the gate;
   - the caller side of a component bound `grpc` never asks; the process
@@ -1402,8 +1437,9 @@ impl CallAuthorizer for Table {
   unchanged: no `component` or `method` metadata is added and the code is
   not normalised, so a browser receives exactly the code, message, reason
   and metadata you chose. Use `PERMISSION_DENIED` (or `UNAUTHENTICATED`). A
-  denial takes no admission or bulkhead permit and does not count against
-  the breaker.
+  denial takes no gate admission or bulkhead permit and does not count
+  against the breaker; the call's serve admission slot is given back with
+  the answer.
 - **Synchronous.** Decide from the target and the context alone; no I/O.
   Load policies before building, or share them through a lock-free cell.
 - **Panics** are answered like a handler panic: `INTERNAL`
@@ -1448,8 +1484,9 @@ SEKVENT_COMPONENT_ACCOUNTS_SEND_CODE_CLIENT_KEY=client_addr
   decoding: a `client_addr` limit before the end-user authenticator, an
   `end_user*` limit right after it ([serving order](#serving-order-for-end-users)).
   A refused call gets `RESOURCE_EXHAUSTED` / `CLIENT_RATE_LIMITED` with
-  `retry_after` and `component`/`method` metadata; its body is not read
-  and the handler never runs. `grpc` callers never retry it, and their
+  `retry_after` and `component`/`method` metadata and the handler never
+  runs; a `client_addr` refusal comes before the request is read or
+  admitted, an `end_user*` refusal after. `grpc` callers never retry it, and their
   breaker does not count it.
 - **Fail closed.** A call without a key (no client address; no end user
   for `end_user`) counts against one shared unknown bucket.
@@ -1481,6 +1518,171 @@ let server = Server::builder().rest(rest).grpc_routes(app.grpc_routes());
 The layer answers a refused request `429` with `Retry-After`. It keys by
 the `CallContext` the server put into the request extensions, so it sees
 the same client address as the gRPC path.
+
+## How to bound what a call costs before it is authenticated
+
+The [scope resolver](#how-to-resolve-a-request-scope) and the end-user
+authenticator run for callers nobody has vouched for yet, and either may do
+I/O. Three bounds stand in front of them on every call served over gRPC or
+gRPC-Web ([serving order](#serving-order-for-end-users)): a cheap check of
+the credential on the head, a serve admission shared by every component the
+App serves and capped per client address, and the request read whole,
+bounded in size and time. The serve admission is not the gate admission a
+call meets later at the component's gate (draining, shedding, the
+bulkhead): it ends before the gate. The defaults apply without any code;
+set other bounds on the builder:
+
+```rust
+use std::time::Duration;
+use sekvent::component::ServeAdmission;
+
+builder.serve_admission(
+    ServeAdmission::new()
+        .with_max_pending(256)                       // calls admitted at once, App-wide
+        .with_max_pending_per_client(16)             // of those, at once per client address
+        .with_read_timeout(Duration::from_secs(5))   // to receive the request whole
+        .with_max_message_bytes(1024 * 1024),        // the largest request message
+)?;
+```
+
+| Bound | Default | Refusal |
+|---|---|---|
+| `max_pending` | `ServeAdmission::DEFAULT_MAX_PENDING` (512) | `RESOURCE_EXHAUSTED` / `ADMISSION_FULL`, `component` and `method` metadata |
+| `max_pending_per_client` | `ServeAdmission::DEFAULT_MAX_PENDING_PER_CLIENT` (32) | `RESOURCE_EXHAUSTED` / `ADMISSION_FULL`, `component` and `method` metadata |
+| `read_timeout` | `ServeAdmission::DEFAULT_READ_TIMEOUT` (10 s; at most `ServeAdmission::MAX_READ_TIMEOUT`, 5 min) | `DEADLINE_EXCEEDED` / `REQUEST_READ_TIMEOUT`, metadata `timeout_ms` |
+| `max_message_bytes` | `ServeAdmission::MAX_MESSAGE_BYTES` (4 MiB, also the largest allowed) | `OUT_OF_RANGE` / `REQUEST_TOO_LARGE`, metadata `max_bytes` |
+
+`serve_admission` returns `BuildError::InvalidServeAdmission` for
+`max_pending` 0 (or above tokio's semaphore limit),
+`max_pending_per_client` 0, a zero `read_timeout` or one above 5 min, and
+`max_message_bytes` 0 or above 4 MiB. A later call replaces an earlier
+one. There are no configuration keys for these bounds: they are capacity
+decisions of the service, like the resolver itself.
+
+### The serve admission
+
+- **One per App.** Every component the App serves shares it, so a listener
+  that mounts `app.grpc_routes()` has one bound across all its public
+  methods. A [second App](#a-second-app-on-one-runtime) has its own.
+- **Who takes a slot.** Every call no link token authenticated: end users,
+  `anonymous` and `optional_end_user` methods, any caller under
+  `SERVE_AUTH=none`. Each takes one shared slot and one of its client
+  address's slots. Link callers never do, so end-user load cannot crowd
+  out the services that call this one.
+- **Per client address.** At most `max_pending_per_client` calls of one
+  address are admitted at once. The address is `cx.client_addr()`, keyed
+  as a `CLIENT_KEY=client_addr` limit keys it (canonical IPv4 or IPv6 /64);
+  every call without a known address shares one bucket. An address's entry exists only while it holds
+  a slot, and both slots are released together however the call ends,
+  cancellation included.
+- **No queue.** When every slot is taken, or the client's share is, the
+  call is refused at once; a
+  queue would hold exactly the connections the bound is there to limit.
+  A client backs off as for `BULKHEAD_FULL`.
+- **How long.** From after the precheck until the call reaches the
+  component's gate: the request read, the scope resolver, the
+  authenticator, the end-user-keyed client limit and the call authorizer.
+  A call answered earlier, or dropped because the client went away, gives
+  its slots back at once. The gate, the bulkhead and the handler come after
+  it, and a stream's response is outside it.
+- **Sizing.** Count what one call may hold between admission and gate (a
+  connection of a tenant's pool the resolver opened, a session lookup) and
+  size `max_pending` so that many of them at once is affordable. The
+  per-client cap, set below `max_pending`, keeps one address from taking
+  every slot; the
+  address-keyed `CLIENT_*` limit, which runs first, bounds how often an
+  address starts calls, not how many slow ones it holds.
+- **Slow bodies and many addresses.** The per-client cap and the read
+  timeout are the framework's part. Rate limits alone bound neither the
+  slow requests in flight nor an attack spread over many addresses: put a
+  gateway in front that buffers request bodies or enforces its own body
+  deadlines, and let it forward the client address through a trusted path
+  ([resolve the client address](server.md#resolve-the-client-address)).
+  Behind a gateway whose address is not resolved past, every caller shares
+  one address and one per-client cap.
+
+### The request read
+
+- **Whole, before the resolver.** The request body of a unary call, and the
+  request message of a server-streaming call, is read completely, then
+  handed to tonic as one buffered body: framing, decoding and its errors
+  (`INVALID_ARGUMENT` / `MALFORMED_REQUEST`) stay as they were, natively
+  and over gRPC-Web. Request trailers are dropped; they were never read.
+- **Size.** The cap counts the bytes of the request body the service
+  receives (for gRPC-Web, after the server's translation): one frame, the
+  5-byte frame header plus `max_message_bytes`. It applies to the message
+  as sent, so a compressed message counts with its compressed size; tonic
+  still answers invalid or unsupported compression, a second frame and
+  trailing data when it decodes the buffered body. A larger request is
+  refused as soon as its 5-byte frame header declares an oversized message,
+  even if truncated, or as soon as bytes read pass the body limit. Wire
+  size hints are ignored: gRPC-Web text yields decoded bytes but retains a
+  base64 wire-size hint. One buffer is reserved from the declared length;
+  the rest of an oversized body is never read.
+- **Time.** `read_timeout` counts from the start of the read. The call's
+  own bound (the caller's deadline, the method's `TIMEOUT`, for a stream
+  its open bound) applies too; whichever passes first answers. The call's
+  own deadline gives the plain `DEADLINE_EXCEEDED` without a reason (also
+  on a tie), so a client can tell the server's read bound from its own.
+- **Every caller.** Link callers are read under the same bounds, the read
+  timeout included, without a slot.
+- **A broken body** (a reset stream, a malformed gRPC-Web body) is answered
+  as tonic answers it.
+
+### The end-user precheck
+
+The precheck is a synchronous hook on the request head that runs for
+exactly the calls the end-user authenticator will see: under a bearer mode,
+no link token matched, the method is not `anonymous`, and for an
+`optional_end_user` method only when an `Authorization` header was sent. It
+runs before the serve admission, so a call it refuses takes no slot, is not
+read and is never resolved. Without one, the App uses `BearerShape`:
+exactly one `Authorization` header of the form `Bearer <token68>`; a second
+`Authorization` header, another scheme or a token outside token68 is
+refused with the constant answer, before the authenticator sees it.
+
+An App whose credentials have a shape of their own checks it here (any
+`Fn(&http::request::Parts, CallTarget) -> Result<(), AppError>`, or the
+`EndUserPrecheck` trait):
+
+```rust
+use sekvent::component::{BearerShape, CallTarget};
+
+builder.end_user_precheck(|request: &http::request::Parts, _target: CallTarget| {
+    match BearerShape::token(&request.headers) {
+        Some(token) if token.starts_with("bil_") => Ok(()),   // a billing access token
+        _ => Err(AppError::unauthenticated("not a billing token")),
+    }
+})?;                                                          // one per App
+```
+
+- **Cheap and without I/O.** Decide from the head alone; anything that
+  needs a store belongs in the authenticator, inside the admission.
+- **Its answer** is the authenticator's: `UNAUTHENTICATED` reaches the
+  caller as the constant `invalid or expired credentials` (an
+  [`EndUserRejection`](#what-a-rejected-end-user-sees) keeps its reason and
+  domain), any other code unchanged, message included, so never format a
+  header value into the error. A panic is `INTERNAL` / `HANDLER_PANICKED`;
+  the payload is never shown to the caller, and the process's panic hook
+  still reports it.
+- **`CallTarget`** names the component and the method, so one precheck can
+  treat components differently.
+- A second precheck is `BuildError::DuplicateEndUserPrecheck`.
+
+### What changes for an existing App
+
+- The default precheck accepts only `Bearer <token68>`; an authenticator
+  that takes another credential needs its own precheck.
+- A request with two `Authorization` headers is refused.
+- Link callers' requests are bounded by `read_timeout` too.
+- A call without a well-formed credential gets the constant
+  `UNAUTHENTICATED` from the precheck; the authenticator no longer sees
+  it, so whatever it answered for a missing credential (an
+  `EndUserRejection` reason, another code) is replaced. Return that answer
+  from your own precheck to keep it.
+- One client address holds at most `max_pending_per_client` calls (32)
+  between admission and the gate; behind a gateway that does not forward
+  the client address, all callers share that cap.
 
 ## How to stream replies (`#[call(stream)]`)
 
@@ -1619,7 +1821,7 @@ level.
 ### Lifetime
 
 Every stream has a lifetime, enforced where the component runs (the local
-bindings and gRPC serving), counted from admission:
+bindings and gRPC serving), counted from its admission at the gate:
 
 - the default is `DEFAULT_STREAM_MAX_LIFETIME`, 15 minutes;
 - `#[call(stream, max_lifetime = "1h")]` sets the method's default;
@@ -1875,6 +2077,9 @@ metadata the server sent.
 | `DOWNSTREAM_FAILURE` | `DOWNSTREAM_FAILURE` | `INTERNAL` | A transient failure further down the chain |
 | `HANDLER_PANICKED` | `HANDLER_PANICKED` | `INTERNAL` | A method panicked |
 | `SCOPE_TENANT_INVALID` | `SCOPE_TENANT_INVALID` | `INTERNAL` | The scope resolver returned a tenant that is not a valid tenant |
+| `ADMISSION_FULL` | `ADMISSION_FULL` | `RESOURCE_EXHAUSTED` | Every slot of the App's [serve admission](#the-serve-admission) is taken, or the client address holds `max_pending_per_client` calls; never for link callers. Not a gate refusal |
+| `REQUEST_TOO_LARGE` | `REQUEST_TOO_LARGE` | `OUT_OF_RANGE` | The request is larger than `max_message_bytes`; metadata `max_bytes` |
+| `REQUEST_READ_TIMEOUT` | `REQUEST_READ_TIMEOUT` | `DEADLINE_EXCEEDED` | The request did not arrive whole within the read timeout; metadata `timeout_ms` |
 
 The caller's own deadline gives a plain `DEADLINE_EXCEEDED` with no reason,
 also when it passes in the middle of a stream. Cancellation gives
@@ -1890,10 +2095,13 @@ answer unchanged, a user who does not name the request scope's tenant
 (another one, or none) gets the constant answer, a scope with an invalid
 tenant gets `INTERNAL` / `SCOPE_TENANT_INVALID`, and a resolver that panics
 gets `INTERNAL` / `HANDLER_PANICKED`. A call authorizer's error is
-the answer unchanged, too; its panic is `INTERNAL` / `HANDLER_PANICKED`.
+the answer unchanged, too; its panic is `INTERNAL` / `HANDLER_PANICKED`. An
+end-user precheck's error is answered like the authenticator's: its
+`UNAUTHENTICATED` as the constant answer, any other error unchanged.
 
 The `BuildError` variants are `DuplicateInstall`, `DuplicateResource`,
-`DuplicateEndUserAuthenticator`, `DuplicateScopeResolver`,
+`DuplicateEndUserAuthenticator`, `DuplicateEndUserPrecheck`,
+`DuplicateScopeResolver`, `InvalidServeAdmission { reason }`,
 `EndUserAuthenticatorMissing { component, key }`, `DuplicateCallAuthorizer`, `CallAuthorizerRefused { component,
 source }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
 `RemoteOnly`, `RemoteOnlyUnbound`, `NotServable`, `Factory` and `Multiple`
@@ -2014,6 +2222,19 @@ source }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
   longer sends its own heartbeat items (for example a `oneof` in the item
   message), or the client reopens it. There is no idle timeout of the
   framework's own.
+- **The precheck must match the authenticator.** The default
+  `BearerShape` accepts exactly one `Authorization: Bearer <token68>` header;
+  duplicate headers and tokens outside token68 are refused before the
+  authenticator sees them. Its constant missing-credential rejection replaces
+  the authenticator's previous answer. An authenticator that reads another
+  credential (a cookie, a header of its own) needs an `end_user_precheck`
+  that accepts it. On upgrade, also account for the 32-call per-client cap
+  and the read timeout applying to link callers; see
+  [What changes for an existing App](#what-changes-for-an-existing-app).
+- **Work that should outlive the client.** A client that goes away during
+  the request read or the resolver drops the call's future: the resolver's
+  work stops there. Start what must finish anyway on a task of its own,
+  with a budget of its own.
 - **Credentials are not re-checked during a stream.** A token that expires
   or is revoked after the open does not end the stream; its lifetime does.
   Keep `STREAM_MAX_LIFETIME` no longer than your access tokens (and link

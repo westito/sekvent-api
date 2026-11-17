@@ -15,9 +15,10 @@ use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 
 use crate::__private::Dispatch;
+use crate::admission::ServeAdmission;
 use crate::authorizer::CallAuthorizer;
 use crate::config::{self, Entry, Resolved, Settings};
-use crate::end_user::EndUserAuthenticator;
+use crate::end_user::{EndUserAuthenticator, EndUserPrecheck};
 use crate::lifecycle::LifecycleDyn;
 use crate::link::Link;
 use crate::scope::ScopeResolver;
@@ -88,8 +89,10 @@ pub struct AppBuilder<'a> {
     installs: Vec<Install>,
     resources: HashMap<TypeId, Resource>,
     end_user: Option<Arc<dyn EndUserAuthenticator>>,
+    precheck: Option<Arc<dyn EndUserPrecheck>>,
     authorizer: Option<Arc<dyn CallAuthorizer>>,
     scope: Option<Arc<dyn ScopeResolver>>,
+    admission: ServeAdmission,
 }
 
 impl AppBuilder<'_> {
@@ -127,6 +130,38 @@ impl AppBuilder<'_> {
             return Err(BuildError::DuplicateEndUserAuthenticator);
         }
         self.end_user = Some(Arc::new(authenticator));
+        Ok(())
+    }
+
+    /// Register the App's end-user precheck: the cheap check of the
+    /// credential on the request head that every call the end-user
+    /// authenticator will see passes before it is admitted, before its
+    /// request is read and before the scope resolver runs. One per App; a
+    /// second is [`BuildError::DuplicateEndUserPrecheck`]. Without one the
+    /// App uses [`BearerShape`](crate::BearerShape).
+    pub fn end_user_precheck(&mut self, precheck: impl EndUserPrecheck) -> Result<(), BuildError> {
+        if self.precheck.is_some() {
+            return Err(BuildError::DuplicateEndUserPrecheck);
+        }
+        self.precheck = Some(Arc::new(precheck));
+        Ok(())
+    }
+
+    /// Bound what the calls this App serves over gRPC may cost before
+    /// their scope is resolved and their end user authenticated: one
+    /// admission shared by every served component, and the size and the
+    /// read time of every request. Optional (the defaults of
+    /// [`ServeAdmission::new`] apply); a later call replaces an earlier one.
+    ///
+    /// Bounds out of range are [`BuildError::InvalidServeAdmission`]:
+    /// `max_pending` 0 (or more than the admission can count), a zero
+    /// `read_timeout`, `max_message_bytes` 0 or above
+    /// [`ServeAdmission::MAX_MESSAGE_BYTES`].
+    pub fn serve_admission(&mut self, admission: ServeAdmission) -> Result<(), BuildError> {
+        if let Some(reason) = admission.problem() {
+            return Err(BuildError::InvalidServeAdmission { reason });
+        }
+        self.admission = admission;
         Ok(())
     }
 
@@ -203,6 +238,7 @@ impl AppBuilder<'_> {
         let mut handles: Vec<Option<Handle>> = Vec::with_capacity(self.installs.len());
         let mut parts = Vec::with_capacity(self.installs.len());
         let mut exposed = Vec::new();
+        let serving = self.serving();
         for (position, (install, resolved)) in self
             .installs
             .into_iter()
@@ -264,8 +300,7 @@ impl AppBuilder<'_> {
                     serve,
                     &server,
                     built.dispatch.clone(),
-                    self.end_user.as_ref(),
-                    self.scope.as_ref(),
+                    &serving,
                 )?);
             }
             handles.push(Some(built.handle));
@@ -299,6 +334,17 @@ impl AppBuilder<'_> {
 }
 
 impl AppBuilder<'_> {
+    /// What every exposed component is served with, one admission for all.
+    fn serving(&self) -> Serving {
+        Serving {
+            end_user: self.end_user.clone(),
+            precheck: self.precheck.clone(),
+            scope: self.scope.clone(),
+            #[cfg(feature = "grpc")]
+            admission: Arc::new(crate::grpc::service::Admission::new(self.admission)),
+        }
+    }
+
     /// The resolved configuration, or every configuration error and every
     /// refusal of the call authorizer.
     fn settings(&self) -> Result<config::Settings, BuildError> {
@@ -439,6 +485,17 @@ impl<'s> Remotes<'s> {
     }
 }
 
+/// What every component the App exposes over gRPC is served with.
+#[cfg_attr(not(feature = "grpc"), allow(dead_code))]
+struct Serving {
+    end_user: Option<Arc<dyn EndUserAuthenticator>>,
+    precheck: Option<Arc<dyn EndUserPrecheck>>,
+    scope: Option<Arc<dyn ScopeResolver>>,
+    /// One admission for all of them.
+    #[cfg(feature = "grpc")]
+    admission: Arc<crate::grpc::service::Admission>,
+}
+
 /// One component exposed over gRPC.
 struct Exposed {
     component: &'static str,
@@ -458,8 +515,7 @@ fn expose(
     serve: &config::Serve,
     server: &Arc<Server>,
     dispatch: Option<Arc<dyn Dispatch>>,
-    end_user: Option<&Arc<dyn EndUserAuthenticator>>,
-    scope: Option<&Arc<dyn ScopeResolver>>,
+    serving: &Serving,
 ) -> Result<Exposed, BuildError> {
     let Some(dispatch) = dispatch else {
         return Err(BuildError::NotServable {
@@ -478,7 +534,7 @@ fn expose(
     };
     // The configuration already refused bearer serving without one.
     let end_user = if serve.auth.bearer {
-        end_user.cloned()
+        serving.end_user.clone()
     } else {
         None
     };
@@ -487,14 +543,16 @@ fn expose(
         key: serve.key.clone(),
         service: crate::grpc::service_name(descriptor),
         served: Arc::new(
-            crate::grpc::service::Served::new(
+            crate::grpc::service::Served::with_shared_admission(
                 Arc::clone(server),
                 dispatch,
                 inbound,
                 settings.max_hops,
+                Arc::clone(&serving.admission),
             )
             .with_end_user(end_user)
-            .with_scope_resolver(scope.cloned()),
+            .with_precheck(serving.precheck.clone())
+            .with_scope_resolver(serving.scope.clone()),
         ),
     })
 }
@@ -507,8 +565,7 @@ fn expose(
     serve: &config::Serve,
     _server: &Arc<Server>,
     _dispatch: Option<Arc<dyn Dispatch>>,
-    _end_user: Option<&Arc<dyn EndUserAuthenticator>>,
-    _scope: Option<&Arc<dyn ScopeResolver>>,
+    _serving: &Serving,
 ) -> Result<Exposed, BuildError> {
     Ok(Exposed {
         component: descriptor.name(),
@@ -536,8 +593,10 @@ impl fmt::Debug for AppBuilder<'_> {
             .field("components", &components)
             .field("resources", &resources)
             .field("end_user_authenticator", &self.end_user.is_some())
+            .field("end_user_precheck", &self.precheck.is_some())
             .field("call_authorizer", &self.authorizer.is_some())
             .field("scope_resolver", &self.scope.is_some())
+            .field("serve_admission", &self.admission)
             .finish_non_exhaustive()
     }
 }
@@ -679,8 +738,10 @@ impl App {
             installs: Vec::new(),
             resources: HashMap::new(),
             end_user: None,
+            precheck: None,
             authorizer: None,
             scope: None,
+            admission: ServeAdmission::new(),
         }
     }
 

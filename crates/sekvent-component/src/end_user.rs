@@ -9,13 +9,15 @@ use http::request::Parts;
 use sekvent_context::EndUser;
 use sekvent_error::{AppError, ErrorCode};
 
+use crate::CallTarget;
+
 /// The message of every end-user authentication failure: one answer for a
 /// missing, malformed, expired or unknown credential.
 pub const END_USER_REJECTED_MESSAGE: &str = "invalid or expired credentials";
 
 /// Authenticates the end users of components served with
 /// `SEKVENT_COMPONENT_<C>_SERVE_AUTH=bearer` or `link,bearer`, from the
-/// request head alone (the body is not read yet).
+/// request head.
 ///
 /// Register one per App with
 /// [`AppBuilder::end_user_authenticator`](crate::AppBuilder::end_user_authenticator).
@@ -30,8 +32,10 @@ pub const END_USER_REJECTED_MESSAGE: &str = "invalid or expired credentials";
 /// that is down) reaches it unchanged. The authenticator runs within the
 /// call's deadline.
 ///
-/// The App's [`ScopeResolver`](crate::ScopeResolver), when it has one, has
-/// run before it: the resolved scope is in `request.extensions`
+/// The App's [`EndUserPrecheck`] has accepted the request head before it,
+/// the request has been read whole (the authenticator never sees the
+/// body), and the App's [`ScopeResolver`](crate::ScopeResolver), when it
+/// has one, has run: the resolved scope is in `request.extensions`
 /// (`request.extensions.get::<RequestScope>()`). When that scope names a
 /// tenant, a user the authenticator accepts who does not name the same
 /// tenant (another one, or none) is refused like a bad credential
@@ -60,6 +64,108 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<EndUser, AppError>> + Send + 'a>> {
         Box::pin(std::future::ready(self(request)))
     }
+}
+
+/// A cheap check of the end-user credential on the request head, made
+/// before anything that costs: before the call is admitted, before its
+/// request is read and before the App's scope resolver runs.
+///
+/// It runs for exactly the calls the [`EndUserAuthenticator`] will see
+/// (`SERVE_AUTH` includes `bearer`, no link token matched, the method is not
+/// `#[call(anonymous)]`, and an `#[call(optional_end_user)]` method only
+/// when the request carries an `Authorization` header), on the head alone,
+/// synchronously. Its job is to refuse what can never be a credential (no
+/// header, a malformed one, another scheme) before such a call takes any
+/// shared capacity; the authenticator still decides everything else.
+///
+/// Register one per App with
+/// [`AppBuilder::end_user_precheck`](crate::AppBuilder::end_user_precheck);
+/// without one the App uses [`BearerShape`]. A sync closure
+/// `Fn(&http::request::Parts, CallTarget) -> Result<(), AppError>` is a
+/// precheck. It must not block or do I/O: look at the headers, never at a
+/// store.
+///
+/// Its error is answered like the authenticator's: `UNAUTHENTICATED`
+/// becomes the constant answer ([`END_USER_REJECTED_MESSAGE`], or an
+/// [`EndUserRejection`]'s reason and domain), any other code passes
+/// unchanged, and a panic is `INTERNAL` /
+/// [`HANDLER_PANICKED`](crate::reasons::HANDLER_PANICKED).
+///
+/// # Warning
+///
+/// Only `UNAUTHENTICATED` is replaced by the constant answer. An error with
+/// any other code reaches the caller exactly as returned: its message,
+/// reason and metadata included. Never put a header value, a token or
+/// anything else read from the request into such an error (`format!` of a
+/// header included); return a fixed message, or refuse with
+/// [`EndUserRejection`]. A panic is caught and answered without its
+/// payload, but it still goes through the process's panic hook first, which
+/// by default prints the panic message: do not panic with request data in
+/// the message either.
+pub trait EndUserPrecheck: Send + Sync + 'static {
+    /// `Ok` lets the call go on to its admission; `Err` is the answer.
+    fn precheck(&self, request: &Parts, target: CallTarget) -> Result<(), AppError>;
+}
+
+impl<F> EndUserPrecheck for F
+where
+    F: Fn(&Parts, CallTarget) -> Result<(), AppError> + Send + Sync + 'static,
+{
+    fn precheck(&self, request: &Parts, target: CallTarget) -> Result<(), AppError> {
+        self(request, target)
+    }
+}
+
+/// The default [`EndUserPrecheck`]: the request carries exactly one
+/// `Authorization` header, and it reads `Bearer <token>`, the scheme in any
+/// case, one or more spaces, and a token68 (letters, digits,
+/// `-._~+/`, then optional `=` padding) up to the end.
+///
+/// Anything else is refused with `UNAUTHENTICATED`, which the caller sees
+/// as the constant [`END_USER_REJECTED_MESSAGE`], the same answer as for a
+/// token the authenticator rejects. An App whose authenticator accepts
+/// another kind of credential registers its own precheck.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BearerShape;
+
+impl BearerShape {
+    /// The token of the request's one well-formed `Authorization: Bearer`
+    /// header; `None` when there is no such header, more than one, or one
+    /// that is not visible ASCII, names another scheme or carries no
+    /// token68.
+    pub fn token(headers: &http::HeaderMap) -> Option<&str> {
+        let mut values = headers.get_all(http::header::AUTHORIZATION).iter();
+        let value = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        let (scheme, rest) = value.to_str().ok()?.split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+        let token = rest.trim_start_matches(' ');
+        is_token68(token).then_some(token)
+    }
+}
+
+impl EndUserPrecheck for BearerShape {
+    fn precheck(&self, request: &Parts, _target: CallTarget) -> Result<(), AppError> {
+        match Self::token(&request.headers) {
+            Some(_) => Ok(()),
+            None => Err(AppError::unauthenticated(
+                "the request carries no well-formed bearer credential",
+            )),
+        }
+    }
+}
+
+/// `1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`.
+fn is_token68(token: &str) -> bool {
+    let body = token.trim_end_matches('=');
+    !body.is_empty()
+        && body.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
 }
 
 /// A refusal of an end user whose reason the caller is told.
@@ -196,6 +302,84 @@ mod tests {
         assert_eq!(user.subject(), "user-7");
         let error = authenticator.authenticate(&parts(None)).await.unwrap_err();
         assert_eq!(error.message(), "no token");
+    }
+
+    const METHODS: &[crate::MethodDescriptor] = &[crate::MethodDescriptor::call("place", "Place")];
+    const ORDERS: &crate::ComponentDescriptor =
+        &crate::ComponentDescriptor::new("orders", "Orders", METHODS);
+
+    fn place() -> CallTarget {
+        CallTarget::new(ORDERS, 0).unwrap()
+    }
+
+    #[test]
+    fn the_bearer_shape_accepts_one_bearer_token68() {
+        for (value, token) in [
+            ("Bearer user-7", "user-7"),
+            ("bearer abc.DEF_ghi~jk+l/m", "abc.DEF_ghi~jk+l/m"),
+            ("BEARER   dG9rZW4=", "dG9rZW4="),
+            ("Bearer eyJh.eyJz.c2ln==", "eyJh.eyJz.c2ln=="),
+        ] {
+            let request = parts(Some(value));
+            assert_eq!(BearerShape::token(&request.headers), Some(token), "{value}");
+            BearerShape.precheck(&request, place()).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_bearer_shape_refuses_anything_else() {
+        let mut twice = parts(Some("Bearer one"));
+        twice
+            .headers
+            .append(http::header::AUTHORIZATION, "Bearer two".parse().unwrap());
+        let mut opaque = parts(None);
+        opaque.headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_bytes(b"Bearer t\xffoken").unwrap(),
+        );
+        let mut cases = vec![parts(None), twice, opaque];
+        for value in [
+            "",
+            "Bearer",
+            "Bearer ",
+            "Bearer  ",
+            "Basic dXNlcg==",
+            "Bearertoken",
+            "Bearer\ttoken",
+            "Bearer to ken",
+            "Bearer token ",
+            "Bearer =abc",
+            "Bearer ===",
+            "Bearer to=ken",
+            "Bearer tök",
+            "Bearer to,ken",
+        ] {
+            cases.push(parts(Some(value)));
+        }
+        for request in cases {
+            assert_eq!(BearerShape::token(&request.headers), None, "{request:?}");
+            let error = BearerShape.precheck(&request, place()).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::Unauthenticated);
+            assert_eq!(rejection(error).message(), END_USER_REJECTED_MESSAGE);
+        }
+        assert_eq!(format!("{BearerShape:?}"), "BearerShape");
+    }
+
+    #[test]
+    fn a_closure_is_a_precheck() {
+        let precheck = |request: &Parts, target: CallTarget| {
+            if target.method().name() == "place" && request.headers.contains_key("x-api-key") {
+                Ok(())
+            } else {
+                Err(AppError::from(EndUserRejection::new("API_KEY_REQUIRED")))
+            }
+        };
+        let mut keyed = parts(None);
+        keyed.headers.insert("x-api-key", "k-1".parse().unwrap());
+        precheck.precheck(&keyed, place()).unwrap();
+        let error = rejection(precheck.precheck(&parts(None), place()).unwrap_err());
+        assert_eq!(error.message(), END_USER_REJECTED_MESSAGE);
+        assert_eq!(error.reason(), Some("API_KEY_REQUIRED"));
     }
 
     #[test]

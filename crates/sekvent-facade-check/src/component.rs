@@ -517,6 +517,51 @@ mod tests {
         assert_eq!(error.domain(), Some("accounts"));
     }
 
+    /// A precheck that lets every request through. Generic over the request
+    /// head, as [`acme`] is.
+    #[allow(clippy::unnecessary_wraps)]
+    fn open<P>(_request: &P, _target: sekvent::component::CallTarget) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_serve_admission_and_the_precheck_are_set_on_the_builder() {
+        use sekvent::component::{BearerShape, EndUserPrecheck, ServeAdmission};
+
+        /// Compiles only for an [`EndUserPrecheck`].
+        fn precheck(precheck: impl EndUserPrecheck) -> impl EndUserPrecheck {
+            precheck
+        }
+
+        let source = MapSource::new();
+        let mut builder = App::builder(&source);
+        let bounds = ServeAdmission::new()
+            .with_max_pending(64)
+            .with_read_timeout(Duration::from_secs(5))
+            .with_max_message_bytes(ServeAdmission::MAX_MESSAGE_BYTES / 4);
+        builder.serve_admission(bounds).unwrap();
+        let error = builder
+            .serve_admission(bounds.with_max_pending(0))
+            .unwrap_err();
+        assert!(
+            matches!(error, BuildError::InvalidServeAdmission { .. }),
+            "{error:?}"
+        );
+        builder.end_user_precheck(precheck(open)).unwrap();
+        let error = builder.end_user_precheck(BearerShape).unwrap_err();
+        assert!(
+            matches!(error, BuildError::DuplicateEndUserPrecheck),
+            "{error:?}"
+        );
+        assert_eq!(reasons::ADMISSION_FULL, "ADMISSION_FULL", "a wire contract");
+        assert_eq!(reasons::REQUEST_TOO_LARGE, "REQUEST_TOO_LARGE");
+        assert_eq!(reasons::REQUEST_READ_TIMEOUT, "REQUEST_READ_TIMEOUT");
+        EchoHandle::install(&mut builder, |_deps| Ok(EchoService)).unwrap();
+        let built = builder.build().unwrap();
+        built.start().await.unwrap();
+        built.stop(Duration::from_secs(1)).await.unwrap();
+    }
+
     #[test]
     fn a_local_only_component_cannot_be_served() {
         let source = MapSource::new()

@@ -209,7 +209,10 @@ Defaults:
   itself (`http_body_util::Limited`); the docs say so.
 - gRPC: per service, documented on `add_service`:
   `OrdersServer::new(svc).max_decoding_message_size(16 << 20)`. The
-  component service keeps its fixed 4 MiB (C2 2.4).
+  component service caps a request at 4 MiB, lowered in code per App with
+  `ServeAdmission::with_max_message_bytes`, and also bounds its read time
+  ([serve-admission.md](serve-admission.md)); neither is a listener-wide
+  setting.
 
 ### 2.6 Request id, span and access log (`sekvent-telemetry`)
 

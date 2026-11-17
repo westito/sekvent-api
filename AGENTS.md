@@ -112,6 +112,8 @@ Specs: `docs/component-model.md` (overview), `docs/design/component-c1.md`
 `docs/design/multi-tenant-building-blocks.md` (the request scope, several
 Apps on one runtime, visible end-user rejections),
 `docs/design/component-streaming.md` (server-streaming methods),
+`docs/design/serve-admission.md` (the end-user precheck, the shared
+admission and the bounded request read before scope resolution),
 `docs/design/p8-service-essentials.md` (jobs, leases).
 Milestones C1, C2 and C4 are done (C4: jobs in `sekvent-runtime`, leases in
 `sekvent-db`); C3 and C5 (bus, async/deferred calls, NATS, extraction
@@ -129,16 +131,20 @@ tooling) are not started.
   rejected at compile time. A stream's open is a call (`TIMEOUT`, open
   retries, breaker, hop limit, auth); after it, the caller's deadline,
   `STREAM_MAX_LIFETIME` (15 min), the consumer and the gate end it; it
-  holds its admission and bulkhead permit for its life; `App::register`
+  holds its gate admission and bulkhead permit for its life; `App::register`
   closes streams when shutdown begins.
 - The `grpc` binding (feature `grpc`, facade `component-grpc`) is one
   generic byte-level tonic client and service over C1's `Dispatch`; never
   generate per-component tonic code, and keep `-api` crates free of tonic.
   Transport is plaintext HTTP/2 with link tokens; TLS comes later.
-- Serving order is fixed: authenticate and decode the context from request
-  **headers** before the body is read (trailers are never trusted), exact
-  `/<service>/<Rpc>` routing, then the gate. Requests are capped at 4 MiB,
-  and so are the items of a served stream. A handler panic answers
+- Serving order is fixed (`docs/design/serve-admission.md` 4): link token,
+  exact `/<service>/<Rpc>` routing, context from request **headers**
+  (trailers are never trusted), the address-keyed client limit, the hop
+  limit, the end-user precheck, the App's shared admission, the request
+  read whole (bounded by `max_message_bytes`, at most 4 MiB, and the read
+  timeout), the scope resolver, the end-user authenticator, the
+  end-user-keyed client limit, the call authorizer, then the gate. Items of
+  a served stream are capped at 4 MiB too. A handler panic answers
   `INTERNAL` (`HANDLER_PANICKED`).
 - A method `TIMEOUT` bounds the whole call (for a stream, the open) and,
   when it fires while the caller still has time, fails with
@@ -158,18 +164,29 @@ tooling) are not started.
   serves every topology.
 - Components can be served to end users with `SERVE_AUTH=bearer` or
   `link,bearer` through the App's one end-user authenticator. It is
-  fail-closed (a bearer mode without it is a build error) and head-only
-  (it runs before the body is read). `#[call(anonymous)]` waives only
-  end-user authentication, never link authentication.
+  fail-closed (a bearer mode without it is a build error) and reads only
+  the head. The App's one `EndUserPrecheck` (default `BearerShape`) runs
+  synchronously for exactly the calls the authenticator will see, before
+  the admission, the request read and the scope resolver; it does no I/O.
+  `#[call(anonymous)]` waives only end-user authentication, never link
+  authentication.
+- One `ServeAdmission` per App: every call no link token authenticated
+  takes shared and per-client-address slots without waiting
+  (`RESOURCE_EXHAUSTED`, `ADMISSION_FULL`; per-client default 32)
+  and holds it through the request read, the resolver, the authenticator
+  and the call authorizer, giving it back at the gate; link callers never
+  take either. Idle address counts are removed immediately. The read timeout
+  is at most 5 minutes; client-address forwarding is trusted-proxy policy.
 - The App's one `CallAuthorizer` (`docs/design/call-authorizer.md`) is
   asked synchronously about every call a component serves, under every
   binding and for every caller, after the hop limit and before the gate
-  (under gRPC before the body); its error is the answer, unchanged. The
+  (under gRPC after the request is read); its error is the answer,
+  unchanged. The
   caller side of a `grpc` binding never asks.
 - The App's one `ScopeResolver` runs once for every call served over gRPC
   or gRPC-Web that no link token authenticated (end users, anonymous and
   optional-end-user methods, `SERVE_AUTH=none`), on the request head, after
-  routing and the address-keyed client limit and before the end-user
+  the precheck, the admission and the request read and before the end-user
   authenticator; its error is the answer, unchanged. Its `RequestScope`
   stays with the serving handler like the end user: never in headers,
   dropped by `child()` and `detached()`, and kept by a served stream until

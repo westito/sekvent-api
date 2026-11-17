@@ -70,7 +70,7 @@ fn a_resource_type_is_provided_once() {
     NotesHandle::install(&mut builder, |_| Ok(Counter::plain())).unwrap();
     assert_eq!(
         format!("{builder:?}"),
-        r#"AppBuilder { components: ["notes"], resources: ["alloc::string::String", "u32"], end_user_authenticator: false, call_authorizer: false, scope_resolver: false, .. }"#
+        r#"AppBuilder { components: ["notes"], resources: ["alloc::string::String", "u32"], end_user_authenticator: false, end_user_precheck: false, call_authorizer: false, scope_resolver: false, serve_admission: ServeAdmission { max_pending: 512, max_pending_per_client: 32, read_timeout: 10s, max_message_bytes: 4194304 }, .. }"#
     );
 }
 

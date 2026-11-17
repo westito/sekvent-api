@@ -138,6 +138,17 @@ pub enum BuildError {
     /// A second scope resolver was registered.
     #[error("a scope resolver is registered twice")]
     DuplicateScopeResolver,
+    /// A second end-user precheck was registered.
+    #[error("an end-user precheck is registered twice")]
+    DuplicateEndUserPrecheck,
+    /// The serve admission given to
+    /// [`AppBuilder::serve_admission`](crate::AppBuilder::serve_admission)
+    /// cannot be used.
+    #[error("the serve admission is not usable: {reason}")]
+    InvalidServeAdmission {
+        /// Which bound is out of range.
+        reason: &'static str,
+    },
     /// The call authorizer's `validate` refused an installed component.
     #[error("the call authorizer refuses component {component}: {source}")]
     CallAuthorizerRefused {
@@ -360,6 +371,16 @@ mod tests {
             (
                 BuildError::DuplicateScopeResolver,
                 "a scope resolver is registered twice",
+            ),
+            (
+                BuildError::DuplicateEndUserPrecheck,
+                "an end-user precheck is registered twice",
+            ),
+            (
+                BuildError::InvalidServeAdmission {
+                    reason: "max_pending must be at least 1",
+                },
+                "the serve admission is not usable: max_pending must be at least 1",
             ),
             (
                 BuildError::CallAuthorizerRefused {

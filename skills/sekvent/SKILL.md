@@ -47,6 +47,7 @@ speed and flakes: the `rust-testing` skill.
 | One value per key, created once, kept while in use, evicted when idle (a Postgres pool per tenant, and what is built on it) | `db` (`Keyed`, `KeyedPools`, `KeyedRef`, `ConnectCandidates`) | `db-keyed`; `db-sqlx-postgres` for `KeyedPools`; `runtime` for `into_unit` |
 | A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; `component-grpc` for the `grpc` binding and serving; `runtime` for `App::register` |
 | A tenant (or another per-request value) resolved from the request head before authentication | `component` (`ScopeResolver`, `AppBuilder::scope_resolver`, `App::resolve_scope`, `admit_end_user`), `context::RequestScope`, `cx.scoped::<T>()` | `component`; `component-grpc` to serve |
+| Bounding what served calls cost before authentication (one serve admission per App with a per-client cap, request size and read timeout, a cheap credential precheck) | `component` (`ServeAdmission`, `AppBuilder::serve_admission`, `EndUserPrecheck`, `BearerShape`, `AppBuilder::end_user_precheck`) | `component`; `component-grpc` to serve |
 | Postgres/MySQL/MinIO test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` (features `postgres`, `mysql`, `minio`) |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
 
@@ -225,7 +226,8 @@ let server = builder.bind(config.listen_addr).await?;
   (`http_body_util::Limited`).
 - gRPC message sizes are set on each generated server
   (`max_decoding_message_size`, `max_encoding_message_size`; tonic's
-  default is 4 MiB); the component service keeps a fixed 4 MiB.
+  default is 4 MiB); the component service accepts at most 4 MiB, lowered
+  per App with `ServeAdmission::with_max_message_bytes`.
 - The access log is one event per request, target `sekvent::access`,
   message `request completed`, with `method`, `path` (never the query),
   `route`, `protocol`, `status`, `grpc_status` (gRPC-Web text included),
@@ -1155,7 +1157,8 @@ toolchain can call the server with `authorization: Bearer <token>`.
 End users (browsers over gRPC-Web, native apps) call a served component
 directly when its `SERVE_AUTH` is `bearer` (end users only) or
 `link,bearer` (link tokens first, then end users). Register the App's one
-end-user authenticator; it sees the request head only, before the body:
+end-user authenticator; it sees the request head only, after the request
+was read (see "Admission before scope resolution"):
 
 ```rust
 // facade features: component-grpc, runtime-grpc-web (browsers), auth-axum or auth-tonic (BearerAuth)
@@ -1277,7 +1280,7 @@ loop {
   token cancelled when it ends. A producer task stops on `cx.cancelled()` or
   `Sender::closed()`; capture `cx.caller()` / `cx.end_user()` during the
   open.
-- An open stream holds its admission and bulkhead permit for its whole life
+- An open stream holds its gate admission and bulkhead permit for its whole life
   (size stream bulkheads for concurrent subscribers). An unpolled stream
   holds a drain until the grace.
 - Keys: `SEKVENT_COMPONENT_<C>_STREAM_MAX_LIFETIME`,
@@ -1443,9 +1446,15 @@ let tenant = cx.tenant();                                // what the scope set
 ```
 
 - It runs once per call served over gRPC or gRPC-Web that no link token
-  authenticated, after routing and before the end-user authenticator, on
-  the request head only. The authenticator reads the same scope with
+  authenticated, on the request head, after routing, the address-keyed
+  client limit, the hop limit, the end-user precheck, the serve admission
+  and the request read (whole, bounded), and before the end-user
+  authenticator. The
+  authenticator reads the same scope with
   `request.extensions.get::<RequestScope>()`.
+- A client that goes away during the read or the resolver drops the
+  resolver's future; work that must finish anyway goes on a task of its
+  own with a budget of its own.
 - A sync closure `Fn(&Parts, &CallContext) -> Result<RequestScope, AppError>`
   is a resolver too. Its error is the caller's answer, unchanged.
 - The scope's tenant becomes `cx.tenant()` and no header can replace it;
@@ -1465,6 +1474,67 @@ let tenant = cx.tenant();                                // what the scope set
   It does not authenticate and does not touch the request's extensions;
   after your own authentication `let cx = admit_end_user(cx, user)?;`
   applies the tenant rule.
+
+### Admission before scope resolution
+
+Every call served over gRPC or gRPC-Web meets three bounds before the scope
+resolver and the end-user authenticator run; the defaults apply without code.
+This serve admission is not the gate admission (draining, shedding,
+bulkhead) a call meets afterwards at the component's gate:
+
+```rust
+use sekvent::component::{BearerShape, CallTarget, ServeAdmission};
+
+builder.serve_admission(
+    ServeAdmission::new()
+        .with_max_pending(256)                       // default 512, shared by every served component of the App
+        .with_max_pending_per_client(16)             // default 32 at once per client address (`cx.client_addr()`)
+        .with_read_timeout(Duration::from_secs(5))   // default 10 s (at most 5 min) to receive the request whole
+        .with_max_message_bytes(1024 * 1024),        // default and largest 4 MiB
+)?;
+// only when the authenticator takes a credential of another shape than `Bearer <token68>`
+builder.end_user_precheck(|request: &http::request::Parts, _target: CallTarget| {
+    match BearerShape::token(&request.headers) {
+        Some(token) if token.starts_with("bil_") => Ok(()),
+        _ => Err(AppError::unauthenticated("not a billing token")),
+    }
+})?;                                                 // one per App; sync, no I/O
+```
+
+- Order: link, route, context, client limit by address, hop limit (all
+  from the head, before any end-user authentication), **precheck**
+  (synchronous, only for calls the authenticator will see; default
+  `BearerShape`), **serve admission** (calls without a link token: one
+  shared slot and one of the client address's slots; refused at once, no
+  queue), **request read** (whole, bounded; unary request and a stream's
+  request message), scope resolver, authenticator, end-user client limit,
+  call authorizer, then the slots are given back and the gate runs.
+- Answers: precheck `UNAUTHENTICATED` → the constant answer, any other
+  error unchanged (never format a header value into it; a panic is
+  `INTERNAL` / `HANDLER_PANICKED` and still reaches the panic hook); no
+  shared or per-client slot `RESOURCE_EXHAUSTED` / `ADMISSION_FULL`; too
+  large `OUT_OF_RANGE` / `REQUEST_TOO_LARGE`; too slow `DEADLINE_EXCEEDED`
+  / `REQUEST_READ_TIMEOUT` (the caller's own deadline first: plain
+  `DEADLINE_EXCEEDED`).
+- The size cap counts the received body (gRPC-Web after translation): the
+  5-byte frame header plus `max_message_bytes`, on the message as sent
+  (compressed size); tonic still answers bad compression, extra frames and
+  trailing data.
+- Per-client cap: keyed like a `CLIENT_KEY=client_addr` limit, unknown
+  addresses share one bucket, an entry is dropped at zero, both slots are
+  released on cancellation.
+- Link callers never take a slot; their request is read under the same
+  bounds, the read timeout included. A stream's response is outside the
+  admission.
+- Slow bodies: the per-client cap and read timeout are the framework's
+  part; rate limits alone bound neither in-flight slow requests nor a
+  distributed attack. Put a gateway in front that buffers bodies and
+  applies deadlines, and forward the client address through a trusted
+  `ClientAddrPolicy`, or every caller shares one per-client cap.
+- Upgrading: only `Bearer <token68>` passes the default precheck; two
+  `Authorization` headers are refused; link callers get the read timeout;
+  a missing credential gets the constant answer instead of the
+  authenticator's; at most 32 calls per address are admitted at once.
 
 ## Pitfalls
 

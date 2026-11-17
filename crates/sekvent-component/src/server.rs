@@ -489,7 +489,7 @@ fn expired(max_lifetime: Option<Duration>) -> AppError {
 }
 
 /// The earlier of two optional instants.
-fn earliest(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+pub(crate) fn earliest(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (left, right) => left.or(right),

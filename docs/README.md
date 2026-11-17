@@ -84,6 +84,7 @@ A typical service:
 | [design/call-authorizer.md](design/call-authorizer.md) | Specification of the App's call authorizer: one synchronous per-method policy hook on the serving side of every call, under every binding |
 | [design/end-user-extensions.md](design/end-user-extensions.md) | Specification of typed extensions on `EndUser`: storage, equality, never logged or propagated |
 | [design/multi-tenant-building-blocks.md](design/multi-tenant-building-blocks.md) | Specification of the keyed resource cache and pools per key, the request scope resolved before authentication, several Apps on one runtime, end-user rejections with a visible reason, CORS origins decided by a function, EdDSA tokens |
+| [design/serve-admission.md](design/serve-admission.md) | Specification of admission before scope resolution: the end-user precheck on the head, one serve admission per App, the request read whole and bounded in size and time before the scope resolver |
 | [design/sso.md](design/sso.md) | Specification of browser single sign-on: providers, state cookie, handoff codes, Bitbucket Cloud |
 | [design/p8-service-essentials.md](design/p8-service-essentials.md) | Specification of server essentials, probes, password schemes, jobs, leases, HTTP helpers |
 | [design/storage.md](design/storage.md) | Specification of object storage: own SigV4 signer on rustls/ring, presigned uploads and downloads, two endpoints, the MinIO test image |

@@ -23,9 +23,11 @@ use crate::{END_USER_REJECTED_MESSAGE, reasons};
 ///
 /// It runs once for every call served over gRPC or gRPC-Web that no link
 /// token authenticated (end users, anonymous and optional-end-user methods,
-/// any caller under `SERVE_AUTH=none`), after routing and the
-/// address-keyed client limit and before the end-user authenticator, on
-/// the request head alone; never for a link caller or an in-process call.
+/// any caller under `SERVE_AUTH=none`), after routing, the address-keyed
+/// client limit, the [end-user precheck](crate::EndUserPrecheck) and the
+/// call's [admission](crate::ServeAdmission), once the request has been
+/// read whole, and before the end-user authenticator, on the request head;
+/// never for a link caller or an in-process call.
 /// `request.uri.path()` is the routed path `/<package>.<Service>/<Rpc>`,
 /// so a resolver can return [`RequestScope::new`] for methods that must
 /// not open a tenant's resources before the caller is authorized. `cx` is
@@ -33,7 +35,11 @@ use crate::{END_USER_REJECTED_MESSAGE, reasons};
 ///
 /// Its error is the caller's answer, unchanged (`UNAUTHENTICATED`
 /// included). It runs within the call's deadline, never once that deadline
-/// has passed, and a panic is answered like a handler panic. A tenant the
+/// has passed, and a panic is answered like a handler panic. When the
+/// client goes away or the deadline passes, its future is dropped and the
+/// call's [cancel token](CallContext::cancel_token) is cancelled: work that
+/// must finish anyway (warming a tenant's pool) runs on a task of its own,
+/// bounded by a budget of its own. A tenant the
 /// scope names must pass
 /// [`is_valid_tenant`](sekvent_context::headers::is_valid_tenant); any
 /// other fails the call with `INTERNAL` and

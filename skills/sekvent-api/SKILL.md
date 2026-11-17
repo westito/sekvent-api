@@ -57,6 +57,7 @@ can describe APIs the project does not have yet.
 | Components (trait + proto contract, App builder, bindings, split topology) | `docs/modules/components.md`, concepts in `docs/component-model.md` |
 | Resolve the tenant (or another per-request value) from the host or path before authentication and read it in handlers | `docs/modules/components.md` ("How to resolve a request scope"), `docs/modules/context.md` ("Request scope") |
 | Tell a client why its credential was refused (`EndUserRejection`) | `docs/modules/components.md` ("What a rejected end user sees") |
+| Bound what a served call costs before its scope is resolved and its caller authenticated (one serve admission per App with a per-client cap, request size and read timeout, a cheap credential precheck) | `docs/modules/components.md` ("How to bound what a call costs before it is authenticated"), `docs/design/serve-admission.md` |
 | Run two Apps on one runtime, each behind its own listener (`App::register_as`) | `docs/modules/components.md` ("Under the runtime") |
 | Stream live updates to a browser or service (server-streaming `#[call(stream)]`, `CallStream`, lifetime, drain, HTTP/2 keep-alive) | `docs/modules/components.md` ("How to stream replies"), `docs/modules/server.md` ("Keep long streams alive") |
 | `build.rs` protobuf codegen without `protoc` | `docs/modules/proto-build.md` |

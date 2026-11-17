@@ -47,7 +47,7 @@ configuration, with a per-method opt-out for the few public RPCs (sign-in).
 | Per-component authenticators | one authenticator per App; it can look at the request path if components need different rules |
 | Optional authentication on anonymous methods | an anonymous method never sees an end user, even when the request carries a valid token (decision 4); `optional_end_user` is the separate attribute for that (section 5.1) |
 | Propagating roles to further components | roles stay with the component that authenticated the end user (decision 3) |
-| `SEKVENT_COMPONENT_<C>_MAX_MESSAGE_SIZE` | the 4 MiB request cap stays fixed |
+| `SEKVENT_COMPONENT_<C>_MAX_MESSAGE_SIZE` | no configuration key; the request cap is 4 MiB, lowered in code per App with `ServeAdmission::with_max_message_bytes` ([serve-admission.md](serve-admission.md)) |
 | Cookies, CSRF | an authenticator may read cookies from the request head; CSRF protection is the application's (gRPC-Web requests need a custom content type, which a plain form cannot send) |
 
 ## 3. Public API
@@ -140,7 +140,9 @@ DuplicateEndUserAuthenticator,
 ```
 
 The authenticator sees the request **head** only (method, URI, headers,
-extensions); the body has not been read. It is available without the
+extensions). Under gRPC the request has already been read whole by then
+(bounded in size and time, [serve-admission.md](serve-admission.md)), but
+the message is never handed to the authenticator. It is available without the
 `grpc` feature, so application code compiles the same way under every
 feature set.
 
@@ -149,7 +151,7 @@ The authenticator's error decides the answer:
 | Authenticator returns | The caller gets |
 |---|---|
 | `Ok(user)` | the call runs with `cx.end_user() == Some(&user)` |
-| `Err(e)` with code `UNAUTHENTICATED` | `UNAUTHENTICATED`, message `END_USER_REJECTED_MESSAGE`, no reason, no metadata — the same answer for a missing, malformed, expired or unknown token |
+| `Err(e)` with code `UNAUTHENTICATED` | `UNAUTHENTICATED`, message `END_USER_REJECTED_MESSAGE`, no reason, no metadata — the same answer for a malformed, expired or unknown token, and the same answer the end-user precheck gives for a missing one (5) |
 | `Err(e)` with any other code | `e` unchanged (for example `UNAVAILABLE` when a session store is down, so a client retries instead of signing out) |
 
 Nothing about the token is logged by the framework.
@@ -228,8 +230,8 @@ An authenticator registered while no component uses it is not an error
 
 ## 5. Serving order
 
-Everything is still decided from the request head before the body is read
-(C2 2.4). For an exposed component:
+The full order is [serve-admission.md](serve-admission.md) 4; the end-user
+steps sit in it as follows. For an exposed component:
 
 1. **Link.** When the mode includes `link`, the bearer token is checked
    against the inbound tokens (constant time). A match makes the caller
@@ -243,24 +245,37 @@ Everything is still decided from the request head before the body is read
    token verification (the path is public anyway).
 4. **Context.** `headers::from_headers(&headers, link_caller)`; the
    deadline is narrowed by the method's timeout.
-5. **End user.** When the mode includes `bearer`, no link matched and the
-   method is not anonymous, the authenticator runs, bounded by the call's
+5. **Address-keyed client limit and hop limit**, from the head alone.
+6. **End-user precheck.** When the authenticator will see the call (the
+   mode includes `bearer`, no link matched, the method is not anonymous,
+   and an `optional_end_user` method only with an `Authorization` header),
+   the App's synchronous `EndUserPrecheck` (default `BearerShape`: exactly
+   one `Authorization: Bearer <token68>` header) looks at the head. A
+   missing or malformed credential is refused here with the constant
+   answer of 3.2, before anything that costs.
+7. **Serve admission and request read.** A call no link token
+   authenticated takes the App's shared and per-client serve admission
+   slots, then the request is read whole, bounded by `max_message_bytes`
+   and the read timeout ([serve-admission.md](serve-admission.md)).
+8. **Request scope.** The App's scope resolver
+   ([multi-tenant-building-blocks.md](multi-tenant-building-blocks.md)).
+9. **End user.** The authenticator runs, bounded by the call's
    deadline: an authenticator that exceeds it yields `DEADLINE_EXCEEDED` with
    the message "the call deadline was exceeded". Its answer is mapped as in
    3.2; on success the context becomes `cx.with_end_user(user)`. Subject and
    tenant headers sent by the client were already dropped in step 4 (the
    client is not a trusted link), so an end user cannot assert another
    identity.
-6. **Hop limit.**
-7. **Call authorizer.** The App's
-   [`CallAuthorizer`](call-authorizer.md), when one is registered, decides
-   from the method and the context (end user, roles, link caller); its
-   error is the answer, unchanged. It runs for link, anonymous and
-   in-process callers too.
-8. The gate, bulkhead, method timeout and handler, exactly as for a link
-   caller.
+10. **End-user-keyed client limit.**
+11. **Call authorizer.** The App's
+    [`CallAuthorizer`](call-authorizer.md), when one is registered, decides
+    from the method and the context (end user, roles, link caller); its
+    error is the answer, unchanged. It runs for link, anonymous and
+    in-process callers too.
+12. The serve admission slots are given back; the gate, bulkhead, method
+    timeout and handler, exactly as for a link caller.
 
-`anonymous` waives step 5 only (the call authorizer still runs). It never waives link authentication: under
+`anonymous` waives steps 6 and 9 only (the serve admission, the scope resolver and the call authorizer still run). It never waives link authentication: under
 `link` an anonymous method still requires a link token, and under local
 bindings it has no effect. A component that must stay closed to the public
 therefore cannot be opened by the attribute alone; the operator has to
@@ -268,9 +283,10 @@ choose a bearer mode too.
 
 ### 5.1 `optional_end_user`
 
-An `optional_end_user` method waives step 5 only when the request carries
-no `Authorization` header; the call then runs with no end user. With the
-header, whatever its value, step 5 runs unchanged: success sets the end
+An `optional_end_user` method waives steps 6 and 9 only when the request
+carries no `Authorization` header; the call then runs with no end user.
+With the header, whatever its value, steps 6 and 9 run unchanged (a header
+the precheck refuses is answered like a rejected token): success sets the end
 user, `UNAUTHENTICATED` is answered with `END_USER_REJECTED_MESSAGE`, any
 other error passes through, and the deadline bounds the authenticator. A
 rejected credential is never downgraded to "no end user", so a stale token
@@ -314,8 +330,9 @@ record neither attribute: both are serving policy, not wire contract.
    applications have one session format; a per-component registry can be
    added later without breaking this API.
 2. **The head, not the body.** The authenticator gets
-   `&http::request::Parts`. It cannot read the message, which keeps the
-   "decide before the body" rule.
+   `&http::request::Parts`. It cannot read the message: identity is decided
+   from the head, even though under gRPC the bounded request read
+   ([serve-admission.md](serve-admission.md)) now comes before it.
 3. **Roles stay local.** `EndUser` carries roles to the authenticating
    component's handlers only; components further down see subject and
    tenant, the same as behind a trusted link. Propagating roles over links

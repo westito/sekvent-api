@@ -658,8 +658,8 @@ async fn every_call_no_link_authenticated_is_scoped() {
 async fn an_unknown_host_gets_the_resolvers_answer() {
     guarded(async {
         let shop = serve().await;
-        for path in [PING, LOOKUP] {
-            let (messages, status) = call(&shop, path, "c.shop.test", &[]).await;
+        for (path, wire) in [(PING, &[][..]), (LOOKUP, &USER[..])] {
+            let (messages, status) = call(&shop, path, "c.shop.test", wire).await;
             assert_eq!(status.code(), tonic::Code::NotFound, "{path}");
             assert_eq!(status.message(), "no such site");
             let info = status.get_details_error_info().expect("error details");
@@ -667,6 +667,13 @@ async fn an_unknown_host_gets_the_resolvers_answer() {
             assert!(info.metadata.is_empty(), "{:?}", info.metadata);
             assert_eq!(messages, [] as [SiteReply; 0]);
         }
+        assert_eq!(shop.hosts.runs(), 2);
+        // A method for signed-in users called without a credential is
+        // refused before the resolver runs.
+        let (_, status) = call(&shop, LOOKUP, "c.shop.test", &[]).await;
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(status.message(), END_USER_REJECTED_MESSAGE);
+        assert_eq!(shop.hosts.runs(), 2);
         assert_eq!(shop.pages.seen(), [] as [Seen; 0]);
         shop.stop().await;
     })

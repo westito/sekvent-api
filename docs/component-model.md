@@ -171,7 +171,7 @@ bindings and options. Its open is a call (timed by `TIMEOUT`, retried when
 `idempotent`, counted by the breaker, authenticated, hop-limited); after it
 the caller's deadline, a maximum lifetime (`STREAM_MAX_LIFETIME`, 15
 minutes by default), the consumer and the component's gate end it. A stream
-holds its admission and bulkhead permit for its life, and ends with
+holds its gate admission and bulkhead permit for its life, and ends with
 `UNAVAILABLE` / `COMPONENT_DRAINING` when its component drains or the
 runtime begins shutting down. See
 [components: How to stream replies](modules/components.md#how-to-stream-replies-callstream).

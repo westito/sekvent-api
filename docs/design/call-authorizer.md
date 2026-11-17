@@ -79,17 +79,21 @@ component name, the method name or RPC, and the declared flags
 
 | Binding | Point | Context | Panic |
 |---|---|---|---|
-| served over gRPC / gRPC-Web | after link authentication, routing, the end-user authenticator, both client limits and the hop limit; before the body is read and before the gate | as decoded from the head, with the end user or link caller | `INTERNAL`, `HANDLER_PANICKED`, tagged; the payload is never exposed |
+| served over gRPC / gRPC-Web | after link authentication, routing, the address-keyed client limit, the hop limit, the end-user precheck, the serve admission, the bounded request read, the scope resolver, the end-user authenticator and the end-user-keyed client limit; before the gate | as decoded from the head, with the request scope and the end user or link caller | `INTERNAL`, `HANDLER_PANICKED`, tagged; the payload is never exposed |
 | `local` | in the caller's task, before the gate | caller `local` (trusted), forwarded subject and tenant, no end user | propagates, like a handler panic |
 | `local-serialized` | in the serving task, after the context is decoded from the headers, before the gate | as under `local` | `INTERNAL`, like a handler panic |
 | caller side of `grpc` | never | | |
 
-Under gRPC the hook sits last among the head-only checks, so a request
-refused by the authenticator, a client limit or the hop limit never costs a
-policy decision, and a refused request never has its body read: a caller
-cannot make the server buffer up to 4 MiB for a call it may not make. It
-runs before the gate, so a denial takes no admission or bulkhead permit,
-does not count against the breaker and does not shed.
+Under gRPC the hook is the last check before the gate
+([serve-admission.md](serve-admission.md) 4), so a request refused by the
+end-user precheck, the authenticator, a client limit or the hop limit never
+costs a policy decision. It runs after the request has been read whole:
+the read is bounded by `max_message_bytes` (at most 4 MiB) and the read
+timeout, and it happens while the call holds its serve admission slots, so
+what a caller can make the server buffer for a call it may not make is
+bounded by those limits, not avoided. A denial gives the serve admission
+slots back. It runs before the gate, so a denial takes no gate admission or
+bulkhead permit, does not count against the breaker and does not shed.
 
 ## 5. Decisions
 
@@ -129,8 +133,7 @@ does not count against the breaker and does not shed.
   caller side of a `grpc` binding never asking.
 - gRPC service (`grpc/service.rs`): after authentication with the roles,
   after the hop limit, never for unknown paths, for anonymous, optional and
-  link callers, before the body (a body that never arrives is still
-  refused), a panic caught.
+  link callers, with the request scope the handler sees, a panic caught.
 - gRPC-Web (`tests/grpc_end_user.rs`): a role-based denial arrives as
   `grpc-status` 7 with the app's message, reason and metadata.
 - Facade (`sekvent-facade-check`): a function registered through

@@ -252,7 +252,8 @@ Apps on one runtime, visible end-user rejections),
 - The App's one `ScopeResolver` runs once for every call served over gRPC
   or gRPC-Web that no link token authenticated (end users, anonymous and
   optional-end-user methods, `SERVE_AUTH=none`), on the request head, after
-  routing and the address-keyed client limit and before the end-user
+  the end-user precheck, the serve admission and the bounded request read
+  ([serve-admission.md](serve-admission.md) 4) and before the end-user
   authenticator; its error is the answer, unchanged. Its `RequestScope`
   stays with the serving handler like the end user: never in headers,
   dropped by `child()` and `detached()`, and kept by a served stream until
@@ -512,7 +513,8 @@ let tenant = cx.tenant();                                // what the scope set
 ```
 
 - It runs once per call served over gRPC or gRPC-Web that no link token
-  authenticated, after routing and before the end-user authenticator, on
+  authenticated, after routing, head-only checks, serve admission and the
+  bounded body read, and before the end-user authenticator. It receives
   the request head only. The authenticator reads the same scope with
   `request.extensions.get::<RequestScope>()`.
 - A sync closure `Fn(&Parts, &CallContext) -> Result<RequestScope, AppError>`
@@ -1561,31 +1563,39 @@ does travel, and treats the scope as a shortcut:
 
 ### 7.5 Serving order
 
-In `ComponentService::call`, between the address-keyed client limit and
-the end-user authenticator. The full order becomes:
+The full order is [serve-admission.md](serve-admission.md) 4; the request
+scope sits in `ComponentService::call` after the bounded request read and
+before the end-user authenticator:
 
 1. Link.
 2. Route.
 3. Context.
 4. Client limit by address.
-5. **Request scope**, when the App has a resolver and no link matched
+5. Hop limit.
+6. End-user precheck (synchronous, head only).
+7. Serve admission, shared and per client (no link token).
+8. Request read, bounded in size and time.
+9. **Request scope**, when the App has a resolver and no link matched
    (`cx.caller()` is `None`).
-6. End user.
-7. Client limit by end user.
-8. Hop limit.
-9. Call authorizer.
-10. Gate, bulkhead, timeout, handler.
+10. End user.
+11. Client limit by end user.
+12. Call authorizer.
+13. Serve admission given back; gate, bulkhead, timeout, handler.
 
-So an unknown path and a flood from one address never cost a resolution,
-the body is not read yet, and the authenticator, both later limits and the
-call authorizer see the scope.
+So an unknown path, a flood from one address, a call over the hop limit
+and a call without a well-formed credential never cost a resolution; the
+resolver runs only once the request has arrived whole, so a slow body
+holds a serve admission slot, never what the resolver acquired; and the
+authenticator, the end-user-keyed limit and the call authorizer see the
+scope.
 
 The call's cancellation guard (`cx.cancel_token().clone().drop_guard()`)
-is taken before step 5, not after step 9: a resolver that hands
+is taken before step 8, not after step 12: a resolver that hands
 `cx.cancel_token()` to spawned work sees it cancelled when the client goes
-away or the deadline passes during resolution. A unary call disarms it
-once the handler answered; a stream hands it to `serve_stream`, which
-disarms it after the open, so the stream's own guard takes over as before.
+away or the deadline passes during the read or the resolution. A unary
+call disarms it once the handler answered; a stream hands it to
+`serve_stream`, which disarms it after the open, so the stream's own guard
+takes over as before.
 
 ```rust
 let guard = cx.cancel_token().clone().drop_guard();
@@ -1611,7 +1621,7 @@ whatever its `SERVE_AUTH`):
 | `Ok(scope)` with a tenant that fails `is_valid_tenant` | `INTERNAL` / `SCOPE_TENANT_INVALID`, tagged, "the scope resolver returned an invalid tenant"; only the tenant's length is logged. Otherwise the header codec would drop it and a downstream call would run without a tenant |
 | `Err(e)` | `e` unchanged: no tag, no metadata, no normalisation, also for `UNAUTHENTICATED` |
 | outlives the call's deadline (for a stream, the open bound) | `DEADLINE_EXCEEDED`, "the call deadline was exceeded", as for the authenticator |
-| the bound has already passed when step 5 is reached (`grpc-timeout: 0n`) | the same `DEADLINE_EXCEEDED`, without running the resolver (`timeout_at` would poll it once first) |
+| the bound has already passed when step 9 is reached (`grpc-timeout: 0n`) | the same `DEADLINE_EXCEEDED`, without running the resolver (`timeout_at` would poll it once first) |
 | panics | `INTERNAL` / `HANDLER_PANICKED`, tagged, message "the scope resolver of component `<name>` panicked"; the payload is never shown |
 
 **The authenticator** keeps its signature. It reads the scope from the
@@ -1782,8 +1792,8 @@ tenant.
   extensions; the handler and the call authorizer see `cx.scope()`,
   `cx.scoped::<T>()` and the tenant; a client `x-sekvent-tenant` loses to
   the scope and is dropped without one; a resolver error arrives unchanged
-  (code, message, reason, metadata), the handler does not run and a body
-  that never arrives is still refused; the deadline; a panic; the four
+  (code, message, reason, metadata) and the handler does not run; a body
+  that never arrives never reaches the resolver; the deadline; a panic; the four
   rows of 7.6; an expired call (`0n`) never reaches the resolver; an
   invalid tenant is `INTERNAL`; a call dropped during resolution, or whose
   deadline passes there, cancels the token the resolver saw, and a served
@@ -1827,12 +1837,13 @@ route-aware resolver, the REST recipe with `App::resolve_scope` and
 `admit_end_user` and the three things `resolve_scope` does not do, and the
 host pitfall (HTTP/2 carries it in the URI, HTTP/1.1 in `host`, which may
 include a port; behind a proxy the app decides which forwarded header it
-trusts), the pitfalls of a scope held while the body is read (no body
-timeout; anonymous calls can hold or churn pinned per-tenant resources:
-return an empty scope for them, rate-limit by address, size the cache) and
+trusts), the pitfalls of anonymous calls, which can hold or churn pinned
+per-tenant resources (return an empty scope for them, rate-limit by
+address, size the cache; the request is read before the resolver runs,
+[serve-admission.md](serve-admission.md)) and
 of the per-end-user client limit keyed on the subject alone (equal
 subjects in different tenants share a budget). The list under "Serving
-order for end users" gets step 5.
+order for end users" gets the request scope step.
 "Pitfalls and security" gets the nested-call rule, "never a task-local",
 and "work that outlives the call takes its own reference".
 
@@ -2037,8 +2048,8 @@ Tests:
   passes unchanged; a rejection one level further down the chain is not
   found; `Display`, `Debug`, the accessors and use in a `const`.
 - `grpc/service.rs` tests: an authenticator that returns the rejection
-  answers `UNAUTHENTICATED` with the reason and the domain, the handler
-  does not run and the body is not read; the same on an
+  answers `UNAUTHENTICATED` with the reason and the domain and the handler
+  does not run; the same on an
   optional-end-user method called with a header; the tenant refusal of 7.6
   still has no reason when the authenticator would have used one for
   another case.

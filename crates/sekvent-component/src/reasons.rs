@@ -39,6 +39,17 @@ pub const DOWNSTREAM_FAILURE: &str = "DOWNSTREAM_FAILURE";
 /// `sekvent_context::headers::is_valid_tenant` (`INTERNAL`): a bug in the
 /// resolver; the call is not served.
 pub const SCOPE_TENANT_INVALID: &str = "SCOPE_TENANT_INVALID";
+/// Every admission slot of the App's served components is taken by calls
+/// still being read, resolved or authenticated (`RESOURCE_EXHAUSTED`); see
+/// [`ServeAdmission`](crate::ServeAdmission).
+pub const ADMISSION_FULL: &str = "ADMISSION_FULL";
+/// The request message is larger than the App's `max_message_bytes`
+/// (`OUT_OF_RANGE`, metadata `max_bytes`); the rest of it is not read.
+pub const REQUEST_TOO_LARGE: &str = "REQUEST_TOO_LARGE";
+/// The request did not arrive whole within the App's `read_timeout`, while
+/// the call's own deadline had not passed (`DEADLINE_EXCEEDED`, metadata
+/// `timeout_ms`).
+pub const REQUEST_READ_TIMEOUT: &str = "REQUEST_READ_TIMEOUT";
 /// A component method panicked (`INTERNAL`).
 pub const HANDLER_PANICKED: &str = "HANDLER_PANICKED";
 /// The stream reached its maximum lifetime (`UNAVAILABLE`, metadata

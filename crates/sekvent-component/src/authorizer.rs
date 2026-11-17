@@ -41,8 +41,9 @@ impl CallTarget {
 /// Register one per App with
 /// [`AppBuilder::call_authorizer`](crate::AppBuilder::call_authorizer). It
 /// runs on the serving side only, after authentication and the hop limit and
-/// before the request body is read (under gRPC) and before the gate admits
-/// the call, under every binding and for every caller: end users, links,
+/// before the gate admits the call (under gRPC the request has been read by
+/// then, and the handler has not run), under every binding and for every
+/// caller: end users, links,
 /// anonymous callers and in-process callers (`local`, `local-serialized`,
 /// whose context names the trusted caller [`LOCAL_CALLER`](crate::LOCAL_CALLER)
 /// and carries the forwarded subject but no end user). A process that only

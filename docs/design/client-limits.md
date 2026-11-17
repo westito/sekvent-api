@@ -58,9 +58,10 @@ describe the behaviour.
 - One limiter per named policy, built once and shared by every method that
   resolves to it; a method with `CLIENT_*` keys of its own gets its own
   buckets, its keys layered over the policy's.
-- The check runs after routing and context decoding, before the body is
-  read: `client_addr` before the end-user authenticator (a flood never
-  costs a token verification), `end_user*` right after it. In-process
+- The check runs after routing and context decoding: `client_addr` before
+  the end-user authenticator (a flood never costs a token verification)
+  and before the request is read ([serve-admission.md](serve-admission.md)),
+  `end_user*` right after the authenticator. In-process
   bindings never apply it; the limit belongs to the network edge.
 - `App::client_limiter(component, method)` hands the same `ClientLimiter`
   to `ClientLimitLayer` (crate feature `http`, facade `resilience-http`),
