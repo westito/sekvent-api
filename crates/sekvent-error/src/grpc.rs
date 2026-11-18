@@ -1,23 +1,64 @@
 //! `AppError` <-> `tonic::Status`, lossless for the caller-visible part.
 //!
 //! Details travel as a `google.rpc.Status` in the standard
-//! `grpc-status-details-bin` trailer (via `tonic-types`): `ErrorInfo`
-//! (reason, domain, metadata), `RetryInfo`, `BadRequest` (field violations).
-//! An optional project-specific binary trailer can be added for clients that
-//! predate the standard one.
+//! `grpc-status-details-bin` trailer: `RetryInfo`, `ErrorInfo` (reason,
+//! domain, metadata) and `BadRequest` (field violations with their field,
+//! description and reason). When any field violation carries metadata, one
+//! more detail of type [`FIELD_VIOLATION_DETAILS_TYPE_URL`]
+//! (`sekvent.error.v1.FieldViolationDetails`, reference schema in
+//! `proto/sekvent/error/v1/details.proto`) follows: entry `i` holds the
+//! metadata of `BadRequest.field_violations[i]`. Readers that do not know
+//! the type skip it. An optional project-specific binary trailer can be
+//! added for clients that predate the standard one.
 //!
 //! `ErrorInfo` is emitted whenever a reason, a domain or metadata is present,
 //! so none of the three is lost when the others are absent. An absent reason
-//! or domain travels as the empty string; on the wire an empty string and an
-//! absent value are therefore the same thing.
+//! or domain, of the error or of a violation, travels as the empty string; on
+//! the wire an empty string and an absent value are therefore the same thing.
 
 use std::collections::HashMap;
 
+use prost::Message;
 use tonic::metadata::{BinaryMetadataKey, MetadataValue};
 use tonic::{Code, Status};
-use tonic_types::{ErrorDetails, StatusExt};
+use tonic_types::{StatusExt, pb};
 
-use crate::{AppError, ErrorCode};
+use crate::{AppError, ErrorCode, FieldViolation};
+
+/// Type URL of the detail carrying the metadata of each field violation,
+/// index-aligned with `google.rpc.BadRequest.field_violations`.
+pub const FIELD_VIOLATION_DETAILS_TYPE_URL: &str =
+    "type.googleapis.com/sekvent.error.v1.FieldViolationDetails";
+
+mod details {
+    // prost generates `pub` accessors, unreachable from this private module.
+    #![allow(unreachable_pub)]
+
+    use std::collections::BTreeMap;
+
+    /// `sekvent.error.v1.FieldViolationDetails`.
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct FieldViolationDetails {
+        #[prost(message, repeated, tag = "1")]
+        pub violations: Vec<FieldViolationDetail>,
+    }
+
+    /// `sekvent.error.v1.FieldViolationDetail`.
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct FieldViolationDetail {
+        #[prost(btree_map = "string, string", tag = "1")]
+        pub metadata: BTreeMap<String, String>,
+    }
+}
+
+use details::{FieldViolationDetail, FieldViolationDetails};
+
+fn any(type_url: &str, message: &impl Message) -> prost_types::Any {
+    prost_types::Any {
+        type_url: type_url.to_owned(),
+        value: message.encode_to_vec(),
+    }
+}
 
 /// Encode an error as a status. The internal source is never sent.
 ///
@@ -26,50 +67,70 @@ use crate::{AppError, ErrorCode};
 /// does both.
 pub fn to_status(error: &AppError) -> Status {
     let code = Code::from(error.code().as_i32());
-    let mut details = ErrorDetails::new();
-    let mut has_details = false;
+    let mut details = Vec::new();
 
+    if let Some(after) = error.retry_after() {
+        let retry = pb::RetryInfo::from(tonic_types::RetryInfo::new(Some(after)));
+        details.push(any(tonic_types::RetryInfo::TYPE_URL, &retry));
+    }
     if error.reason().is_some() || error.domain().is_some() || !error.metadata().is_empty() {
         let metadata: HashMap<String, String> = error
             .metadata()
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        details.set_error_info(
-            error.reason().unwrap_or_default(),
-            error.domain().unwrap_or_default(),
+        let info = pb::ErrorInfo {
+            reason: error.reason().unwrap_or_default().to_owned(),
+            domain: error.domain().unwrap_or_default().to_owned(),
             metadata,
-        );
-        has_details = true;
+        };
+        details.push(any(tonic_types::ErrorInfo::TYPE_URL, &info));
     }
-    if let Some(after) = error.retry_after() {
-        details.set_retry_info(Some(after));
-        has_details = true;
+    let violations = error.field_violations();
+    if !violations.is_empty() {
+        let bad_request = pb::BadRequest {
+            field_violations: violations
+                .iter()
+                .map(|violation| pb::bad_request::FieldViolation {
+                    field: violation.field.clone(),
+                    description: violation.description.clone(),
+                    reason: violation.reason.clone().unwrap_or_default(),
+                    localized_message: None,
+                })
+                .collect(),
+        };
+        details.push(any(tonic_types::BadRequest::TYPE_URL, &bad_request));
     }
-    if !error.field_violations().is_empty() {
-        let violations: Vec<tonic_types::FieldViolation> = error
-            .field_violations()
-            .iter()
-            .map(|violation| {
-                tonic_types::FieldViolation::new(
-                    violation.field.clone(),
-                    violation.description.clone(),
-                )
-            })
-            .collect();
-        details.set_bad_request(violations);
-        has_details = true;
+    if violations
+        .iter()
+        .any(|violation| !violation.metadata.is_empty())
+    {
+        let extra = FieldViolationDetails {
+            violations: violations
+                .iter()
+                .map(|violation| FieldViolationDetail {
+                    metadata: violation.metadata.clone(),
+                })
+                .collect(),
+        };
+        details.push(any(FIELD_VIOLATION_DETAILS_TYPE_URL, &extra));
     }
 
-    if has_details {
-        Status::with_error_details(code, error.message(), details)
-    } else {
-        Status::new(code, error.message())
+    if details.is_empty() {
+        return Status::new(code, error.message());
     }
+    let status = pb::Status {
+        code: error.code().as_i32(),
+        message: error.message().to_owned(),
+        details,
+    };
+    Status::with_details(code, error.message(), status.encode_to_vec().into())
 }
 
 /// Decode a status. Missing or malformed details yield an error with only
-/// the code and message; an unknown code number becomes `UNKNOWN`.
+/// the code and message; an unknown code number becomes `UNKNOWN`. A
+/// missing, malformed or misaligned `FieldViolationDetails` detail only
+/// loses the violation metadata it would have carried.
 pub fn from_status(status: &Status) -> AppError {
     let code = ErrorCode::from_i32(i32::from(status.code()));
     let mut error = AppError::new(code, status.message());
@@ -92,12 +153,35 @@ pub fn from_status(status: &Status) -> AppError {
         error = error.with_retry_after(delay);
     }
     if let Some(bad_request) = details.bad_request() {
+        let mut metadata = violation_metadata(status).into_iter();
         for violation in &bad_request.field_violations {
-            error =
-                error.with_field_violation(violation.field.clone(), violation.description.clone());
+            let mut built =
+                FieldViolation::new(violation.field.clone(), violation.description.clone());
+            if !violation.reason.is_empty() {
+                built = built.with_reason(violation.reason.clone());
+            }
+            if let Some(entry) = metadata.next() {
+                built.metadata = entry.metadata;
+            }
+            error = error.with_violation(built);
         }
     }
     error
+}
+
+/// The entries of the first decodable `FieldViolationDetails` detail; empty
+/// when there is none.
+fn violation_metadata(status: &Status) -> Vec<FieldViolationDetail> {
+    let Ok(rpc_status) = pb::Status::decode(status.details()) else {
+        return Vec::new();
+    };
+    rpc_status
+        .details
+        .iter()
+        .filter(|detail| detail.type_url == FIELD_VIOLATION_DETAILS_TYPE_URL)
+        .find_map(|detail| FieldViolationDetails::decode(detail.value.as_slice()).ok())
+        .map(|extra| extra.violations)
+        .unwrap_or_default()
 }
 
 /// Attach an extra binary trailer (`key` must end in `-bin`) carrying a

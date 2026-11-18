@@ -46,6 +46,10 @@ mod pb {
         pub field: String,
         #[prost(string, tag = "2")]
         pub description: String,
+        #[prost(string, optional, tag = "3")]
+        pub reason: Option<String>,
+        #[prost(btree_map = "string, string", tag = "4")]
+        pub metadata: BTreeMap<String, String>,
     }
 }
 
@@ -66,6 +70,8 @@ impl From<WireError> for WireErrorPb {
                 .map(|violation| FieldViolationPb {
                     field: violation.field,
                     description: violation.description,
+                    reason: violation.reason,
+                    metadata: violation.metadata,
                 })
                 .collect(),
         }
@@ -84,9 +90,11 @@ impl From<WireErrorPb> for WireError {
             field_violations: pb
                 .field_violations
                 .into_iter()
-                .map(|violation| FieldViolation {
-                    field: violation.field,
-                    description: violation.description,
+                .map(|violation| {
+                    let mut built = FieldViolation::new(violation.field, violation.description);
+                    built.reason = violation.reason;
+                    built.metadata = violation.metadata;
+                    built
                 })
                 .collect(),
         }
@@ -213,6 +221,12 @@ mod tests {
             .with_retry_after(Duration::from_millis(1500))
             .with_field_violation("quantity", "must be positive")
             .with_field_violation("sku", "unknown")
+            .with_violation(
+                FieldViolation::new("note", "too long")
+                    .with_reason("TOO_LONG")
+                    .with_metadata("max", "200")
+                    .with_metadata("actual", "317"),
+            )
             .with_source(std::io::Error::other("hidden cause"));
         let back = decode_error(encode_error(&error)).unwrap();
         assert_eq!(back.to_wire(), error.to_wire());

@@ -1,0 +1,20 @@
+// Reference schema of the extra error detail sekvent writes into
+// google.rpc.Status.details (the grpc-status-details-bin trailer), for
+// clients in other languages. Its type URL is
+// type.googleapis.com/sekvent.error.v1.FieldViolationDetails. sekvent-error
+// encodes it with a hand-written prost struct; nothing is generated from
+// this file.
+
+syntax = "proto3";
+
+package sekvent.error.v1;
+
+// Rides in google.rpc.Status.details next to google.rpc.BadRequest. Entry i belongs to
+// BadRequest.field_violations[i]; an entry without metadata is empty.
+message FieldViolationDetails {
+  repeated FieldViolationDetail violations = 1;
+}
+
+message FieldViolationDetail {
+  map<string, string> metadata = 1;
+}

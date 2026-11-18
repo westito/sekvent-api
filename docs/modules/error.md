@@ -141,12 +141,22 @@ Builders (each `#[must_use]`, consuming `self`):
 | `with_domain(domain)` | the reason's domain |
 | `with_metadata(key, value)` | one caller-visible key/value (sorted map; a repeated key replaces) |
 | `with_retry_after(Duration)` | retry hint |
-| `with_field_violation(field, description)` | appends a `FieldViolation { field, description }` |
+| `with_field_violation(field, description)` | appends a `FieldViolation` with only a field and a description |
+| `with_violation(FieldViolation)` | appends a built `FieldViolation` (one with a reason or metadata) |
 | `with_source(source)` | the internal cause (replaces an earlier one) |
+
+`FieldViolation` is `#[non_exhaustive]`: build it with
+`FieldViolation::new(field, description)` and the `#[must_use]` builders
+`with_reason(reason)` (machine-readable, `UPPER_SNAKE_CASE` by convention,
+the `google.rpc.BadRequest.FieldViolation.reason`) and `with_metadata(key,
+value)` (sorted map; a repeated key replaces). Its public fields are `field`,
+`description`, `reason: Option<String>` and `metadata: BTreeMap<String,
+String>`; all four are caller-visible.
 
 Getters: `code()`, `message()`, `reason()`, `domain()`, `metadata() ->
 &BTreeMap<String, String>`, `retry_after()`, `field_violations() ->
-&[FieldViolation]`, `is_transient()`. `std::error::Error::source()` returns
+&[FieldViolation]` (read `violation.reason` and `violation.metadata`
+directly), `is_transient()`. `std::error::Error::source()` returns
 the internal cause. `Display` prints `CODE: message`; `Debug` prints every
 field, the source included, so keep `Debug` output of an `AppError` out of
 responses.
@@ -171,7 +181,13 @@ responses.
     "metadata": { "order_id": "ord-1" },
     "retry_after_ms": 1234,
     "field_violations": [
-      { "field": "currency", "description": "unsupported" }
+      { "field": "items[0].qty", "description": "must be positive" },
+      {
+        "field": "currency",
+        "description": "unsupported",
+        "reason": "CURRENCY_UNSUPPORTED",
+        "metadata": { "supported": "EUR,USD" }
+      }
     ]
   }
 }
@@ -179,7 +195,9 @@ responses.
 
 Only `code` and `message` are always present; `reason`, `domain`,
 `metadata`, `retry_after_ms` and `field_violations` are omitted when absent
-or empty. A minimal body is `{"error":{"code":"NOT_FOUND","message":"gone"}}`.
+or empty, and so are a violation's `reason` and `metadata` (a plain violation
+is exactly `{"field", "description"}`; a body without them parses with the
+defaults). A minimal body is `{"error":{"code":"NOT_FOUND","message":"gone"}}`.
 
 Client side, `sekvent::error::http::from_json_body(status: u16, body: &[u8])
 -> Option<AppError>` accepts only a body this module could have produced: a
@@ -198,11 +216,20 @@ trailer:
 |---|---|
 | reason, domain, metadata | `ErrorInfo` (emitted when any of the three is present; an absent reason or domain travels as `""`) |
 | retry hint | `RetryInfo` |
-| field violations | `BadRequest` |
+| field violations | `BadRequest` (field, description and `reason`; an absent reason travels as `""`) |
+| field violation metadata | `sekvent.error.v1.FieldViolationDetails`, type URL `grpc::FIELD_VIOLATION_DETAILS_TYPE_URL` (`type.googleapis.com/sekvent.error.v1.FieldViolationDetails`); emitted only when a violation has metadata. Entry `i` belongs to `BadRequest.field_violations[i]`, an entry without metadata is empty |
+
+The extra detail's schema, for clients in other languages, is
+`crates/sekvent-error/proto/sekvent/error/v1/details.proto`; standard
+readers skip a detail type they do not know.
 
 `From<tonic::Status> for AppError` decodes it; missing or malformed details
 yield code and message only, an unknown code number becomes `UNKNOWN`, and an
-empty reason or domain reads back as absent.
+empty reason or domain, of the error or of a violation, reads back as absent.
+A missing, undecodable or misaligned `FieldViolationDetails` never fails the
+decode: the first one that decodes is applied entry by entry, so a shorter
+list leaves the remaining violations without metadata and extra entries are
+dropped.
 
 The `sekvent::error::grpc` module:
 
@@ -210,6 +237,7 @@ The `sekvent::error::grpc` module:
 |---|---|
 | `to_status(&AppError) -> Status` | Encode only (never logs). |
 | `from_status(&Status) -> AppError` | Decode. |
+| `FIELD_VIOLATION_DETAILS_TYPE_URL` | The type URL of the field-violation metadata detail. |
 | `with_legacy_detail(status, key: &'static str, &M) -> Status` | Add an extra binary trailer (`key` must be lowercase and end in `-bin`; panics otherwise) carrying any prost message, for clients that predate the standard details. |
 | `legacy_detail::<M>(&Status, key) -> Option<M>` | Read it back; `None` when absent or undecodable. |
 
@@ -244,10 +272,39 @@ would be logged twice.
 name becomes `UNKNOWN`; there is no source). `WireError` is the same shape as
 the HTTP body's `error` object, with public fields `code: String`, `message`,
 `reason`, `domain`, `metadata: BTreeMap<String, String>`, `retry_after_ms:
-Option<u64>` and `field_violations: Vec<FieldViolation>`. It derives
+Option<u64>` and `field_violations: Vec<FieldViolation>` (each with its
+`reason` and `metadata`). It derives
 `Serialize`/`Deserialize` when the crate's `serde` feature is on (the facade
 turns it on with `error-http`), which makes it suitable for dead-letter rows
 and job failure records.
+
+## How to send locale-free field messages
+
+A client that renders messages in its own language needs a code and the
+values to fill in, not a sentence. Put the code in the violation's reason and
+the values in its metadata; keep the description a plain fallback:
+
+```rust
+use sekvent::error::{AppError, FieldViolation};
+
+fn check_quantity(quantity: u32, in_stock: u32) -> Result<(), AppError> {
+    if quantity > in_stock {
+        return Err(AppError::invalid_argument("the order cannot be filled")
+            .with_reason("ORDER_INVALID")
+            .with_domain("orders")
+            .with_violation(
+                FieldViolation::new("items[0].quantity", "more than the stock")
+                    .with_reason("QUANTITY_ABOVE_STOCK")
+                    .with_metadata("in_stock", in_stock.to_string()),
+            ));
+    }
+    Ok(())
+}
+```
+
+The reason and the metadata survive HTTP, gRPC, the component bindings and
+`WireError`, so the client looks up `QUANTITY_ABOVE_STOCK` in its catalog and
+substitutes `in_stock`.
 
 ## Typed component errors (`ComponentError`)
 

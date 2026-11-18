@@ -5,9 +5,10 @@ use std::time::Duration;
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use prost::Message;
-use sekvent_error::{AppError, ErrorCode, grpc, http};
+use sekvent_error::{AppError, ErrorCode, FieldViolation, grpc, http};
 use tonic::metadata::{BinaryMetadataKey, MetadataValue};
 use tonic::{Code, Status};
+use tonic_types::StatusExt;
 
 fn every_field() -> AppError {
     AppError::new(ErrorCode::FailedPrecondition, "order is closed")
@@ -17,7 +18,12 @@ fn every_field() -> AppError {
         .with_metadata("state", "closed")
         .with_retry_after(Duration::new(1, 234_567_891))
         .with_field_violation("items[0].qty", "must be positive")
-        .with_field_violation("currency", "unsupported")
+        .with_violation(
+            FieldViolation::new("currency", "unsupported")
+                .with_reason("CURRENCY_UNSUPPORTED")
+                .with_metadata("currency", "XTS")
+                .with_metadata("supported", "EUR,USD"),
+        )
         .with_source(std::io::Error::other("secret upstream detail"))
 }
 
@@ -29,6 +35,9 @@ fn one_field_each() -> Vec<AppError> {
         AppError::unavailable("c").with_metadata("k", "v"),
         AppError::unavailable("d").with_retry_after(Duration::from_millis(250)),
         AppError::unavailable("e").with_field_violation("f", "g"),
+        AppError::unavailable("f").with_violation(FieldViolation::new("f", "g").with_reason("R")),
+        AppError::unavailable("g")
+            .with_violation(FieldViolation::new("f", "g").with_metadata("k", "v")),
     ]
 }
 
@@ -121,6 +130,223 @@ async fn the_http_body_has_the_documented_shape_and_no_source() {
     assert_eq!(json["error"]["reason"], "ORDER_CLOSED");
     assert_eq!(json["error"]["retry_after_ms"], 1234);
     assert_eq!(json["error"]["field_violations"][1]["field"], "currency");
+    assert_eq!(
+        json["error"]["field_violations"][1]["reason"],
+        "CURRENCY_UNSUPPORTED"
+    );
+    assert_eq!(
+        json["error"]["field_violations"][1]["metadata"],
+        serde_json::json!({"currency": "XTS", "supported": "EUR,USD"})
+    );
+    assert_eq!(
+        json["error"]["field_violations"][0],
+        serde_json::json!({"field": "items[0].qty", "description": "must be positive"}),
+        "a plain violation keeps exactly the two original members"
+    );
+}
+
+#[test]
+fn an_old_json_violation_parses_with_defaults() {
+    let body = br#"{"error":{"code":"INVALID_ARGUMENT","message":"bad","field_violations":[{"field":"qty","description":"must be positive"}]}}"#;
+    let back = http::from_json_body(400, body).expect("error body");
+    assert_eq!(
+        back.field_violations(),
+        [FieldViolation::new("qty", "must be positive")]
+    );
+    assert_eq!(back.field_violations()[0].reason, None);
+    assert!(back.field_violations()[0].metadata.is_empty());
+}
+
+/// The detail types of a status, in order.
+fn detail_types(status: &Status) -> Vec<String> {
+    tonic_types::Status::decode(status.details())
+        .expect("rpc status")
+        .details
+        .into_iter()
+        .map(|detail| detail.type_url)
+        .collect()
+}
+
+#[test]
+fn the_reason_rides_in_the_standard_bad_request() {
+    let error = AppError::invalid_argument("bad")
+        .with_violation(FieldViolation::new("qty", "must be positive").with_reason("NOT_POSITIVE"))
+        .with_field_violation("sku", "unknown");
+    let status = grpc::to_status(&error);
+    let bad_request = status.get_details_bad_request().expect("bad request");
+    assert_eq!(bad_request.field_violations[0].reason, "NOT_POSITIVE");
+    assert_eq!(bad_request.field_violations[1].reason, "");
+    assert_eq!(
+        detail_types(&status),
+        ["type.googleapis.com/google.rpc.BadRequest"],
+        "no extra detail without violation metadata"
+    );
+}
+
+#[test]
+fn violation_metadata_rides_in_the_extra_detail() {
+    let error = AppError::invalid_argument("bad")
+        .with_field_violation("sku", "unknown")
+        .with_violation(FieldViolation::new("qty", "too large").with_metadata("max", "10"));
+    let status = grpc::to_status(&error);
+    assert_eq!(
+        detail_types(&status),
+        [
+            "type.googleapis.com/google.rpc.BadRequest",
+            grpc::FIELD_VIOLATION_DETAILS_TYPE_URL
+        ]
+    );
+    assert_eq!(
+        grpc::FIELD_VIOLATION_DETAILS_TYPE_URL,
+        "type.googleapis.com/sekvent.error.v1.FieldViolationDetails"
+    );
+    assert_eq!(grpc::from_status(&status).to_wire(), error.to_wire());
+}
+
+#[test]
+fn a_status_written_by_tonic_types_alone_decodes_without_reason_or_metadata() {
+    let mut details = tonic_types::ErrorDetails::new();
+    details.set_bad_request(vec![tonic_types::FieldViolation::new(
+        "qty",
+        "must be positive",
+    )]);
+    let status = Status::with_error_details(Code::InvalidArgument, "bad", details);
+    let back = grpc::from_status(&status);
+    assert_eq!(
+        back.to_wire(),
+        AppError::invalid_argument("bad")
+            .with_field_violation("qty", "must be positive")
+            .to_wire()
+    );
+}
+
+/// A status with a `BadRequest` of `fields` and the given extra detail
+/// payloads, typed as `FieldViolationDetails`.
+fn with_extra_details(fields: &[&str], extras: Vec<Vec<u8>>) -> Status {
+    let bad_request = tonic_types::pb::BadRequest {
+        field_violations: fields
+            .iter()
+            .map(|field| tonic_types::pb::bad_request::FieldViolation {
+                field: (*field).to_owned(),
+                description: "d".into(),
+                reason: "R".into(),
+                localized_message: None,
+            })
+            .collect(),
+    };
+    let mut details = vec![prost_types::Any {
+        type_url: "type.googleapis.com/google.rpc.BadRequest".into(),
+        value: bad_request.encode_to_vec(),
+    }];
+    details.extend(extras.into_iter().map(|value| prost_types::Any {
+        type_url: grpc::FIELD_VIOLATION_DETAILS_TYPE_URL.into(),
+        value,
+    }));
+    let status = tonic_types::Status {
+        code: 3,
+        message: "bad".into(),
+        details,
+    };
+    Status::with_details(Code::InvalidArgument, "bad", status.encode_to_vec().into())
+}
+
+/// The protobuf form of `FieldViolationDetails` for the given per-entry
+/// metadata, written by hand so the test does not share the encoder.
+fn extra_detail(entries: &[&[(&str, &str)]]) -> Vec<u8> {
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Entry {
+        #[prost(btree_map = "string, string", tag = "1")]
+        metadata: std::collections::BTreeMap<String, String>,
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Extra {
+        #[prost(message, repeated, tag = "1")]
+        violations: Vec<Entry>,
+    }
+    Extra {
+        violations: entries
+            .iter()
+            .map(|pairs| Entry {
+                metadata: pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            })
+            .collect(),
+    }
+    .encode_to_vec()
+}
+
+fn expected(fields: &[&str], metadata: &[&[(&str, &str)]]) -> AppError {
+    let mut error = AppError::invalid_argument("bad");
+    for (index, field) in fields.iter().enumerate() {
+        let mut violation = FieldViolation::new(*field, "d").with_reason("R");
+        for (key, value) in metadata.get(index).copied().unwrap_or_default() {
+            violation = violation.with_metadata(*key, *value);
+        }
+        error = error.with_violation(violation);
+    }
+    error
+}
+
+#[test]
+fn a_garbage_extra_detail_leaves_the_standard_part() {
+    let status = with_extra_details(&["a", "b"], vec![vec![0xff, 0xff, 0xff]]);
+    assert_eq!(
+        grpc::from_status(&status).to_wire(),
+        expected(&["a", "b"], &[]).to_wire()
+    );
+}
+
+#[test]
+fn a_misaligned_extra_detail_is_applied_entry_by_entry() {
+    let shorter = with_extra_details(&["a", "b"], vec![extra_detail(&[&[("k", "1")]])]);
+    assert_eq!(
+        grpc::from_status(&shorter).to_wire(),
+        expected(&["a", "b"], &[&[("k", "1")]]).to_wire()
+    );
+
+    let longer = with_extra_details(
+        &["a"],
+        vec![extra_detail(&[&[("k", "1")], &[("k", "2")], &[]])],
+    );
+    assert_eq!(
+        grpc::from_status(&longer).to_wire(),
+        expected(&["a"], &[&[("k", "1")]]).to_wire()
+    );
+}
+
+#[test]
+fn the_first_decodable_extra_detail_wins() {
+    let status = with_extra_details(
+        &["a"],
+        vec![
+            vec![0xff],
+            extra_detail(&[&[("k", "1")]]),
+            extra_detail(&[&[("k", "2")]]),
+        ],
+    );
+    assert_eq!(
+        grpc::from_status(&status).to_wire(),
+        expected(&["a"], &[&[("k", "1")]]).to_wire()
+    );
+}
+
+#[test]
+fn an_extra_detail_without_a_bad_request_is_ignored() {
+    let status = tonic_types::Status {
+        code: 3,
+        message: "bad".into(),
+        details: vec![prost_types::Any {
+            type_url: grpc::FIELD_VIOLATION_DETAILS_TYPE_URL.into(),
+            value: extra_detail(&[&[("k", "1")]]),
+        }],
+    };
+    let status = Status::with_details(Code::InvalidArgument, "bad", status.encode_to_vec().into());
+    assert_eq!(
+        grpc::from_status(&status).to_wire(),
+        AppError::invalid_argument("bad").to_wire()
+    );
 }
 
 #[tokio::test]

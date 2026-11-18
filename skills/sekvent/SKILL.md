@@ -103,7 +103,11 @@ fn find(id: &str) -> Result<Order, AppError> {
 
 AppError::invalid_argument("the request is invalid")
     .with_field_violation("quantity", "must be positive")
-    .with_metadata("max", "100");
+    .with_violation(
+        FieldViolation::new("note", "too long")
+            .with_reason("NOTE_TOO_LONG")             // per-violation code
+            .with_metadata("max", "200"),             // values for a client-side message
+    );
 AppError::unavailable("billing is unavailable").with_retry_after(Duration::from_secs(5));
 ```
 
@@ -113,6 +117,11 @@ AppError::unavailable("billing is unavailable").with_retry_after(Duration::from_
   `cancelled`, `internal(source)`, or `AppError::new(ErrorCode::…, msg)`.
 - The message is shown to callers: no internals, ids of other tenants, SQL
   or upstream text. Put those in `.with_source(err)`.
+- `FieldViolation` is `#[non_exhaustive]`: `FieldViolation::new(field,
+  description)` plus `with_reason` / `with_metadata`, added with
+  `.with_violation(v)`; both survive gRPC (`BadRequest` reason, metadata in
+  the `sekvent.error.v1.FieldViolationDetails` detail), HTTP JSON and the
+  component bindings.
 - `is_transient()` drives retries: `UNAVAILABLE`, `DEADLINE_EXCEEDED`,
   `RESOURCE_EXHAUSTED`, `ABORTED`.
 - Mapping: `impl From<AppError> for tonic::Status` (`error-grpc`), axum

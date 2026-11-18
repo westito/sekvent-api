@@ -8,13 +8,56 @@ use crate::ErrorCode;
 type Source = Box<dyn StdError + Send + Sync + 'static>;
 
 /// One invalid request field, reported back to the caller.
+///
+/// Every field is caller-visible, like the rest of [`AppError`]'s wire form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct FieldViolation {
     /// Path of the offending field, e.g. `items[2].quantity`.
     pub field: String,
     /// Caller-safe description of what is wrong.
     pub description: String,
+    /// Machine-readable reason of this violation, `UPPER_SNAKE_CASE` by
+    /// convention (`google.rpc.BadRequest.FieldViolation.reason`).
+    /// Caller-visible.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub reason: Option<String>,
+    /// Caller-visible key/value context of this violation.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl FieldViolation {
+    /// A violation of `field` with a caller-safe description.
+    pub fn new(field: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            description: description.into(),
+            reason: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// Machine-readable reason, `UPPER_SNAKE_CASE` by convention.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Caller-visible key/value context; a repeated key keeps the last value.
+    #[must_use]
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
 }
 
 /// The error type every sekvent service returns.
@@ -136,17 +179,19 @@ impl AppError {
         self.inner.retry_after = Some(after);
         self
     }
-    /// Add a field violation.
+    /// Add a field violation with only a field and a description.
     #[must_use]
     pub fn with_field_violation(
-        mut self,
+        self,
         field: impl Into<String>,
         description: impl Into<String>,
     ) -> Self {
-        self.inner.field_violations.push(FieldViolation {
-            field: field.into(),
-            description: description.into(),
-        });
+        self.with_violation(FieldViolation::new(field, description))
+    }
+    /// Add a built field violation, e.g. one carrying a reason or metadata.
+    #[must_use]
+    pub fn with_violation(mut self, violation: FieldViolation) -> Self {
+        self.inner.field_violations.push(violation);
         self
     }
     /// Attach the internal cause. Logged by the server, never sent.
