@@ -69,6 +69,7 @@ repository; describe behaviour in your own words and use neutral examples
 | `sekvent-storage` | S3-compatible object storage: SigV4 presigned uploads and downloads, head, delete, copy, bucket probe | config, error, context, client, resilience, runtime (optional) |
 | `sekvent-db` | named pools, a keyed resource cache with a pool per key, migrations (directory or embedded), distinct-target check, sea-query execution, sea-orm filters, probes, leases | config, error, runtime (optional) |
 | `sekvent-component` | components, App builder, local, serialized and gRPC bindings, server-streaming methods | config, error, context, resilience, link (optional), macros, runtime (optional), telemetry (optional) |
+| `sekvent-tenancy` | tenants on a database and a role each: ids and object names, derived role credentials, cluster operations and the startup preflight; tenant selection, the tenant cache and cross-process invalidation (slice 1b); lifecycle operations, admin tokens and the manager kit (slice 1c) | config, error, context, db, component, telemetry, runtime (optional), auth (optional), client (optional) |
 | `sekvent-testing` | Postgres/MySQL/MinIO containers, reaper, `await_until!` | — |
 | `sekvent-proto-build` | build.rs codegen helpers, component service-contract constants and RPC type aliases | — |
 | `sekvent-api` (lib `sekvent`) | facade re-exporting the above behind features | all |
@@ -114,6 +115,8 @@ Apps on one runtime, visible end-user rejections),
 `docs/design/component-streaming.md` (server-streaming methods),
 `docs/design/serve-admission.md` (the end-user precheck, the shared
 admission and the bounded request read before scope resolution),
+`docs/design/tenancy.md` (`sekvent-tenancy`: tenants on a database and a
+role each, built in slices 1a to 1c),
 `docs/design/p8-service-essentials.md` (jobs, leases).
 Milestones C1, C2 and C4 are done (C4: jobs in `sekvent-runtime`, leases in
 `sekvent-db`); C3 and C5 (bus, async/deferred calls, NATS, extraction

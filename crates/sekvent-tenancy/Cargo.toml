@@ -1,0 +1,73 @@
+[package]
+name = "sekvent-tenancy"
+description = "Tenants on a Postgres database and a role each: names, derived role credentials, cluster operations and the startup preflight."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["serving"]
+# Selection, the tenant cache, the control registry, invalidation.
+serving = [
+    "dep:sekvent-context", "dep:sekvent-db", "dep:sekvent-component",
+    "dep:sekvent-telemetry", "dep:sqlx", "dep:chrono", "dep:tokio",
+    "dep:tokio-util", "dep:futures", "dep:http", "dep:tracing",
+    "dep:hmac", "dep:sha2", "dep:base64", "dep:zeroize",
+]
+# The maintenance connection, roles, databases, tenant operations.
+lifecycle = ["serving", "dep:getrandom"]
+# The admin token verifier, authenticator and guard.
+admin = ["serving", "dep:sekvent-auth", "dep:serde", "dep:serde_json"]
+# The token minter and the admin client; no database.
+manager = [
+    "dep:sekvent-auth", "dep:sekvent-client", "dep:sekvent-context",
+    "dep:serde", "dep:serde_json", "dep:prost", "dep:bytes",
+    "dep:base64", "dep:tokio",
+]
+# Runtime units for the tenant cache and the listener.
+runtime = ["serving", "dep:sekvent-runtime", "sekvent-db/runtime"]
+
+[dependencies]
+sekvent-config = { workspace = true }
+sekvent-error = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+sekvent-auth = { workspace = true, optional = true }
+sekvent-client = { workspace = true, optional = true }
+sekvent-context = { workspace = true, optional = true }
+sekvent-db = { workspace = true, optional = true, features = ["sqlx-postgres", "keyed", "migrate"] }
+# Path, not workspace: the scope resolver and the authenticator need no
+# macros, and a member cannot turn off a root pin's defaults.
+sekvent-component = { path = "../sekvent-component", default-features = false, optional = true }
+# Path, not workspace: keeps sekvent-runtime's default grpc-web feature off.
+sekvent-runtime = { path = "../sekvent-runtime", default-features = false, optional = true }
+sekvent-telemetry = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true, features = ["postgres"] }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+[dev-dependencies]
+sekvent-testing = { workspace = true, features = ["postgres"] }
+tokio = { workspace = true, features = ["test-util"] }
+# Serving an App in the tests of the resolver and the admin surface.
+sekvent-component = { path = "../sekvent-component", features = ["runtime", "grpc"] }
+sekvent-runtime = { path = "../sekvent-runtime", features = ["grpc-web"] }
+
+[lints]
+workspace = true

@@ -38,6 +38,7 @@ sekvent-proto-build = { path = "crates/sekvent-proto-build" }
 sekvent-component = { path = "crates/sekvent-component" }
 sekvent-sso = { path = "crates/sekvent-sso" }
 sekvent-storage = { path = "crates/sekvent-storage" }
+sekvent-tenancy = { path = "crates/sekvent-tenancy" }
 # --- async runtime ---
 tokio = { version = "1.54.0", features = ["full"] }
 tokio-util = "0.7.20"

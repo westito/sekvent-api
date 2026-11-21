@@ -48,6 +48,10 @@ speed and flakes: the `rust-testing` skill.
 | A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; `component-grpc` for the `grpc` binding and serving; `runtime` for `App::register` |
 | A tenant (or another per-request value) resolved from the request head before authentication | `component` (`ScopeResolver`, `AppBuilder::scope_resolver`, `App::resolve_scope`, `admit_end_user`), `context::RequestScope`, `cx.scoped::<T>()` | `component`; `component-grpc` to serve |
 | Bounding what served calls cost before authentication (one serve admission per App with a per-client cap, request size and read timeout, a cheap credential precheck) | `component` (`ServeAdmission`, `AppBuilder::serve_admission`, `EndUserPrecheck`, `BearerShape`, `AppBuilder::end_user_precheck`) | `component`; `component-grpc` to serve |
+| Tenants on a Postgres database and a role each: tenant ids and object names, hosts and labels, role passwords derived instead of stored, the startup check that no tenant role reaches the service's own databases (selection and the tenant cache arrive with slice 1b) | `tenancy` (`TenantId`, `ObjectNames`, `RoleSecrets`, `Connector`, `cluster::preflight`) | `tenancy` |
+| Create, check and drop tenant roles and databases as a non-superuser maintenance role; hand an existing database over to a tenant role (provisioning and the other tenant operations arrive with slice 1c) | `tenancy` (`cluster::{Maintenance, roles, databases, handover}`, `ScramVerifier`) | `tenancy-lifecycle` |
+| Guard a product's admin RPCs with single-use operator tokens (the admin guard; arrives with slice 1c) | `tenancy` (admin surface) | `tenancy-admin` |
+| Mint operator tokens and call a product's admin RPC from another service, without a database (the manager kit; arrives with slice 1c) | `tenancy` (manager kit) | `tenancy-manager` with `default-features = false` |
 | Postgres/MySQL/MinIO test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` (features `postgres`, `mysql`, `minio`) |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
 
@@ -1545,6 +1549,58 @@ builder.end_user_precheck(|request: &http::request::Parts, _target: CallTarget| 
   a missing credential gets the constant answer instead of the
   authenticator's; at most 32 calls per address are admitted at once.
 
+### Tenant roles and databases (startup preflight, cluster operations)
+
+Facade feature `tenancy-lifecycle` (`tenancy` alone for the names, the
+secrets, the connector and the preflight):
+
+```rust
+use sekvent::tenancy::cluster::{databases, preflight, roles};
+use sekvent::tenancy::{Maintenance, ObjectNames, RoleKey, RoleSecrets, ScramVerifier};
+
+// Startup, on every process that serves tenants, before any migration.
+let names = ObjectNames::new("app_t_")?;
+let secrets = RoleSecrets::parse(&config.role_secrets, "billing.role.v1")?; // Secret: "k1:<32+ bytes>,k2:…"
+preflight::check_control_and_maintenance(&control_pool, &maintenance_options, &names).await?;
+// … control migrations …
+let maintenance = Maintenance::new(maintenance_options, names.clone()); // one session at a time
+
+// Create a tenant's role and database (both converge when called again).
+let role = names.role(tenant);
+let database = names.database(tenant);
+let key = RoleKey { key_id: "k1".to_owned(), generation: 1 };   // stored on the tenant's row
+let password = secrets.derive(tenant, &key)?;
+let verifier = tokio::task::spawn_blocking(move || ScramVerifier::new(&password))
+    .await
+    .map_err(AppError::internal)??;                              // 4096 PBKDF2 rounds: blocking pool
+let mut conn = maintenance.connect().await?;
+roles::create(&mut conn, &role, &verifier, 20).await?;           // connection limit 20
+databases::create(&mut conn, &database, &role).await?;           // only the role may connect
+conn.close().await?;
+
+// Drop them: the database first (as its owner), then the role.
+let mut conn = maintenance.connect().await?;
+databases::drop(&mut conn, &database, &role).await?;
+roles::drop(&mut conn, &role).await?;
+conn.close().await?;
+```
+
+- The maintenance role is no superuser: `LOGIN CREATEDB CREATEROLE`, no
+  database of its own, `CONNECT` on a maintenance database another role
+  owns. Postgres 16 or later.
+- The preflight is `FAILED_PRECONDITION` naming every finding; fix the
+  grants, never skip it. A process without the maintenance credential
+  checks its own databases with `preflight::check_session_database`.
+- Drift on an existing role or database is `INTERNAL` and left alone for
+  the operator. A timed-out operation poisons the connection: close it and
+  `connect` again (`conn.is_poisoned()`).
+- Tenant pools connect through `Connector::candidates(tenant, &role,
+  &database, &keys)`; rotate a password with a new `RoleKey` generation,
+  never by storing one.
+- Hand an existing database over with `cluster::handover::{prepare, adopt}`
+  while no maintenance connection is open; refusals carry
+  `ADOPTION_REFUSED` and a `check`.
+
 ## Pitfalls
 
 - **Secrets in logs.** Never log, `format!`, `Debug`-print or return a
@@ -1611,6 +1667,10 @@ builder.end_user_precheck(|request: &http::request::Parts, _target: CallTarget| 
   the `KeyedRef` while working; a `PgPool` cloned out of it may be closed
   under you. Build `PgConnectOptions` field by field and never print them.
   `invalidate` is for an operator's action, not for every request.
+- **Tenant roles.** Never format a role or database name yourself (only
+  `ObjectNames`, `parse_role` and `DatabaseName::parse` make the checked
+  types the cluster operations take) and never store a tenant credential:
+  store the `RoleKey`, derive the password with `RoleSecrets`.
 - **Tests.** No fixed sleeps: completion signals, `RuntimeHandle::wait`,
   `tokio::time::pause`. Servers bind port 0.
 - **Thin `main`.** Telemetry, config, `serve`; everything else in the

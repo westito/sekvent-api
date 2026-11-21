@@ -31,6 +31,7 @@ workspaces and runs the quality gate.
 | `sekvent::auth` | `auth` | [auth](modules/auth.md) | argon2id and bcrypt passwords, login helper, HS256 and EdDSA JWT with injected time |
 | `sekvent::sso` | `sso` | [sso](modules/sso.md) | Browser single sign-on (OAuth 2.0 code flow), Bitbucket Cloud provider, one-time handoff codes |
 | `sekvent::storage` | `storage` | [storage](modules/storage.md) | S3-compatible object storage: presigned browser uploads and downloads, head, delete, copy, bucket probe |
+| `sekvent::tenancy` | `tenancy` | [tenancy](modules/tenancy.md) | Tenants on a database and a role each: ids and object names, derived role credentials, cluster operations and the startup preflight; tenant selection, the tenant cache and cross-process invalidation (slice 1b); lifecycle operations, admin tokens and the manager kit (slice 1c) |
 | `sekvent::link` | `link` | [link](modules/link.md) | Service-to-service tokens, inbound checks, outbound attachment |
 | `sekvent::client` | `client` | [client](modules/client.md) | Outbound HTTP with policies, context propagation, OAuth 2.0 |
 | `sekvent::resilience` | `resilience` | [resilience](modules/resilience.md) | Backoff, retries with budgets, rate gate, bulkhead, breaker, TTL cache |
@@ -88,6 +89,7 @@ A typical service:
 | [design/sso.md](design/sso.md) | Specification of browser single sign-on: providers, state cookie, handoff codes, Bitbucket Cloud |
 | [design/p8-service-essentials.md](design/p8-service-essentials.md) | Specification of server essentials, probes, password schemes, jobs, leases, HTTP helpers |
 | [design/storage.md](design/storage.md) | Specification of object storage: own SigV4 signer on rustls/ring, presigned uploads and downloads, two endpoints, the MinIO test image |
+| [design/tenancy.md](design/tenancy.md) | Specification of tenants on a database and a role each (`sekvent-tenancy`): names and derived credentials, cluster operations and the preflight, selection and the tenant cache, invalidation, lifecycle, the admin surface and the manager kit; the work order of slices 1a to 1c |
 | [design/static-site.md](design/static-site.md) | Specification of serving a built frontend: the virtual filesystem, path normalization, `StaticSite`, server routing |
 | [design/client-limits.md](design/client-limits.md) | Client addresses behind proxies and their propagation, the keyed rate limiter, per-client limits of served component methods and REST routes |
 | [examples/shop](../examples/shop/README.md) | Three components (orders, inventory, notifications) in monolith and split topologies |

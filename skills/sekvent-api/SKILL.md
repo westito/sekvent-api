@@ -60,6 +60,9 @@ can describe APIs the project does not have yet.
 | Bound what a served call costs before its scope is resolved and its caller authenticated (one serve admission per App with a per-client cap, request size and read timeout, a cheap credential precheck) | `docs/modules/components.md` ("How to bound what a call costs before it is authenticated"), `docs/design/serve-admission.md` |
 | Run two Apps on one runtime, each behind its own listener (`App::register_as`) | `docs/modules/components.md` ("Under the runtime") |
 | Stream live updates to a browser or service (server-streaming `#[call(stream)]`, `CallStream`, lifetime, drain, HTTP/2 keep-alive) | `docs/modules/components.md` ("How to stream replies"), `docs/modules/server.md` ("Keep long streams alive") |
+| Give each tenant a Postgres database and a role of its own: tenant ids and object names, hosts and labels, derived role credentials | `docs/modules/tenancy.md` ("Names, hosts and labels", "Role credentials") |
+| Create and drop tenant roles and databases without a superuser; check at startup that no tenant role reaches the service's own databases; adopt an existing database | `docs/modules/tenancy.md` ("The maintenance connection", "Roles and databases", "The startup preflight", "Adopting a database") |
+| Select the tenant per request, cache its scope, follow changes made on other processes (slice 1b); provision, suspend and purge tenants, guard admin RPCs, call them from an operator service (slice 1c) | `docs/modules/tenancy.md` ("Select the tenant", "The tenant cache", "Provision a tenant", "The admin surface"), `docs/design/tenancy.md` |
 | `build.rs` protobuf codegen without `protoc` | `docs/modules/proto-build.md` |
 | Container-backed DB and MinIO tests, deterministic tests, coverage | `docs/modules/testing.md` |
 | Why something is designed the way it is | `docs/design/*.md` (decisions; the module pages describe current behaviour) |
@@ -150,6 +153,10 @@ this shape; read it before restructuring.
 | Per-client rate limit on axum routes (`ClientLimitLayer`) | `resilience-http` |
 | Service-to-service tokens | `link` (+ `link-axum` / `link-tonic`) |
 | Components | `component` (+ `component-grpc` for the gRPC binding, also for serving streams; `runtime-grpc-web` for browsers) |
+| Tenants on a database and a role each (names, derived credentials, the startup preflight) | `tenancy` |
+| Tenant roles and databases through a maintenance role, adopting a database | `tenancy-lifecycle` |
+| Guard a product's admin RPCs with operator tokens (slice 1c) | `tenancy-admin` |
+| Mint operator tokens and call a product's admin RPC, no database (slice 1c) | `tenancy-manager` with `default-features = false` (the default `runtime` pulls in the database driver) |
 
 A browser frontend: in development run Vite's dev server with
 `server.proxy` sending `/api` to the backend (one origin, no CORS); in

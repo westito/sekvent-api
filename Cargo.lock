@@ -4043,6 +4043,7 @@ dependencies = [
  "sekvent-sso",
  "sekvent-storage",
  "sekvent-telemetry",
+ "sekvent-tenancy",
  "tokio",
 ]
 
@@ -4402,6 +4403,40 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "sekvent-tenancy"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "futures",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "http",
+ "prost",
+ "sekvent-auth",
+ "sekvent-client",
+ "sekvent-component",
+ "sekvent-config",
+ "sekvent-context",
+ "sekvent-db",
+ "sekvent-error",
+ "sekvent-runtime",
+ "sekvent-telemetry",
+ "sekvent-testing",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
