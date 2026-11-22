@@ -14,7 +14,7 @@ set hosts, purge, adopt) with an admin surface an operator service calls.
 > [`component-end-user.md`](component-end-user.md) and
 > [`p8-service-essentials.md`](p8-service-essentials.md). Where this note
 > is more specific, it wins. The note is also the work order: three slices
-> on a feature branch (section 5), each opened by a step 0 the coordinator
+> landing on `master` one by one (section 5), each opened by a step 0 the coordinator
 > does alone (section 6). Slice 1a (section 8) is specified in full; 1b and
 > 1c (sections 9 and 10) fix behaviour and the shape of the API and mark the
 > signatures their own step 0 pins.
@@ -218,11 +218,12 @@ re-exports only and belong to the coordinator in every slice.
 
 ## 5. How the work is run
 
-1. **A feature branch.** All work lands on the branch `tenancy`. It is
-   merged to `master` only after the first consuming product's own test
-   suite passes against the branch. Projects track `master`, so nothing
-   reaches them before that. Pushing the branch to the public repository
-   needs the owner's yes (15, question 1).
+1. **Each slice lands on `master`** once its gate and coverage are green
+   (owner's decision, answering 15, question 1). The crate is new and
+   additive: a project that does not enable a `tenancy` feature compiles
+   nothing of it. A slice's public items may still change in a later
+   slice until the first consuming product deploys the crate; the
+   consumer check (item 2.4) follows the slice on `master`.
 2. **Three slices**, in this order: **1a leaves**, **1b serving half**,
    **1c lifecycle and admin**. Each slice is one full loop:
    1. *Step 0*, by the coordinator alone: every file more than one writer
@@ -238,9 +239,10 @@ re-exports only and belong to the coordinator in every slice.
       ends its report with what in the tree contradicted this note.
    3. *Verification*: one run of the gate and of coverage (section 17),
       then fixes grouped by file.
-   4. *Consumer check*: the consuming product points its git dependency at
-      the branch, replaces its own code of the slice by the crate's and
-      runs its own suite. The slice is done when that is green.
+   4. *Consumer check*: the consuming product moves its lock to the
+      slice's commit on `master`, replaces its own code of the slice by
+      the crate's and runs its own suite. The slice is done when that is
+      green.
 3. **Sizes are re-estimated after 1a.** The plan for 1b and 1c is revised
    with what 1a taught before their step 0.
 
@@ -1849,11 +1851,8 @@ coverage.
 
 ## 15. Open questions for the repository owner
 
-1. **The branch.** Push `tenancy` to the public repository so a consumer
-   can depend on it by git (a path dependency outside the consuming
-   project does not exist on the remote builder), or keep it local and
-   vendor it into the consumer as a submodule. *Recommended: push the
-   branch;* it holds only neutral, gated work and is merged or deleted.
+1. **Decided: slices land on `master`** (section 5, item 1), not on a
+   feature branch.
 2. **One crate or two.** Keep the manager kit in `sekvent-tenancy` behind
    a feature, or give it a crate of its own (`sekvent-tenancy-manager`)
    so an operator service never sees the serving code in its dependency
@@ -1903,8 +1902,8 @@ database checks (8.9), the preflight (8.10), role creation and the
 verifier path (8.4, 8.7), the database drop and the handover (8.8, 8.11),
 name and verifier formatting (8.2, 8.6), selection and the origin check
 (9.4, 9.5), the lookup and cold-open bounds (9.3, 9.6), and the admin
-token, the replay record and the guard (10.6). The merge to `master`
-waits for it, alongside the consumer check.
+token, the replay record and the guard (10.6). The first product
+deployment of the crate waits for it.
 
 ## 17. Verification
 
@@ -1917,6 +1916,6 @@ Per slice, on the remote builder, one command at a time:
 
 Then the consumer check of the slice (8.13, 9.8, 10.8) in the consuming
 product's own tree. A slice is committed only when the gate and coverage
-are green and the crate's own line coverage is at least 95 %; the branch
-is merged only when all three consumer checks and the review of section
-16 are done.
+are green and the crate's own line coverage is at least 95 %; it then
+lands on `master`. A product deploys the crate only when all three
+consumer checks and the review of section 16 are done.
