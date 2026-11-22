@@ -653,6 +653,8 @@ impl ScramVerifier {
     pub fn with_salt(password: &Secret, salt: &[u8; 16]) -> Self;
     /// A verifier made elsewhere, after the syntax check. `INTERNAL`.
     pub fn parse(text: Secret) -> Result<Self, AppError>;
+    /// The verifier text, as `Secret::expose`.
+    pub fn expose(&self) -> &str;
 }
 /// `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`, each part standard
 /// base64 (`[A-Za-z0-9+/]+={0,2}`), nothing before or after.
@@ -722,10 +724,15 @@ on the roles it creates).
 /// The cluster's maintenance connection: one at a time. Clones share the
 /// permit. `Debug` prints nothing.
 #[derive(Clone)]
-pub struct Maintenance { /* options, names, a semaphore of one */ }
+pub struct Maintenance { /* options, names, a semaphore of one, the application name */ }
 
 impl Maintenance {
     pub fn new(options: PgConnectOptions, names: ObjectNames) -> Self;
+    /// The `application_name` of every maintenance session and pool, clamped
+    /// to printable ASCII (others become `?`) and 63 bytes; never fails.
+    #[must_use]
+    pub fn with_application_name(self, name: &str) -> Self;
+    pub fn application_name(&self) -> &str;
     /// The maintenance role (the options' user).
     pub fn role(&self) -> &str;
     /// The maintenance database (the options' database, else the role's name).
@@ -769,7 +776,8 @@ Rules of every maintenance session:
   database may stand in for a catalog operator or function.
 - Statement logging is off on the connection: role statements carry
   verifiers.
-- Application name `sekvent-tenancy-maintenance`.
+- Application name `sekvent-tenancy-maintenance`, unless the product sets
+  another with `with_application_name`.
 - Catalog reads are static SQL with bound names. Utility statements are
   built only in `cluster/sql.rs`, only from `TenantRole`, `DatabaseName`
   and `ScramVerifier`.
@@ -844,7 +852,9 @@ pub async fn size(conn: &mut MaintenanceConn, database: &DatabaseName) -> Result
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatabaseAccess { pub owner: String, pub public_connect: bool }
-pub async fn access(conn: &mut MaintenanceConn, database: &DatabaseName) -> Result<Option<DatabaseAccess>, AppError>;
+/// The owner and `PUBLIC`'s `CONNECT` of any database, in one bound
+/// statement; `None` when there is none. No name check.
+pub async fn access(conn: &mut MaintenanceConn, database: &str) -> Result<Option<DatabaseAccess>, AppError>;
 ```
 
 **`create`** (`database` must be a tenant object name of the connection's
@@ -924,6 +934,7 @@ pub struct RoleFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum DatabasePrivilege { Connect, Temporary, Create }
+impl DatabasePrivilege { pub fn sql_name(self) -> &'static str; }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Grantee { Public, Role(String) }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -937,6 +948,8 @@ pub enum RoleFinding { Attribute(&'static str), Reaches(String), ReachedBy(Strin
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DatabaseFinding { Owner(String), Template, Grant(DatabaseGrant) }
+impl fmt::Display for RoleFinding;      // `it holds SUPERUSER`, `role x reaches it`, …
+impl fmt::Display for DatabaseFinding;  // `it is owned by x`, `PUBLIC holds CREATE`, …
 
 pub async fn role_facts(conn: &mut PgConnection, role: &str) -> Result<Option<RoleFacts>, AppError>;
 pub async fn database_facts(conn: &mut PgConnection, database: &str) -> Result<Option<DatabaseFacts>, AppError>;
@@ -1072,6 +1085,8 @@ pub enum Adoption {
 pub async fn prepare(maintenance: &Maintenance, database: &DatabaseName, role: &TenantRole) -> Result<Adoption, AppError>;
 /// `prepare`, the handover, the CONNECT restriction.
 pub async fn adopt(maintenance: &Maintenance, database: &DatabaseName, role: &TenantRole) -> Result<(), AppError>;
+/// The metadata key of a refusal: `check`.
+pub const CHECK_KEY: &str = "check";
 ```
 
 Each step runs on a connection of its own, one at a time, closed after.
@@ -2249,6 +2264,8 @@ coverage.
 
 1. Checked names and the verifier are **types** (`TenantRole`,
    `DatabaseName`, `ScramVerifier`); functions take them, never `&str`.
+   Catalog reads that only bind a name as a value (`privileges`,
+   `databases::access`) take any `&str`.
 2. Statements are static SQL with bound values; no `sea-query` dependency.
 3. `privileges` and `preflight` belong to `serving`; `admin` needs
    `serving`, not `lifecycle`.

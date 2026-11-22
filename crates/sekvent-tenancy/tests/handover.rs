@@ -180,7 +180,7 @@ fn refused_check(err: &AppError) -> String {
     assert_eq!(err.message(), "the database cannot be adopted");
     assert_eq!(err.metadata().len(), 1);
     err.metadata()
-        .get("check")
+        .get(handover::CHECK_KEY)
         .cloned()
         .expect("the refusal names its check")
 }

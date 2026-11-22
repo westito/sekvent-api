@@ -28,6 +28,14 @@ const DROP_FACTS: &str = "SELECT pg_catalog.pg_get_userbyid(d.datdba)::text, d.d
 const SIZE_FACTS: &str = "SELECT pg_catalog.pg_get_userbyid(datdba)::text, CURRENT_USER::text \
      FROM pg_catalog.pg_database WHERE datname = $1";
 
+/// The owner of a database and whether its ACL (or the default one) gives
+/// `PUBLIC` `CONNECT`, in one row; no row when there is no such database.
+const DATABASE_ACCESS: &str = "SELECT pg_catalog.pg_get_userbyid(d.datdba)::text, \
+     EXISTS (SELECT 1 \
+     FROM pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a \
+     WHERE a.grantee = 0::oid AND a.privilege_type = 'CONNECT') \
+     FROM pg_catalog.pg_database d WHERE d.datname = $1";
+
 /// The size of a database, no row when it is gone.
 const DATABASE_SIZE: &str = "SELECT pg_catalog.pg_database_size(oid) \
      FROM pg_catalog.pg_database WHERE datname = $1";
@@ -99,10 +107,16 @@ pub struct DatabaseAccess {
     pub public_connect: bool,
 }
 
-/// The access facts of `database`, `None` when there is no such database.
+/// The owner of `database` and `PUBLIC`'s effective `CONNECT` on it, read in
+/// one statement with the name bound as a parameter; `None` when there is no
+/// such database.
+///
+/// Any database name is read, `postgres` and other names [`DatabaseName`]
+/// refuses included, and nothing checks it against the connection's object
+/// names.
 pub async fn access(
     conn: &mut MaintenanceConn,
-    database: &DatabaseName,
+    database: &str,
 ) -> Result<Option<DatabaseAccess>, AppError> {
     let outcome = timeout(OPERATION_TIMEOUT, async {
         let session = conn.live()?;
@@ -154,16 +168,17 @@ async fn database_owner(
         .map_err(to_app_error)
 }
 
-/// The body of [`access`]: the owner, then `PUBLIC`'s effective `CONNECT`.
+/// The body of [`access`]: its one statement.
 async fn access_on(
     session: &mut PgConnection,
-    database: &DatabaseName,
+    database: &str,
 ) -> Result<Option<DatabaseAccess>, AppError> {
-    let Some(owner) = database_owner(session, database).await? else {
-        return Ok(None);
-    };
-    let public_connect = privileges::public_may_connect(session, database.as_str()).await?;
-    Ok(public_connect.map(|public_connect| DatabaseAccess {
+    let row = sqlx::query_as::<_, (String, bool)>(DATABASE_ACCESS)
+        .bind(database)
+        .fetch_optional(session)
+        .await
+        .map_err(to_app_error)?;
+    Ok(row.map(|(owner, public_connect)| DatabaseAccess {
         owner,
         public_connect,
     }))
@@ -588,7 +603,7 @@ mod tests {
             create(&mut conn, &database, &role).await,
             drop(&mut conn, &adopted, &role).await,
             size(&mut conn, &database).await.map(|_| ()),
-            access(&mut conn, &database).await.map(|_| ()),
+            access(&mut conn, database.as_str()).await.map(|_| ()),
         ] {
             let error = error.expect_err("the connection is poisoned");
             assert_eq!(error.code(), ErrorCode::Internal);

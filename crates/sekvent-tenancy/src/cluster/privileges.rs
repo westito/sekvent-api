@@ -12,6 +12,8 @@
 //! two: any finding is `INTERNAL` without a reason, the findings in the
 //! error's source. Nothing here repairs what it finds.
 
+use std::fmt;
+
 use sekvent_db::to_app_error;
 use sekvent_error::AppError;
 use sqlx::PgConnection;
@@ -100,8 +102,8 @@ pub enum DatabasePrivilege {
 }
 
 impl DatabasePrivilege {
-    /// The privilege's SQL name.
-    pub(crate) fn sql_name(self) -> &'static str {
+    /// The privilege's SQL name: `CONNECT`, `TEMPORARY` or `CREATE`.
+    pub fn sql_name(self) -> &'static str {
         match self {
             Self::Connect => "CONNECT",
             Self::Temporary => "TEMPORARY",
@@ -592,6 +594,26 @@ fn database_verdict(
     )))
 }
 
+/// `it holds SUPERUSER`, `it reaches role x`, `role x reaches it`, `the
+/// maintenance role's membership has INHERIT`.
+impl fmt::Display for RoleFinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&describe_role_finding(self))
+    }
+}
+
+/// `it is owned by x`, `it is a template`, `PUBLIC holds CREATE`, `role x
+/// holds CONNECT with grant option`.
+impl fmt::Display for DatabaseFinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Owner(actual) => write!(f, "it is owned by {actual}"),
+            Self::Template => f.write_str("it is a template"),
+            Self::Grant(grant) => f.write_str(&describe_grant(grant)),
+        }
+    }
+}
+
 fn describe_role_finding(finding: &RoleFinding) -> String {
     match finding {
         RoleFinding::Attribute(attribute) => format!("it holds {attribute}"),
@@ -605,9 +627,8 @@ fn describe_role_finding(finding: &RoleFinding) -> String {
 
 fn describe_database_finding(finding: &DatabaseFinding, owner: &str) -> String {
     match finding {
-        DatabaseFinding::Owner(actual) => format!("it is owned by {actual}, not {owner}"),
-        DatabaseFinding::Template => "it is a template".to_owned(),
-        DatabaseFinding::Grant(grant) => describe_grant(grant),
+        DatabaseFinding::Owner(_) => format!("{finding}, not {owner}"),
+        _ => finding.to_string(),
     }
 }
 
@@ -1175,5 +1196,40 @@ mod tests {
             describe_grant(&grant(Grantee::Public, DatabasePrivilege::Connect, true)),
             "PUBLIC holds CONNECT with grant option"
         );
+    }
+
+    #[test]
+    fn findings_display_their_description() {
+        assert_eq!(
+            RoleFinding::Attribute("SUPERUSER").to_string(),
+            "it holds SUPERUSER"
+        );
+        assert_eq!(
+            RoleFinding::Reaches("orders_reader".to_owned()).to_string(),
+            "it reaches role orders_reader"
+        );
+        assert_eq!(
+            RoleFinding::ReachedBy("orders_reader".to_owned()).to_string(),
+            "role orders_reader reaches it"
+        );
+        assert_eq!(
+            RoleFinding::MaintenanceInherits.to_string(),
+            "the maintenance role's membership has INHERIT"
+        );
+        assert_eq!(
+            DatabaseFinding::Owner("orders_owner".to_owned()).to_string(),
+            "it is owned by orders_owner"
+        );
+        assert_eq!(
+            describe_database_finding(&DatabaseFinding::Owner("orders_owner".to_owned()), TENANT),
+            format!("it is owned by orders_owner, not {TENANT}")
+        );
+        assert_eq!(DatabaseFinding::Template.to_string(), "it is a template");
+        assert_eq!(
+            DatabaseFinding::Grant(grant(Grantee::Public, DatabasePrivilege::Create, false))
+                .to_string(),
+            "PUBLIC holds CREATE"
+        );
+        assert_eq!(DatabasePrivilege::Temporary.sql_name(), "TEMPORARY");
     }
 }

@@ -51,8 +51,10 @@ use crate::{DatabaseName, TenantRole, reasons};
 /// The message of every refusal.
 const REFUSED: &str = "the database cannot be adopted";
 
-/// The metadata key naming the refused check.
-const CHECK_KEY: &str = "check";
+/// The metadata key of a refusal, `check`: its value names the refused
+/// check (`missing`, `template`, `owner`, `grantee`, `owns_more`,
+/// `foreign_object`, `session`).
+pub const CHECK_KEY: &str = "check";
 
 /// Other databases and tablespaces owned by the maintenance role (`$1`),
 /// the candidate (`$2`) aside.
@@ -505,8 +507,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Adoption, Check, adopt, check_database, check_foreign_objects, check_owns_nothing_else,
-        check_sessions, inspect, isolate, prepare, restrict, transfer,
+        Adoption, CHECK_KEY, Check, adopt, check_database, check_foreign_objects,
+        check_owns_nothing_else, check_sessions, inspect, isolate, prepare, restrict, transfer,
     };
     use crate::cluster::maintenance::OPERATION_TIMEOUT;
     use crate::cluster::privileges::{DatabaseFacts, DatabaseGrant, DatabasePrivilege, Grantee};
@@ -606,7 +608,8 @@ mod tests {
             assert_eq!(err.reason(), Some(reasons::ADOPTION_REFUSED));
             assert_eq!(err.domain(), None);
             assert_eq!(err.message(), "the database cannot be adopted");
-            let expected = BTreeMap::from([("check".to_owned(), check.name().to_owned())]);
+            let expected = BTreeMap::from([(CHECK_KEY.to_owned(), check.name().to_owned())]);
+            assert_eq!(CHECK_KEY, "check");
             assert_eq!(err.metadata(), &expected);
         }
     }

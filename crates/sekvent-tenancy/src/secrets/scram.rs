@@ -93,6 +93,13 @@ impl ScramVerifier {
         }
     }
 
+    /// The verifier text, `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`,
+    /// as [`Secret::expose`] gives it: for storing or comparing it, never for
+    /// a log or an error. `Debug` still prints nothing of it.
+    pub fn expose(&self) -> &str {
+        self.text.expose()
+    }
+
     /// The verifier as a single-quoted SQL string literal,
     /// `'SCRAM-SHA-256$…'`. Its alphabet holds no quote, so nothing is
     /// escaped; this is the only literal the crate formats into a statement.
@@ -339,6 +346,17 @@ mod tests {
             assert_eq!(literal.matches('\'').count(), 2);
             assert!(!literal.contains('\\'));
         }
+    }
+
+    #[test]
+    fn expose_round_trips_through_parse() {
+        let built = ScramVerifier::with_salt(&Secret::new("pencil"), &rfc_salt());
+        assert_eq!(built.expose(), RFC_VERIFIER);
+        let parsed =
+            ScramVerifier::parse(Secret::new(built.expose())).expect("an exposed verifier parses");
+        assert_eq!(parsed.expose(), built.expose());
+        assert_eq!(parsed.literal().expose(), format!("'{}'", built.expose()));
+        assert_eq!(format!("{parsed:?}"), "ScramVerifier(..)");
     }
 
     #[test]

@@ -27,6 +27,10 @@ const LOCK_WAITERS: &str =
 const MAINTENANCE_SESSIONS: &str = "SELECT count(*) FROM pg_stat_activity \
      WHERE usename = $1 AND datname = $2 AND application_name = 'sekvent-tenancy-maintenance'";
 
+/// The sessions of a role under an application name.
+const NAMED_SESSIONS: &str =
+    "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND application_name = $2";
+
 /// The state and the last statement of every maintenance session of a role.
 const MAINTENANCE_ACTIVITY: &str = "SELECT coalesce(state, ''), coalesce(query, '') \
      FROM pg_stat_activity \
@@ -228,7 +232,7 @@ async fn a_created_database_opens_only_to_its_owner() {
         let mut conn = cluster.maintenance().connect().await.expect("connected");
         let tenant = tenant(&cluster, &mut conn).await;
         assert_eq!(
-            databases::access(&mut conn, &tenant.database)
+            databases::access(&mut conn, tenant.database.as_str())
                 .await
                 .expect("read"),
             Some(DatabaseAccess {
@@ -311,7 +315,7 @@ async fn a_create_interrupted_after_create_database_converges() {
         databases::create(&mut conn, &tenant.database, &tenant.role)
             .await
             .expect("the create converged");
-        let access = databases::access(&mut conn, &tenant.database)
+        let access = databases::access(&mut conn, tenant.database.as_str())
             .await
             .expect("read")
             .expect("the database exists");
@@ -445,22 +449,149 @@ async fn access_reads_the_owner_and_public_connect() {
         let third = cluster.create_role("third", "").await;
         let open = cluster.create_database("open", &third).await;
         assert_eq!(
-            databases::access(&mut conn, &name(&open))
+            databases::access(&mut conn, &open).await.expect("read"),
+            Some(DatabaseAccess {
+                owner: third.clone(),
+                public_connect: true,
+            })
+        );
+
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!(
+                    "REVOKE CONNECT ON DATABASE {} FROM PUBLIC",
+                    common::quote(&open)
+                ),
+            )
+            .await;
+        assert_eq!(
+            databases::access(&mut conn, &open).await.expect("read"),
+            Some(DatabaseAccess {
+                owner: third.clone(),
+                public_connect: false,
+            })
+        );
+        // `TEMPORARY` alone is not `CONNECT`.
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!(
+                    "GRANT TEMPORARY ON DATABASE {} TO PUBLIC",
+                    common::quote(&open)
+                ),
+            )
+            .await;
+        assert_eq!(
+            databases::access(&mut conn, &open)
                 .await
-                .expect("read"),
+                .expect("read")
+                .map(|access| access.public_connect),
+            Some(false)
+        );
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!(
+                    "GRANT CONNECT ON DATABASE {} TO PUBLIC",
+                    common::quote(&open)
+                ),
+            )
+            .await;
+        assert_eq!(
+            databases::access(&mut conn, &open).await.expect("read"),
             Some(DatabaseAccess {
                 owner: third,
                 public_connect: true,
             })
         );
+        conn.close().await.expect("closed");
+    }))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn access_is_one_statement_for_any_name() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let mut conn = cluster.maintenance().connect().await.expect("connected");
         let missing = cluster.unique_name("missing");
         assert_eq!(
-            databases::access(&mut conn, &name(&missing))
-                .await
-                .expect("read"),
+            databases::access(&mut conn, &missing).await.expect("read"),
             None
         );
+        // The session's last statement read the owner and the ACL together.
+        let (state, query) = maintenance_activity(&cluster, cluster.maintenance_role()).await;
+        assert_eq!(state, "idle", "after: {query}");
+        assert!(
+            query.contains("datdba") && query.contains("aclexplode"),
+            "{query}"
+        );
+        assert!(query.contains("$1"), "the name is bound: {query}");
+        assert!(!query.contains(&missing), "{query}");
+
+        let postgres = databases::access(&mut conn, "postgres")
+            .await
+            .expect("read")
+            .expect("postgres exists");
+        assert!(postgres.public_connect, "postgres keeps its default ACL");
+        assert_ne!(postgres.owner, "");
+
+        let quoted = "orders'; DROP DATABASE postgres; --";
+        assert_eq!(
+            databases::access(&mut conn, quoted).await.expect("read"),
+            None
+        );
+        assert!(!conn.is_poisoned());
         conn.close().await.expect("closed");
+    }))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_custom_application_name_shows_on_every_session() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance = cluster.maintenance().with_application_name("orders-upkeep");
+        assert_eq!(maintenance.application_name(), "orders-upkeep");
+        let conn = maintenance.connect().await.expect("connected");
+        let sessions = admin_count(
+            &cluster,
+            NAMED_SESSIONS,
+            cluster.maintenance_role(),
+            Some("orders-upkeep"),
+        )
+        .await;
+        assert_eq!(sessions, 1);
+        assert_eq!(
+            admin_count(
+                &cluster,
+                MAINTENANCE_SESSIONS,
+                cluster.maintenance_role(),
+                Some(cluster.maintenance_database()),
+            )
+            .await,
+            0,
+            "the default name is replaced"
+        );
+        conn.close().await.expect("closed");
+
+        let pool = maintenance
+            .pool_on(&name(cluster.maintenance_database()))
+            .await
+            .expect("the pool holds the permit");
+        let shown: String = sqlx::query_scalar("SELECT current_setting('application_name')")
+            .fetch_one(pool.pool())
+            .await
+            .expect("the setting was read");
+        assert_eq!(shown, "orders-upkeep");
+        pool.close().await;
     }))
     .await;
 }
@@ -736,7 +867,9 @@ async fn a_poisoned_connection_refuses_every_operation() {
             databases::create(&mut conn, &database, &role).await,
             databases::drop(&mut conn, &database, &role).await,
             databases::size(&mut conn, &database).await.map(|_| ()),
-            databases::access(&mut conn, &database).await.map(|_| ()),
+            databases::access(&mut conn, database.as_str())
+                .await
+                .map(|_| ()),
             roles::create(&mut conn, &role, &verifier, 5).await,
             roles::exists(&mut conn, &role).await.map(|_| ()),
             roles::drop(&mut conn, &role).await,

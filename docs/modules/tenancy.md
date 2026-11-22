@@ -387,7 +387,9 @@ base64. `SaltedPassword` is one block of PBKDF2-HMAC-SHA-256 with
 
 Roles are created and altered with the verifier only, so the password never
 appears in a statement. The verifier's alphabet contains no quote, and it is
-the only value the crate puts into a string literal. `Debug` prints
+the only value the crate puts into a string literal. `expose` returns the
+verifier text, for a product that stores or compares it; treat it like a
+`Secret`'s exposed value and never log it. `Debug` prints
 `ScramVerifier(..)`.
 
 ```rust
@@ -477,7 +479,8 @@ let options = PgConnectOptions::new_without_pgpass()
     .username("billing_maintenance")
     .password(maintenance_password.expose())
     .database("billing_maintenance");
-let maintenance = Maintenance::new(options, ObjectNames::new("app_t_")?);
+let maintenance = Maintenance::new(options, ObjectNames::new("app_t_")?)
+    .with_application_name("billing-upkeep");
 
 let mut conn = maintenance.connect().await?;
 // … roles::create, databases::create …
@@ -496,7 +499,9 @@ conn.close().await?;
 Every maintenance session runs with `search_path = pg_catalog, pg_temp`
 (during an adoption it is connected to a database that is not the
 product's, and no object there may stand in for a catalog function), with
-the application name `sekvent-tenancy-maintenance`, and with sqlx's
+the application name `sekvent-tenancy-maintenance` (or the one
+`Maintenance::with_application_name` sets, read back with
+`application_name`), and with sqlx's
 statement logging off, because role statements carry verifiers. Catalog
 reads are static SQL with bound names; utility statements are built only
 from the checked `TenantRole`, `DatabaseName` and `ScramVerifier`.
@@ -581,9 +586,11 @@ refused and left exactly as it was; drift is an operator's to resolve.
   allowed. The database opens only together with its restriction, so a call
   resumed after a failure at any point converges. Afterwards only the owner
   may connect.
-- `databases::access(conn, &database)` returns a `DatabaseAccess` (the
+- `databases::access(conn, database)` returns a `DatabaseAccess` (the
   owner and whether `PUBLIC` holds an effective `CONNECT`), `None` for no
-  such database.
+  such database. It takes any name as a `&str`, `postgres` and other names
+  `DatabaseName` refuses included, binds it as a parameter and reads both
+  facts in one statement.
 - `databases::size(conn, &database)` reads `pg_database_size` as the owner
   (`SET LOCAL ROLE`) when a tenant role of the connection's names owns it,
   as the session's role when that role owns it; any other owner and a
@@ -783,6 +790,11 @@ object:
   `CONNECT` and `TEMPORARY` without grant option, a grant to the
   maintenance role included.
 
+Both finding types display as a short English text (`it holds SUPERUSER`,
+`role x reaches it`, `it is owned by x`, `PUBLIC holds CREATE with grant
+option`), the texts of the checks' error sources; `DatabasePrivilege::sql_name`
+gives a privilege's SQL name.
+
 `check_tenant_role` and `check_tenant_database` run both on a connection of
 the maintenance role and turn any finding, or a missing object, into
 `INTERNAL` without a reason, the findings in the error's source. The roles
@@ -846,8 +858,8 @@ connecting and closing keep their own bounds.
 ### Preconditions
 
 A refusal is `FAILED_PRECONDITION` with the reason `ADOPTION_REFUSED`, the
-message `the database cannot be adopted` and the metadata key `check`; it
-carries no domain. In the order they run:
+message `the database cannot be adopted` and the metadata key `check`
+(`handover::CHECK_KEY`); it carries no domain. In the order they run:
 
 | `check` | Refused when | What the operator does |
 |---|---|---|
@@ -922,7 +934,7 @@ conn.close().await?;
 if let Err(err) = handover::adopt(&maintenance, &database, &role).await {
     if err.reason() == Some(sekvent::tenancy::reasons::ADOPTION_REFUSED) {
         // "session", "foreign_object", …: never a role, an object or a connection detail.
-        let check = err.metadata().get("check").cloned();
+        let check = err.metadata().get(handover::CHECK_KEY).cloned();
         tracing::warn!(?check, "the database cannot be adopted yet");
     }
     return Err(err);

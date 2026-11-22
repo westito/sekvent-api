@@ -33,8 +33,11 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The bound of acquiring the connection of a [`MaintenancePool`].
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The application name of every maintenance session.
+/// The default application name of every maintenance session and pool.
 const APPLICATION_NAME: &str = "sekvent-tenancy-maintenance";
+/// The longest `application_name` Postgres keeps, in bytes (`NAMEDATALEN`
+/// less one).
+const APPLICATION_NAME_MAX: usize = 63;
 /// The server-side `lock_timeout` of every maintenance session.
 const LOCK_TIMEOUT: &str = "10s";
 /// The server-side `statement_timeout` of every maintenance session.
@@ -58,9 +61,9 @@ const DETACHED: &str = "the maintenance connection has no session";
 /// The options of a maintenance session: the product's server settings with
 /// the session rules applied (the safe `search_path`, the server-side
 /// bounds, the application name, no statement logging).
-fn session_options(base: &PgConnectOptions) -> PgConnectOptions {
+fn session_options(base: &PgConnectOptions, application_name: &str) -> PgConnectOptions {
     base.clone()
-        .application_name(APPLICATION_NAME)
+        .application_name(application_name)
         .options([
             ("search_path", SAFE_SEARCH_PATH),
             ("lock_timeout", LOCK_TIMEOUT),
@@ -71,16 +74,37 @@ fn session_options(base: &PgConnectOptions) -> PgConnectOptions {
 
 /// The options of a [`MaintenancePool`] session on `database`: the server
 /// bounds and read-only transactions, the database's own `search_path`.
-fn pool_options(base: &PgConnectOptions, database: &DatabaseName) -> PgConnectOptions {
+fn pool_options(
+    base: &PgConnectOptions,
+    database: &DatabaseName,
+    application_name: &str,
+) -> PgConnectOptions {
     base.clone()
         .database(database.as_str())
-        .application_name(APPLICATION_NAME)
+        .application_name(application_name)
         .options([
             ("lock_timeout", LOCK_TIMEOUT),
             ("statement_timeout", STATEMENT_TIMEOUT),
             ("default_transaction_read_only", "on"),
         ])
         .disable_statement_logging()
+}
+
+/// `name` as an `application_name` Postgres shows unchanged: every character
+/// outside printable ASCII becomes `?`, and the result is cut to 63 bytes.
+fn clamp_application_name(name: &str) -> String {
+    let mut clamped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    clamped.truncate(APPLICATION_NAME_MAX);
+    clamped
 }
 
 /// The cluster's maintenance connection: one at a time. Clones share the
@@ -94,6 +118,8 @@ pub struct Maintenance {
     names: ObjectNames,
     /// One permit: at most one maintenance session or pool at a time.
     permit: Arc<Semaphore>,
+    /// The `application_name` of every session and pool, already clamped.
+    application_name: String,
 }
 
 impl Maintenance {
@@ -103,7 +129,26 @@ impl Maintenance {
             options,
             names,
             permit: Arc::new(Semaphore::new(1)),
+            application_name: APPLICATION_NAME.to_owned(),
         }
+    }
+
+    /// The `application_name` of every maintenance session and pool, by
+    /// default `sekvent-tenancy-maintenance`.
+    ///
+    /// Never fails: the name is clamped to what Postgres shows unchanged,
+    /// every character outside printable ASCII replaced by `?` and the
+    /// result cut to 63 bytes, so `pg_stat_activity` shows what
+    /// [`Maintenance::application_name`] returns. It is not a secret.
+    #[must_use]
+    pub fn with_application_name(mut self, name: &str) -> Self {
+        self.application_name = clamp_application_name(name);
+        self
+    }
+
+    /// The `application_name` of every maintenance session and pool.
+    pub fn application_name(&self) -> &str {
+        &self.application_name
     }
 
     /// The maintenance role (the options' user).
@@ -129,13 +174,16 @@ impl Maintenance {
     /// Waits at most 30 s for the permit and 10 s for the session
     /// (`UNAVAILABLE` past either).
     pub async fn connect(&self) -> Result<MaintenanceConn, AppError> {
-        self.open(session_options(&self.options)).await
+        self.open(session_options(&self.options, &self.application_name))
+            .await
     }
 
     /// Connected to `database` instead (the handover only).
     pub async fn connect_to(&self, database: &DatabaseName) -> Result<MaintenanceConn, AppError> {
-        self.open(session_options(&self.options).database(database.as_str()))
-            .await
+        self.open(
+            session_options(&self.options, &self.application_name).database(database.as_str()),
+        )
+        .await
     }
 
     /// A pool of one connection on `database` that holds the permit, for a
@@ -150,7 +198,11 @@ impl Maintenance {
             .min_connections(0)
             .max_connections(1)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect_lazy_with(pool_options(&self.options, database));
+            .connect_lazy_with(pool_options(
+                &self.options,
+                database,
+                &self.application_name,
+            ));
         Ok(MaintenancePool {
             pool,
             _permit: permit,
@@ -544,7 +596,7 @@ mod tests {
     #[test]
     fn a_session_gets_the_session_rules() {
         let base = options().options([("work_mem", "4MB")]);
-        let session = session_options(&base);
+        let session = session_options(&base, APPLICATION_NAME);
         assert_eq!(session.get_host(), "127.0.0.1");
         assert_eq!(session.get_port(), 1);
         assert_eq!(session.get_username(), "orders_maintenance");
@@ -562,7 +614,7 @@ mod tests {
     #[test]
     fn a_pool_session_reads_only_and_keeps_the_search_path() {
         let database = DatabaseName::parse("orders_candidate").expect("a valid name");
-        let pool = pool_options(&options(), &database);
+        let pool = pool_options(&options(), &database, APPLICATION_NAME);
         assert_eq!(pool.get_database(), Some("orders_candidate"));
         assert_eq!(pool.get_username(), "orders_maintenance");
         assert_eq!(pool.get_application_name(), Some(APPLICATION_NAME));
@@ -572,6 +624,43 @@ mod tests {
                 "-c lock_timeout=10s -c statement_timeout=120s \
                  -c default_transaction_read_only=on"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_application_name_is_set_on_sessions_and_pools() {
+        assert_eq!(maintenance().application_name(), APPLICATION_NAME);
+        let named = maintenance().with_application_name("orders-upkeep");
+        assert_eq!(named.application_name(), "orders-upkeep");
+        assert_eq!(
+            session_options(&options(), named.application_name()).get_application_name(),
+            Some("orders-upkeep")
+        );
+        let database = DatabaseName::parse("orders").expect("a valid name");
+        let pool = named.pool_on(&database).await.expect("a lazy pool");
+        assert_eq!(
+            pool.pool().connect_options().get_application_name(),
+            Some("orders-upkeep")
+        );
+        pool.close().await;
+        assert_eq!(format!("{named:?}"), "Maintenance(..)");
+    }
+
+    #[test]
+    fn an_application_name_is_clamped_as_postgres_keeps_it() {
+        assert_eq!(clamp_application_name("billing jobs ~1"), "billing jobs ~1");
+        assert_eq!(clamp_application_name(""), "");
+        assert_eq!(clamp_application_name("orders\tupkeep\n"), "orders?upkeep?");
+        assert_eq!(clamp_application_name("café"), "caf?");
+        let long = "a".repeat(80);
+        assert_eq!(
+            clamp_application_name(&long),
+            "a".repeat(APPLICATION_NAME_MAX)
+        );
+        let wide = format!("{}é", "b".repeat(62));
+        assert_eq!(
+            clamp_application_name(&wide),
+            format!("{}?", "b".repeat(62))
         );
     }
 
