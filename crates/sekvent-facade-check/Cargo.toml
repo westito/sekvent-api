@@ -11,12 +11,17 @@ publish = false
 # The only sekvent dependency is the facade, as in a consumer's manifest.
 # A path dependency so `default-features = false` is honoured (see the
 # facade's own manifest for the edition 2024 rule). `component-grpc` checks
-# that the gRPC binding builds from the facade alone.
+# that the gRPC binding builds from the facade alone; `tenancy` that a scope
+# factory and the tenant resolver do.
 [dependencies]
-sekvent-api = { path = "../sekvent", default-features = false, features = ["config", "component", "component-grpc"] }
+sekvent-api = { path = "../sekvent", default-features = false, features = ["config", "component", "component-grpc", "tenancy"] }
 # `#[derive(prost::Message)]` names `::prost`, so a crate with protobuf
 # messages depends on prost itself.
 prost = { workspace = true }
+# A scope factory names `sqlx::PgPool` and a test builds a request head, as
+# a product does: the facade re-exports neither crate.
+http = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

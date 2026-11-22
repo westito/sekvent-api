@@ -4199,8 +4199,10 @@ dependencies = [
 name = "sekvent-facade-check"
 version = "0.1.0"
 dependencies = [
+ "http",
  "prost",
  "sekvent-api",
+ "sqlx",
  "tokio",
 ]
 

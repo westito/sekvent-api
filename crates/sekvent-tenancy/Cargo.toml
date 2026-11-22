@@ -1,6 +1,6 @@
 [package]
 name = "sekvent-tenancy"
-description = "Tenants on a Postgres database and a role each: names, derived role credentials, cluster operations and the startup preflight."
+description = "Tenants on a Postgres database and a role each: names, derived role credentials, cluster operations, the startup preflight, tenant selection, the tenant cache and cross-process invalidation."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

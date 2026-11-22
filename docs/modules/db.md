@@ -1157,5 +1157,6 @@ Startup errors are `DbError` variants: `UnknownPool`, `NotConfigured`,
 - [Errors](error.md) — `AppError`, codes and wire mappings
 - [Configuration](config.md) — `ConfigSource`, `Secret`, duration syntax
 - [Testing](testing.md) — container harness and deterministic tests
+- [Tenancy](tenancy.md#the-tenant-cache) — the tenant cache (`Tenants`), built on `KeyedPools`: a pool and a scope per tenant
 - [Design: P8 service essentials](../design/p8-service-essentials.md) — probes and leases design
 - [Design: sea-query and embedded migrations](../design/db-sea-query.md)

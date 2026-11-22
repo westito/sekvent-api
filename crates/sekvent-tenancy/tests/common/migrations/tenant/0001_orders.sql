@@ -1,0 +1,4 @@
+CREATE TABLE orders (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    item text NOT NULL
+);

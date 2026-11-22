@@ -2254,6 +2254,7 @@ source }`, `KeyCollision`, `Config`, `BindingUnavailable`, `LocalOnly`,
 - [component-streaming.md](../design/component-streaming.md) — design note on server-streaming methods
 - [resilience](resilience.md) — policy fields and their semantics
 - [runtime](runtime.md), [server](server.md) — running the App and serving gRPC
+- [tenancy](tenancy.md#select-the-tenant) — `TenantResolver`, a `ScopeResolver` that selects the tenant and leases its scope; the CORS origin predicate over the tenants' hosts
 - [error](error.md), [context](context.md) — `AppError`, `ErrorCode`, `CallContext`
 - [cli](../cli.md) — `cargo sekvent contract`, `gate`
 - [`examples/shop`](../../examples/shop) — the complete example

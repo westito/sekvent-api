@@ -1,0 +1,178 @@
+//! The registry: the control pool of this process with its lookup cache and its two admissions.
+
+use std::fmt;
+use std::sync::Arc;
+
+use sekvent_context::Clock;
+use sekvent_db::to_app_error;
+use sekvent_error::AppError;
+use sqlx::PgPool;
+
+use super::admission::{LifecycleAdmission, LifecyclePermit};
+use super::lookup::Lookups;
+use super::rows::{self, TenantRow, VersionStored};
+use crate::{Selector, TenantId, TenantInfo};
+
+/// The control database of this process: the pool, the lookup cache and the two admissions.
+/// Clones share everything: one lookup cache with its reads in flight, one set of lookup permits and
+/// one set of lifecycle permits, however many clones exist. `Debug` prints the type name only.
+#[derive(Clone)]
+pub struct Registry {
+    pool: PgPool,
+    lookups: Lookups,
+    lifecycle: LifecycleAdmission,
+}
+
+impl Registry {
+    /// The fewest connections a control pool may have.
+    pub const MIN_CONNECTIONS: u32 = 3;
+
+    /// `INVALID_ARGUMENT` when `control.options().get_max_connections()` is below
+    /// `MIN_CONNECTIONS`. No I/O.
+    pub fn new(control: PgPool, clock: Arc<dyn Clock>) -> Result<Self, AppError> {
+        let max = control.options().get_max_connections();
+        if max < Self::MIN_CONNECTIONS {
+            return Err(AppError::invalid_argument(
+                "the control pool needs at least 3 connections",
+            ));
+        }
+        Ok(Self {
+            pool: control,
+            lookups: Lookups::new(max, clock),
+            lifecycle: LifecycleAdmission::new(max),
+        })
+    }
+
+    /// The control pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// A request's lookup: through the cache, a miss under the lookup admission. `TENANT_BUSY`
+    /// (no domain) without a permit, before any connection is taken. Returns the row in any state.
+    pub async fn lookup(&self, selector: &Selector) -> Result<Option<TenantRow>, AppError> {
+        self.lookups.find(&self.pool, selector).await
+    }
+
+    /// An internal read by id: through the cache, no permit, never joined with a request's read.
+    pub async fn tenant(&self, id: TenantId) -> Result<Option<TenantRow>, AppError> {
+        self.lookups.find_internal(&self.pool, id).await
+    }
+
+    /// The row as committed now: no cache, no permit, one statement.
+    pub async fn tenant_now(&self, id: TenantId) -> Result<Option<TenantRow>, AppError> {
+        let mut conn = self.pool.acquire().await.map_err(to_app_error)?;
+        rows::get(&mut conn, id).await
+    }
+
+    /// `rows::list_active` on a connection held for that one statement.
+    pub async fn active(&self) -> Result<Vec<TenantInfo>, AppError> {
+        let mut conn = self.pool.acquire().await.map_err(to_app_error)?;
+        rows::list_active(&mut conn).await
+    }
+
+    /// `rows::store_schema_version` on a connection held for that one statement.
+    pub async fn store_schema_version(
+        &self,
+        id: TenantId,
+        version: i64,
+    ) -> Result<VersionStored, AppError> {
+        let mut conn = self.pool.acquire().await.map_err(to_app_error)?;
+        rows::store_schema_version(&mut conn, id, version).await
+    }
+
+    /// Drops the tenant's cached lookups and every not-found host entry; a read already running
+    /// does not store its answer.
+    pub fn forget(&self, tenant: TenantId) {
+        self.lookups.forget(tenant);
+    }
+
+    /// Drops every cached lookup; a read already running does not store its answer.
+    pub fn clear_lookups(&self) {
+        self.lookups.clear();
+    }
+
+    /// The lifecycle admission: waits up to 10 s for a permit, then `UNAVAILABLE` without a
+    /// reason.
+    pub async fn admit(&self) -> Result<LifecyclePermit, AppError> {
+        self.lifecycle.admit().await
+    }
+}
+
+// `Registry(..)`, one `write_str`
+impl fmt::Debug for Registry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Registry(..)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use sekvent_context::ManualClock;
+    use sekvent_error::ErrorCode;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+
+    use super::*;
+
+    /// A pool that never connects until asked: nobody listens on port 1.
+    fn lazy_pool(max_connections: u32) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect_lazy_with(PgConnectOptions::new().host("127.0.0.1").port(1))
+    }
+
+    fn clock() -> Arc<dyn Clock> {
+        Arc::new(ManualClock::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_pool_of_two_connections_is_refused() {
+        let error = Registry::new(lazy_pool(2), clock()).expect_err("two are too few");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.reason(), None);
+        assert_eq!(
+            error.message(),
+            "the control pool needs at least 3 connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pool_of_three_connections_is_accepted_without_io() {
+        let pool = lazy_pool(3);
+        let registry = Registry::new(pool.clone(), clock()).expect("three are enough");
+        assert_eq!(registry.pool().options().get_max_connections(), 3);
+        assert_eq!(pool.size(), 0);
+    }
+
+    #[tokio::test]
+    async fn debug_prints_the_type_name_only() {
+        let registry = Registry::new(lazy_pool(3), clock()).expect("three are enough");
+        assert_eq!(format!("{registry:?}"), "Registry(..)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clones_share_the_lifecycle_permits() {
+        let registry = Registry::new(lazy_pool(3), clock()).expect("three are enough");
+        let holder = registry.clone();
+        let waiter = registry.clone();
+
+        let permit = holder.admit().await.expect("the one permit is free");
+        let started = tokio::time::Instant::now();
+        let refused = waiter
+            .admit()
+            .await
+            .expect_err("the permit is held through another clone");
+        assert!(started.elapsed() >= Duration::from_secs(10));
+        assert_eq!(refused.code(), ErrorCode::Unavailable);
+        assert_eq!(refused.reason(), None);
+
+        drop(permit);
+        let third = registry.clone();
+        let admitted = third.admit().await;
+        assert!(admitted.is_ok(), "the returned permit is free again");
+    }
+}

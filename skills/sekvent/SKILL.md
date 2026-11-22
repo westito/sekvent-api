@@ -48,7 +48,7 @@ speed and flakes: the `rust-testing` skill.
 | A feature as a component (in-process now, a service later) | `component` (+ `#[sekvent::component]`, `sekvent::ComponentError`) | `component`; `component-grpc` for the `grpc` binding and serving; `runtime` for `App::register` |
 | A tenant (or another per-request value) resolved from the request head before authentication | `component` (`ScopeResolver`, `AppBuilder::scope_resolver`, `App::resolve_scope`, `admit_end_user`), `context::RequestScope`, `cx.scoped::<T>()` | `component`; `component-grpc` to serve |
 | Bounding what served calls cost before authentication (one serve admission per App with a per-client cap, request size and read timeout, a cheap credential precheck) | `component` (`ServeAdmission`, `AppBuilder::serve_admission`, `EndUserPrecheck`, `BearerShape`, `AppBuilder::end_user_precheck`) | `component`; `component-grpc` to serve |
-| Tenants on a Postgres database and a role each: tenant ids and object names, hosts and labels, role passwords derived instead of stored, the startup check that no tenant role reaches the service's own databases (selection and the tenant cache arrive with slice 1b) | `tenancy` (`TenantId`, `ObjectNames`, `RoleSecrets`, `Connector`, `cluster::preflight`) | `tenancy` |
+| Tenants on a Postgres database and a role each: tenant ids and object names, hosts and labels, role passwords derived instead of stored, the startup check that no tenant role reaches the service's own databases; the control registry, the tenant of a request, a cached scope per tenant, changes followed across processes | `tenancy` (`TenantId`, `ObjectNames`, `RoleSecrets`, `Connector`, `cluster::preflight`, `Registry`, `control::verify_schema`, `SelectorRules`, `Tenants`, `ScopeFactory`, `TenantResolver`, `hosts`, `invalidation::{Sender, Listener}`) | `tenancy`; `runtime` for `into_unit` |
 | Create, check and drop tenant roles and databases as a non-superuser maintenance role; hand an existing database over to a tenant role (provisioning and the other tenant operations arrive with slice 1c) | `tenancy` (`cluster::{Maintenance, roles, databases, handover}`, `ScramVerifier`) | `tenancy-lifecycle` |
 | Guard a product's admin RPCs with single-use operator tokens (the admin guard; arrives with slice 1c) | `tenancy` (admin surface) | `tenancy-admin` |
 | Mint operator tokens and call a product's admin RPC from another service, without a database (the manager kit; arrives with slice 1c) | `tenancy` (manager kit) | `tenancy-manager` with `default-features = false` |
@@ -1600,6 +1600,172 @@ conn.close().await?;
 - Hand an existing database over with `cluster::handover::{prepare, adopt}`
   while no maintenance connection is open; refusals carry
   `ADOPTION_REFUSED` and a `check`.
+
+### Serve tenants: the tenant cache, the resolver, the host snapshot, the listener
+
+Facade feature `tenancy` (with the default `runtime` for the two units). The
+control database holds the tenant rows: copy `control::REFERENCE_SCHEMA`
+into a control migration of your own.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+
+use http::HeaderName;
+use sekvent::context::SystemClock;
+use sekvent::runtime::{Cors, Runtime, Stage, UnitPolicy};
+use sekvent::tenancy::control::verify_schema;
+use sekvent::tenancy::invalidation::{ChangeKind, Channel, Listener, Sender, Sink, Topic};
+use sekvent::tenancy::{
+    Connector, ErrorDomains, ObjectNames, Registry, RoleSecrets, ScopeFactory, ScopeFuture,
+    SelectorRules, StreamTenant, TenantId, TenantInfo, TenantLease, TenantResolver, Tenants, hosts,
+};
+use sqlx::postgres::PgPoolOptions;
+
+static TENANT_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("migrations/tenant"); // never `ignore_missing`
+const BYPASS: &[&str] = &["/billing.health.v1.Health/"];   // no tenant: an empty scope; plain prefix, end it with `/`
+const STREAMING: &[&str] = &["billing.v1.Invoices/Watch"];  // the id only; one leading `/` optional, compared whole
+
+pub struct BillingScope { pub pool: sqlx::PgPool }          // need not be Clone
+
+struct BillingFactory;
+impl ScopeFactory for BillingFactory {
+    type Scope = BillingScope;
+    fn build<'a>(&'a self, _info: &'a TenantInfo, pool: sqlx::PgPool) -> ScopeFuture<'a, BillingScope> {
+        Box::pin(async move {                               // pool: migrated, connected as the tenant's role
+            if ledger_is_moving(&pool).await? {             // your check; may take seconds
+                return Err(AppError::failed_precondition("the ledger is being moved")
+                    .with_reason("LEDGER_MOVING")           // with a reason: reaches the caller as written
+                    .with_domain("billing.v1"));
+            }
+            Ok(BillingScope { pool })                       // without a reason: TENANT_UNAVAILABLE
+        })
+    }
+}
+
+// Startup: the control pool, its schema, the registry.
+let control = PgPoolOptions::new()
+    .max_connections(8)                                     // at least Registry::MIN_CONNECTIONS (3)
+    .connect_with(control_options).await
+    .map_err(sekvent::db::to_app_error)?;
+verify_schema(&control).await?;                             // FAILED_PRECONDITION / CONTROL_SCHEMA_MISSING
+let registry = Registry::new(control.clone(), Arc::new(SystemClock))?;
+
+let names = ObjectNames::new("app_t_")?;
+let secrets = RoleSecrets::parse(&config.role_secrets, "billing.role.v1")?;
+let connector = Connector::new(tenant_server_options, secrets); // host, port, TLS; no user, password or database
+
+let rules = SelectorRules::new()
+    .id_header(HeaderName::from_static("x-tenant-id"), ["api.example.com".to_owned()])?
+    .path_label("/t/", ["go.example.com".to_owned()])?     // go.example.com/t/<label>/…
+    .tenant_hosts(true)                                     // any other host: a tenant's own host
+    .bypass(BYPASS);
+
+let tenants = Tenants::builder(registry, connector, names, rules.clone(), &TENANT_MIGRATOR, BillingFactory)
+    .domains(ErrorDomains::new().with_serving("billing.tenants.v1"))
+    .capacity(64)                                           // tenants held at once (the default)
+    .create_timeout(Duration::from_secs(30))                // connect + migrate + build (the default)
+    .build()?;
+
+// One resolver per App: selects the tenant and leases its scope before authentication.
+builder.scope_resolver(TenantResolver::new(tenants.clone(), STREAMING))?;
+
+// CORS for the id-header hosts: sync, no I/O, reads the host snapshot.
+let snapshot = tenants.hosts().cloned().ok_or_else(|| AppError::internal("a fixed tenant cache"))?;
+server = server.cors(Cors::origin_predicate(hosts::predicate(snapshot, rules)));
+
+// Announce a change after its transaction committed; queued, never waits, never fails the caller.
+let channel = Channel::new("app_changes")?;
+let sender = Sender::new(control.clone(), channel.clone());
+sender.change(tenant, &ChangeKind::STATE);
+sender.hint(tenant, &Topic::new("invoices")?, seq);         // a product stream moved to `seq`
+
+// Follow every process's changes: drops lookups and scopes, reloads the snapshot.
+struct WakeWatchers(tokio::sync::broadcast::Sender<TenantId>);
+impl Sink for WakeWatchers {                                // runs on the listener's task: return quickly
+    fn hint(&self, tenant: TenantId, _topic: &Topic, _seq: i64) { let _ = self.0.send(tenant); }
+    fn reconnected(&self) { /* a read of the channel failed, notifications may be lost: wake them all */ }
+}
+let listener = Listener::new(tenants.clone(), channel)
+    .sink(WakeWatchers(wake.clone()))
+    .resync_every(Duration::from_secs(60))?;                // the default
+
+let runtime = Runtime::builder()
+    .unit("tenants", Stage::Infrastructure, UnitPolicy::Critical, tenants.clone().into_unit())
+    .unit("tenant-changes", Stage::Infrastructure, UnitPolicy::Critical, listener.into_unit());
+
+// A unary method: the lease the resolver took.
+let scope = cx.scoped::<TenantLease<BillingScope>>().ok_or_else(|| AppError::internal("no tenant scope"))?;
+let invoices = list_invoices(&scope.pool).await?;
+
+// A method listed in STREAMING: the id only; open the tenant for each read.
+let StreamTenant(id) = *cx.scoped::<StreamTenant>().ok_or_else(|| AppError::internal("no tenant"))?;
+let lease = tenants.get(id).await?;                         // refused once the tenant is suspended
+let batch = next_invoices(&lease.pool, after).await?;
+drop(lease);                                                // before waiting for the next wake
+
+// Jobs: every active tenant in turn, and the migration sweep.
+let report = tenants.for_each_active(|lease| async move { close_month(&lease.pool).await }).await?;
+let report = tenants.migration_sweep().await?;              // migrates and stores each schema version
+
+// One tenant, no control database: TenantId::LOCAL, the bypass prefixes still honoured.
+let tenants = Tenants::fixed_with_bypass(BillingScope { pool }, BYPASS);
+```
+
+- Hold the `TenantLease` for the whole call and no longer: while it
+  lives the scope is never evicted, and a scope retired meanwhile stays
+  in use until its last lease drops. Never keep one in a task that
+  outlives the call; such work takes its own `tenants.get(id)`.
+- A streaming method gets `StreamTenant`, not a lease: take a lease per
+  read and drop it before waiting, so that a suspended tenant's stream
+  is refused at its next read and its pool can close. List the stream's
+  path in the resolver's `streaming`, or it holds a lease for its life.
+- Never format a database or role name into SQL yourself: use the
+  checked `ObjectNames::role` / `ObjectNames::database` (`TenantRole`,
+  `DatabaseName`) and the cluster operations, which quote them.
+- Never store or log a role password, connect options (their `Debug`
+  shows the password) or a notification payload. The cache logs a failed
+  open with fixed words and at most a SQLSTATE; the factory's own error
+  source is dropped, so a factory that wants its cause logged writes its
+  own event without connection details.
+- A successful resync repairs a lost notification about what a tenant's
+  row holds (state, hosts, primary host, role key: the fields of
+  `TenantInfo`), a batch the sender dropped included; it happens only when
+  the control database answers, so there is no bound in seconds. It does
+  not repair a lost hint or a lost change of a kind of your own: on
+  `Sink::resync` and `Sink::reconnected` your consumers catch up from their
+  own durable data. Two failed resyncs in a row empty the host snapshot, so
+  CORS refuses origins rather than trusting stale hosts.
+- Start the listener before the cache serves requests: its first load is
+  the baseline and retires nothing, so a scope opened before it is never
+  compared with anything. Registering both units in
+  `Stage::Infrastructure` does this.
+- Never build the tenant migrator with `ignore_missing`: with it, a
+  database ahead of the binary is not refused.
+- A cached lookup lives 30 s, but that bounds only the reuse of a cached
+  answer: it is not a revocation guarantee (a read in flight still
+  answers, held leases survive an invalidation). Stop a tenant by
+  changing its row and announcing the change.
+- The predicate answers for the id-header hosts only and never looks at
+  the path; it allows an origin of any active tenant, and the resolver
+  checks again that the origin may call the tenant the request names.
+- Refusals carry `TENANT_NOT_HERE`, `TENANT_SUSPENDED`, `TENANT_BUSY`
+  (retry after a second), `TENANT_UNAVAILABLE` and the other serving
+  reasons of `tenancy::reasons` under the serving domain (a refusal of
+  your factory with a reason keeps its own); a bypass path gets an
+  empty scope in both forms. `Tenants::fixed` serves `TenantId::LOCAL`
+  without bypass prefixes; use `fixed_with_bypass` for health and other
+  tenant-less paths.
+- Register both units in `Stage::Infrastructure`: the cache's stage
+  drains last, after the calls that hold leases; the listener reports
+  ready after its first `LISTEN` and its first host load, so the
+  snapshot is filled before the listeners accept traffic. The listener's
+  policy is your choice: with `UnitPolicy::Critical` a listener that ends
+  (a closed control pool) stops the process. Without a listener, refresh
+  the snapshot yourself with `tenants.refresh_hosts()`.
+- `Sink::reconnected` is called after any failed read of the channel that
+  did not end the listener, once it listens again and has resynced (also
+  when that resync failed): treat every waiter as stale there.
 
 ## Pitfalls
 

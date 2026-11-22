@@ -8,16 +8,16 @@ derived role password, migrates on first open, caches, follows changes made
 on other processes, and carries the lifecycle (provision, suspend, resume,
 set hosts, purge, adopt) with an admin surface an operator service calls.
 
-> Status: **draft for approval; nothing is implemented.** Builds on
+> Status: **slices 1a and 1b are built; 1c is a draft.** Builds on
 > [`multi-tenant-building-blocks.md`](multi-tenant-building-blocks.md),
 > [`serve-admission.md`](serve-admission.md),
 > [`component-end-user.md`](component-end-user.md) and
 > [`p8-service-essentials.md`](p8-service-essentials.md). Where this note
 > is more specific, it wins. The note is also the work order: three slices
 > landing on `master` one by one (section 5), each opened by a step 0 the coordinator
-> does alone (section 6). Slice 1a (section 8) is specified in full; 1b and
-> 1c (sections 9 and 10) fix behaviour and the shape of the API and mark the
-> signatures their own step 0 pins.
+> does alone (section 6). Slices 1a and 1b (sections 8 and 9) describe
+> what is built; 1c (section 10) fixes behaviour and the shape of the API
+> and marks the signatures its own step 0 pins.
 
 ## 1. Problem
 
@@ -348,11 +348,23 @@ changed file against a list of terms kept outside the repository.
 Step 0 of each: the slice's module declarations and re-exports in
 `lib.rs`, the pinned public signatures (everything this note marks
 "pinned in step 0"), additions to `tests/common/` (11.1), the
-`sekvent-facade-check` module `src/tenancy.rs` (1b: a `ScopeFactory` and a
-`TenantResolver` compiled through the facade alone; 1c: `TenantHooks` and a
-guarded method), and in 1c the three example members in the root manifest.
-A slice that changes a signature of an earlier slice records it in this
-note in place.
+`sekvent-facade-check` module `src/tenancy.rs`, and in 1c the three example
+members in the root manifest. A slice that changes a signature of an
+earlier slice records it in this note in place.
+
+The facade check of 1b, through `sekvent::…` paths only: a `ScopeFactory`
+for a scope that holds the tenant's `sqlx::PgPool`; the keyed builder with
+its defaults; a `TenantResolver` returned as `impl ScopeResolver`; and
+unit tests on a fixed `Tenants` whose scope type is not `Clone`, proving
+the lease is `Clone + Deref` by itself: a unary path gets a lease and the
+tenant text of `TenantId::LOCAL`, a listed streaming path gets
+`StreamTenant` and no lease, a path under a bypass prefix of
+`fixed_with_bypass` gets an empty scope. The crate takes its facade
+features `config`, `component`, `component-grpc` and `tenancy`, and
+depends directly on `http` and on `sqlx` (feature `postgres`): a scope
+factory names `sqlx::PgPool` and a test builds a request head, as a
+product does, and the facade re-exports neither crate. 1c adds
+`TenantHooks` and a guarded method.
 
 ## 7. Errors
 
@@ -381,12 +393,12 @@ Both are `&'static str` because `EndUserRejection` takes nothing else.
 
 | Reason | Code | Domain | Message | When |
 |---|---|---|---|---|
-| `TENANT_NOT_HERE` | `NOT_FOUND` | serving | `this tenant is not served here` | unknown, purging or purged tenant; a host that selects nothing |
+| `TENANT_NOT_HERE` | `NOT_FOUND` | serving | `this tenant is not served here` | unknown, purging or purged tenant; no usable request host, a host that selects nothing, the refusals of the path-label prefix (9.4) |
 | `TENANT_PROVISIONING` | `UNAVAILABLE` | serving | `this tenant is being set up` | state `provisioning` |
 | `TENANT_SUSPENDED` | `FAILED_PRECONDITION` | serving | `this tenant is suspended` | state `suspended` |
 | `TENANT_UNAVAILABLE` | `UNAVAILABLE` | serving | `this tenant is unavailable, try again later` | the tenant's database cannot be opened |
-| `TENANT_BUSY` | `UNAVAILABLE` | serving | `the server is busy, try again shortly` | no lookup permit, or the tenant cache is full; retry hint 1 s |
-| `TENANT_SELECTOR_MISSING` | `INVALID_ARGUMENT` | serving | `the request names no tenant` | a selecting host without its selector |
+| `TENANT_BUSY` | `UNAVAILABLE` | serving | `the server is busy, try again shortly` | no lookup permit, a caller that joined two reads of its key without an answer, or the tenant cache is full; retry hint 1 s |
+| `TENANT_SELECTOR_MISSING` | `INVALID_ARGUMENT` | serving | `the request names no tenant` | an id-header host without the id header |
 | `TENANT_MISMATCH` | `INVALID_ARGUMENT` | serving | `the request names two different tenants` | two selectors disagree, or a malformed id |
 | `ORIGIN_NOT_ALLOWED` | `PERMISSION_DENIED` | serving | `this origin may not call this tenant` | an `Origin` that is not a host of the selected tenant |
 | `ADMIN_TOKEN_INVALID` | `UNAUTHENTICATED` | admin | the component layer's constant rejection message | every failure of an admin token, whatever the cause |
@@ -399,10 +411,12 @@ Both are `&'static str` because `EndUserRejection` takes nothing else.
 
 - Reasons are wire contract; messages are not. Message text is fixed in
   this milestone (15, question 6).
-- Cluster operations return reasons without a domain (they know no
+- Cluster operations and the control rows (`TENANT_STATE`,
+  `CONTROL_SCHEMA_MISSING`) return reasons without a domain (they know no
   product); the guard gives a reasoned error without a domain the admin
-  domain (10.6). Serving errors are built with the serving domain by the
-  cache and the resolver, which hold the `ErrorDomains`.
+  domain (10.6). Serving errors get the serving domain from `Tenants`,
+  which holds the `ErrorDomains` and through which the resolver selects;
+  a refusal of the product's `ScopeFactory` keeps its own domain (9.6).
 - Drift, a refused name and a misconfiguration are `INTERNAL` without a
   reason: the cause goes to the source, which is logged and never sent.
 - Database errors map through `sekvent_db::to_app_error`. No error of this
@@ -1130,8 +1144,8 @@ adoption tests pass unchanged.
 
 ## 9. Slice 1b: the serving half
 
-Behaviour is fixed here. Signatures marked † are pinned in the slice's
-step 0, after 1a.
+Built. The sketches below name the public surface (the crate's source has
+the full signatures and their docs); the behaviour is fixed here.
 
 ### 9.1 File ownership
 
@@ -1157,64 +1171,173 @@ pub struct TenantInfo {
     pub subdomain: String,
     pub display_name: String,
     pub state: TenantState,
-    pub primary_host: String,
-    pub hosts: Vec<String>,        // canonical, sorted
+    pub primary_host: String,      // empty only for a tenant without hosts
+    pub hosts: Vec<String>,        // canonical, byte-sorted, no duplicates; holds `primary_host`
     pub role_key: RoleKey,
 }
 impl TenantInfo {
-    pub fn local() -> Self;                 // the fixed scope's: nil id, active
-    pub fn origin(&self) -> Option<String>; // `origin_of_host(primary_host)`
+    /// The fixed scope's: `TenantId::LOCAL`, `Active`, empty texts, no hosts, key id empty, generation 0.
+    pub fn local() -> Self;
+    /// `origin_of_host(primary_host)`; `None` without a primary host.
+    pub fn origin(&self) -> Option<String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Selector {
     Id(TenantId),
-    Host(String),
+    Host(String),                                         // canonical
     PathLabel { segment: String, listener_host: String },
 }
 ```
 
-The reference schema, `control::REFERENCE_SCHEMA` (DDL text the product
-copies into a migration of its own):
+The reference schema, `control::REFERENCE_SCHEMA` (`src/control/reference_schema.sql`,
+one DDL text with all three tables, which the product copies into a
+migration of its own):
 
-| Table | Columns | Named constraints the crate relies on |
+| Table | Columns | Named constraints and indexes |
 |---|---|---|
-| `tenants` | `id uuid`, `subdomain text`, `display_name text`, `state text`, `provision_step text default ''`, `db_cluster text default 'main'`, `db_name text`, `db_role text`, `db_role_key_id text`, `db_role_generation integer default 1`, `schema_version bigint null`, `created_at timestamptz`, `updated_at timestamptz` | `tenants_pkey (id)`; `tenants_db_role_key` unique `(db_cluster, db_role)`; `tenants_db_name_key` unique `(db_cluster, db_name)` where `state <> 'purged'`; checks on `state` (the five values) and `db_role_generation >= 1` |
-| `tenant_hosts` | `host text`, `tenant_id uuid`, `is_primary boolean default false` | `tenant_hosts_pkey (host)`; a foreign key to `tenants` with `ON DELETE CASCADE`; one primary per tenant (partial unique index) |
-| `admin_audit` | `token_id uuid`, `occurred_at timestamptz`, `operation text`, `actor text`, `outcome text default 'started'`, `tenant_id uuid null` | `admin_audit_pkey (token_id)`: the replay refusal of 10.6 |
+| `tenants` | `id uuid`, `subdomain text`, `display_name text`, `state text`, `provision_step text default ''`, `db_cluster text default 'main'`, `db_name text`, `db_role text`, `db_role_key_id text`, `db_role_generation integer default 1`, `schema_version bigint null`, `created_at timestamptz`, `updated_at timestamptz` | `tenants_pkey (id)`; `tenants_db_role_key` unique `(db_cluster, db_role)`; the unique index `tenants_db_name_key (db_cluster, db_name)` where `state <> 'purged'`; `tenants_state_check` (the five values); `tenants_db_role_generation_check` (`>= 1`) |
+| `tenant_hosts` | `host text`, `tenant_id uuid`, `is_primary boolean default false` | `tenant_hosts_pkey (host)`; `tenant_hosts_tenant_id_fkey` to `tenants` with `ON DELETE CASCADE`; the unique index `tenant_hosts_primary_key (tenant_id)` where `is_primary`; the index `tenant_hosts_tenant_id_idx (tenant_id)` |
+| `admin_audit` | `token_id uuid`, `occurred_at timestamptz`, `operation text`, `actor text`, `outcome text default 'started'`, `tenant_id uuid null` (no foreign key: an audit row outlives its tenant's row) | `admin_audit_pkey (token_id)`: the replay refusal of 10.6 |
 
-- `control::verify_schema(&PgPool)`† selects every column the crate uses
+- `control::verify_schema(&PgPool)` selects every column the crate uses
   from each table with a false predicate (the method of
-  `LeaseStore::verify_schema`) and reads from the catalog that the named
-  unique constraints and indexes exist, since error mapping goes by
-  constraint name. A gap is `FAILED_PRECONDITION` / `CONTROL_SCHEMA_MISSING`.
+  `LeaseStore::verify_schema`) and reads from the catalog that
+  `tenants_pkey`, `tenants_db_role_key`, `tenant_hosts_pkey`,
+  `tenants_db_name_key` and `tenant_hosts_primary_key` are each a valid
+  unique index on their table, since error mapping goes by constraint name
+  and the reads rely on the uniqueness: partial exactly for the two partial
+  keys of the reference schema (`tenants_db_name_key`,
+  `tenant_hosts_primary_key`), total for the others. A missing, non-unique,
+  invalid, wrongly partial or wrongly total index is a gap naming it.
+  `admin_audit` and `admin_audit_pkey` (total) are checked only with the
+  feature `admin`, which the facade's `full` feature turns on; a product
+  without it may leave the table out. A gap is `FAILED_PRECONDITION` /
+  `CONTROL_SCHEMA_MISSING` with metadata `table` or `constraint`; extra
+  columns and indexes pass.
 - **Extra columns are the product's.** Every statement of the crate names
   its columns; an extra column on `tenants` must be nullable or have a
   default. The product reads and writes its columns with statements of its
   own, each holding a control connection for that one statement.
-- `db_cluster` holds the one value `main`; `admin_audit` exists only for a
-  product that enables `admin`; verification checks it only then.
 - Statements are static SQL with bound values. Repository functions take
-  `&mut PgConnection` and never commit.
-- The control pool has at least 3 connections; `Registry::new`† refuses a
-  smaller one (the two admissions below each leave room for the other).
+  `&mut PgConnection`, never commit, and the writes that set a timestamp
+  (`insert`, `set_state`, `set_hosts`) take `now: SystemTime`.
+
+The repository is the public module `control::rows`:
+
+```rust
+pub const MAIN_CLUSTER: &str = "main";
+
+/// `tenants.provision_step`, in the order the steps are recorded (`Ord`).
+#[non_exhaustive]
+pub enum ProvisionStep { Inserted, Role, Database, Migrated, Seeded, Active }
+// as_str / parse: the empty text, `role`, `database`, `migrated`, `seeded`, `active`
+
+#[non_exhaustive]
+pub struct TenantRow {
+    pub info: TenantInfo,
+    pub provision_step: ProvisionStep,
+    pub db_cluster: String,      // as stored; serving opens only `MAIN_CLUSTER`
+    pub db_name: String,         // as stored; checked with `DatabaseName::parse` before use
+    pub db_role: String,         // as stored; must equal `ObjectNames::role(info.id)` before use
+    pub schema_version: Option<i64>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+/// A tenant to insert: `Provisioning`, step `Inserted`.
+pub struct NewTenant { pub id, pub subdomain, pub display_name, pub hosts: Vec<String>,
+    pub primary_host, pub database: DatabaseName, pub role: TenantRole, pub role_key: RoleKey }
+#[non_exhaustive]
+pub enum VersionStored { Stored, Unchanged, Busy }
+
+pub async fn insert(conn, &NewTenant, now) -> Result<(TenantRow, bool), AppError>;
+pub async fn get(conn, TenantId) -> Result<Option<TenantRow>, AppError>;
+pub async fn lock(conn, TenantId) -> Result<Option<TenantRow>, AppError>;   // FOR UPDATE
+pub async fn by_host(conn, &str) -> Result<Option<TenantRow>, AppError>;
+pub async fn by_loopback_label(conn, &str) -> Result<Option<TenantRow>, AppError>;
+pub async fn list_active(conn) -> Result<Vec<TenantInfo>, AppError>;
+pub async fn set_state(conn, TenantId, TenantState, now) -> Result<bool, AppError>;
+pub async fn set_hosts(conn, TenantId, subdomain, hosts, primary_host, now) -> Result<(), AppError>;
+pub async fn store_schema_version(conn, TenantId, i64) -> Result<VersionStored, AppError>;
+```
+
+Stored rows are held to what the crate writes. A stored state outside the
+five values, a step outside the six texts, a generation that is not
+positive, or a missing primary host (accepted only for a row without hosts
+that is `purging` or `purged`) is `INTERNAL`, naming the column and never
+a value. `list_active` fails as a whole on one such active row, and with it
+every reader of the active list: the walks, the sweep, `refresh_hosts` and
+the listener's loads (question 11 of 15). Stored hosts are trusted to be canonical and returned
+byte-sorted. The rules of the writes:
+
+- `insert` validates the hosts before any statement (canonical, at least
+  one, sorted and de-duplicated, the primary among them; `INVALID_ARGUMENT`
+  with field violations, a refused host named by its position from 0,
+  never its text) and the role key's generation (1 to 2147483647); a
+  repeated id changes nothing and returns the existing row with `false`. A host, role or database name another tenant
+  holds is `FAILED_PRECONDITION` / `TENANT_STATE` without a domain, mapped
+  from `tenant_hosts_pkey`, `tenants_db_role_key` and `tenants_db_name_key`.
+  A database name is free again once its row is `purged`; a role name
+  never is.
+- `lock` reads the hosts with a second statement after the lock is held, so
+  a waiter sees the hosts the holder committed.
+- `set_hosts` replaces the host set and the subdomain whole, with
+  `insert`'s host checks and conflicts; a missing row is `NOT_FOUND`
+  without a reason.
+- `store_schema_version` takes the row `FOR UPDATE SKIP LOCKED` and never
+  waits: it only raises the version (`Stored`, `Unchanged`), answers `Busy`
+  for a locked or missing row, and never touches `updated_at`.
+- No statement writes `db_cluster` or `provision_step`: the defaults give
+  `main` and `Inserted`, and no 1b code compares a row's state with its
+  step. `by_loopback_label` is the rule of 9.4.
+
+The control pool has at least 3 connections; `Registry::new` refuses a
+smaller one (the two admissions below each leave room for the other).
 
 ### 9.3 Lookups and their admission
 
-`Registry`† holds the control pool, a `Clock`, the lookup cache and the two
-admissions.
+```rust
+/// Clones share one lookup cache with its reads in flight, one set of lookup permits and one
+/// set of lifecycle permits.
+#[derive(Clone)]
+pub struct Registry { /* private */ }
+impl Registry {
+    pub const MIN_CONNECTIONS: u32 = 3;
+    pub fn new(control: PgPool, clock: Arc<dyn Clock>) -> Result<Self, AppError>; // no I/O
+    pub fn pool(&self) -> &PgPool;
+    /// A request's lookup: the cache, then a read under the lookup admission. Any state.
+    pub async fn lookup(&self, selector: &Selector) -> Result<Option<TenantRow>, AppError>;
+    /// An internal read by id: the cache, no permit, never joined with a request's read.
+    pub async fn tenant(&self, id: TenantId) -> Result<Option<TenantRow>, AppError>;
+    /// The row as committed now: no cache, no permit, one statement.
+    pub async fn tenant_now(&self, id: TenantId) -> Result<Option<TenantRow>, AppError>;
+    pub async fn active(&self) -> Result<Vec<TenantInfo>, AppError>;
+    pub async fn store_schema_version(&self, id: TenantId, version: i64) -> Result<VersionStored, AppError>;
+    pub fn forget(&self, tenant: TenantId);
+    pub fn clear_lookups(&self);
+    /// The lifecycle admission of 10.5.
+    pub async fn admit(&self) -> Result<LifecyclePermit, AppError>;
+}
+```
 
 | | Value |
 |---|---|
-| Lookup cache | two key spaces (id, exact host); 4,096 found and 1,024 not-found entries each; 30 s from the start of the read; errors are never cached; no stale answer is ever served |
-| When a space is full | expired entries are dropped, then the space is cleared |
-| `forget(tenant)` | drops the tenant's entries and every not-found host entry, and bumps an epoch so a read already running does not store its answer |
+| Lookup cache | two key spaces (id, exact host); each with a partition of 4,096 found and one of 1,024 not-found entries; an entry is fresh while `start <= now < start + 30 s` on the registry's `Clock` (a clock set back never extends it); errors are never cached; no stale answer is ever served |
+| Filling | a host lookup that finds a row also fills the id space; an id lookup does not fill the host space; a found entry replaces a not-found entry of the same key and the reverse. The key spaces are therefore not independent: a found host read fills the id space and `forget` drops from both |
+| Replacing | an entry is replaced only by the answer of a read that started later than the read that made it; on a tie the stored entry stays, so a slower, older read (a host read's cross-fill included) never overwrites a newer observation |
+| Freshness on sight | an entry found not fresh (expired, or dated after now because the clock was set back) is removed when it is found and never served later; an answer already past its lifetime when its read ends goes to its caller and is not stored |
+| When a partition is full | expired entries are dropped, then only the partition that is still full is cleared, so not-found entries never push found entries out |
+| `forget(tenant)` | drops the tenant's id entry, its found host entries and every not-found host entry; `clear_lookups` drops everything. The cache has one epoch and both raise it, so no read already running, of any tenant or key, stores its answer (its caller still gets it) |
+| An invalid selector | a host that is not canonical, a segment that is no label, or a path label on a listener that is neither loopback nor one a host can be derived from: no row, without a read |
 | **Lookup admission** | `max(1, control max_connections / 2)` permits for selector cache misses |
 | No permit | `TENANT_BUSY` at once, **before** any control connection is taken |
-| Same key in flight | the caller joins that read, then looks again; a caller that joined twice without an answer is `TENANT_BUSY` |
+| Same key in flight | the caller joins that read, then looks again; a caller that joined twice without an answer is `TENANT_BUSY`. Joiners are woken when the read ends, however it ends, and never receive its error. A finished read gives its permit back first, then leaves the reads in flight, and wakes its joiners last, so a same-key caller in between joins instead of getting `TENANT_BUSY` |
 | A caller that goes away | the read runs on a task of its own, keeps its permit and fills the cache; nothing is cancelled and no slot is freed early |
-| Internal reads by id (lifecycle, the connector) | share the cache, take no permit |
+| A read task that panics | its caller gets `INTERNAL`; its permit and its place among the reads in flight are given back |
+| Internal reads by id (`tenant`: lifecycle, the first read inside a tenant cache's creation) | share the cache, take no permit, never join or wait for a request's read; they run on the caller's own task. `Tenants::get`'s state check is a request's lookup, not an internal read (9.6) |
+| The loopback path label | never cached, never joined, and each read spends a lookup permit (9.4) |
+| A failed control read | returned as the database error; serving maps it to `TENANT_UNAVAILABLE` |
 | A control connection | is held for a single statement and returned before a tenant is opened; none spans a tenant open |
 
 This is the crate's bound inside the scope resolver. The App's
@@ -1227,13 +1350,18 @@ theirs.
 
 ```rust
 /// Which request names which tenant. Built by the product from its own keys.
+#[derive(Clone)]
 pub struct SelectorRules { /* private */ }
 impl SelectorRules {
-    pub fn new() -> Self;
+    pub fn new() -> Self;                                   // selects nothing; also `Default`
     /// Requests to these hosts name the tenant by id in `header`.
     pub fn id_header(self, header: http::HeaderName, hosts: impl IntoIterator<Item = String>) -> Result<Self, AppError>;
     /// Requests to these hosts under `prefix` name the tenant by a path label.
     pub fn path_label(self, prefix: &str, hosts: impl IntoIterator<Item = String>) -> Result<Self, AppError>;
+    /// Names so that `<prefix>.well-known/<name>/<label>` selects like `<prefix><label>`.
+    pub fn well_known(self, names: impl IntoIterator<Item = String>) -> Result<Self, AppError>;
+    /// The product's label rules (default `LabelRules::new()`).
+    pub fn labels(self, rules: LabelRules) -> Self;
     /// Any other host is looked up as a tenant's own host.
     pub fn tenant_hosts(self, enabled: bool) -> Self;
     /// RPC path prefixes that belong to no tenant: an empty scope, no selection.
@@ -1241,30 +1369,55 @@ impl SelectorRules {
 }
 ```
 
-(† `SelectorRules` is pinned in step 0.)
+The builders refuse with `INVALID_ARGUMENT`, naming a position and never a
+host: a host `canonical_host` refuses, a second `id_header` or
+`path_label` call, a host in both lists that is not loopback, a prefix that
+does not start and end with `/`, is not longer than `/` (the prefix is
+reserved on every host, so `/` alone would reserve every path) or is not
+visible ASCII without `%`, `?` and `#`, a well-known name outside 1 to 64
+of `[A-Za-z0-9._-]`. A second
+`well_known` or `bypass` call replaces the list.
 
 The request host is the canonical form of the URI authority and of the one
 `Host` header; when both are present they must agree. Forwarded-host
-headers are never read. Absent, malformed, repeated or disagreeing:
-`TENANT_NOT_HERE`.
+headers are never read. Absent, malformed, repeated, carrying user info or
+disagreeing: `TENANT_NOT_HERE`.
+
+The path-label prefix is a reserved namespace on every host: a path under
+it is decided by row 2 and never falls through to another row.
 
 | Order | Condition | Selector | Further checks |
 |---|---|---|---|
-| 1 | the path starts with a bypass prefix | none; the scope is empty | |
-| 2 | the host is a path-label host and the path is under the prefix | `PathLabel` | the id header is optional; when present it must name the tenant found (`TENANT_MISMATCH`) |
-| 3 | the host is an id-header host | `Id` from the header: exactly one value, a `TenantId::parse` text (`TENANT_SELECTOR_MISSING` when absent, `TENANT_MISMATCH` when malformed or repeated) | an `Origin`, when present, must be a host of the selected tenant (`ORIGIN_NOT_ALLOWED`); a request without `Origin` passes |
-| 4 | `tenant_hosts` is on | `Host` | the id header as in row 2 |
-| 5 | otherwise | | `TENANT_NOT_HERE` |
+| 1 | the path starts with a bypass prefix (decided before the host is read) | none; the scope is empty | |
+| 2 | the path is under the path-label prefix | `PathLabel` when the host is a path-label host and the label is usable; otherwise `TENANT_NOT_HERE` (another host, a missing or malformed label, a label the product's `LabelRules` refuse, an unknown well-known name) | the id header is optional; when present it must name the tenant found (`TENANT_MISMATCH`, also for a malformed or repeated one) |
+| 3 | the host is an id-header host | `Id` from the header: exactly one value, a `TenantId::parse` text (`TENANT_SELECTOR_MISSING` when absent, `TENANT_MISMATCH` when malformed or repeated) | an `Origin`, when present, must be exactly one value whose canonical host is a host of the selected tenant (`ORIGIN_NOT_ALLOWED`, also for a malformed or repeated one); a request without `Origin` passes |
+| 4 | the host is a path-label host (the path is outside the prefix) | | `TENANT_NOT_HERE`: a path-label host serves nothing outside the prefix |
+| 5 | `tenant_hosts` is on | `Host` | the id header as in row 2 |
+| 6 | otherwise | | `TENANT_NOT_HERE` |
 
-The path label is the first segment after the prefix and stands for the
-host `path_label_host` derives from it (on a loopback listener, for the
-one tenant of that label that has a loopback host). A product may list
-well-known names so that `<prefix>.well-known/<name>/<label>` selects the
-same tenant.
+A bypass prefix is a plain string prefix of the request path as received
+(it starts with `/`, it is never percent-decoded): `"/"` would bypass every
+path, a prefix without a trailing `/` also matches longer service names,
+and an empty prefix matches nothing, so a product ends its prefixes with
+`/`. The one crate-private comparison serves both forms of `Tenants` (9.6),
+and a bypass path gets an empty scope even when the host or the id header
+is missing or malformed.
+
+The path label is the first segment after the prefix (or after
+`.well-known/<name>/`); what follows is ignored, a `%` in the segment
+selects nothing, and a label the product's rules refuse causes no read. It
+stands for the host `path_label_host` derives from it. On a loopback
+listener, where `path_label_host` derives none, exactly one tenant that is
+not purged may carry the label, else nothing is selected; that tenant must
+have a registered loopback host (any port). That read is never cached and
+never joined, and spends a lookup permit.
 
 A host may be in both lists only on loopback. The tenant's existence and
-state are checked before a header comparison, so a mismatch tells a caller
-nothing about a tenant it cannot name. The path is never percent-decoded.
+state are checked before a header or origin comparison, so a mismatch
+tells a caller nothing about a tenant it cannot name. Only an id-header
+selection checks the `Origin`; a path-label selection does not, also on a
+loopback host listed for both selectors, for which the CORS predicate
+(9.5) answers all the same.
 
 ```rust
 /// What the scope holds for a streaming method instead of a lease.
@@ -1273,36 +1426,64 @@ pub struct StreamTenant(pub TenantId);
 
 pub struct TenantResolver<S> { /* private */ }
 impl<S: Send + Sync + 'static> TenantResolver<S> {
-    /// `streaming`: RPC paths (`<package>.<Service>/<Rpc>`) that get the id only.
+    /// `streaming`: RPC paths (`<package>.<Service>/<Rpc>`, with or without one leading slash),
+    /// each compared whole with the routed path, that get the id only.
     pub fn new(tenants: Tenants<S>, streaming: &'static [&'static str]) -> Self;
 }
 impl<S: Send + Sync + 'static> ScopeResolver for TenantResolver<S>;
 ```
 
-The scope's tenant is `TenantId`'s text, so `cx.tenant()` is the id and an
-end user of another tenant is refused by the framework. Its extension is a
-`TenantLease<S>` (the handler reads `cx.scoped::<TenantLease<S>>()`), or a
-`StreamTenant` for the listed paths. **The id-only variant** exists
-because a served stream keeps its scope until it ends (up to the stream
-lifetime): a lease in it would keep the tenant's pool in use, and a
-suspended tenant's stream alive, for that long. A stream takes
-`tenants.get(id)` for each read and gives it back. The resolver logs
-nothing and opens no span.
+The resolver calls `Tenants::select`; `None` (a bypass path) is an empty
+`RequestScope`. Otherwise the scope's tenant is `TenantId`'s text, so
+`cx.tenant()` is the id and an end user of another tenant is refused by
+the framework. Its extension is a `TenantLease<S>` (the handler reads
+`cx.scoped::<TenantLease<S>>()`), or a `StreamTenant` for the listed paths.
+**The id-only variant** exists because a served stream keeps its scope
+until it ends (up to the stream lifetime): a lease in it would keep the
+tenant's pool in use, and a suspended tenant's stream alive, for that
+long. A streaming resolution opens nothing; a stream takes
+`tenants.get(id)` for each read and gives it back. The resolver passes
+errors on unchanged (only `Tenants` adds the serving domain), logs nothing
+and opens no span.
 
 ### 9.5 The host snapshot and CORS
 
-`HostSnapshot`†: every host of every active tenant in memory, replaced as a
-whole. `hosts::predicate(snapshot, rules)`† is the function for
-`Cors::origin_predicate`: synchronous, no I/O. It allows a request when its
-host is a selecting host of the rules, it has exactly one `Origin`, and
-that origin's canonical host is in the snapshot. Whether that origin may
-call *the selected tenant* is decided again at resolution (row 3 above),
-because CORS only shapes response headers. Methods, allowed and exposed
-headers and the max age are the product's `Cors` settings.
+```rust
+/// Every host of every active tenant, replaced as a whole. Starts empty; clones share it.
+#[derive(Clone, Default)]
+pub struct HostSnapshot { /* private */ }
+impl HostSnapshot {
+    pub fn new() -> Self;
+    pub fn tenant_of(&self, host: &str) -> Option<TenantId>;   // compared as given
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn replace(&self, hosts: impl IntoIterator<Item = (String, TenantId)>); // last pair wins
+}
+pub async fn refresh_hosts(snapshot: &HostSnapshot, registry: &Registry) -> Result<Vec<TenantInfo>, AppError>;
+pub fn predicate(snapshot: HostSnapshot, rules: SelectorRules)
+    -> impl Fn(&str, &http::request::Parts) -> bool + Send + Sync + 'static;
+```
 
-`refresh_hosts`† reads the active hosts with one statement, returns the
-connection, then swaps the map; on failure the old snapshot stays. Reloads
-are serialised.
+`hosts::predicate` is the function for `Cors::origin_predicate`:
+synchronous, no I/O, and it borrows nothing (the snapshot and the rules
+are moved in; a product passes clones). It answers for **id-header hosts
+only** and never looks at the path: it allows a request when its host is
+an id-header host of the rules, it has exactly one `Origin`, and that
+origin's canonical host is in the snapshot. Any active tenant's origin
+passes it; whether that origin may call *the selected tenant* is decided
+again at resolution (row 3 above), because CORS only shapes response
+headers. A request to another kind of host gets no cross-origin headers
+from it; a product that wants more composes its own function. On a
+loopback host in both lists it answers as for an id-header host, also for
+a request under the path-label prefix, whose selection has no origin
+check (9.4). Methods,
+allowed and exposed headers and the max age are the product's `Cors`
+settings. `Debug` of the snapshot prints its size only.
+
+`refresh_hosts` reads the active tenants with one statement
+(`Registry::active`), returns the connection, then swaps the map and
+returns what it read (the listener compares it, 9.7); on failure the old
+snapshot stays. Reloads are serialised across clones.
 
 ### 9.6 The tenant cache
 
@@ -1315,30 +1496,82 @@ pub trait ScopeFactory: Send + Sync + 'static {
     fn build<'a>(&'a self, info: &'a TenantInfo, pool: PgPool) -> ScopeFuture<'a, Self::Scope>;
 }
 
-/// The tenants this process serves: one fixed scope, or a cache of scopes.
-pub struct Tenants<S> { /* private; clones share */ }
+/// The tenants this process serves: one fixed scope, or a cache of scopes. Clones share everything.
+pub struct Tenants<S> { /* private */ }
+impl<S: Send + Sync + 'static> Tenants<S> {
+    pub fn fixed(scope: S) -> Self;                                  // `fixed_with_bypass(scope, &[])`
+    pub fn fixed_with_bypass(scope: S, bypass: &'static [&'static str]) -> Self;
+    pub fn builder<F: ScopeFactory<Scope = S>>(registry: Registry, connector: Connector,
+        names: ObjectNames, rules: SelectorRules, migrator: &'static sqlx::migrate::Migrator,
+        factory: F) -> TenantsBuilder<S>;
+    /// The lookup, the state check, the header and origin checks; `None` for a bypass path.
+    pub async fn select(&self, request: &http::request::Parts) -> Result<Option<TenantId>, AppError>;
+    pub async fn resolve(&self, request: &http::request::Parts) -> Result<Option<TenantLease<S>>, AppError>;
+    pub async fn get(&self, id: TenantId) -> Result<TenantLease<S>, AppError>;
+    pub fn peek(&self, id: TenantId) -> Option<TenantLease<S>>;
+    pub async fn invalidate(&self, id: TenantId) -> bool;
+    pub async fn evict_idle_older_than(&self, idle: Duration) -> usize;
+    pub async fn refresh_hosts(&self) -> Result<Vec<TenantInfo>, AppError>;
+    pub async fn for_each_active<F, Fut>(&self, visit: F) -> Result<WalkReport, AppError>;
+    pub async fn migration_sweep(&self) -> Result<WalkReport, AppError>;
+    pub fn stats(&self) -> TenantsStats;
+    pub fn hosts(&self) -> Option<&HostSnapshot>;
+    pub fn registry(&self) -> Option<&Registry>;
+    pub fn domains(&self) -> ErrorDomains;
+    pub async fn close(&self);
+    #[cfg(feature = "runtime")] pub fn into_unit(self) -> impl FnMut(UnitContext) -> BoxFuture<..>;
+}
 
-/// A tenant's scope, held for as long as it is used.
+/// The keyed form's settings; `build` refuses what `KeyedPoolsBuilder::build` refuses.
+pub struct TenantsBuilder<S> { /* private */ }
+// domains, capacity, max_connections, acquire_timeout, create_timeout, evict_idle_after,
+// reap_interval, connection_idle_timeout, connection_max_lifetime; build() -> Result<Tenants<S>, AppError>
+
+/// Counters only grow; the rest are gauges.
+#[non_exhaustive]
+pub struct TenantsStats { pub capacity, pub warm, pub in_use, pub creating, pub retiring: usize,
+    pub creations, pub create_failures, pub evictions, pub capacity_refusals: u64 }
+
+/// A tenant's scope, held for as long as it is used. `Clone` and `Deref` whatever `S` is.
 pub struct TenantLease<S> { /* private */ }
-impl<S> Clone for TenantLease<S>;
-impl<S> std::ops::Deref for TenantLease<S> { type Target = S; }
 impl<S> TenantLease<S> { pub fn id(&self) -> TenantId; pub fn info(&self) -> &TenantInfo; }
+
+#[non_exhaustive]
+pub struct WalkReport { pub visited: usize, pub busy: usize, pub failed: Vec<TenantId> }
 ```
 
-`Tenants<S>`†: `fixed(scope)`; a builder for the keyed form over a
-`Registry`, a `Connector`, `ObjectNames`, `SelectorRules`, `ErrorDomains`,
-the tenant schema's `&'static sqlx::migrate::Migrator` and a
-`ScopeFactory`; `select(&Parts) -> TenantId` (never opens), `resolve`,
-`get(TenantId)`, `peek`, `invalidate`, `evict_idle_older_than`,
-`for_each_active`, `migration_sweep`, `stats`, `hosts`, `registry`,
-`into_unit` (feature `runtime`).
+The builder's defaults are those of the framework's `KeyedPools`:
+capacity 64, 5 connections per tenant, a 5 s acquire, a 30 s create
+deadline, idle eviction after 10 min, reaping every 30 s, a connection
+idle timeout of 10 min and a lifetime of 30 min; the error domains are
+`ErrorDomains::new()` unless `domains` is set.
 
 The keyed form is a `KeyedPools<TenantId, _>`: its connector reads the
-committed row (through the lookup cache, no permit) and returns
-`Connector::candidates`; its `init` runs the tenant migrator **as the
-tenant's role**; its `build_value` rereads the row and calls the factory.
-The cached value carries the `TenantInfo` it was built from, so the scope
-type needs no trait.
+row (`Registry::tenant`) and returns `Connector::candidates`; its `init`
+runs the tenant migrator **as the tenant's role**; its `build_value`
+rereads the row as committed now (`Registry::tenant_now`) and calls the
+factory. The cached value carries the `TenantInfo` it was built from, so
+the scope type needs no trait. Both reads refuse a row that is not
+`active`, so **a creation never caches a tenant that is not active**. A
+warm scope of a tenant that later left `active` is refused at the next
+`get` by its state check (once that lookup shows the new state) and its
+entry is retired by the listener's invalidation, by `invalidate` or by idle
+eviction; `peek` reads no row and can still return it until then.
+**A cold open is consistent with the row it is published for**: the
+committed re-read must name the same database, role and role key (id and
+generation) the pool was opened with, else the open is
+`TENANT_UNAVAILABLE` (log stage `row`), the factory is not called, nothing
+is cached and the next `get` opens from the current row. The tenant
+migrator must not be built with `ignore_missing`, which would let a
+database ahead of the binary pass.
+Both also check the stored row, the connector's read before anything
+connects and the build's read before the factory runs: the cluster is
+`MAIN_CLUSTER`, the stored role equals `ObjectNames::role(id)` exactly
+(the role used is the derived one, never a parse of the text), and the
+stored database name passes `DatabaseName::parse` (an adopted name is
+allowed). A row that fails the first check connects nothing; a failed
+check answers `TENANT_UNAVAILABLE` (logged with the stage `row`), as a row
+the registry cannot decode does.
 
 | State (the row's, and the built value's) | `get` and `select` |
 |---|---|
@@ -1347,13 +1580,34 @@ type needs no trait.
 | `suspended` | `TENANT_SUSPENDED` |
 | `purging`, `purged`, no row | `TENANT_NOT_HERE` |
 
+`get` checks the state before the open with a request's lookup by id
+(`Registry::lookup`): through the lookup cache, joining a read of the same
+id in flight, otherwise under a lookup permit taken without waiting; no
+free permit (or a second join without an answer) is `TENANT_BUSY`. The
+reads inside a creation are internal reads without a permit. A
+creation's outcome is decided by where an error came from:
+
 | A creation ends with | The caller gets |
 |---|---|
-| a serving reason of 7 (the row changed under it) | that error |
-| `KEYED_CAPACITY` | `TENANT_BUSY` |
-| an error of `ScopeFactory::build` that carries a reason | that error, unchanged: the product's refusal (the single-owner seam) |
-| a panic | `INTERNAL` |
-| anything else: connect, rejected credentials, a failed migration, the create deadline, a closed cache, a build error without a reason | `TENANT_UNAVAILABLE`; the cause is in the creation's log event |
+| a refusal of `ScopeFactory::build` that carries a reason | that error exactly as the factory wrote it (code, message, reason, domain, metadata, field violations, and the retry hint to the millisecond), whatever its reason text, even one equal to a framework or serving reason, and without the serving domain added: the single-owner seam |
+| a serving reason of this crate (the row changed under it) | that error, in the serving domain |
+| `KEYED_CAPACITY` (or, before the creation, no free lookup permit) | `TENANT_BUSY` |
+| a panic anywhere in the creation, the factory's included | `INTERNAL` |
+| anything else: connect, rejected credentials, a failed migration, a database ahead of the binary, a refused stored row, a row that no longer names the pool's database, role or role key, the create deadline, a closed cache, a build error without a reason | `TENANT_UNAVAILABLE` |
+
+The product's refusal is recognised by a private mark it carries across
+the keyed cache, never by its reason, so an unmarked error can only be the
+framework's or this crate's. **What a failed open logs**: the framework's
+keyed cache writes one event with the error's code, reason and source
+chain; inside a creation the only source is a fixed stage text
+(`opening the tenant failed: control_read`, `row`, `candidates`,
+`migrate` or `build`, the first and the fourth followed by
+` (sqlstate <code>)` when the failure carried a five-character SQLSTATE),
+or the framework's own connect failure, which carries no driver text; a
+state refusal has no source. The
+product's error loses its source and the cache does not log it; a factory
+that wants its cause logged writes its own event, without connection
+detail.
 
 **Cold-open semantics**, inherited from `Keyed` and relied on:
 
@@ -1366,90 +1620,208 @@ type needs no trait.
   turn cold opens into unbounded work.
 - A failure is never cached; the next `get` tries again. A product whose
   build refuses on purpose bounds that cost itself.
-- `invalidate` retires a warm entry or a creation; holders keep their
-  lease until they drop it; a retired creation runs to its end and its
-  value is discarded.
-- `peek` never opens and does not count as a use.
+- `invalidate` forgets the tenant's lookups and retires a warm entry or a
+  creation; holders keep their lease until they drop it; a retired
+  creation runs to its end and its value is discarded.
+- `peek` never opens, reads no row and does not count as a use, so it can
+  return the warm scope of a tenant whose row changed a moment ago.
+- `select` and a streaming resolution never open a tenant.
 
-`Tenants::fixed(scope)` serves `TenantId::LOCAL` alone through the same
-calls: `select` ignores the request, `get` of any other id is
-`TENANT_NOT_HERE`, walks visit the one scope, there is no registry and no
-snapshot.
+`Tenants::fixed(scope)` and `Tenants::fixed_with_bypass(scope, prefixes)`
+serve `TenantId::LOCAL` alone through the same calls: `select` answers
+`None` for a path under a bypass prefix (the comparison of 9.4) and
+`Some(TenantId::LOCAL)` otherwise, reading nothing else of the request;
+`get` of any other id is `TENANT_NOT_HERE`; walks visit the one scope;
+`stats` reports `warm` and `capacity` 1; there is no registry, no snapshot
+and no cache (`invalidate` is `false`, `refresh_hosts` reads nothing).
 
-**Walks.** `for_each_active(f)`† visits the active tenants one after
-another with a lease each; a tenant answered `TENANT_BUSY` is counted and
-skipped, any other failure is logged and recorded, and only a failed list
-read fails the walk (`WalkReport { visited, busy, failed }`).
-**`migration_sweep()`**† opens every active tenant (which migrates it),
-two at a time, drops the lease, then stores the schema version with
-`FOR UPDATE SKIP LOCKED`: it never waits on a lifecycle call's row lock. A
-skipped row is retried once after the others, then counted `busy`. A cold
-open itself writes no version.
+**Walks.** `for_each_active(f)` visits the active tenants in id order, one
+after another, with a lease each; a tenant the cache or the lookup
+refuses on its own as busy (the cache full, no lookup permit) is counted
+and skipped, any other failure (a refusal of the product's factory
+included, whatever its reason: told apart by provenance, never by reason
+text) is logged and recorded, and only a failed list read fails the walk
+(`WalkReport { visited, busy, failed }`, `visited` counting every tenant
+tried). **`migration_sweep()`** opens every active tenant (which migrates
+it), at most two at a time and never more than the cache's capacity, drops
+the lease, then stores the migrator's latest up version with `FOR UPDATE
+SKIP LOCKED`: it never waits on a lifecycle call's row lock. A skipped
+(locked or missing) row's write is retried once after the others, then
+counted `busy`; an open the cache or the lookup refuses as busy is counted
+`busy` without a retry; a product refusal and a failed write are in
+`failed`. A migrator without an up migration, and the fixed form, store
+nothing. A cold open itself writes no version.
+
+Seams for what is out of scope (3, "Out"): single-owner tenants are
+`ScopeFactory::build` and its refusal above; capacity by weight is
+`stats()` with `evict_idle_older_than`; an eviction callback is the
+scope's `Drop`, which runs before its pool closes, and a disposal hook
+would be a `sekvent-db` change passed through `TenantsBuilder::build`.
 
 Capacity against the server: `capacity × max_connections`, plus headroom
 for retiring values, plus the lifecycle pools of 10.1, stays below the
-cluster's limit; the role's connection limit covers every process that
-serves the tenant.
+cluster's limit. The role's connection limit is the server's, counted over
+every process that serves the tenant; the crate checks it against nothing
+(`p` processes can hold up to `p × max_connections` of the role's
+connections).
 
 ### 9.7 The invalidation channel
 
 One NOTIFY channel on the control database; the product names it
-(`Channel::new`†, the grammar of `DatabaseName`).
+(`invalidation::Channel::new`, the grammar of `DatabaseName`).
+
+```rust
+pub struct ChangeKind(/* private */);   // `^[a-z][a-z0-9_]{0,15}$`; `STATE`, `HOSTS`, `new(&str)`
+pub struct Topic(/* private */);        // `^[A-Za-z0-9_-]{1,64}$`; `new(&str)`
+#[non_exhaustive]
+pub enum Message {
+    Change { tenant: TenantId, kind: ChangeKind },
+    Hint { tenant: TenantId, topic: Topic, seq: i64 },
+}   // parse(&str) -> Option<Self>, encode(&self) -> String
+```
 
 | Message | Payload | Meaning |
 |---|---|---|
-| change | `t:<tenant>:<kind>` | the tenant's control row or hosts changed. Kinds `state` and `hosts` are the crate's; a product adds kinds of its own, `^[a-z][a-z0-9_]{0,15}$` |
-| hint | `e:<tenant>:<topic>:<seq>` | product data of the tenant moved; `topic` is `^[A-Za-z0-9_-]{1,64}$`, `seq` a non-negative `i64` |
+| change | `t:<tenant>:<kind>` | the tenant's control row or hosts changed. Kinds `state` and `hosts` are the crate's; a product adds kinds of its own |
+| hint | `e:<tenant>:<topic>:<seq>` | product data of the tenant moved; `seq` a non-negative `i64` in decimal without a sign or a leading zero |
 
-`Message::parse` accepts exactly these shapes; anything else is ignored at
-`debug`.
+`Message::parse` accepts exactly these shapes, the tenant in `TenantId`'s
+one text; anything else is ignored at `debug`. The grammar is checked once,
+when a `ChangeKind` or `Topic` is made (`INVALID_ARGUMENT` outside it).
 
-**The sender**† (`Sender::new(control, channel)`, `change(tenant, kind)`,
-`hint(tenant, topic, seq)`): both calls are synchronous and **never make
-the caller wait**. They queue under a short mutex; at most one statement
-is in flight and it carries the whole queue (`pg_notify` with bound
-values); the highest `seq` per tenant and topic wins, a change is kept
-once per tenant and kind and goes out before hints. A failed acquire or
-statement drops the batch with one warning: the resync below is the
-guarantee, a notification is the fast path.
+**The sender** (`Sender::new(control, channel)`, `change(tenant, &kind)`,
+`hint(tenant, &topic, seq)`; clones share the queue): both calls are
+synchronous, cannot fail and **never make the caller wait**. They queue
+under a short mutex; at most one statement is in flight and it carries the
+whole queue (`pg_notify` with bound values); the sender takes its
+connection before it takes the queue, so what was queued while it waited
+goes out in the same statement. The highest `seq` per tenant and topic
+wins, a negative `seq` is ignored, a change is kept once per tenant and
+kind, and changes go out in the order queued and before hints. A failed
+acquire or statement drops that batch with one warning and newer work is
+still sent; a dropped batch is not re-sent. The resync below repairs what
+a dropped change said about a tenant's row, not a hint or a
+product-defined kind. The warning names the error's class and the number
+of messages dropped, never a payload. Outside a tokio runtime a call only
+queues: the message goes out with the next round of a send already
+running, or with the next call made inside a runtime. A send task that
+never ran (its runtime shut down) or panicked does not stop later sends:
+the flag that says a send runs is cleared by a guard made before the task
+is spawned. The queue has no limit on the number of distinct keys (tenant
+and kind, tenant and topic) while a send is stalled (question 12 of 15).
 
-**The listener**† (`listen(tenants, channel, sink, ready, shutdown)`), a
-`PgListener` on the control pool:
+**The listener** (`Listener::new(tenants, channel)` with `.sink(sink)` and
+`.resync_every(interval)`, default 60 s, zero refused; `run(ready,
+shutdown)`; `into_unit()` with the feature `runtime`; `listen(tenants,
+channel, sink, ready, shutdown)` as the short form), a `PgListener` on the
+control pool:
 
 | Event | Built in | Then |
 |---|---|---|
-| a change | forget the tenant's lookups, invalidate its scope, reload the host snapshot | `sink.change(tenant, kind)` |
+| a change | forget the tenant's lookups, reload the active list (which refreshes the host snapshot and that tenant's entry in the baseline), then retire the tenant's scope | `sink.change(tenant, kind)`, also when the reload failed |
 | a hint | nothing | `sink.hint(tenant, topic, seq)` |
-| every 60 s | clear every lookup, reload the snapshot, compare the active tenants with the last load, invalidate each one that changed, joined or left | `sink.resync(&changed)` |
-| a reconnect | as the 60 s resync | `sink.reconnected()`: the product treats every waiter as stale |
+| each resync interval | clear every lookup, reload the snapshot, compare the active tenants (`TenantInfo` only) with the last load, retire each one that changed, joined or left | `sink.resync(&changed)` after a successful load |
+| a read of the channel that failed without ending the listener (a lost connection, or any other read error) | drop the session, take a new connection from the pool and listen on it, then a resync as above | `sink.resync(&changed)` when that resync succeeds, then `sink.reconnected()`, also when it failed: the product treats every waiter as stale |
 
-The first `LISTEN` and the first load must succeed before `ready` is
-called; a later failure retries after 1 s. A second consecutive failed
-resync empties the snapshot: an origin is then refused rather than
-allowed from stale data. `Sink`† is the product's (waking its streams);
-a product without one passes `()`.
+- The first `LISTEN` and the first load must succeed before `ready` is
+  called; a failure before that is `run`'s result. The first load is the
+  baseline: no sink call, no invalidation. So the listener is started
+  before the cache serves requests: a scope opened before the baseline is
+  never compared with anything. A fixed `Tenants` is
+  `FAILED_PRECONDITION` without I/O.
+- Retiring takes the scope out of the cache at once; its pool closes in the
+  background on the cache's own task and never blocks the listener (it
+  relies on the keyed cache removing the entry before it awaits the
+  disposal: question 13 of 15).
+- The resync timer is checked before the next notification. The first
+  periodic resync is one interval after `ready`; each next one is one
+  interval after the previous resync ended, a reconnect's resync included;
+  a tick that came due during other work runs once, at once, and is never
+  replayed. `resync_every` refuses zero; an interval above 100 years never
+  ticks.
+- After any failed read that does not end the listener, the listener drops
+  its session, takes a new connection from the pool (sessions are built
+  without the driver's eager reconnect, so a loss is reported by the read
+  itself) and listens again, then resyncs (with the sink's `resync`, as
+  any resync) and then calls `sink.reconnected()`, also when that resync
+  failed. A lost connection is listened on again at once; a failed read
+  and a failed attempt to listen again are logged at `warn` with their
+  code and followed by a 1 s wait, during which the timer and `shutdown`
+  still apply.
+- A resync's load has **no deadline**: it runs as long as the control read
+  takes and a tick does not interrupt it. A load that fails is a failed
+  resync and keeps the previous baseline; a successful one resets the
+  count. **A second consecutive failed resync empties the snapshot**: an
+  origin is then refused rather than allowed from stale data.
+- A change-driven reload that fails does not count towards the failed
+  resyncs, still retires the scope, leaves the baseline unchanged, and the
+  sink is still told. A successful one updates the baseline for that tenant
+  only, so another tenant's lost notification is still found by the next
+  resync. The scope is retired after that read, so a scope opened before
+  the read never outlives it and a later lost change still differs from
+  the baseline.
+- `shutdown` ends the listener with `Ok(())`, also while a load is
+  awaited; a closed control pool ends it with `UNAVAILABLE`.
 
-The guarantee across processes is therefore: one notification in the
-normal case, at most 60 s otherwise, plus the 30 s lookup cache where no
-message arrived.
+```rust
+/// The product's (waking its streams). Every method defaults to nothing; each is called on the
+/// listener's task, must return quickly and must not panic.
+pub trait Sink: Send + Sync + 'static {
+    fn change(&self, tenant: TenantId, kind: &ChangeKind);
+    fn hint(&self, tenant: TenantId, topic: &Topic, seq: i64);
+    fn resync(&self, changed: &[TenantId]);
+    fn reconnected(&self);
+}
+impl Sink for () {}
+impl<T: Sink + ?Sized> Sink for Arc<T> { /* forwards every call to `T` */ }   // one sink shared by the listener and the product
+```
+
+The guarantee across processes is therefore conditional: one notification
+drops a tenant's scope and lookups on every listening process in the
+normal case, and a lost notification about what a tenant's row holds
+(state, hosts, primary host, role key: the fields of `TenantInfo`) is
+repaired by the next successful resync, also when its batch was dropped by
+the sender. A lost hint or a lost change of a product-defined kind is not
+repaired: after `resync` and `reconnected` the product's consumers catch up
+from their own durable data. A resync happens only when the control
+database answers, so there is no bound in seconds during an outage or a
+hanging read. The 30 s lookup
+lifetime bounds how long a cached lookup answer is reused and nothing
+else: it is not a bound on how fast a changed tenant stops being served
+(the caller that leads a read in flight still gets that read's answer, and
+a lease already held survives an invalidation until it is dropped).
 
 ### 9.8 Tests
 
-`tests/common` gains the control fixture and the test product (11.1).
-Unit: selector table of 9.4 row by row; message codec round trips and
-refusals; the sender's coalescing on a paused clock with a gated fake
-drain; lookup cache expiry, capacity and the epoch on a `ManualClock`.
-Docker: registry reads and uniqueness mapped to `TENANT_STATE`;
-`verify_schema` with a column and a constraint missing and with an extra
-column; lookup admission (permits exhausted is `TENANT_BUSY` with no
-control connection taken, observed on `pg_stat_activity`; joiners; a
-cancelled caller's read still fills the cache); the state table of 9.6;
-twenty cold `get`s migrate and build once; a gated slow build; a build
-refusal with a reason reaches the caller; a cancelled waiter neither
-cancels the creation nor frees its slot; `invalidate` under a held lease;
-the origin check; the snapshot and predicate; a change sent on one
-`Tenants` drops the scope on another; the 60 s resync on a paused
-interval seam; walks and the sweep, with a row locked by the test.
+`tests/common` gains the control fixture and the test product (11.1). Unit
+tests, without a server, sit next to the code: the serving errors and the
+state table (`error.rs`); state texts, `local()`, `origin()` and narrow
+`Debug` (`info.rs`); the row-decoding rules and `ProvisionStep`'s texts and
+order (`rows.rs`); every verified name in the schema text (`schema.rs`);
+`Registry::new` below 3 and permits shared across clones; the lookup cache
+(expiry, both partitions, replacement, a clock set back, `forget`, the
+epoch) on a `ManualClock`, and joining, the second join, a cancelled, a
+failed and a panicked read on a gated fake read; the lifecycle admission's
+wait, timeout and cancelled wait on a paused clock; the selector table of
+9.4 row by row, `is_bypass`, the request host, the claims and the builder
+refusals (`select.rs`); the snapshot and the predicate (`hosts.rs`); the
+resolver on a fixed `Tenants`, bypass included; the fixed form, the error
+classification, the mark and the stored-row check (`tenants/`); the
+message codec; the sender's coalescing and ordering on a paused clock with
+a gated fake drain; the listener's rules on a fake source and target on a
+paused clock (baseline, change, hint, the timer, one and two failed
+resyncs, a load that never returns and is not cut short, reconnect,
+shutdown, a sink shared through an `Arc`).
+
+Docker tests, one file each:
+
+| File | Proves |
+|---|---|
+| `tests/control.rs` | registry reads; uniqueness mapped to `TENANT_STATE` (the partial index name confirmed by a real violation); a repeated insert; the lock sees committed hosts; the active list; the version store (raised, unchanged, locked, missing); a database name reused only after purge; the stored step and cluster; `verify_schema` with a table, a column and a constraint missing and an extra column, `admin_audit` checked only with `admin` |
+| `tests/admission.rs` | no permit is `TENANT_BUSY` with no control connection taken (observed on `pg_stat_activity`), also through another clone; joiners; a cancelled caller's read fills the cache; internal reads take no permit; the loopback label rule; a host lookup warms the id space |
+| `tests/resolve.rs` | every state through each selector; the id check after the state check; the origin check; the reserved prefix; snapshot refresh and the predicate after a host change; a keyed lease in the scope; a streaming or bypass resolution builds nothing |
+| `tests/tenants.rs` | the state table of 9.6; twenty cold `get`s migrate and build once, as the tenant's role; a gated slow build; a reasoned refusal reaches the caller unchanged, also with a framework reason; one without a reason; a panic; the captured log of failed opens holds fixed texts only; a refused stored row connects nothing; a cancelled waiter (dropped after the build arrived) neither cancels nor frees; `invalidate` under a held lease; capacity; eviction; rejected credentials; a failed migration retried; a database ahead of the binary; no tenant reaches another's data; walks; the sweep with a row locked by the test; the unit |
+| `tests/invalidation.rs` | a change sent on one `Tenants` drops the scope on another; a hint reaches the sink; a lost notification repaired by the next successful resync on a short interval; a real reconnect; a reconnect after failed read attempts (the control owner refused a login for a while) reported to the sink; no `ready` when the first `LISTEN` fails; closing the control pool ends a running listener; a fixed `Tenants` refused; the unit |
 
 **Consumer check.** The product's serving path runs on `Tenants`,
 `TenantResolver`, the snapshot and the channel; its isolation suite (no
@@ -1457,6 +1829,35 @@ tenant reaches another's data, a suspended tenant stops being served on
 every process) passes unchanged.
 
 ## 10. Slice 1c: lifecycle and admin
+
+What the serving half already gives this slice, so that no signature of 9
+changes:
+
+- `TenantRow::provision_step` is the typed `control::ProvisionStep` with
+  the stored texts of 10.2, and `TenantRow::db_cluster` is read.
+  `control::rows` has no function yet that records a step, stores a role
+  key, clears the hosts, counts the rows that are not `purged` or pages a
+  list: 1c's step 0 adds them there; no existing one changes. Repository
+  writes that set a timestamp take `now: SystemTime`, which the
+  provisioner takes from its `Clock`.
+- `admin_audit` is in `REFERENCE_SCHEMA`, and `verify_schema` checks it
+  with the feature `admin`; 1c adds only the statements that write it.
+- `Registry::admit` with `LifecyclePermit` (10.5), `Registry::tenant_now`
+  (the committed row, no cache) and `Registry::forget` exist.
+- A creation of the tenant cache never caches a tenant that is not
+  `active`, and `get` refuses one (9.6), so the
+  dedicated lifecycle pools of 10.1 are the only way to open one, and
+  `LifecycleCapability` gates those, not `Tenants`. The cache opens a
+  tenant only when its stored role is the derived one, its database name
+  parses and its cluster is `main`: provisioning and adoption store
+  exactly that.
+- `Tenants::invalidate` already forgets the tenant's lookups; `Sink` is
+  object-safe and implemented for `Arc<T>`, so the listener and the
+  announce of 10.5 share one sink; `ChangeKind::STATE` and
+  `ChangeKind::HOSTS` are the kinds the announce sends.
+- A fixed `Tenants` names `TenantId::LOCAL` as the scope's tenant, so an
+  end user of a fixed-scope product carries that tenant text; the admin
+  authenticator's `tid` rule (10.6) must allow for it.
 
 ### 10.1 File ownership
 
@@ -1519,7 +1920,9 @@ async, fallible, a pool and the tenant's info, a `Secret` for a handover.)
   `Connector` and `ObjectNames`, the tenant migrator, the hooks, the key
   id for new tenants, the role connection limit, the tenant cap, the
   `LabelRules`, the invalidation `Sender`, a `Clock`, and the cache to
-  invalidate as a trait object (it is not generic over the scope type).
+  invalidate as a trait object (it is not generic over the scope type): a
+  crate-private object-safe trait over `Tenants::invalidate` and
+  `Tenants::refresh_hosts`, added in `tenants/keyed.rs` by 1c's step 0.
 
 ### 10.2 Provisioning
 
@@ -1537,7 +1940,10 @@ holds is `TENANT_STATE`.
 Each step locks the row (`FOR UPDATE`), re-reads it, does its work,
 records the step and commits. A call for an existing id resumes at the
 recorded step when the request matches the row (label, display name,
-hosts, primary host), and is `TENANT_STATE` when it does not.
+hosts, primary host), and is `TENANT_STATE` when it does not. The steps
+are `control::ProvisionStep` (9.2): `Inserted` (the empty stored text,
+a new row) and the five of the table below, in that order; an unknown
+stored text is `INTERNAL`.
 
 | Step recorded | Connection | Work |
 |---|---|---|
@@ -1751,14 +2157,26 @@ binary, Postgres 17 by default), `#[ignore]`d and skipped unless
   are revoked from `PUBLIC` on both, so the preflight passes on a fresh
   fixture. The harness's superuser is used only to set up and to observe
   (`pg_stat_activity`, catalog reads, creating drift on purpose).
-- **The test product** (from 1b): an embedded tenant migrator of two
-  migrations (an `orders` table, then one more column, so a sweep has a
-  version to move); a scope type whose async build can be gated and failed
-  by the test and whose `Drop` signals; hooks whose seed inserts one row
-  and returns a `Secret` on its first call and nothing on a second, and
-  whose usage counter is the number of rows in `orders`.
-- Time is a `ManualClock` wherever the crate takes a `Clock`; blocking is
-  observed on `pg_stat_activity` with `await_until!`, never slept for;
+- **The control fixture** (from 1b): `control_pool_of(n)`, a control
+  owner's pool of `n` connections (the plain control pool has 2, below
+  `Registry::MIN_CONNECTIONS`); the reference schema applied; a registry
+  on a pool of 4; the fixture's master secrets, role key and connector;
+  control rows inserted by hand in any state; a whole tenant (role,
+  database and an `active` row) built from the cluster operations of 1a
+  with the feature `lifecycle`, which 1c replaces by the provisioner;
+  `tenants(..)` and `tenants_builder(..)` over the test product.
+- **The test product** (`tests/common/product.rs`, from 1b): an embedded
+  tenant migrator of two migrations (an `orders` table, then one more
+  column, so a sweep has a version to move); a scope that holds the
+  tenant's pool, is not `Clone`, and whose `Drop` is counted and
+  signalled; a factory whose build the test can gate, count, and fail with
+  any error it builds (or a panic). 1c adds hooks whose seed inserts one
+  row and returns a `Secret` on its first call and nothing on a second,
+  and whose usage counter is the number of rows in `orders`.
+- Time is a `ManualClock` (from `sekvent-context`) wherever the crate
+  takes a `Clock`; tokio's paused clock serves the unit tests of timers on
+  fakes; blocking is observed on `pg_stat_activity` with `await_until!`,
+  never slept for; the factory's gate and counters are completion signals;
   anything with a socket binds `127.0.0.1:0`.
 - Nothing is dropped per test; the container is reaped with the process.
 
@@ -1768,8 +2186,11 @@ binary, Postgres 17 by default), `#[ignore]`d and skipped unless
 Docker tests included (the coverage run sets `SEKVENT_DOCKER_TESTS=1` and
 passes `--include-ignored`). The configured run applies one floor to the
 whole repository, so the crate's own figure is read from the summary and
-is the acceptance (15, question 8). Pure rules (`findings`, the drop
-decision, the selector table, the message codec, the claim rules) are
+is the acceptance (15, question 8): the sum of covered over total lines of
+the rows under `crates/sekvent-tenancy/src/`. Pure rules (`findings`, the
+drop decision, the selector table, the row decoding, the error
+classification, the message codec, the listener's loop on fakes, the claim
+rules) are
 unit-tested so coverage does not depend on reaching every branch through a
 server.
 
@@ -1848,6 +2269,70 @@ coverage.
     off, so `tenancy-manager` compiles without a database driver.
 14. The control table names and column names are fixed by the reference
     schema (question 3 asks whether that holds).
+15. **The path-label prefix is a reserved namespace on every host**, with
+    no fall-through: under it, a host that is not a path-label host, a
+    missing or malformed label and an unknown well-known name are
+    `TENANT_NOT_HERE`, and a path-label host serves nothing outside it
+    (owner's decision; 9.4).
+16. **The CORS predicate answers for id-header hosts only** and never
+    looks at the path (owner's decision; 9.5).
+17. **The loopback path label**: exactly one tenant that is not purged may
+    carry the label, and it must have a registered loopback host; the read
+    is never cached or joined and spends a lookup permit (owner's
+    decision; 9.4).
+18. **A caller that joined a read twice** without an answer is
+    `TENANT_BUSY` (owner's decision, confirming 9.3).
+19. **Found and not-found lookups are separate partitions**; when one is
+    full, expired entries are dropped and only that partition is cleared
+    (owner's decision; 9.3).
+20. **A bypass path gets an empty scope in every form** of `Tenants`; the
+    fixed form takes its prefixes through `Tenants::fixed_with_bypass`
+    (owner's decision; 9.6).
+21. **A resync attempt has no deadline**, and the cross-process guarantee
+    is worded conditionally: a lost notification is repaired by the next
+    successful resync; the 30 s lookup lifetime bounds only the reuse of a
+    cached answer and is no revocation bound (owner's decision; 9.7;
+    question 10).
+22. The tenant cache's defaults are the framework's `KeyedPools` defaults
+    (capacity 64, 5 connections per tenant, 10 min idle eviction, a 30 s
+    create deadline); the 30 s create deadline this note fixes is that
+    default, and the builder sets none of its own.
+23. The tenant cache drops the source of a `ScopeFactory` error and logs
+    only a fixed stage text (with at most a SQLSTATE); a product that
+    wants its cause logged writes its own event.
+24. `shutdown` ends the listener even while a resync's load is awaited,
+    since that load has no deadline.
+25. The provisioning step is a type (`ProvisionStep`) in the serving half,
+    and the reference schema keeps all three tables in one text, so 1c
+    changes neither.
+26. **A change is handled as forget, reload, retire, tell**: the scope is
+    retired after the read that becomes the tenant's baseline, so a scope
+    opened in between can never hide a later lost change (9.7).
+27. **`get`'s state check is a request's lookup** (admitted, coalesced,
+    `TENANT_BUSY` without a free permit), so concurrent cold `get`s of one
+    id cause one control read; only the reads inside a creation are
+    internal (9.6).
+28. **A cold open checks the committed row against its pool**: same
+    database, role and role key, else `TENANT_UNAVAILABLE` and nothing
+    cached (9.6).
+29. **Walks and the sweep tell busy answers apart by provenance**: only the
+    cache's full answer and the lookup's busy answer count as `busy`; a
+    product refusal is a failure whatever its reason (9.6).
+30. **The sweep opens at most two tenants at once and never more than the
+    cache's capacity**, so it never refuses itself on a small cache (9.6).
+31. **A lookup entry is replaced only by a read that started later**; an
+    entry found not fresh is removed, and an answer past its lifetime is
+    not stored (9.3).
+32. **A path-label prefix of `/` is refused**: the prefix is reserved on
+    every host, and `/` would reserve every path (9.4).
+33. **After a failed read the listener listens on a new connection** from
+    the pool, its sessions built without the driver's eager reconnect, so
+    a dead connection is never read again and a loss is never hidden by a
+    tick (9.7).
+34. **The resync deadline restarts when a resync ends**: the next periodic
+    resync is one interval after the previous one ended, so a slow resync
+    never starves the notifications; an interval above 100 years never
+    ticks (9.7).
 
 ## 15. Open questions for the repository owner
 
@@ -1861,13 +2346,16 @@ coverage.
 3. **Control table names.** Fixed (`tenants`, `tenant_hosts`,
    `admin_audit`, found through the pool's `search_path`), or
    configurable. *Recommended: fixed;* a product that needs other names
-   puts the tables in a schema of their own.
-4. **The host selector.** Row 4 of 9.4 (a tenant's own host selects it)
+   puts the tables in a schema of their own. Slice 1b is built on the
+   recommendation; the question stays open.
+4. **The host selector.** Row 5 of 9.4 (a tenant's own host selects it)
    is not exercised by the first consumer. Build it in 1b behind its
    switch, or specify it now and build it with the product that needs it.
    *Recommended: build it in 1b;* it is one lookup that already exists
    and a table row of tests, and selection rules are the hardest part to
-   change once products depend on them.
+   change once products depend on them. Slice 1b is built on the
+   recommendation (`SelectorRules::tenant_hosts`); the question stays
+   open.
 5. **The manager client's transport.** gRPC-Web over the `sekvent-client`
    HTTP stack (works through HTTP proxies and with TLS today; the product
    enables gRPC-Web on its admin listener), or native gRPC through tonic
@@ -1876,7 +2364,8 @@ coverage.
 6. **Message text.** Fixed neutral messages (the table of 7), or a way
    for a product to supply its own per reason. *Recommended: fixed;*
    reasons and codes are the contract, and a product that wants other
-   words maps by reason at its edge.
+   words maps by reason at its edge. Slice 1b is built on the
+   recommendation; the question stays open.
 7. **The example.** `examples/tenants` as in 12.3 with 1c, or a smaller
    one (serving only) with 1b and the lifecycle added later.
    *Recommended: once, with 1c,* so it is written against final
@@ -1885,13 +2374,38 @@ coverage.
    configured coverage run applies one floor to the whole tree. Accept
    the crate's own figure from the summary as this work's gate, or change
    the run to per-package floors first. *Recommended: the crate's own
-   figure now, the run fixed separately.*
+   figure now, the run fixed separately.* Slice 1b is measured on the
+   recommendation; the question stays open.
 9. **The repository rule on origin.** `AGENTS.md` says the framework is
    written from scratch. This crate is specified from a product's working
    behaviour and written anew from this note. Leave the rule as it is, or
    add a sentence that a behaviour may be re-specified in a design note
    and implemented from the note alone. *Recommended: add the sentence,*
    so the next such port has a stated method.
+10. **A deadline on a resync attempt.** A resync's load has none for now
+    (decision 21 of 14): a control read that hangs postpones the second
+    failed resync, and with it the fail-closed emptying of the host
+    snapshot, for as long as it hangs. Keep it so, or cut a resync's load
+    off after a deadline and count that as a failed resync.
+11. **An undecodable active row.** One active row the crate cannot decode
+    fails the whole active list today, and with it the walks, the sweep,
+    `refresh_hosts` and the listener's loads. Skip such a row with a
+    warning, or have the reference schema constrain the stored step (it
+    has no check on `provision_step`) so the row cannot be written.
+12. **The sender's pending keys.** While a send is stalled the queue keeps
+    one entry per distinct tenant and kind and per tenant and topic,
+    without a limit. Bound it (and drop what does not fit, as a failed
+    batch is dropped), or keep it unbounded.
+13. **Retiring without waiting.** The listener takes a scope out of the
+    cache with one poll of `Tenants::invalidate`, relying on `sekvent-db`'s
+    keyed cache removing the entry before it awaits the disposal. Should
+    the keyed cache offer a retire that removes the entry and starts the
+    disposal without waiting for it, so this does not rest on an
+    implementation detail?
+14. **Feature sets in the gate.** The gate runs every command with all
+    features, so the code compiled without `admin` (and the default
+    feature set) is only checked, never tested, by it. Should the gate also
+    run the crate's tests without `admin`?
 
 ## 16. Security review
 
@@ -1902,7 +2416,10 @@ database checks (8.9), the preflight (8.10), role creation and the
 verifier path (8.4, 8.7), the database drop and the handover (8.8, 8.11),
 name and verifier formatting (8.2, 8.6), selection and the origin check
 (9.4, 9.5), the lookup and cold-open bounds (9.3, 9.6), and the admin
-token, the replay record and the guard (10.6). The first product
+token, the replay record and the guard (10.6). Its scope includes a
+loopback host listed for both selectors: a path-label selection there
+carries no `Origin` check, while the CORS predicate answers for that host
+as for an id-header host. The first product
 deployment of the crate waits for it.
 
 ## 17. Verification

@@ -19,7 +19,7 @@
 //! | [`component`](mod@component) | `sekvent-component` | `component` | components, the App builder, local, serialized and gRPC bindings |
 //! | [`sso`] | `sekvent-sso` | `sso` | browser single sign-on: OAuth 2.0 code flow, identity providers (Bitbucket Cloud), one-time handoff codes |
 //! | [`storage`] | `sekvent-storage` | `storage` | S3-compatible object storage: presigned uploads and downloads, head, delete, copy |
-//! | [`tenancy`] | `sekvent-tenancy` | `tenancy` | tenants on a database and a role each: ids and object names, derived role credentials, privilege inspection and the startup preflight |
+//! | [`tenancy`] | `sekvent-tenancy` | `tenancy` | tenants on a database and a role each: ids and object names, derived role credentials, privilege inspection and the startup preflight, the control registry and its schema check, tenant selection and the scope resolver, the host snapshot and CORS predicate, the tenant cache, cross-process invalidation |
 //!
 //! # Sub-features
 //!
@@ -60,11 +60,18 @@
 //!   (`PoolRegistry::probes`) on a sqlx backend.
 //! - `storage` and `runtime` together give the bucket readiness probe
 //!   (`storage::StorageProbe`).
+//! - `tenancy` and `runtime` together give the runtime units of the tenant
+//!   cache and the invalidation listener (`tenancy::Tenants::into_unit`,
+//!   `tenancy::invalidation::Listener::into_unit`).
 //! - `tenancy-lifecycle`: the maintenance connection, role and database
 //!   operations and the ownership handover (`tenancy::cluster`), with the
-//!   SCRAM verifier they create roles with. Turns on `tenancy`.
-//! - `tenancy-admin`: the admin token verifier, authenticator and guard
-//!   (not built yet). Turns on `tenancy` and `auth`.
+//!   SCRAM verifier they create roles with; the tenant lifecycle operations
+//!   are not built yet. Turns on `tenancy`.
+//! - `tenancy-admin`: reserved for the admin token verifier, authenticator
+//!   and guard, none of which is built yet. With it on,
+//!   `tenancy::control::verify_schema` already requires the reference
+//!   schema's `admin_audit` table and its key `admin_audit_pkey`. Turns on
+//!   `tenancy` and `auth`; `full` turns it on.
 //! - `tenancy-manager`: the token minter and the admin client (not built
 //!   yet). Needs no database driver when the facade's default features are
 //!   off: with `runtime` on, the crate's runtime units pull in `tenancy`'s

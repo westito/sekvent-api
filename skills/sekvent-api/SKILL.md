@@ -62,7 +62,10 @@ can describe APIs the project does not have yet.
 | Stream live updates to a browser or service (server-streaming `#[call(stream)]`, `CallStream`, lifetime, drain, HTTP/2 keep-alive) | `docs/modules/components.md` ("How to stream replies"), `docs/modules/server.md` ("Keep long streams alive") |
 | Give each tenant a Postgres database and a role of its own: tenant ids and object names, hosts and labels, derived role credentials | `docs/modules/tenancy.md` ("Names, hosts and labels", "Role credentials") |
 | Create and drop tenant roles and databases without a superuser; check at startup that no tenant role reaches the service's own databases; adopt an existing database | `docs/modules/tenancy.md` ("The maintenance connection", "Roles and databases", "The startup preflight", "Adopting a database") |
-| Select the tenant per request, cache its scope, follow changes made on other processes (slice 1b); provision, suspend and purge tenants, guard admin RPCs, call them from an operator service (slice 1c) | `docs/modules/tenancy.md` ("Select the tenant", "The tenant cache", "Provision a tenant", "The admin surface"), `docs/design/tenancy.md` |
+| Serve many tenants from one process: the control registry and its schema check, a scope per tenant opened on demand and cached (`Tenants`, `ScopeFactory`), walks and the migration sweep | `docs/modules/tenancy.md` ("The control schema", "Lookups and their admission", "The tenant cache", "Sizing") |
+| Select the tenant of a request (id header, path label, a tenant's own host) with `TenantResolver`; allow the tenants' origins in CORS | `docs/modules/tenancy.md` ("Select the tenant", "CORS") |
+| Follow tenant changes made on other processes (`LISTEN`/`NOTIFY` with a periodic resync) and announce your own | `docs/modules/tenancy.md` ("Follow changes from other processes") |
+| Provision, suspend and purge tenants, guard admin RPCs, call them from an operator service (slice 1c) | `docs/modules/tenancy.md` ("Provision a tenant", "The admin surface"), `docs/design/tenancy.md` |
 | `build.rs` protobuf codegen without `protoc` | `docs/modules/proto-build.md` |
 | Container-backed DB and MinIO tests, deterministic tests, coverage | `docs/modules/testing.md` |
 | Why something is designed the way it is | `docs/design/*.md` (decisions; the module pages describe current behaviour) |
@@ -153,7 +156,7 @@ this shape; read it before restructuring.
 | Per-client rate limit on axum routes (`ClientLimitLayer`) | `resilience-http` |
 | Service-to-service tokens | `link` (+ `link-axum` / `link-tonic`) |
 | Components | `component` (+ `component-grpc` for the gRPC binding, also for serving streams; `runtime-grpc-web` for browsers) |
-| Tenants on a database and a role each (names, derived credentials, the startup preflight) | `tenancy` |
+| Tenants on a database and a role each (names, derived credentials, the startup preflight, selection and the resolver, the tenant cache, invalidation) | `tenancy` (with `runtime`: the cache's and the listener's units) |
 | Tenant roles and databases through a maintenance role, adopting a database | `tenancy-lifecycle` |
 | Guard a product's admin RPCs with operator tokens (slice 1c) | `tenancy-admin` |
 | Mint operator tokens and call a product's admin RPC, no database (slice 1c) | `tenancy-manager` with `default-features = false` (the default `runtime` pulls in the database driver) |

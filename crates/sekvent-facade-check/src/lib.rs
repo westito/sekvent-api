@@ -7,11 +7,13 @@
 //! `sekvent::component`. If a macro ever names a crate the consumer does not
 //! depend on, this crate stops compiling. The facade's `component-grpc`
 //! feature is on, so the gRPC binding and serving are checked through the
-//! facade as well. It is not published.
+//! facade as well. With `tenancy`, [`tenancy`] builds a scope factory and
+//! the tenant resolver from `sekvent::tenancy` alone. It is not published.
 
 #![forbid(unsafe_code)]
 
 pub mod component;
+pub mod tenancy;
 
 use sekvent::EnvConfig;
 use sekvent::config::{ConfigError, ConfigSource, Secret};

@@ -45,7 +45,7 @@ example an `-api` crate that only declares a component contract).
 | `client` | `sekvent::client` (outbound HTTP, OAuth 2.0) | `sekvent-client` | [client](modules/client.md) |
 | `db` | `sekvent::db` (pools, a pool per key, migrations, filters, errors) | `sekvent-db` | [db](modules/db.md) |
 | `storage` | `sekvent::storage` (S3-compatible object storage, presigned uploads and downloads) | `sekvent-storage` | [storage](modules/storage.md) |
-| `tenancy` | `sekvent::tenancy` (tenant ids and object names, hosts and labels, derived role credentials, the connector, the startup preflight; selection, the tenant cache and invalidation arrive with slice 1b) | `sekvent-tenancy` | [tenancy](modules/tenancy.md) |
+| `tenancy` | `sekvent::tenancy` (tenant ids and object names, hosts and labels, derived role credentials, the connector, the startup preflight; the control registry and its schema check, tenant selection and the scope resolver, the host snapshot and CORS predicate, the tenant cache and cross-process invalidation) | `sekvent-tenancy` | [tenancy](modules/tenancy.md) |
 | `component` | `sekvent::component` plus `sekvent::{App, ComponentError, component}`; unary and server-streaming methods (`CallStream`) | `sekvent-component` | [components](modules/components.md) |
 
 `component` also turns on `config`, `error` and `context`. `tenancy` also
@@ -79,7 +79,7 @@ turns on `config`, `error`, `context`, `db` and `component`.
 | `db-keyed` | `db` | `Keyed`: one lazily created value per key, shared while in use, evicted when idle or over capacity; with `db-sqlx-postgres` also `KeyedPools`, a Postgres pool per key and the value built on it ([db](modules/db.md#keep-one-pool-per-key-keyedpools)) |
 | `component-grpc` | `component` | The `grpc` binding and serving components over gRPC, unary and server-streaming (`#[call(stream)]`, also to browsers over gRPC-Web) |
 | `tenancy-lifecycle` | `tenancy` | The maintenance connection (`Maintenance`), roles and databases, the SCRAM verifier (`ScramVerifier`), the ownership handover of an adopted database ([tenancy](modules/tenancy.md#the-maintenance-connection)); provisioning and the tenant operations arrive with slice 1c |
-| `tenancy-admin` | `tenancy`, `auth` | The admin token verifier, the authenticator of an admin App and the guard around a product's admin RPCs; arrives with slice 1c |
+| `tenancy-admin` | `tenancy`, `auth` | With it on, `tenancy::control::verify_schema` also requires the `admin_audit` table and its key `admin_audit_pkey` ([tenancy](modules/tenancy.md#the-control-schema)); nothing else of the admin surface is built: the admin token verifier, the authenticator of an admin App and the guard around a product's admin RPCs arrive with slice 1c. `full` turns it on |
 | `tenancy-manager` | `config`, `error`, `context`, `auth`, `client` | The token minter and the client that calls a product's admin RPC, with no database dependency when the facade's default features are off; arrives with slice 1c |
 | `full` | everything above | Every module and integration (handy for experiments, not for services) |
 
@@ -95,7 +95,7 @@ Some APIs need two features at once. The facade wires them for you:
 | `db-keyed` | `runtime` (default) | `Keyed::into_unit` and `KeyedPools::into_unit`: the unit that evicts idle entries and closes the cache on shutdown |
 | `storage` | `runtime` (default) | `StorageProbe`, a bucket readiness probe |
 | `component` | `runtime` (default) | `App::register`, which runs the components as one runtime unit |
-| `tenancy` | `runtime` (default) | `Tenants::into_unit` and the invalidation listener as runtime units; arrive with slice 1b |
+| `tenancy` | `runtime` (default) | `Tenants::into_unit` (evicts idle tenant scopes, closes the cache on shutdown) and `invalidation::Listener::into_unit` (follows the invalidation channel) as runtime units |
 
 ## Things that surprise people
 

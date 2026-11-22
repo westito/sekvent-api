@@ -31,7 +31,7 @@ workspaces and runs the quality gate.
 | `sekvent::auth` | `auth` | [auth](modules/auth.md) | argon2id and bcrypt passwords, login helper, HS256 and EdDSA JWT with injected time |
 | `sekvent::sso` | `sso` | [sso](modules/sso.md) | Browser single sign-on (OAuth 2.0 code flow), Bitbucket Cloud provider, one-time handoff codes |
 | `sekvent::storage` | `storage` | [storage](modules/storage.md) | S3-compatible object storage: presigned browser uploads and downloads, head, delete, copy, bucket probe |
-| `sekvent::tenancy` | `tenancy` | [tenancy](modules/tenancy.md) | Tenants on a database and a role each: ids and object names, derived role credentials, cluster operations and the startup preflight; tenant selection, the tenant cache and cross-process invalidation (slice 1b); lifecycle operations, admin tokens and the manager kit (slice 1c) |
+| `sekvent::tenancy` | `tenancy` | [tenancy](modules/tenancy.md) | Tenants on a database and a role each: ids and object names, derived role credentials, cluster operations and the startup preflight; the control registry, tenant selection and the scope resolver, the tenant cache and cross-process invalidation; lifecycle operations, admin tokens and the manager kit (slice 1c) |
 | `sekvent::link` | `link` | [link](modules/link.md) | Service-to-service tokens, inbound checks, outbound attachment |
 | `sekvent::client` | `client` | [client](modules/client.md) | Outbound HTTP with policies, context propagation, OAuth 2.0 |
 | `sekvent::resilience` | `resilience` | [resilience](modules/resilience.md) | Backoff, retries with budgets, rate gate, bulkhead, breaker, TTL cache |

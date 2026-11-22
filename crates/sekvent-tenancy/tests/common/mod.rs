@@ -25,16 +25,38 @@
 //! }
 //! ```
 //!
+//! With feature `serving` the fixture also holds the control schema
+//! ([`Cluster::apply_control_schema`]), a registry on it, control rows
+//! without a database ([`Cluster::insert_row`]), whole tenants (feature
+//! `lifecycle`, [`Cluster::create_tenant`]) and the test product of
+//! [`product`]: a tenant cache over it is [`Cluster::tenants`].
+//!
 //! Nothing is dropped per test; the container is reaped with the process.
 //! Nothing here prints a password or connect options.
 #![allow(dead_code, unreachable_pub)]
 
+#[cfg(feature = "serving")]
+pub mod product;
+
 use std::future::Future;
 use std::str::FromStr;
+#[cfg(feature = "serving")]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+#[cfg(feature = "serving")]
+use std::time::SystemTime;
 
 use sekvent_config::Secret;
+#[cfg(feature = "serving")]
+use sekvent_context::{Clock, ManualClock};
+#[cfg(feature = "serving")]
+use sekvent_tenancy::control::{self, NewTenant, rows};
+#[cfg(feature = "serving")]
+use sekvent_tenancy::{
+    Connector, Registry, RoleKey, RoleSecrets, SelectorRules, TenantRow, TenantState, Tenants,
+    TenantsBuilder,
+};
 use sekvent_tenancy::{ObjectNames, TenantId};
 use sekvent_testing::{PostgresHarness, docker_tests_enabled};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -72,6 +94,19 @@ pub async fn execute(conn: &mut PgConnection, sql: &str) {
     try_execute(conn, sql)
         .await
         .expect("the fixture statement succeeded");
+}
+
+/// The time the fixture writes into control rows: 1 700 000 000 s after the
+/// epoch, the start of [`manual_clock`].
+#[cfg(feature = "serving")]
+pub fn fixture_time() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+/// A clock frozen at 1 700 000 000 s after the epoch.
+#[cfg(feature = "serving")]
+pub fn manual_clock() -> ManualClock {
+    ManualClock::new(fixture_time())
 }
 
 /// `"name"`. Fixture names are lower-case letters, digits and underscores.
@@ -203,6 +238,18 @@ impl Cluster {
     pub async fn control_pool(&self) -> PgPool {
         PgPoolOptions::new()
             .max_connections(2)
+            .connect_with(self.control_options())
+            .await
+            .expect("the control owner connected")
+    }
+
+    /// A pool of the control owner on the control database with
+    /// `max_connections` connections and a 5 s acquire timeout (the
+    /// [`control_pool`](Self::control_pool) keeps its 2).
+    pub async fn control_pool_of(&self, max_connections: u32) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(5))
             .connect_with(self.control_options())
             .await
             .expect("the control owner connected")
@@ -357,5 +404,203 @@ impl Cluster {
                 .expect("pg_stat_activity is readable");
         admin.close().await.expect("the admin session closed");
         count
+    }
+
+    /// The sessions `role` has on the server, from `pg_stat_activity`.
+    pub async fn sessions_of(&self, role: &str) -> i64 {
+        let mut admin = self.admin().await;
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE usename = $1")
+                .bind(role)
+                .fetch_one(&mut admin)
+                .await
+                .expect("pg_stat_activity is readable");
+        admin.close().await.expect("the admin session closed");
+        count
+    }
+}
+
+#[cfg(feature = "serving")]
+impl Cluster {
+    /// Applies [`control::REFERENCE_SCHEMA`] (all three tables) as the
+    /// control owner.
+    pub async fn apply_control_schema(&self) {
+        let mut owner = PgConnection::connect_with(&self.control_options())
+            .await
+            .expect("the control owner connected");
+        execute(&mut owner, control::REFERENCE_SCHEMA).await;
+        owner.close().await.expect("the control session closed");
+    }
+
+    /// The schema applied, a pool of 4 and a registry on it.
+    pub async fn registry(&self, clock: Arc<dyn Clock>) -> (Registry, PgPool) {
+        self.apply_control_schema().await;
+        let pool = self.control_pool_of(4).await;
+        let registry = Registry::new(pool.clone(), clock).expect("a pool of 4 is enough");
+        (registry, pool)
+    }
+
+    /// The fixture's master secrets: key id `k1`, context `fixture`, a
+    /// secret derived from the stem.
+    pub fn secrets(&self) -> RoleSecrets {
+        let text = Secret::new(format!("k1:{}0123", self.stem.repeat(5)));
+        RoleSecrets::parse(&text, "fixture").expect("the fixture's master secret is valid")
+    }
+
+    /// `RoleKey { key_id: "k1", generation: 1 }`.
+    #[allow(clippy::unused_self)] // a method, like the fixture's other identity values
+    pub fn role_key(&self) -> RoleKey {
+        RoleKey {
+            key_id: "k1".to_owned(),
+            generation: 1,
+        }
+    }
+
+    /// A connector whose base options are the bootstrap admin's (never used
+    /// for a tenant: the connector replaces the role, the password and the
+    /// database).
+    pub fn connector(&self) -> Connector {
+        Connector::new(self.admin_options("postgres"), self.secrets())
+    }
+
+    /// Inserts a control row only (no role, no database) and sets `state`.
+    /// `hosts[0]` is the primary; hosts are canonical. `label` is the
+    /// subdomain.
+    pub async fn insert_row(
+        &self,
+        control: &PgPool,
+        label: &str,
+        hosts: &[&str],
+        state: TenantState,
+    ) -> TenantRow {
+        self.insert_row_with(control, new_tenant(), label, hosts, state)
+            .await
+    }
+
+    async fn insert_row_with(
+        &self,
+        control: &PgPool,
+        id: TenantId,
+        label: &str,
+        hosts: &[&str],
+        state: TenantState,
+    ) -> TenantRow {
+        let hosts: Vec<String> = hosts.iter().map(|host| (*host).to_owned()).collect();
+        let primary_host = hosts.first().expect("a fixture row has a host").clone();
+        let tenant = NewTenant {
+            id,
+            subdomain: label.to_owned(),
+            display_name: label.to_owned(),
+            hosts,
+            primary_host,
+            database: self.names().database(id),
+            role: self.names().role(id),
+            role_key: self.role_key(),
+        };
+        let mut tx = control.begin().await.expect("a control transaction began");
+        let (_, inserted) = rows::insert(&mut tx, &tenant, fixture_time())
+            .await
+            .expect("the fixture row was inserted");
+        assert!(inserted, "the fixture row is new");
+        if state != TenantState::Provisioning {
+            let changed = rows::set_state(&mut tx, id, state, fixture_time())
+                .await
+                .expect("the fixture row's state was set");
+            assert!(changed, "the fixture row exists");
+        }
+        tx.commit().await.expect("the fixture row was committed");
+        let mut conn = control.acquire().await.expect("a control connection");
+        rows::get(&mut conn, id)
+            .await
+            .expect("the fixture row is readable")
+            .expect("the fixture row exists")
+    }
+
+    /// Sets a row's state in a transaction of its own.
+    pub async fn set_state(&self, control: &PgPool, id: TenantId, state: TenantState) {
+        let mut tx = control.begin().await.expect("a control transaction began");
+        let changed = rows::set_state(&mut tx, id, state, fixture_time())
+            .await
+            .expect("the row's state was set");
+        assert!(changed, "the row exists");
+        tx.commit().await.expect("the state was committed");
+    }
+
+    /// Replaces a row's hosts and subdomain in a transaction of its own.
+    /// `hosts[0]` is the primary.
+    pub async fn set_hosts(&self, control: &PgPool, id: TenantId, label: &str, hosts: &[&str]) {
+        let hosts: Vec<String> = hosts.iter().map(|host| (*host).to_owned()).collect();
+        let primary_host = hosts.first().expect("a fixture row has a host").clone();
+        let mut tx = control.begin().await.expect("a control transaction began");
+        rows::set_hosts(&mut tx, id, label, &hosts, &primary_host, fixture_time())
+            .await
+            .expect("the row's hosts were set");
+        tx.commit().await.expect("the hosts were committed");
+    }
+
+    /// A whole tenant: the role (verifier of the derived password,
+    /// connection limit 20) and the database through the crate's
+    /// maintenance connection, then the control row, `Active`.
+    #[cfg(feature = "lifecycle")]
+    pub async fn create_tenant(&self, control: &PgPool, label: &str, hosts: &[&str]) -> TenantRow {
+        use sekvent_tenancy::ScramVerifier;
+        use sekvent_tenancy::cluster::{databases, roles};
+
+        let id = new_tenant();
+        let role = self.names().role(id);
+        let database = self.names().database(id);
+        let password = self
+            .secrets()
+            .derive(id, &self.role_key())
+            .expect("the fixture key derives a password");
+        let verifier = ScramVerifier::new(&password).expect("a verifier of the password");
+        let mut conn = self
+            .maintenance()
+            .connect()
+            .await
+            .expect("the maintenance role connected");
+        roles::create(&mut conn, &role, &verifier, 20)
+            .await
+            .expect("the tenant role was created");
+        databases::create(&mut conn, &database, &role)
+            .await
+            .expect("the tenant database was created");
+        conn.close().await.expect("the maintenance session closed");
+        self.insert_row_with(control, id, label, hosts, TenantState::Active)
+            .await
+    }
+
+    /// Tenants over the test product with `capacity`, 2 connections per
+    /// tenant and default domains.
+    pub fn tenants(
+        &self,
+        registry: &Registry,
+        rules: SelectorRules,
+        factory: &product::OrdersFactory,
+        capacity: usize,
+    ) -> Tenants<product::OrdersScope> {
+        self.tenants_builder(registry, rules, factory)
+            .capacity(capacity)
+            .build()
+            .expect("the tenant cache settings are valid")
+    }
+
+    /// The builder behind [`tenants`](Self::tenants), for a test that changes
+    /// a setting.
+    pub fn tenants_builder(
+        &self,
+        registry: &Registry,
+        rules: SelectorRules,
+        factory: &product::OrdersFactory,
+    ) -> TenantsBuilder<product::OrdersScope> {
+        Tenants::builder(
+            registry.clone(),
+            self.connector(),
+            self.names().clone(),
+            rules,
+            &product::TENANT_MIGRATOR,
+            factory.clone(),
+        )
+        .max_connections(2)
     }
 }
