@@ -1577,7 +1577,7 @@ pub struct TenantsBuilder<S> { /* private */ }
 
 /// Counters only grow; the rest are gauges.
 #[non_exhaustive]
-pub struct TenantsStats { pub capacity, pub warm, pub in_use, pub creating, pub retiring: usize,
+pub struct TenantsStats { pub capacity, pub warm, pub in_use, pub creating, pub reserved, pub retiring: usize,
     pub creations, pub create_failures, pub evictions, pub capacity_refusals: u64 }
 
 /// A tenant's scope, held for as long as it is used. `Clone` and `Deref` whatever `S` is.
@@ -1948,13 +1948,22 @@ pub struct UsageCounters { pub counters: BTreeMap<String, i64>, pub last_activit
 ```
 
 - **Hooks get a pool, never a scope.** Every hook but `check_adoptable`
-  receives a pool on the tenant's **migrated** database, opened as the
-  tenant's role for this one operation (at most two connections, its
-  first connected within 10 s, closed within 10 s when the operation ends)
-  and outside the tenant cache: a provisioning or suspended tenant never
-  gets a cached scope, and an expensive scope is never built to seed,
-  suspend or measure. A failure to open is `UNAVAILABLE` without a reason;
-  its source is a stage text (`connect`, `migrate`) and at most a SQLSTATE.
+  receives a pool on the tenant's **migrated** database as the tenant's
+  role. For an `active` tenant that the provisioner's tenant cache holds
+  warm (with the database, role and role key the row names) it is that
+  entry's pool, held through a crate-private lease (`TenantCache::lease_pool`
+  returns a `PoolLease` keeping the `KeyedRef`, so the entry is in use and
+  never evicted meanwhile; `Built` keeps a clone of its pool for this).
+  Otherwise it is a pool opened for this one operation (at most two
+  connections, its first connected within 10 s, closed within 10 s when the
+  operation ends) outside the tenant cache, which first reserves one slot
+  of the cache's capacity (`TenantCache::reserve` over `KeyedPools::reserve`)
+  and holds it until the pool is closed: a full cache answers
+  `UNAVAILABLE` / `TENANT_BUSY` (retry 1 s, no domain) before any
+  connection. A provisioning or suspended tenant never gets a cached scope,
+  and an expensive scope is never built to seed, suspend or measure. A
+  failure to open is `UNAVAILABLE` without a reason; its source is a stage
+  text (`reserve`, `connect`, `migrate`) and at most a SQLSTATE.
 - `check_adoptable` is the exception: its pool is `Maintenance::pool_on`
   on the candidate database, before the handover and before any migration
   of ours; its sessions start read-only and keep the server-side bounds of
@@ -1972,12 +1981,15 @@ pub struct UsageCounters { pub counters: BTreeMap<String, i64>, pub last_activit
   Migrator, sender, hooks) -> ProvisionerBuilder<H>` with the required
   `role_key_id(&str)` (a key of the connector's secrets),
   `connection_limit(u32)` (1 to 2147483647) and `tenant_cap(u64)` (at
-  least 1), and the optional `labels(LabelRules)`, `tenants(Tenants<S>)`,
+  least 1), and the optional `provision_lock(i64)` (default
+  `PROVISION_LOCK`), `labels(LabelRules)`, `tenants(Tenants<S>)`,
   `sink(impl Sink)` and `clock(Arc<dyn Clock>)`; `build()` does no I/O and
   refuses a missing or out-of-range setting with `INVALID_ARGUMENT`. The
-  cache it announces to is held as a crate-private object-safe trait over
-  `Tenants::invalidate` and `Tenants::refresh_hosts` (`tenants/keyed.rs`),
-  so the provisioner is not generic over the scope type. It also offers
+  cache it announces to, borrows warm pools from and reserves slots in is
+  held as a crate-private object-safe trait over `Tenants::invalidate`,
+  `Tenants::refresh_hosts`, `lease_pool` and `reserve`
+  (`tenants/keyed.rs`), so the provisioner is not generic over the scope
+  type. It also offers
   `tenant(id) -> Result<TenantRow, AppError>` (`TENANT_NOT_FOUND` without a
   row), `list(after: Option<TenantId>, limit: u32) -> Result<Vec<TenantRow>,
   AppError>`, `registry()`, `hooks()` and `names()`.
@@ -2004,7 +2016,8 @@ duplicates, the primary among them; every violation as a field violation of
 one `INVALID_ARGUMENT`, a host named by its position); the lifecycle
 admission is taken; under a transaction-level advisory lock the row is
 inserted when the id is new, and a new id at the tenant cap (rows not
-`purged`) is `TENANT_LIMIT_REACHED`. A host, role or database name another
+`purged`) is `TENANT_LIMIT_REACHED`. The lock's key is the provisioner's
+`provision_lock`; every process of a deployment must use the same one. A host, role or database name another
 tenant holds is `TENANT_STATE`.
 
 Each step locks the row (`FOR UPDATE`), re-reads it, does its work,
@@ -2054,7 +2067,7 @@ row lock, and decide from the locked row. A missing row is
 
 | Call | From | To | Before the row changes |
 |---|---|---|---|
-| `suspend` | `active` | `suspended` | `before_suspend` on a lifecycle pool. Strict: a tenant whose database cannot be opened, or whose hook fails, stays `active` |
+| `suspend` | `active` | `suspended` | `before_suspend` on the warm entry's pool or a lifecycle pool (10.1). Strict: a tenant whose database cannot be opened (`TENANT_BUSY` for a full cache included), or whose hook fails, stays `active` |
 | `resume` | `suspended` | `active` | `before_resume` on a lifecycle pool, same strictness |
 | `set_hosts` | `active`, `suspended` | unchanged | validation after the lock; the host set is replaced whole; announced as `ChangeKind::HOSTS` |
 | `purge` | `suspended`, `purging` | `purging`, then `purged` | nothing of the product runs |
@@ -2071,11 +2084,13 @@ purged.
 `usage` returns the database's size (`databases::size` on the maintenance
 connection) and the product's `UsageCounters`; `describe` returns the
 product's `Description` for an operator's view. Both read the row as
-committed now, accept only `active` and `suspended` tenants, take no
-lifecycle admission, and run the hook on a read-only lifecycle pool: the
-migrator runs first on a read-write pool of one connection, closed before
-the pool with `default_transaction_read_only = on` and `statement_timeout =
-5s` is opened (decision 39).
+committed now, accept exactly `active` and `suspended` tenants (a product
+that refuses a suspended one does it in its adapter), take no lifecycle
+admission, and run the hook on the warm entry's pool of a warm `active`
+tenant, otherwise on a read-only lifecycle pool: the migrator runs first on
+a read-write pool of one connection, closed before the pool with
+`default_transaction_read_only = on` and `statement_timeout = 5s` is opened
+(decisions 39, 43).
 
 ### 10.4 Adopt
 
@@ -2110,8 +2125,11 @@ pub struct AdoptRequest {
 - **Admission first, then the row lock.** Every lifecycle call that
   changes a row takes `Registry::admit()` before its first control
   connection and holds it to its end: one semaphore of `max(1, (control
-  max_connections − 1) / 2)` permits, a wait of 10 s, then `UNAVAILABLE`
-  without a reason. A lifecycle call holds a control connection while it
+  max_connections − 1) / 2)` permits, a wait of 10 s by default
+  (`Registry::with_admission_wait(Duration)`, a value's own setting like
+  `labels`), then `UNAVAILABLE` without a reason.
+  `Registry::lifecycle_available()` reports the free permits, so a product
+  drops a semaphore of its own and its tests observe the admission. A lifecycle call holds a control connection while it
   waits on the maintenance connection, a tenant open or a hook; the
   admission keeps such calls from holding the whole pool.
 - **Brief holders never wait while holding.** Every other holder of a
@@ -2192,6 +2210,8 @@ constant `UNAUTHENTICATED`.
 impl AdminAudit {
     pub fn new(control: PgPool, clock: Arc<dyn Clock>) -> Self;
     pub fn with_domains(self, domains: ErrorDomains) -> Self;
+    pub async fn record<X>(&self, claims: &AdminClaims<X>) -> Result<(), AppError>; // before the body
+    pub async fn finish(&self, token_id: Uuid, ok: bool);                          // after the body
 }
 
 pub mod guard {
@@ -2219,7 +2239,11 @@ pub mod guard {
 6. An error with a reason and no domain gets the admin domain.
 
 Which subjects an operation accepts stays the operation's rule. Pruning
-`admin_audit` is the product's, never below the token lifetime.
+`admin_audit` is the product's, never below the token lifetime. Steps 3
+and 5 are `AdminAudit::record` and `AdminAudit::finish`, public for a body
+a product runs outside the guard: record before the body (a duplicate
+token id is the replay reason and the body must not run), finish after it.
+Both take the time from the audit's clock, so no `record_at` exists.
 
 ### 10.7 The manager kit (feature `manager`)
 
@@ -2524,6 +2548,32 @@ Examples are outside coverage.
     its `session_user` (`RoleSwitched`), and every `connect` and
     `connect_to` session is checked the same way when it opens (owner's
     decision; 8.10, 8.6).
+42. **The provision lock key is a setting**: `ProvisionerBuilder::
+    provision_lock(i64)`, default `PROVISION_LOCK`, so a deployment that
+    already orders its inserts under a key of its own keeps it; every
+    process of a deployment must use the same key (owner's decision; 10.2).
+43. **A warm active tenant lends its cache pool** to `suspend`, `usage` and
+    `describe` through a held lease, instead of a second pool of the same
+    role; only a cold or non-active tenant opens a lifecycle pool. On a
+    warm tenant `usage` and `describe` therefore run on the cache's
+    read-write sessions, and decision 39's read-only sessions apply to the
+    lifecycle pool only (owner's decision; 10.1, 10.3).
+44. **Lifecycle pools count against the tenant cache's capacity**: each
+    holds one reserved slot (`KeyedPools::reserve`, an entry in use for the
+    eviction and the refusal) for its life; a full cache is `TENANT_BUSY`
+    before any connection, an idle warm entry is evicted to make room, and
+    a closed cache is `UNAVAILABLE` without a reason. Without a tenant
+    cache there is no budget to keep (owner's decision; 10.1).
+45. **No public open of a tenant.** With 43 and 44 every lifecycle need
+    of a product (seed, adopt, suspend, resume, usage, describe) has a
+    hook that receives the pool, so `lifecycle::open` stays crate-private
+    behind `LifecycleCapability`: a public open would hand a pool on a
+    non-active tenant to code outside the review rule of 10.1 and outside
+    the cache's budget. A product that needs more work on a non-active
+    tenant does it in a hook (10.1).
+46. **Admission tuning is per value, permits are shared**:
+    `Registry::with_admission_wait` and `lifecycle_available` (10.5); the
+    usage and describe states stay `active` and `suspended` (10.3).
 
 ## 15. Open questions for the repository owner
 

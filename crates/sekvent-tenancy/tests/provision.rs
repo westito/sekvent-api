@@ -1,6 +1,7 @@
 //! Provisioning on a real server: end to end, repeats, validation, a resume after a failure at
-//! each step, the cap, mismatching repeats, held names, refused states, the lifecycle admission,
-//! the announce reaching this process's tenant cache, and the reads `tenant` and `list`.
+//! each step, the cap and its advisory lock key, mismatching repeats, held names, refused states,
+//! the lifecycle admission, the announce reaching this process's tenant cache, and the reads
+//! `tenant` and `list`.
 #![cfg(feature = "lifecycle")]
 
 mod common;
@@ -14,7 +15,7 @@ use common::product::hooks::{OrdersHooks, OrdersSeed, SEED, handover_of};
 use common::product::{LATEST_TENANT_VERSION, OrdersFactory};
 use sekvent_config::Secret;
 use sekvent_error::{AppError, ErrorCode};
-use sekvent_tenancy::lifecycle::{ProvisionRequest, Provisioned, Provisioner};
+use sekvent_tenancy::lifecycle::{PROVISION_LOCK, ProvisionRequest, Provisioned, Provisioner};
 use sekvent_tenancy::{
     ProvisionStep, Registry, SelectorRules, TenantId, TenantRow, TenantState, reasons,
 };
@@ -569,7 +570,12 @@ async fn a_second_call_waits_for_the_lifecycle_admission_then_is_refused() {
     };
     common::guard(Box::pin(async {
         let fx = fixture(&cluster).await;
-        let provisioner = fx.provisioner(&cluster);
+        assert_eq!(fx.registry.lifecycle_available(), 1);
+        let brief = fx
+            .registry
+            .clone()
+            .with_admission_wait(Duration::from_secs(2));
+        let provisioner = cluster.provisioner(&brief, &fx.hooks);
         let first = request("orders");
         let first_id = first.tenant;
 
@@ -581,6 +587,11 @@ async fn a_second_call_waits_for_the_lifecycle_admission_then_is_refused() {
         fx.hooks.arrived(1).await;
         // The step's control transaction stays open while the seed runs.
         sekvent_testing::await_until!(idle_in_transaction(&cluster).await >= 1);
+        assert_eq!(
+            fx.registry.lifecycle_available(),
+            0,
+            "the clones share the permits"
+        );
 
         let second = request("billing");
         let second_id = second.tenant;
@@ -589,7 +600,7 @@ async fn a_second_call_waits_for_the_lifecycle_admission_then_is_refused() {
             .provision(second)
             .await
             .expect_err("no lifecycle permit");
-        assert!(started.elapsed() >= Duration::from_secs(10));
+        assert!(started.elapsed() >= Duration::from_secs(2));
         assert_eq!(error.code(), ErrorCode::Unavailable);
         assert_eq!(error.reason(), None);
         assert_no_row(&provisioner, second_id).await;
@@ -600,6 +611,95 @@ async fn a_second_call_waits_for_the_lifecycle_admission_then_is_refused() {
             .expect("the first call finished")
             .expect("provisioned");
         assert_provisioned(&done, first_id);
+        assert_eq!(fx.registry.lifecycle_available(), 1);
+    }))
+    .await;
+}
+
+/// A key other than the default, below 2^62 so `pg_locks` shows it as two non-negative halves.
+const CUSTOM_LOCK: i64 = 0x0123_4567_89ab_cdef;
+
+/// Sessions waiting for the advisory lock `key` on the control database, from `pg_locks`.
+async fn lock_waiters(cluster: &Cluster, key: i64) -> i64 {
+    let mut admin = cluster.admin().await;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_catalog.pg_locks l \
+         JOIN pg_catalog.pg_database d ON d.oid = l.database \
+         WHERE l.locktype = 'advisory' AND NOT l.granted AND d.datname = $1 \
+         AND l.objsubid = 1 AND ((l.classid::bigint << 32) | l.objid::bigint) = $2",
+    )
+    .bind(cluster.control_database())
+    .bind(key)
+    .fetch_one(&mut admin)
+    .await
+    .expect("pg_locks is readable");
+    admin.close().await.expect("the admin session closed");
+    count
+}
+
+/// Takes the session-level advisory lock `key` on `conn`.
+async fn lock(conn: &mut PgConnection, key: i64) {
+    sqlx::query("SELECT pg_catalog.pg_advisory_lock($1)")
+        .bind(key)
+        .execute(conn)
+        .await
+        .expect("the advisory lock was taken");
+}
+
+/// Gives back the session-level advisory lock `key` on `conn`.
+async fn unlock(conn: &mut PgConnection, key: i64) {
+    let released: bool = sqlx::query_scalar("SELECT pg_catalog.pg_advisory_unlock($1)")
+        .bind(key)
+        .fetch_one(conn)
+        .await
+        .expect("the advisory lock was given back");
+    assert!(released, "the session held the lock");
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_custom_provision_lock_is_the_key_a_new_row_waits_for() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let fx = fixture(&cluster).await;
+        let provisioner = cluster
+            .provisioner_builder(&fx.registry, &fx.hooks)
+            .provision_lock(CUSTOM_LOCK)
+            .build()
+            .expect("the provisioner settings are valid");
+        let mut holder = cluster.admin_on(cluster.control_database()).await;
+
+        // The default key held elsewhere does not hold this provisioner up.
+        lock(&mut holder, PROVISION_LOCK).await;
+        let first = request("orders");
+        let first_id = first.tenant;
+        let done = provisioner
+            .provision(first)
+            .await
+            .expect("the default key is not this provisioner's");
+        assert_provisioned(&done, first_id);
+        unlock(&mut holder, PROVISION_LOCK).await;
+
+        // The custom key held elsewhere makes a new row wait for it.
+        lock(&mut holder, CUSTOM_LOCK).await;
+        let second = request("billing");
+        let second_id = second.tenant;
+        let running = tokio::spawn({
+            let provisioner = provisioner.clone();
+            async move { provisioner.provision(second).await }
+        });
+        sekvent_testing::await_until!(lock_waiters(&cluster, CUSTOM_LOCK).await == 1);
+        assert_no_row(&provisioner, second_id).await;
+        unlock(&mut holder, CUSTOM_LOCK).await;
+        let done = running
+            .await
+            .expect("the call finished")
+            .expect("provisioned once the key was free");
+        assert_provisioned(&done, second_id);
+        assert_eq!(lock_waiters(&cluster, CUSTOM_LOCK).await, 0);
+        holder.close().await.expect("the holder's session closed");
     }))
     .await;
 }

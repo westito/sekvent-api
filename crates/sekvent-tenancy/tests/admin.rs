@@ -255,6 +255,60 @@ async fn a_failed_body_is_stored_and_its_reason_is_placed_in_the_admin_domain() 
     .await;
 }
 
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn record_and_finish_audit_a_body_run_outside_the_guard() {
+    let Some(cluster) = common::Cluster::start().await else {
+        return;
+    };
+    common::guard(async {
+        let (audit, control) = audit_of(&cluster).await;
+        let tenant = common::new_tenant();
+        let claims = claims_for(Some(tenant));
+
+        audit.record(&claims).await.expect("the first record");
+        assert_eq!(
+            row_of(&control, claims.token_id).await,
+            Some((
+                OP.to_owned(),
+                SUBJECT.to_owned(),
+                "started".to_owned(),
+                Some(Uuid::from(tenant))
+            ))
+        );
+        let replayed = audit.record(&claims).await.expect_err("a replay");
+        assert_eq!(replayed.code(), ErrorCode::AlreadyExists);
+        assert_eq!(replayed.reason(), Some(reasons::ADMIN_TOKEN_REPLAYED));
+        assert_eq!(replayed.domain(), Some(DOMAIN));
+
+        audit.finish(claims.token_id, false).await;
+        audit.finish(claims.token_id, true).await;
+        assert_eq!(
+            row_of(&control, claims.token_id).await.map(|row| row.2),
+            Some("failed".to_owned()),
+            "only a started row takes an outcome"
+        );
+        audit.finish(Uuid::new_v4(), true).await;
+        assert_eq!(
+            audit_rows(&control).await,
+            1,
+            "an unknown token writes nothing"
+        );
+
+        let untenanted = claims_for(None);
+        audit
+            .record(&untenanted)
+            .await
+            .expect("a call without a tenant");
+        audit.finish(untenanted.token_id, true).await;
+        assert_eq!(
+            row_of(&control, untenanted.token_id).await,
+            Some((OP.to_owned(), SUBJECT.to_owned(), "ok".to_owned(), None))
+        );
+    })
+    .await;
+}
+
 /// The test's admin service, as sekvent-proto-build would declare it for
 /// `billing.admin.v1.TenantAdmin` with one RPC taking and answering `google.protobuf.Empty`.
 #[cfg(feature = "manager")]

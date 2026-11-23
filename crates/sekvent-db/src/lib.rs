@@ -129,7 +129,7 @@ pub use registry::{Pool, PoolRegistry};
 #[cfg(all(feature = "keyed", feature = "sqlx-postgres"))]
 pub use keyed::{ConnectCandidates, KeyedPools, KeyedPoolsBuilder};
 #[cfg(feature = "keyed")]
-pub use keyed::{Keyed, KeyedBuilder, KeyedRef, KeyedStats};
+pub use keyed::{Keyed, KeyedBuilder, KeyedRef, KeyedReservation, KeyedStats};
 #[cfg(all(
     feature = "runtime",
     any(feature = "sqlx-postgres", feature = "sqlx-mysql")

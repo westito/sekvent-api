@@ -1,7 +1,8 @@
 //! Provisioning as resumable steps: the role, the database, the migration, the seed, `active`.
 //!
 //! The call is admitted first (`Registry::admit`, held to its end). The row is inserted under a
-//! transaction-level advisory lock that orders the cap check and the insert. Then each step is a
+//! transaction-level advisory lock (the provisioner's `provision_lock`) that orders the cap check
+//! and the insert. Then each step is a
 //! control transaction of its own: lock the row, re-read it, decide (`plan`), do the step's work
 //! (idempotent), record the step, commit. A repeated call resumes after the last recorded step;
 //! two calls for one tenant run one after the other. Adoption runs the same machine
@@ -24,9 +25,10 @@ use crate::error::{tenant_limit_reached, tenant_state};
 use crate::invalidation::ChangeKind;
 use crate::{RoleKey, ScramVerifier, TenantRow, TenantState};
 
-/// The control database's transaction-level advisory lock under which a new tenant row is
-/// counted against the cap and inserted (provisioning and adoption).
-pub(crate) const PROVISION_LOCK: i64 = 0x7365_6b76_5f74_6e74;
+/// The default key of the control database's transaction-level advisory lock under which a new
+/// tenant row is counted against the cap and inserted (provisioning and adoption); see
+/// [`ProvisionerBuilder::provision_lock`](super::ProvisionerBuilder::provision_lock).
+pub const PROVISION_LOCK: i64 = 0x7365_6b76_5f74_6e74;
 
 /// The most rounds of the step machine: one per step, with room to spare.
 const MAX_ROUNDS: usize = 8;
@@ -136,7 +138,7 @@ async fn insert_locked<H: TenantHooks>(
     new: &NewTenant,
 ) -> Result<bool, AppError> {
     sqlx::query("SELECT pg_catalog.pg_advisory_xact_lock($1)")
-        .bind(PROVISION_LOCK)
+        .bind(provisioner.inner.provision_lock)
         .execute(&mut **tx)
         .await
         .map_err(to_app_error)?;

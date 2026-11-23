@@ -34,7 +34,7 @@ Pick a backend and the extras you need:
 | `db-lease` | `lease` | `LeaseStore`, `Lease`, `HeldLease`, `FencingToken`, `LeaseInfo` (needs a sqlx backend) |
 | `db` + `runtime` | `runtime` | `PoolProbe`, `PoolRegistry::probes` (needs a sqlx backend) |
 | `db-lease` + `runtime` | `lease` + `runtime` | `LeaseGuard` for singleton jobs |
-| `db-keyed` | `keyed` | `Keyed`, `KeyedBuilder`, `KeyedRef`, `KeyedStats`: one lazily created value per key, evicted when idle or over capacity, and its `reasons`; with `runtime`, `Keyed::into_unit` |
+| `db-keyed` | `keyed` | `Keyed`, `KeyedBuilder`, `KeyedRef`, `KeyedReservation`, `KeyedStats`: one lazily created value per key, evicted when idle or over capacity, and its `reasons`; with `runtime`, `Keyed::into_unit` |
 | `db-keyed` + `db-sqlx-postgres` | `keyed` + `sqlx-postgres` | `KeyedPools`, `KeyedPoolsBuilder`, `ConnectCandidates`: a Postgres pool per key and the value built on it; with `runtime`, `KeyedPools::into_unit` |
 
 `runtime` is a default facade feature, so probes and `LeaseGuard` are there
@@ -876,7 +876,10 @@ is no `dispose` hook.
 The rest is `Keyed`'s: `peek` never creates and is not a use;
 `invalidate(&key)` after a credential change or a restore makes the next
 `get` connect afresh while holders finish on the old pool;
-`evict_idle_older_than(Duration::ZERO)` sheds every pool not in use. With
+`evict_idle_older_than(Duration::ZERO)` sheds every pool not in use;
+`reserve()` holds one entry of the capacity for a pool the caller opens
+outside the cache (an evicted entry's pool is closed when it returns), so
+the cache's budget covers that pool too. With
 `runtime`, `tenants.clone().into_unit()` evicts idle pools every
 `reap_interval` without waiting for their close (a pool waits for its
 checked-out connections), and closes every pool at shutdown; register it
@@ -933,7 +936,8 @@ What `get` does:
   entries being created. A new key over it evicts the warm entry nothing
   refers to with the oldest last use; when every entry is in use or being
   created the call fails with `RESOURCE_EXHAUSTED` / `KEYED_CAPACITY`. A
-  `get` of a key the cache holds never counts against it.
+  `get` of a key the cache holds never counts against it. A reservation
+  (`reserve`) counts like an entry in use.
 
 The other operations:
 
@@ -944,7 +948,8 @@ The other operations:
 | `evict_idle_older_than(idle)` | the same with an explicit age; `Duration::ZERO` sheds every entry not in use |
 | `invalidate(&key)` | makes the next `get` create a fresh value (after a credential change or a restore); `true` when there was an entry |
 | `close()` | refuses further `get`s, cancels creations in flight, drops every value and waits for the disposals it can |
-| `stats()` | `KeyedStats`: `capacity`, `warm`, `in_use`, `creating`, `retiring`, and the counters `creations`, `create_failures`, `evictions`, `capacity_refusals` |
+| `reserve()` | a `KeyedReservation`: one entry of the capacity held for a resource kept outside the cache (a pool the cache's connection budget must cover) until it drops. A full cache evicts its least recently used entry nothing refers to and waits for that disposal; when every entry is in use, being created or reserved it fails with `RESOURCE_EXHAUSTED` / `KEYED_CAPACITY` (counted in `capacity_refusals`), and after `close` with `KEYED_CLOSED`. It never waits for room |
+| `stats()` | `KeyedStats`: `capacity`, `warm`, `in_use`, `creating`, `reserved`, `retiring`, and the counters `creations`, `create_failures`, `evictions`, `capacity_refusals` |
 
 Taking a reference with `get` and dropping it both mark the entry used;
 idle time is measured on tokio's clock.

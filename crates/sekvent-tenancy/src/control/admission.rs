@@ -8,7 +8,7 @@ use std::time::Duration;
 use sekvent_error::AppError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// How long a lifecycle call waits for a permit.
+/// How long a lifecycle call waits for a permit by default.
 const LIFECYCLE_WAIT: Duration = Duration::from_secs(10);
 
 /// The message of a lifecycle call that found no permit in time.
@@ -80,26 +80,36 @@ impl fmt::Debug for LifecyclePermit {
     }
 }
 
-/// The lifecycle admission: `max(1, (control_max - 1) / 2)` permits. Clones share the one semaphore.
+/// The lifecycle admission: `max(1, (control_max - 1) / 2)` permits. Clones share the one
+/// semaphore; each value keeps its own wait.
 #[derive(Clone)]
 pub(super) struct LifecycleAdmission {
     /// The permits, shared by every clone.
     permits: Arc<Semaphore>,
+    /// How long `admit` waits for a permit.
+    wait: Duration,
 }
 
 impl LifecycleAdmission {
-    /// `control_max` is the control pool's `max_connections`.
+    /// `control_max` is the control pool's `max_connections`; the wait is 10 s.
     pub(super) fn new(control_max: u32) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(lifecycle_permits(control_max))),
+            wait: LIFECYCLE_WAIT,
         }
     }
 
-    /// Waits up to 10 s on tokio's clock; then `UNAVAILABLE` ("the server is busy, try again
-    /// shortly") without a reason. A cancelled wait takes no permit.
+    /// The same permits, waited for up to `wait`.
+    pub(super) fn with_wait(self, wait: Duration) -> Self {
+        Self { wait, ..self }
+    }
+
+    /// Waits up to the wait on tokio's clock (`Duration::ZERO` takes a free permit and does not
+    /// wait); then `UNAVAILABLE` ("the server is busy, try again shortly") without a reason. A
+    /// cancelled wait takes no permit.
     pub(super) async fn admit(&self) -> Result<LifecyclePermit, AppError> {
         let wait = Arc::clone(&self.permits).acquire_owned();
-        match tokio::time::timeout(LIFECYCLE_WAIT, wait).await {
+        match tokio::time::timeout(self.wait, wait).await {
             Ok(Ok(permit)) => Ok(LifecyclePermit { _permit: permit }),
             // The semaphore is never closed: only the deadline ends a wait without a permit.
             Ok(Err(_)) | Err(_) => Err(AppError::unavailable(LIFECYCLE_BUSY)),
@@ -107,8 +117,7 @@ impl LifecycleAdmission {
     }
 
     /// The permits free now.
-    #[cfg(test)]
-    fn available(&self) -> usize {
+    pub(super) fn available(&self) -> usize {
         self.permits.available_permits()
     }
 }
@@ -210,6 +219,42 @@ mod tests {
         assert_eq!(error.reason(), None);
         assert_eq!(error.domain(), None);
         assert_eq!(error.retry_after(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_value_with_its_own_wait_shares_the_permits() {
+        let admission = LifecycleAdmission::new(3);
+        let brief = admission.clone().with_wait(Duration::from_secs(2));
+        let held = brief.admit().await.expect("the one permit");
+        assert_eq!(admission.available(), 0);
+
+        let started = tokio::time::Instant::now();
+        let error = brief.admit().await.expect_err("no permit came free");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(error.reason(), None);
+
+        let started = tokio::time::Instant::now();
+        let error = admission
+            .admit()
+            .await
+            .expect_err("the original waits its own 10 s");
+        assert_eq!(started.elapsed(), LIFECYCLE_WAIT);
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+
+        let at_once = admission.clone().with_wait(Duration::ZERO);
+        let started = tokio::time::Instant::now();
+        let error = at_once.admit().await.expect_err("no wait at all");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        drop(held);
+        let permit = at_once
+            .admit()
+            .await
+            .expect("a free permit is taken at once");
+        assert_eq!(brief.available(), 0);
+        drop(permit);
+        assert_eq!(brief.available(), 1);
     }
 
     #[tokio::test(start_paused = true)]

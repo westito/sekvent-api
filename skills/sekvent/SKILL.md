@@ -1821,7 +1821,8 @@ let provisioner = Provisioner::builder(
 .role_key_id("k1")                                          // required; a key of the connector's secrets
 .connection_limit(20)                                       // required; per tenant role, all processes
 .tenant_cap(500)                                            // required; tenants that are not purged
-.tenants(tenants.clone())                                   // retire this process's scope on each change
+.tenants(tenants.clone())                                   // retire scopes on each change; lend warm pools, budget the rest
+// .provision_lock(key)                                     // only to match a key the deployment already takes; same on every process
 .build()?;                                                  // no I/O
 
 let done = provisioner.provision(ProvisionRequest {
@@ -1838,7 +1839,7 @@ provisioner.suspend(id).await?;                             // before_suspend fi
 provisioner.resume(id).await?;
 provisioner.set_hosts(id, HostsChange { subdomain, hosts, primary_host }).await?;
 provisioner.purge(id).await?;                               // suspended only; drops database and role
-let usage = provisioner.usage(id).await?;                   // active or suspended; read-only, 5 s timeout
+let usage = provisioner.usage(id).await?;                   // active or suspended; read-only and 5 s unless warm
 ```
 
 - Every step commits on its own: a failure leaves the work before it, and
@@ -1847,8 +1848,14 @@ let usage = provisioner.usage(id).await?;                   // active or suspend
 - `TENANT_LIMIT_REACHED` at the cap, `TENANT_NOT_FOUND` for an unknown id,
   `TENANT_STATE` for a state the call refuses; a hook's error is the
   answer unchanged. No lifecycle error carries a domain.
-- Hooks never get a built scope: their pool is opened for the one operation
-  and closed after it. Do not reach into the tenant cache from a hook.
+- Hooks never get a built scope: a warm `active` tenant lends its cache
+  pool (held for the hook), otherwise a pool is opened for the one
+  operation, holds a slot of the tenant cache's capacity and is closed
+  after it; a full cache is `TENANT_BUSY`. Do not reach into the tenant
+  cache from a hook.
+- Lifecycle calls share `Registry::admit`'s permits; tune the wait with
+  `Registry::with_admission_wait` and watch `Registry::lifecycle_available`
+  instead of a semaphore of your own.
 
 ### Admin RPCs: the guard and the admin App
 
@@ -1886,7 +1893,9 @@ async fn suspend(&self, cx: &CallContext, req: SuspendRequest) -> Result<Suspend
   that addresses no tenant).
 - The guard records the token id before the body runs; a replay is
   `ADMIN_TOKEN_REPLAYED`. Prune `admin_audit` only for rows older than
-  60 s.
+  60 s. A body run outside the guard calls `audit.record(&claims)` before
+  it (a replay must not run the body) and `audit.finish(token_id, ok)`
+  after it.
 - Tests: `guard::end_user(claims)` on a `CallContext` calls a body without
   a token.
 

@@ -13,6 +13,10 @@ pub(super) struct Built<S> {
     /// The row's info as it was committed right before the build; the row named the database,
     /// the role and the role key the scope's pool was opened with.
     pub(super) info: TenantInfo,
+    /// The scope's pool (the keyed form's; the fixed form has none): lifecycle operations on a
+    /// warm active tenant run their hooks on it.
+    #[cfg_attr(not(feature = "lifecycle"), allow(dead_code))]
+    pub(super) pool: Option<sqlx::PgPool>,
     /// The product's scope.
     pub(super) scope: S,
 }

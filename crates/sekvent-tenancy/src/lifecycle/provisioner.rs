@@ -17,6 +17,7 @@ use sqlx::migrate::Migrator;
 use sqlx::{Postgres, Transaction};
 
 use super::hooks::{TenantHooks, UsageCounters};
+use super::provision::PROVISION_LOCK;
 use crate::control::{MAIN_CLUSTER, rows};
 use crate::host::{HostError, canonical_host};
 use crate::invalidation::{Sender, Sink};
@@ -38,7 +39,10 @@ pub(crate) type ControlTx = Transaction<'static, Postgres>;
 ///
 /// Every operation but `usage`, `describe`, `tenant` and `list` takes the registry's lifecycle
 /// admission ([`Registry::admit`]) before its first control connection and holds it to its end,
-/// then locks the tenant's control row and decides from the locked row. A committed change is
+/// then locks the tenant's control row and decides from the locked row. A hook runs on the warm
+/// pool of this process's tenant cache for an `active` tenant it holds, and otherwise on a pool
+/// opened for the operation that holds one slot of that cache's capacity (see
+/// [`ProvisionerBuilder::tenants`]). A committed change is
 /// announced (this process's lookups forgotten and its scope retired, the sink told, the change
 /// sent to the other processes, the host snapshot reloaded) in a task of its own that the call
 /// awaits, so a caller that goes away still announces.
@@ -59,6 +63,8 @@ pub(crate) struct Inner<H> {
     pub(crate) connection_limit: u32,
     /// The most tenants that are not `purged`.
     pub(crate) tenant_cap: u64,
+    /// The key of the advisory lock that orders the cap check and the insert of a new row.
+    pub(crate) provision_lock: i64,
     pub(crate) labels: LabelRules,
     pub(crate) sender: Sender,
     pub(crate) sink: Arc<dyn Sink>,
@@ -106,6 +112,7 @@ impl<H: TenantHooks> Provisioner<H> {
             role_key_id: None,
             connection_limit: None,
             tenant_cap: None,
+            provision_lock: PROVISION_LOCK,
             labels: LabelRules::new(),
             sink: Arc::new(()),
             cache: None,
@@ -231,6 +238,7 @@ pub struct ProvisionerBuilder<H> {
     role_key_id: Option<String>,
     connection_limit: Option<u32>,
     tenant_cap: Option<u64>,
+    provision_lock: i64,
     labels: LabelRules,
     sink: Arc<dyn Sink>,
     cache: Option<Arc<dyn TenantCache>>,
@@ -269,6 +277,17 @@ impl<H: TenantHooks> ProvisionerBuilder<H> {
         self
     }
 
+    /// The key of the control database's transaction-level advisory lock under which a new
+    /// tenant row is counted against the cap and inserted, by provisioning and adoption (default
+    /// [`PROVISION_LOCK`]). Every process of a deployment must use the same key: processes on
+    /// different keys do not exclude each other, and the cap can be passed. A deployment that
+    /// already takes a key of its own for this sets it here.
+    #[must_use]
+    pub fn provision_lock(mut self, key: i64) -> Self {
+        self.provision_lock = key;
+        self
+    }
+
     /// The product's label rules (default `LabelRules::new()`): a request's subdomain must pass
     /// them.
     #[must_use]
@@ -279,6 +298,11 @@ impl<H: TenantHooks> ProvisionerBuilder<H> {
 
     /// The tenant cache of this process, whose lookups and scope every committed change drops
     /// and whose host snapshot it reloads. Without one, only the registry's lookups are dropped.
+    ///
+    /// The lifecycle also opens tenants through it: a hook on an `active` tenant the cache holds
+    /// warm runs on that entry's pool (held, so it is not evicted meanwhile), and a pool the
+    /// lifecycle opens itself holds one slot of the cache's capacity for its life, so a full
+    /// cache answers `TENANT_BUSY` instead of opening connections past the cache's budget.
     #[must_use]
     pub fn tenants<S: Send + Sync + 'static>(mut self, tenants: Tenants<S>) -> Self {
         self.cache = Some(Arc::new(tenants));
@@ -339,6 +363,7 @@ impl<H: TenantHooks> ProvisionerBuilder<H> {
                 role_key_id,
                 connection_limit,
                 tenant_cap,
+                provision_lock: self.provision_lock,
                 labels: self.labels,
                 sender: self.sender,
                 sink: self.sink,

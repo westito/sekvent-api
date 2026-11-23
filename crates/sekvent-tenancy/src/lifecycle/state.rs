@@ -82,9 +82,10 @@ pub(super) async fn finish(mut tx: ControlTx, tenant: TenantId) -> Result<Tenant
 }
 
 impl<H: TenantHooks> Provisioner<H> {
-    /// `active` → `suspended`. `TenantHooks::before_suspend` runs first on the tenant opened for
-    /// the operation; strict: a tenant whose database cannot be opened, or whose hook fails,
-    /// stays `active`. A suspended tenant is returned unchanged and announced again.
+    /// `active` → `suspended`. `TenantHooks::before_suspend` runs first on the tenant's pool for
+    /// the operation (the warm entry's of this process's tenant cache, or one opened for it);
+    /// strict: a tenant whose database cannot be opened (a full tenant cache included:
+    /// `TENANT_BUSY`), or whose hook fails, stays `active`. A suspended tenant is returned unchanged and announced again.
     /// `TENANT_NOT_FOUND` without a row; `TENANT_STATE` for `provisioning`, `purging`, `purged`.
     pub async fn suspend(&self, tenant: TenantId) -> Result<TenantRow, AppError> {
         self.state_change(
@@ -176,8 +177,8 @@ impl<H: TenantHooks> Provisioner<H> {
         }
     }
 
-    /// Opens the tenant read-write for the operation, runs `hook` on it and closes it whatever
-    /// the hook answered. A failure to open is the open's error; the hook's error is unchanged.
+    /// Opens the tenant read-write for the operation (or lends the warm entry's pool), runs `hook`
+    /// on it and closes it whatever the hook answered. A failure to open is the open's error; the hook's error is unchanged.
     async fn state_hook(&self, row: &TenantRow, hook: Hook) -> Result<(), AppError> {
         let pool = open(self, &LifecycleCapability::new(), row, OpenMode::ReadWrite).await?;
         let hooks = &self.inner.hooks;

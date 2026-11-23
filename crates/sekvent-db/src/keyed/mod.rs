@@ -233,6 +233,9 @@ pub struct KeyedStats {
     pub in_use: usize,
     /// Entries whose value is being created.
     pub creating: usize,
+    /// Entries held by [`KeyedReservation`]s: they count against `capacity`
+    /// like warm entries in use.
+    pub reserved: usize,
     /// Values out of the cache that are still referenced or being
     /// disposed. Not bounded by `capacity`.
     pub retiring: usize,
@@ -261,6 +264,8 @@ struct Shared<K, V> {
 
 struct State<K, V> {
     map: HashMap<K, Entry<V>>,
+    /// Entries held by live reservations.
+    reserved: usize,
     closed: bool,
     next_generation: u64,
     creations: u64,
@@ -417,6 +422,7 @@ impl<K, V> Shared<K, V> {
             warm,
             in_use,
             creating,
+            reserved: state.reserved,
             retiring: self.tracker.retiring(),
             creations: state.creations,
             create_failures: state.create_failures,
@@ -432,6 +438,62 @@ impl<K, V> Shared<K, V> {
             slot,
             task: self.tracker.task(false),
         }
+    }
+
+    /// Room for one more entry under the map's lock: nothing when the
+    /// entries and the reservations are below the capacity, otherwise the
+    /// warm entry nothing refers to with the oldest last use, taken out of
+    /// the map (an eviction). `KEYED_CAPACITY` (a capacity refusal) when
+    /// every entry is in use, being created or reserved.
+    fn make_room(&self, state: &mut State<K, V>) -> Result<Option<Leaving<V>>, AppError>
+    where
+        K: Clone + Eq + Hash,
+    {
+        if state.map.len() + state.reserved < self.settings.capacity {
+            return Ok(None);
+        }
+        let Some(victim) = least_recently_used(&state.map) else {
+            state.capacity_refusals += 1;
+            return Err(capacity_error());
+        };
+        state.evictions += 1;
+        Ok(match state.map.remove(&victim) {
+            Some(Entry::Warm(slot)) => Some(self.leave(slot)),
+            _ => None,
+        })
+    }
+}
+
+/// What a [`KeyedReservation`] gives back when it drops.
+trait Unreserve: Send + Sync {
+    fn unreserve(&self);
+}
+
+impl<K: Send + Sync, V: Send + Sync> Unreserve for Shared<K, V> {
+    fn unreserve(&self) {
+        let mut state = self.lock();
+        state.reserved = state.reserved.saturating_sub(1);
+    }
+}
+
+/// One entry of a cache's capacity, held for a resource kept outside the
+/// cache (from [`Keyed::reserve`]). While it exists the cache holds one
+/// entry fewer; dropping it gives the entry back. `Debug` prints the type
+/// name only.
+pub struct KeyedReservation {
+    shared: Arc<dyn Unreserve>,
+}
+
+impl Drop for KeyedReservation {
+    fn drop(&mut self) {
+        self.shared.unreserve();
+    }
+}
+
+// `KeyedReservation(..)`
+impl fmt::Debug for KeyedReservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("KeyedReservation(..)")
     }
 }
 
@@ -583,19 +645,7 @@ where
             }
             None => {}
         }
-        let evicted = if state.map.len() >= shared.settings.capacity {
-            let Some(victim) = least_recently_used(&state.map) else {
-                state.capacity_refusals += 1;
-                return Err(capacity_error());
-            };
-            state.evictions += 1;
-            match state.map.remove(&victim) {
-                Some(Entry::Warm(slot)) => Some(shared.leave(slot)),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let evicted = shared.make_room(&mut state)?;
         // The key's own code (`Clone`, `Hash`, `Eq`) may panic: it all runs
         // before the entry exists, so a panic leaves no entry behind that
         // no creation would ever settle.
@@ -648,6 +698,36 @@ where
             }),
             _ => None,
         }
+    }
+
+    /// Hold one entry of the capacity for a resource kept outside the cache
+    /// (a connection pool the cache's budget must cover), until the
+    /// reservation drops.
+    ///
+    /// When the entries and the reservations fill the capacity, the warm
+    /// entry nothing refers to with the oldest last use is evicted, as for a
+    /// new key, and its disposal has finished when this returns. Fails with
+    /// `RESOURCE_EXHAUSTED` / `KEYED_CAPACITY` (counted in
+    /// `capacity_refusals`) when every entry is in use, being created or
+    /// reserved, and with `UNAVAILABLE` / `KEYED_CLOSED` after
+    /// [`close`](Self::close). A reservation never waits for room.
+    pub async fn reserve(&self) -> Result<KeyedReservation, AppError> {
+        let evicted = {
+            let shared = &self.inner;
+            let mut state = shared.lock();
+            if state.closed {
+                return Err(closed_error());
+            }
+            let evicted = shared.make_room(&mut state)?;
+            state.reserved += 1;
+            evicted
+        };
+        let shared: Arc<dyn Unreserve> = self.inner.clone();
+        let reservation = KeyedReservation { shared };
+        if let Some(disposal) = evicted.and_then(Leaving::release) {
+            let _ = disposal.await;
+        }
+        Ok(reservation)
     }
 
     /// Drop the cache's value of `key`; whether there was one.
@@ -1063,6 +1143,7 @@ where
                 state: Mutex::new(State {
                     map: HashMap::new(),
                     closed: false,
+                    reserved: 0,
                     next_generation: 0,
                     creations: 0,
                     create_failures: 0,

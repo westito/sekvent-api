@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use http::request::Parts;
+#[cfg(feature = "lifecycle")]
+use sekvent_db::KeyedReservation;
 use sekvent_db::reasons::{KEYED_CAPACITY, KEYED_FACTORY_PANICKED};
 use sekvent_db::{ConnectCandidates, KeyedPools, KeyedPoolsBuilder, KeyedStats};
 use sekvent_error::{AppError, ErrorCode};
@@ -102,6 +104,7 @@ const FIXED_STATS: TenantsStats = TenantsStats {
     warm: 1,
     in_use: 0,
     creating: 0,
+    reserved: 0,
     retiring: 0,
     creations: 0,
     create_failures: 0,
@@ -120,6 +123,7 @@ impl<S> Form<S> {
                     warm: stats.warm,
                     in_use: stats.in_use,
                     creating: stats.creating,
+                    reserved: stats.reserved,
                     retiring: stats.retiring,
                     creations: stats.creations,
                     create_failures: stats.create_failures,
@@ -162,6 +166,7 @@ impl<S: Send + Sync + 'static> Tenants<S> {
     pub fn fixed_with_bypass(scope: S, bypass: &'static [&'static str]) -> Self {
         let built = Arc::new(Built {
             info: TenantInfo::local(),
+            pool: None,
             scope,
         });
         Self {
@@ -423,6 +428,40 @@ pub(crate) trait TenantCache: Send + Sync + 'static {
     fn refresh_hosts(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<TenantInfo>, AppError>> + Send + '_>>;
+
+    /// The warm entry's pool of the tenant, held so the entry is not evicted while the lease
+    /// exists; `None` when the tenant is not warm (absent, being opened, or the cache closed) and
+    /// for the fixed form. Never opens, never reads the row, does not count as a use.
+    fn lease_pool(&self, id: TenantId) -> Option<PoolLease>;
+
+    /// One slot of the cache's capacity for a pool a lifecycle operation opens outside it
+    /// (`KeyedPools::reserve`, with its `KEYED_CAPACITY` and `KEYED_CLOSED` errors); `None` for
+    /// the fixed form, which has no budget to keep.
+    fn reserve(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<KeyedReservation>, AppError>> + Send + '_>>;
+}
+
+/// A warm tenant's pool, with the reference that keeps its cache entry from being evicted.
+/// `Debug` prints the tenant's id only.
+#[cfg(feature = "lifecycle")]
+pub(crate) struct PoolLease {
+    /// The info the entry was built from.
+    pub(crate) info: TenantInfo,
+    /// The entry's pool: migrated, connected as the tenant's role.
+    pub(crate) pool: PgPool,
+    /// The cache reference; dropped with the lease.
+    _held: Box<dyn Send + Sync>,
+}
+
+// `PoolLease { id: <id>, .. }`
+#[cfg(feature = "lifecycle")]
+impl fmt::Debug for PoolLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PoolLease")
+            .field("id", &self.info.id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "lifecycle")]
@@ -435,6 +474,31 @@ impl<S: Send + Sync + 'static> TenantCache for Tenants<S> {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<TenantInfo>, AppError>> + Send + '_>> {
         Box::pin(Tenants::refresh_hosts(self))
+    }
+
+    fn lease_pool(&self, id: TenantId) -> Option<PoolLease> {
+        let Form::Keyed(cache) = &*self.form else {
+            return None;
+        };
+        let reference = cache.pools.peek(&id)?;
+        let pool = reference.pool.clone()?;
+        let info = reference.info.clone();
+        Some(PoolLease {
+            info,
+            pool,
+            _held: Box::new(reference),
+        })
+    }
+
+    fn reserve(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<KeyedReservation>, AppError>> + Send + '_>> {
+        Box::pin(async move {
+            match &*self.form {
+                Form::Fixed { .. } => Ok(None),
+                Form::Keyed(cache) => cache.pools.reserve().await.map(Some),
+            }
+        })
     }
 }
 
@@ -816,9 +880,13 @@ async fn build_scope<F: ScopeFactory>(
         return Err(open_failed(Stage::Row, None));
     }
     let info = row.info;
-    let built = factory.build(&info, pool).await;
+    let built = factory.build(&info, pool.clone()).await;
     match built {
-        Ok(scope) => Ok(Built { info, scope }),
+        Ok(scope) => Ok(Built {
+            info,
+            pool: Some(pool),
+            scope,
+        }),
         Err(error) if error.reason().is_some() => Err(mark(&error)),
         Err(_) => Err(open_failed(Stage::Build, None)),
     }
@@ -958,6 +1026,9 @@ pub struct TenantsStats {
     pub in_use: usize,
     /// Tenants being opened.
     pub creating: usize,
+    /// Slots of the capacity held by lifecycle operations for the pools they open outside the
+    /// cache (`lifecycle::Provisioner` built with `tenants`).
+    pub reserved: usize,
     /// Scopes out of the cache that a lease still holds or that are being closed. Not bounded by
     /// `capacity`.
     pub retiring: usize,
@@ -1157,7 +1228,7 @@ mod tests {
         assert_eq!(
             format!("{tenants:?}"),
             "Tenants { stats: TenantsStats { capacity: 1, warm: 1, in_use: 0, creating: 0, \
-             retiring: 0, creations: 0, create_failures: 0, evictions: 0, \
+             reserved: 0, retiring: 0, creations: 0, create_failures: 0, evictions: 0, \
              capacity_refusals: 0 }, .. }"
         );
     }

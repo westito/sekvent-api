@@ -329,6 +329,66 @@ async fn an_entry_being_created_counts_against_the_capacity() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_reservation_holds_an_entry_of_the_capacity_until_it_drops() {
+    let mut h = Harness::new(|b| b.capacity(2));
+    let reserved = h.cache.reserve().await.unwrap();
+    assert_eq!(format!("{reserved:?}"), "KeyedReservation(..)");
+    assert_eq!(h.cache.stats().reserved, 1);
+    let one = h.warm(1, 1).await;
+
+    let refused = h.cache.get(&2).await.unwrap_err();
+    assert_reason(&refused, ErrorCode::ResourceExhausted, KEYED_CAPACITY);
+    let refused = h.cache.reserve().await.unwrap_err();
+    assert_reason(&refused, ErrorCode::ResourceExhausted, KEYED_CAPACITY);
+    let stats = h.cache.stats();
+    assert_eq!((stats.reserved, stats.capacity_refusals), (1, 2));
+    assert!(h.no_call());
+
+    drop(reserved);
+    assert_eq!(h.cache.stats().reserved, 0);
+    let two = h.warm(2, 2).await;
+    drop((one, two));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reservation_evicts_the_least_recently_used_entry_and_waits_for_its_disposal() {
+    let mut h = Harness::new(|b| b.capacity(2));
+    drop(h.warm(1, 1).await);
+    advance(Duration::from_secs(1)).await;
+    let two = h.warm(2, 2).await;
+
+    h.hold.store(true, Ordering::SeqCst);
+    let cache = h.cache.clone();
+    let reserving = tokio::spawn(async move { cache.reserve().await });
+    let disposed = h.disposed.recv().await.expect("a disposal");
+    assert_eq!((disposed.key, disposed.serial), (1, 1));
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !reserving.is_finished(),
+        "the reservation waits for the evicted entry's disposal"
+    );
+    let _ = disposed.release.expect("the hook was held").send(());
+    let reserved = reserving.await.unwrap().unwrap();
+    let stats = h.cache.stats();
+    assert_eq!((stats.warm, stats.reserved, stats.evictions), (1, 1, 1));
+    assert!(h.cache.peek(&1).is_none());
+    drop((reserved, two));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_closed_cache_reserves_nothing_and_a_late_drop_is_harmless() {
+    let h = Harness::new(|b| b.capacity(1));
+    let reserved = h.cache.reserve().await.unwrap();
+    h.cache.close().await;
+    let refused = h.cache.reserve().await.unwrap_err();
+    assert_reason(&refused, ErrorCode::Unavailable, KEYED_CLOSED);
+    drop(reserved);
+    assert_eq!(h.cache.stats().reserved, 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn idle_entries_are_evicted_only_after_the_idle_time_and_never_in_use() {
     let idle = Duration::from_secs(10);
     let mut h = Harness::new(|b| b.evict_idle_after(Some(idle)));

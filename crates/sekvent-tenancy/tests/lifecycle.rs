@@ -1,12 +1,14 @@
 //! Suspend, resume, set hosts, usage and describe on a real server: the state table, idempotent
-//! repeats that announce again, strictness, the hooks' errors, read-only usage, and every
-//! committed change reaching this process before the call returns and the other processes after.
+//! repeats that announce again, strictness, the hooks' errors, read-only usage, the warm pool a
+//! cached tenant lends and the cache slot an opened pool holds, and every committed change
+//! reaching this process before the call returns and the other processes after.
 #![cfg(feature = "lifecycle")]
 
 mod common;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use common::Cluster;
 use common::product::hooks::{BEFORE_RESUME, BEFORE_SUSPEND, DESCRIBE, OrdersHooks, USAGE};
@@ -794,6 +796,175 @@ async fn a_call_dropped_while_it_announces_still_announces() {
         let there = other.tenants.get(id).await.expect_err("suspended there");
         assert_eq!(there.reason(), Some(reasons::TENANT_SUSPENDED));
         stop(handle, shutdown).await;
+    })
+    .await;
+}
+
+/// A provisioner announcing to a tenant cache of `capacity` over the test product, and the cache.
+fn cached(
+    cluster: &Cluster,
+    registry: &Registry,
+    hooks: &OrdersHooks,
+    capacity: usize,
+) -> (Provisioner<OrdersHooks>, Tenants<OrdersScope>) {
+    let factory = OrdersFactory::new();
+    let tenants = cluster.tenants(registry, SelectorRules::new(), &factory, capacity);
+    let provisioner = cluster
+        .provisioner_builder(registry, hooks)
+        .tenants(tenants.clone())
+        .build()
+        .expect("the provisioner settings are valid");
+    (provisioner, tenants)
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+#[allow(clippy::too_many_lines)]
+async fn a_warm_active_tenant_lends_its_pool_and_a_cold_one_holds_a_cache_slot() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(async {
+        let (registry, _pool, hooks) = set_up(&cluster).await;
+        let (provisioner, tenants) = cached(&cluster, &registry, &hooks, 4);
+        let row = provision(&provisioner, "billing").await;
+        let id = row.info.id;
+        drop(tenants.get(id).await.expect("the tenant opens"));
+        let sessions = cluster.sessions_of(&row.db_role).await;
+        assert!(sessions >= 1, "the warm pool keeps its connection");
+
+        // Suspend on the warm tenant: its hook runs on the entry's pool, leased, no pool opened.
+        hooks.hold(BEFORE_SUSPEND);
+        let suspending = tokio::spawn({
+            let provisioner = provisioner.clone();
+            async move { provisioner.suspend(id).await }
+        });
+        hooks.arrived(1).await;
+        let stats = tenants.stats();
+        assert_eq!((stats.in_use, stats.reserved, stats.creations), (1, 0, 1));
+        assert!(
+            cluster.sessions_of(&row.db_role).await <= sessions,
+            "no session was opened for the hook"
+        );
+        hooks.release();
+        let suspended = suspending
+            .await
+            .expect("the call finished")
+            .expect("suspended");
+        assert_eq!(state_of(&suspended), TenantState::Suspended);
+        assert!(tenants.peek(id).is_none(), "the entry was retired");
+
+        // Usage on the suspended tenant: a pool of its own, holding a slot of the cache.
+        hooks.hold(USAGE);
+        let measuring = tokio::spawn({
+            let provisioner = provisioner.clone();
+            async move { provisioner.usage(id).await }
+        });
+        hooks.arrived(2).await;
+        let stats = tenants.stats();
+        assert_eq!((stats.warm, stats.reserved), (0, 1));
+        hooks.release();
+        measuring
+            .await
+            .expect("the call finished")
+            .expect("measured");
+        assert_eq!(tenants.stats().reserved, 0);
+
+        // Resumed and warm again: usage and describe read on the entry's pool.
+        provisioner.resume(id).await.expect("resumed");
+        assert_eq!(tenants.stats().reserved, 0);
+        drop(tenants.get(id).await.expect("served again"));
+        hooks.hold(DESCRIBE);
+        let describing = tokio::spawn({
+            let provisioner = provisioner.clone();
+            async move { provisioner.describe(id).await }
+        });
+        hooks.arrived(3).await;
+        let stats = tenants.stats();
+        assert_eq!((stats.in_use, stats.reserved), (1, 0));
+        hooks.release();
+        let description = describing
+            .await
+            .expect("the call finished")
+            .expect("described");
+        assert_eq!(
+            description.attributes,
+            BTreeMap::from([("orders".to_owned(), "1".to_owned())])
+        );
+        let usage = provisioner.usage(id).await.expect("measured warm");
+        assert_eq!(
+            usage.counters.counters,
+            BTreeMap::from([("orders".to_owned(), 1)])
+        );
+        let stats = tenants.stats();
+        assert_eq!((stats.warm, stats.in_use, stats.reserved), (1, 0, 0));
+        tenants.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+#[allow(clippy::too_many_lines)]
+async fn a_lifecycle_open_when_the_cache_is_full_is_busy_and_opens_no_connection() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(async {
+        let (registry, _pool, hooks) = set_up(&cluster).await;
+        let (provisioner, tenants) = cached(&cluster, &registry, &hooks, 1);
+        let first = provision(&provisioner, "billing").await.info.id;
+        let second = provision(&provisioner, "orders").await;
+        let id = second.info.id;
+        let lease = tenants
+            .get(first)
+            .await
+            .expect("the first tenant fills the cache");
+        sekvent_testing::await_until!(cluster.sessions_of(&second.db_role).await == 0);
+        // A connection to the second tenant's database would fail: the busy answer comes first.
+        let database = common::quote(&second.db_name);
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!("ALTER DATABASE {database} ALLOW_CONNECTIONS false"),
+            )
+            .await;
+        let refusals = tenants.stats().capacity_refusals;
+
+        let busy = [
+            provisioner.suspend(id).await.map(drop),
+            provisioner.usage(id).await.map(drop),
+            provisioner.describe(id).await.map(drop),
+        ];
+        for answer in busy {
+            let error = answer.expect_err("the cache is full");
+            assert_eq!(error.code(), ErrorCode::Unavailable, "{error:?}");
+            assert_eq!(error.reason(), Some(reasons::TENANT_BUSY));
+            assert_eq!(error.domain(), None);
+            assert_eq!(error.retry_after(), Some(Duration::from_secs(1)));
+        }
+        assert_eq!(tenants.stats().capacity_refusals, refusals + 3);
+        assert_eq!(hooks.count(BEFORE_SUSPEND), 0);
+        assert_eq!(hooks.count(USAGE), 0);
+        assert_eq!(cluster.sessions_of(&second.db_role).await, 0);
+        assert_eq!(
+            state_of(&committed(&provisioner, id).await),
+            TenantState::Active
+        );
+
+        // Once nothing holds the warm entry, the lifecycle pool takes its place.
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!("ALTER DATABASE {database} ALLOW_CONNECTIONS true"),
+            )
+            .await;
+        drop(lease);
+        let suspended = provisioner.suspend(id).await.expect("room once evicted");
+        assert_eq!(state_of(&suspended), TenantState::Suspended);
+        assert!(tenants.peek(first).is_none(), "the idle entry was evicted");
+        assert_eq!(tenants.stats().reserved, 0);
+        tenants.close().await;
     })
     .await;
 }

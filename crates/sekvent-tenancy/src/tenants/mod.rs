@@ -8,7 +8,7 @@ mod unit;
 mod walk;
 
 #[cfg(feature = "lifecycle")]
-pub(crate) use keyed::TenantCache;
+pub(crate) use keyed::{PoolLease, TenantCache};
 pub use keyed::{ScopeFactory, ScopeFuture, Tenants, TenantsBuilder, TenantsStats};
 pub use lease::TenantLease;
 pub use walk::WalkReport;

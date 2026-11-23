@@ -1,5 +1,8 @@
-//! A tenant's database opened for one lifecycle operation: a pool of at most two connections as
-//! the tenant's role, migrated, outside the tenant cache, closed when the operation ends.
+//! A tenant's database for one lifecycle operation. An active tenant that this process's tenant
+//! cache holds warm lends the operation its entry's pool, held so the entry is not evicted.
+//! Otherwise a pool of at most two connections is opened as the tenant's role, migrated, outside
+//! the tenant cache, and closed when the operation ends; while it exists it holds one slot of the
+//! cache's capacity, so the cache's connection budget covers it.
 //!
 //! Review rule: [`LifecycleCapability::new`] is called only in `provision.rs`, `state.rs`,
 //! `adopt.rs` and `usage.rs`. `select`, the resolver, the tenant cache, `purge.rs` and the admin
@@ -9,6 +12,8 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::time::Duration;
 
+use sekvent_db::KeyedReservation;
+use sekvent_db::reasons::KEYED_CAPACITY;
 use sekvent_error::AppError;
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
@@ -17,6 +22,8 @@ use tokio::time::timeout;
 
 use super::hooks::TenantHooks;
 use super::provisioner::Provisioner;
+use crate::error::serving;
+use crate::tenants::{PoolLease, TenantCache};
 use crate::{TenantRow, TenantState};
 
 /// The most connections a lifecycle pool holds.
@@ -49,19 +56,47 @@ impl LifecycleCapability {
 
 /// A tenant's migrated pool for one operation. `Debug` prints the type name only.
 pub(crate) struct LifecyclePool {
-    pool: PgPool,
+    held: Held,
+}
+
+/// Where a lifecycle pool comes from.
+enum Held {
+    /// The warm cache entry of an active tenant, held for the operation.
+    Warm(PoolLease),
+    /// A pool opened for the operation, and the cache slot it holds (none without a keyed
+    /// cache).
+    Opened {
+        pool: PgPool,
+        slot: Option<KeyedReservation>,
+    },
 }
 
 impl LifecyclePool {
     /// The pool, connected as the tenant's role.
     pub(crate) fn pool(&self) -> &PgPool {
-        &self.pool
+        match &self.held {
+            Held::Warm(lease) => &lease.pool,
+            Held::Opened { pool, .. } => pool,
+        }
     }
 
-    /// Closes the pool. A close that takes longer than 10 s is abandoned; the connections are
-    /// dropped with the pool.
+    /// Whether the pool is a warm cache entry's.
+    #[cfg(test)]
+    fn is_warm(&self) -> bool {
+        matches!(self.held, Held::Warm(_))
+    }
+
+    /// Ends the operation's use. A warm entry's lease is dropped and the pool stays the cache's;
+    /// an opened pool is closed, then its cache slot given back. A close that takes longer than
+    /// 10 s is abandoned; the connections are dropped with the pool.
     pub(crate) async fn close(self) {
-        close_pool(&self.pool).await;
+        match self.held {
+            Held::Warm(lease) => drop(lease),
+            Held::Opened { pool, slot } => {
+                close_pool(&pool).await;
+                drop(slot);
+            }
+        }
     }
 }
 
@@ -84,14 +119,20 @@ pub(crate) enum OpenMode {
 }
 
 /// Opens `row`'s tenant for one operation, in any state but `purging` and `purged`
-/// (`TENANT_STATE`): the stored names checked (`Provisioner::stored_names`), a pool of at most
-/// two connections with the connector's options for the tenant's derived role under the row's
-/// role key, connected, and the tenant migrator run on it (for `ReadOnly`, on a read-write pool
-/// of its own first).
+/// (`TENANT_STATE`), after the stored names are checked (`Provisioner::stored_names`).
 ///
-/// A failure to connect or to migrate is `UNAVAILABLE` without a reason ("the tenant's database
-/// could not be opened"); its source is a fixed stage text (`connect`, `migrate`) with at most a
-/// SQLSTATE, never a driver message or connect options.
+/// An `active` row whose tenant the provisioner's tenant cache holds warm, with the database,
+/// the role and the role key the row names, gets that entry's pool, held for the operation
+/// (`mode` does not apply: the sessions are the cache's). Otherwise one slot of the cache's
+/// capacity is reserved (`TENANT_BUSY`, retried after a second, when every slot is in use, being
+/// opened or reserved, before any connection), then a pool of at most two connections with the
+/// connector's options for the tenant's derived role under the row's role key is connected and
+/// the tenant migrator run on it (for `ReadOnly`, on a read-write pool of its own first).
+///
+/// A failure to reserve for another cause (a closed cache), to connect or to migrate is
+/// `UNAVAILABLE` without a reason ("the tenant's database could not be opened"); its source is a
+/// fixed stage text (`reserve`, `connect`, `migrate`) with at most a SQLSTATE, never a driver
+/// message or connect options.
 pub(crate) async fn open<H: TenantHooks>(
     provisioner: &Provisioner<H>,
     capability: &LifecycleCapability,
@@ -104,23 +145,61 @@ pub(crate) async fn open<H: TenantHooks>(
     }
     let (role, database) = provisioner.stored_names(row)?;
     let inner = &provisioner.inner;
+    let cache = inner.cache.as_deref();
+    if let Some(lease) = warm(cache, row) {
+        return Ok(LifecyclePool {
+            held: Held::Warm(lease),
+        });
+    }
     let options = inner
         .connector
         .options(row.info.id, &role, &database, &row.info.role_key)?;
-    match mode {
+    let slot = reserve(cache).await?;
+    let pool = match mode {
         OpenMode::ReadWrite => {
             let pool = connect(options, MAX_CONNECTIONS).await?;
             migrate(inner.migrator, &pool).await?;
-            Ok(LifecyclePool { pool })
+            pool
         }
         OpenMode::ReadOnly => {
             let writer = connect(options.clone(), 1).await?;
             migrate(inner.migrator, &writer).await?;
             close_pool(&writer).await;
-            let pool = connect(options.options(READ_ONLY_SETTINGS), MAX_CONNECTIONS).await?;
-            Ok(LifecyclePool { pool })
+            connect(options.options(READ_ONLY_SETTINGS), MAX_CONNECTIONS).await?
         }
+    };
+    Ok(LifecyclePool {
+        held: Held::Opened { pool, slot },
+    })
+}
+
+/// The warm entry of `row`'s tenant: only for an `active` row, and only when the entry's pool
+/// connects to the database and as the role the row names, with the row's role key.
+fn warm(cache: Option<&dyn TenantCache>, row: &TenantRow) -> Option<PoolLease> {
+    if row.info.state != TenantState::Active {
+        return None;
     }
+    let lease = cache?.lease_pool(row.info.id)?;
+    let options = lease.pool.connect_options();
+    let same = lease.info.role_key == row.info.role_key
+        && options.get_database() == Some(row.db_name.as_str())
+        && options.get_username() == row.db_role;
+    same.then_some(lease)
+}
+
+/// One slot of the cache's capacity; `None` without a cache or for the fixed form. A full cache
+/// is `TENANT_BUSY`; any other refusal `UNAVAILABLE` without a reason.
+async fn reserve(cache: Option<&dyn TenantCache>) -> Result<Option<KeyedReservation>, AppError> {
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    cache.reserve().await.map_err(|error| {
+        if error.reason() == Some(KEYED_CAPACITY) {
+            serving::busy()
+        } else {
+            open_failed(Stage::Reserve, None)
+        }
+    })
 }
 
 /// A pool of at most `max` connections on `options`, its first connection made now.
@@ -155,6 +234,8 @@ async fn close_pool(pool: &PgPool) {
 /// Where opening a tenant for a lifecycle operation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
+    /// Reserving a slot of the tenant cache.
+    Reserve,
     /// Connecting as the tenant's role.
     Connect,
     /// Running the tenant migrator.
@@ -164,6 +245,7 @@ enum Stage {
 impl Stage {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Reserve => "reserve",
             Self::Connect => "connect",
             Self::Migrate => "migrate",
         }
@@ -238,8 +320,8 @@ mod tests {
     use crate::control::{MAIN_CLUSTER, ProvisionStep};
     use crate::invalidation::{Channel, Sender};
     use crate::{
-        Connector, Maintenance, ObjectNames, Registry, RoleKey, RoleSecrets, TenantId, TenantInfo,
-        reasons,
+        Connector, Maintenance, ObjectNames, Registry, RoleKey, RoleSecrets, ScopeFactory,
+        ScopeFuture, SelectorRules, TenantId, TenantInfo, Tenants, reasons,
     };
 
     static MIGRATOR: Migrator = Migrator::DEFAULT;
@@ -304,27 +386,39 @@ mod tests {
         ObjectNames::new("app_t_").expect("a valid prefix")
     }
 
-    /// A provisioner built without I/O.
-    fn provisioner() -> Provisioner<Hooks> {
-        let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
-        let registry = Registry::new(lazy_pool(3), clock).expect("three connections");
-        let secrets = RoleSecrets::parse(
+    fn secrets() -> RoleSecrets {
+        RoleSecrets::parse(
             &Secret::new("k1:correct horse battery staple 936".to_owned()),
             "example-app.role.v1",
         )
-        .expect("the test secrets parse");
+        .expect("the test secrets parse")
+    }
+
+    /// A provisioner built without I/O.
+    fn provisioner() -> Provisioner<Hooks> {
+        provisioner_with(None)
+    }
+
+    /// A provisioner built without I/O, announcing to `tenants` when given.
+    fn provisioner_with(tenants: Option<Tenants<()>>) -> Provisioner<Hooks> {
+        let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+        let registry = Registry::new(lazy_pool(3), clock).expect("three connections");
         let channel = Channel::new("orders_changes").expect("a channel name");
-        Provisioner::builder(
+        let builder = Provisioner::builder(
             registry,
             Maintenance::new(nowhere(), names()),
-            Connector::new(nowhere(), secrets),
+            Connector::new(nowhere(), secrets()),
             &MIGRATOR,
             Sender::new(lazy_pool(1), channel),
             Hooks,
         )
         .role_key_id("k1")
         .connection_limit(2)
-        .tenant_cap(10)
+        .tenant_cap(10);
+        match tenants {
+            Some(tenants) => builder.tenants(tenants),
+            None => builder,
+        }
         .build()
         .expect("the provisioner settings are valid")
     }
@@ -402,6 +496,7 @@ mod tests {
 
     #[test]
     fn a_failure_says_only_its_stage_and_sqlstate() {
+        assert_eq!(Stage::Reserve.as_str(), "reserve");
         assert_eq!(Stage::Connect.as_str(), "connect");
         assert_eq!(Stage::Migrate.as_str(), "migrate");
         let error = open_failed(Stage::Migrate, Some("42P07".to_owned()));
@@ -438,12 +533,106 @@ mod tests {
     #[tokio::test]
     async fn a_lifecycle_pool_prints_its_type_name_and_closes() {
         let pool = LifecyclePool {
-            pool: lazy_pool(MAX_CONNECTIONS),
+            held: Held::Opened {
+                pool: lazy_pool(MAX_CONNECTIONS),
+                slot: None,
+            },
         };
         assert_eq!(format!("{pool:?}"), "LifecyclePool(..)");
+        assert!(!pool.is_warm());
         assert_eq!(pool.pool().size(), 0);
         let inner = pool.pool().clone();
         pool.close().await;
         assert!(inner.is_closed());
+    }
+
+    /// A factory the unit tests never reach.
+    struct Unreached;
+
+    impl ScopeFactory for Unreached {
+        type Scope = ();
+
+        fn build<'a>(&'a self, _info: &'a TenantInfo, _pool: PgPool) -> ScopeFuture<'a, ()> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// A keyed tenant cache of one slot over pools that never connect.
+    fn one_slot_cache() -> Tenants<()> {
+        let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+        let registry = Registry::new(lazy_pool(3), clock).expect("three connections");
+        Tenants::builder(
+            registry,
+            Connector::new(nowhere(), secrets()),
+            names(),
+            SelectorRules::new(),
+            &MIGRATOR,
+            Unreached,
+        )
+        .capacity(1)
+        .build()
+        .expect("the cache settings are valid")
+    }
+
+    #[tokio::test]
+    async fn a_full_tenant_cache_answers_busy_before_any_connection() {
+        let tenants = one_slot_cache();
+        let provisioner = provisioner_with(Some(tenants.clone()));
+        let held = TenantCache::reserve(&tenants)
+            .await
+            .expect("the one slot is free")
+            .expect("a keyed cache reserves");
+        assert_eq!(tenants.stats().reserved, 1);
+        for mode in [OpenMode::ReadWrite, OpenMode::ReadOnly] {
+            let error = open(
+                &provisioner,
+                &LifecycleCapability::new(),
+                &row(TenantState::Active),
+                mode,
+            )
+            .await
+            .expect_err("the cache is full");
+            assert_eq!(error.code(), ErrorCode::Unavailable);
+            assert_eq!(error.reason(), Some(reasons::TENANT_BUSY));
+            assert_eq!(error.domain(), None);
+            assert_eq!(error.retry_after(), Some(Duration::from_secs(1)));
+        }
+        assert_eq!(tenants.stats().capacity_refusals, 2);
+
+        drop(held);
+        assert_eq!(tenants.stats().reserved, 0);
+
+        tenants.close().await;
+        let error = open(
+            &provisioner,
+            &LifecycleCapability::new(),
+            &row(TenantState::Active),
+            OpenMode::ReadWrite,
+        )
+        .await
+        .expect_err("the cache is closed");
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(error.reason(), None);
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("opening the tenant for a lifecycle operation failed: reserve")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fixed_form_lends_no_pool_and_reserves_nothing() {
+        let tenants = Tenants::fixed(());
+        assert!(TenantCache::lease_pool(&tenants, TenantId::LOCAL).is_none());
+        let slot = TenantCache::reserve(&tenants).await.expect("no budget");
+        assert!(slot.is_none());
+        assert!(
+            warm(
+                Some(&tenants as &dyn TenantCache),
+                &row(TenantState::Active)
+            )
+            .is_none()
+        );
+        assert!(warm(None, &row(TenantState::Active)).is_none());
+        assert!(reserve(None).await.expect("no cache").is_none());
     }
 }

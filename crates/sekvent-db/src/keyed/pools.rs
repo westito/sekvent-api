@@ -23,7 +23,7 @@ use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use super::task::{BoxFut, Tracker};
-use super::{Keyed, KeyedBuilder, KeyedRef, KeyedStats, Made, Settings};
+use super::{Keyed, KeyedBuilder, KeyedRef, KeyedReservation, KeyedStats, Made, Settings};
 use crate::reasons::DB_CREDENTIALS_REJECTED;
 use crate::{ConnectFailure, classify_connect, public_message};
 
@@ -226,6 +226,13 @@ where
     /// waits, and does not count as a use.
     pub fn peek(&self, key: &K) -> Option<KeyedRef<V>> {
         self.cache.peek(key)
+    }
+
+    /// Hold one entry of the capacity for a pool kept outside the cache, so
+    /// the cache's connection budget covers it; see [`Keyed::reserve`]. An
+    /// evicted entry's pool is closed when this returns.
+    pub async fn reserve(&self) -> Result<KeyedReservation, AppError> {
+        self.cache.reserve().await
     }
 
     /// Drop the cache's value of `key`; whether there was one. Its pool is

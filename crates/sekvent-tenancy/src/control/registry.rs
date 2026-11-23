@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sekvent_context::Clock;
 use sekvent_db::to_app_error;
@@ -17,7 +18,8 @@ use crate::{Selector, TenantId, TenantInfo};
 /// The control database of this process: the pool, the lookup cache and the two admissions.
 /// Clones share everything: one lookup cache with its reads in flight, one set of lookup permits and
 /// one set of lifecycle permits, however many clones exist. Each value keeps its own label rules
-/// (`labels`), copied into the clones made after they are set. `Debug` prints the type name only.
+/// (`labels`) and lifecycle wait (`with_admission_wait`), copied into the clones made after they
+/// are set. `Debug` prints the type name only.
 #[derive(Clone)]
 pub struct Registry {
     pool: PgPool,
@@ -107,10 +109,25 @@ impl Registry {
         self.lookups.clear();
     }
 
-    /// The lifecycle admission: waits up to 10 s for a permit, then `UNAVAILABLE` without a
-    /// reason.
+    /// How long [`admit`](Self::admit) waits for a lifecycle permit (default 10 s;
+    /// `Duration::ZERO` takes a free permit and never waits). The permits stay shared with every
+    /// clone; the wait is this value's, and the clones made after it.
+    #[must_use]
+    pub fn with_admission_wait(mut self, wait: Duration) -> Self {
+        self.lifecycle = self.lifecycle.with_wait(wait);
+        self
+    }
+
+    /// The lifecycle admission: waits up to the admission wait (10 s by default) for a permit,
+    /// then `UNAVAILABLE` without a reason.
     pub async fn admit(&self) -> Result<LifecyclePermit, AppError> {
         self.lifecycle.admit().await
+    }
+
+    /// The lifecycle permits free now, shared by every clone: `max(1, (max_connections − 1) /
+    /// 2)` of the control pool while no lifecycle call runs.
+    pub fn lifecycle_available(&self) -> usize {
+        self.lifecycle.available()
     }
 }
 
@@ -197,6 +214,28 @@ mod tests {
             let read = lax.lookup(&on("admin", listener)).await;
             assert!(read.is_err(), "{listener}: a clone keeps its own rules");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_admission_wait_is_a_values_own_and_the_free_permits_are_shared() {
+        let registry = Registry::new(lazy_pool(5), clock()).expect("five are enough");
+        assert_eq!(registry.lifecycle_available(), 2);
+        let brief = registry.clone().with_admission_wait(Duration::from_secs(1));
+        let first = brief.admit().await.expect("a first permit");
+        let second = registry.admit().await.expect("a second permit");
+        assert_eq!(registry.lifecycle_available(), 0);
+        assert_eq!(brief.lifecycle_available(), 0);
+
+        let started = tokio::time::Instant::now();
+        let refused = brief.clone().admit().await.expect_err("both are held");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(refused.code(), ErrorCode::Unavailable);
+        assert_eq!(refused.reason(), None);
+
+        drop(first);
+        assert_eq!(registry.lifecycle_available(), 1);
+        drop(second);
+        assert_eq!(brief.lifecycle_available(), 2);
     }
 
     #[tokio::test(start_paused = true)]

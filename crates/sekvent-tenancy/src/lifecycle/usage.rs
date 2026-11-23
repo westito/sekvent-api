@@ -1,4 +1,4 @@
-//! A tenant's usage and its description for an operator: read on the tenant opened for the
+//! A tenant's usage and its description for an operator: read on the tenant's pool for the
 //! operation, without the lifecycle admission.
 
 use sekvent_error::AppError;
@@ -17,10 +17,14 @@ fn readable(state: TenantState) -> bool {
 
 impl<H: TenantHooks> Provisioner<H> {
     /// The database's size (`databases::size` on the maintenance connection) and the product's
-    /// counters (`TenantHooks::usage`), read on the tenant opened for the operation, on sessions
-    /// that start read-only and whose statements time out after 5 s. The row is read as committed
-    /// now; `TENANT_NOT_FOUND` without one, `TENANT_STATE` unless it is
-    /// `active` or `suspended`.
+    /// counters (`TenantHooks::usage`). The row is read as committed now; `TENANT_NOT_FOUND`
+    /// without one, `TENANT_STATE` unless it is `active` or `suspended` (both are accepted; a
+    /// product that refuses a suspended tenant does so in its own adapter).
+    ///
+    /// The hook runs on the warm entry's pool when this process's tenant cache holds the
+    /// `active` tenant (the cache's sessions), and otherwise on a pool opened for the operation
+    /// whose sessions start read-only and whose statements time out after 5 s; that pool holds a
+    /// slot of the cache's capacity (`TENANT_BUSY` when the cache is full).
     pub async fn usage(&self, tenant: TenantId) -> Result<Usage, AppError> {
         let row = self.usage_row(tenant).await?;
         let pool = open(self, &LifecycleCapability::new(), &row, OpenMode::ReadOnly).await?;
@@ -36,8 +40,8 @@ impl<H: TenantHooks> Provisioner<H> {
         Ok(Usage::new(database_bytes, counters))
     }
 
-    /// The product's description of the tenant (`TenantHooks::describe`) on the tenant opened for
-    /// the operation; the states and refusals of [`usage`](Self::usage).
+    /// The product's description of the tenant (`TenantHooks::describe`) on the tenant's pool for
+    /// the operation; the states, pools and refusals of [`usage`](Self::usage).
     pub async fn describe(&self, tenant: TenantId) -> Result<Description, AppError> {
         let row = self.usage_row(tenant).await?;
         let pool = open(self, &LifecycleCapability::new(), &row, OpenMode::ReadOnly).await?;

@@ -61,10 +61,14 @@ impl AdminAudit {
         self.domains
     }
 
-    /// Records the token id with the time, the operation, the subject and the tenant, outcome
-    /// `started`. A second record of one id is `ADMIN_TOKEN_REPLAYED` in the admin domain; any
-    /// other failure is the database's error.
-    pub(crate) async fn record<X>(&self, claims: &AdminClaims<X>) -> Result<(), AppError> {
+    /// Records the token id with the audit clock's time, the operation, the subject and the
+    /// tenant, outcome `started`: what [`guard::run`](super::guard::run) does before its body.
+    /// A product that runs an admin body outside the guard calls it **before the body** and the
+    /// body only on `Ok`, then [`finish`](Self::finish) after it. A second record of one token id
+    /// violates `admin_audit_pkey` and is `ALREADY_EXISTS` / `ADMIN_TOKEN_REPLAYED` in the admin
+    /// domain: the token was replayed and the body must not run. Any other failure is the
+    /// database's error.
+    pub async fn record<X>(&self, claims: &AdminClaims<X>) -> Result<(), AppError> {
         sqlx::query(RECORD)
             .bind(claims.token_id)
             .bind(DateTime::<Utc>::from(self.clock.now()))
@@ -83,9 +87,11 @@ impl AdminAudit {
             })
     }
 
-    /// Stores the outcome of the call of `token_id`: `ok` or `failed`. A failure to store it is a
-    /// warning with the token id and the error's code only.
-    pub(crate) async fn finish(&self, token_id: Uuid, ok: bool) {
+    /// Stores the outcome of the call of `token_id` **after its body**: `ok` or `failed`. Only a
+    /// row still `started` changes, so a second finish keeps the first outcome. A failure to store
+    /// it is a warning with the token id and the error's code only; a call that never finishes
+    /// leaves `started`.
+    pub async fn finish(&self, token_id: Uuid, ok: bool) {
         let outcome = if ok { "ok" } else { "failed" };
         let stored = sqlx::query(FINISH)
             .bind(token_id)

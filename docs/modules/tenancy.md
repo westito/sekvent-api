@@ -1079,7 +1079,9 @@ production) dates the lookup cache's entries.
 | `active()` | every active tenant with its hosts (`rows::list_active`): one active row that cannot be decoded fails the whole read, and with it every caller of the active list: the walks, the sweep, `refresh_hosts` and the invalidation listener's loads |
 | `store_schema_version(id, version)` | the row function of that name |
 | `forget(id)`, `clear_lookups()` | drop cached lookups, no I/O |
-| `admit()` | a lifecycle permit: every `Provisioner` call that changes a row takes one, and so may the product's own lifecycle work; waits up to 10 s, then `UNAVAILABLE` without a reason |
+| `admit()` | a lifecycle permit: every `Provisioner` call that changes a row takes one, and so may the product's own lifecycle work; waits up to the admission wait, then `UNAVAILABLE` without a reason |
+| `with_admission_wait(wait)` | builder: how long `admit` waits (default 10 s; `Duration::ZERO` takes a free permit and never waits). Each `Registry` value keeps its own wait and passes it to the clones made from it; the permits stay shared |
+| `lifecycle_available()` | the lifecycle permits free now, shared by every clone: `max(1, (max_connections − 1) / 2)` while no lifecycle call runs. A product that ran its own lifecycle semaphore drops it for `admit`, and its tests observe the admission here |
 | `pool()` | the control pool |
 
 Each read holds one control connection for one statement and gives it back
@@ -1502,7 +1504,7 @@ scope was built from; `Debug` prints the id only.
 | `peek(id)` | the warm scope or `None`. Never opens, never reads the row and does not count as a use, so it can return the scope of a tenant whose row changed a moment ago |
 | `invalidate(id)` | forgets the tenant's lookups and retires its warm scope or its creation in flight; whether there was one. Holders keep their lease; a retired creation runs to its end, its scope is dropped unseen and its waiters look again |
 | `evict_idle_older_than(idle)` | evicts every scope nothing holds that was last used at least `idle` ago; how many. `Duration::ZERO` evicts every scope not held |
-| `stats()` | `TenantsStats`: the gauges `capacity`, `warm`, `in_use`, `creating`, `retiring` and the counters `creations`, `create_failures`, `evictions`, `capacity_refusals` |
+| `stats()` | `TenantsStats`: the gauges `capacity`, `warm`, `in_use`, `creating`, `reserved` (slots held by lifecycle pools, [Provision a tenant](#provision-a-tenant)), `retiring` and the counters `creations`, `create_failures`, `evictions`, `capacity_refusals` |
 | `refresh_hosts()`, `hosts()`, `registry()`, `domains()` | the host snapshot's reload, the snapshot, the registry (`None` on the fixed form) and the error domains |
 | `close()` | closes the cache; a closed cache stays closed and answers `TENANT_UNAVAILABLE` |
 
@@ -1531,7 +1533,7 @@ stays usable until it drops.
 |---|---|
 | a refusal of the factory with a reason | that error unchanged: code, message, reason, domain, metadata and field violations, and its retry hint to the millisecond, whatever the reason text is (one equal to a framework reason included); no serving domain is added |
 | the row not `active` (any of its reads) | the state's reason, under the serving domain |
-| a full cache (every slot warm and held, or creating), or no free lookup permit for `get`'s state check | `UNAVAILABLE` / `TENANT_BUSY`, retry hint 1 s |
+| a full cache (every slot warm and held, creating, or reserved by a lifecycle pool), or no free lookup permit for `get`'s state check | `UNAVAILABLE` / `TENANT_BUSY`, retry hint 1 s |
 | a panic anywhere in the creation, the factory's included | `INTERNAL`, no reason |
 | anything else: a failed control read, the stored row refused, a row that changed under the open (another database, role or role key than the pool's), the connect or the credentials refused, a failed migration, the create deadline, a closed cache, a factory error without a reason | `UNAVAILABLE` / `TENANT_UNAVAILABLE`, its fixed message, no metadata |
 
@@ -1861,7 +1863,7 @@ let provisioner = Provisioner::builder(
 .connection_limit(20)             // required: every tenant role's connection limit
 .tenant_cap(500)                  // required: the most tenants that are not purged
 .labels(label_rules.clone())     // the LabelRules the SelectorRules were given
-.tenants(tenants.clone())         // this process's tenant cache, told of every change
+.tenants(tenants.clone())         // this process's tenant cache: told of every change, lends warm pools
 .sink(Arc::clone(&sink))          // the sink the listener has too
 .build()?;
 ```
@@ -1871,12 +1873,18 @@ let provisioner = Provisioner::builder(
 | `role_key_id(id)` | required | missing, or not a key of the connector's secrets |
 | `connection_limit(n)` | required | missing, 0, or above 2147483647 |
 | `tenant_cap(n)` | required | missing or 0 |
+| `provision_lock(key)` | `PROVISION_LOCK` | |
 | `labels(LabelRules)` | `LabelRules::new()` | |
-| `tenants(Tenants<S>)` | none: only the registry's lookups are dropped on a change | |
+| `tenants(Tenants<S>)` | none: only the registry's lookups are dropped on a change, and lifecycle pools are opened without a budget | |
 | `sink(impl Sink)` | none | |
 | `clock(Arc<dyn Clock>)` | the system clock | |
 
 `build` does no I/O; a refusal is `INVALID_ARGUMENT` naming the setting.
+`provision_lock` is the key of the control database's advisory lock that
+orders the cap check and the insert of a new row: **every process of a
+deployment must use the same key**, because processes on different keys do
+not exclude each other and can pass the cap together. Change it only to
+match a key the deployment already takes for this.
 Clones share everything; `Debug` prints `Provisioner(..)`. Every operation
 but `usage`, `describe`, `tenant` and `list` takes the registry's lifecycle
 admission (`Registry::admit`) before its first control connection and holds
@@ -1957,11 +1965,32 @@ committed before it in place, and a repeated call runs the hook again.
 | `adopted(tenant, pool)` | an adoption's `seeded` step, instead of the seed | the tenant's, read-write | nothing |
 | `before_suspend(tenant, pool)` | `suspend`, before the state changes | the tenant's, read-write | nothing |
 | `before_resume(tenant, pool)` | `resume`, before the state changes | the tenant's, read-write | nothing |
-| `describe(tenant, pool)` | `describe` | the tenant's, read-only | the display name, no attribute |
-| `usage(tenant, pool)` | `usage` | the tenant's, read-only | no counter, no activity |
+| `describe(tenant, pool)` | `describe` | the tenant's, read-only when opened for the call | the display name, no attribute |
+| `usage(tenant, pool)` | `usage` | the tenant's, read-only when opened for the call | no counter, no activity |
 
-The tenant's pool is a lifecycle pool, opened for that one operation:
+The tenant's pool is on its migrated database, connected as its derived
+role, and comes from one of two places.
 
+**A warm entry.** When the tenant is `active` and this process's tenant
+cache (`ProvisionerBuilder::tenants`) holds it warm, with the database, the
+role and the role key the row names, the hook gets that entry's pool. The
+entry is held for the operation (it counts as `in_use` and is never evicted
+meanwhile) and released when the hook ends; no pool is opened, so the
+tenant role's connection limit is not spent twice. This applies to
+`suspend`, `usage` and `describe` of a warm tenant; its sessions are the
+cache's, read-write, so a `usage` or `describe` hook on a warm tenant must
+not write. A tenant that is not `active` is never warm.
+
+**A lifecycle pool**, opened for that one operation otherwise:
+
+- it first reserves one slot of the tenant cache's capacity and holds it
+  until the pool is closed (`TenantsStats::reserved`), so the cache's
+  connection budget (`capacity × max_connections`) covers it. When every
+  slot is warm and held, being opened or reserved, the call answers
+  `UNAVAILABLE` / `TENANT_BUSY`, retried after a second (the cache's own
+  busy answer, without a domain), before any connection; an idle warm entry
+  is evicted to make room. Without a tenant cache there is no budget to
+  keep;
 - at most two connections as the tenant's derived role, outside the tenant
   cache, so a hook never gets a built scope and no scope is built to seed,
   suspend or measure a tenant;
@@ -1969,9 +1998,9 @@ The tenant's pool is a lifecycle pool, opened for that one operation:
   opens, within 10 s, and it is closed when the operation ends (within
   10 s, then dropped);
 - it opens in any state but `purging` and `purged`; a failure to connect or
-  to migrate is `UNAVAILABLE` without a reason ("the tenant's database could
-  not be opened"), its source the stage (`connect` or `migrate`) and at most
-  a SQLSTATE;
+  to migrate, or a closed tenant cache, is `UNAVAILABLE` without a reason
+  ("the tenant's database could not be opened"), its source the stage
+  (`reserve`, `connect` or `migrate`) and at most a SQLSTATE;
 - the read-only form (`usage`, `describe`) migrates on a read-write pool of
   one connection first, closes it, and returns a pool whose sessions start
   with `default_transaction_read_only = on` and `statement_timeout = 5s`, so
@@ -2022,8 +2051,8 @@ Before anything is written:
    stored as given.
 2. **The lifecycle admission**, held to the end of the call.
 3. **The row**, when the id has none: inserted in a control transaction
-   under a transaction-level advisory lock, so the cap check and the insert
-   of concurrent calls are ordered. A new id when the tenants that are not
+   under a transaction-level advisory lock (`provision_lock`), so the cap
+   check and the insert of concurrent calls are ordered. A new id when the tenants that are not
    `purged` already reach the cap is `RESOURCE_EXHAUSTED` /
    `TENANT_LIMIT_REACHED`, and no row is written. A host, role or database
    name another tenant holds is `FAILED_PRECONDITION` / `TENANT_STATE`, and
@@ -2066,6 +2095,7 @@ again; the provisioner never runs the seed twice for it.
 | an existing role with drift (a widening attribute, a membership) | `INTERNAL` | none yet |
 | a database of that name owned by another role | `INTERNAL` | `role` |
 | the tenant's database cannot be connected to or migrated | `UNAVAILABLE`, no reason | `database` |
+| the tenant cache is full | `UNAVAILABLE` / `TENANT_BUSY` | `database` |
 | the seed hook fails | the hook's error, unchanged | `migrated` |
 | the stored cluster, role or database name was changed by hand | `INTERNAL`, naming the column, before any statement | unchanged |
 
@@ -2102,7 +2132,7 @@ row and decides from what it finds there. A missing row is `NOT_FOUND` /
 
 | Call | From | To | Before the row changes |
 |---|---|---|---|
-| `suspend(id)` | `active` | `suspended` | `TenantHooks::before_suspend` on the tenant opened for the call |
+| `suspend(id)` | `active` | `suspended` | `TenantHooks::before_suspend` on the tenant's pool for the call (a warm entry's, or a lifecycle pool) |
 | `resume(id)` | `suspended` | `active` | `TenantHooks::before_resume`, likewise |
 | `set_hosts(id, HostsChange)` | `active`, `suspended` | unchanged | the label and hosts validated after the lock; the set replaced whole |
 | `purge(id)` | `suspended`, `purging` | `purging`, then `purged` | nothing of the product runs |
@@ -2111,9 +2141,10 @@ A call that finds its target state already set changes nothing, returns the
 row and announces it again, so a repeated call is safe.
 
 - **Suspend and resume are strict.** If the tenant's database cannot be
-  opened (`UNAVAILABLE`) or the hook fails, the transaction is rolled back,
-  the tenant keeps its state and the error reaches the caller unchanged. The
-  pool opened for the hook is closed whatever happened.
+  opened (`UNAVAILABLE`, or `TENANT_BUSY` for a full tenant cache) or the
+  hook fails, the transaction is rolled back, the tenant keeps its state and
+  the error reaches the caller unchanged. The pool opened for the hook is
+  closed, or the warm entry released, whatever happened.
 - **`set_hosts`** canonicalises the label by the provisioner's `LabelRules`
   and the hosts (sorted, without duplicates, the primary among them);
   problems come back together as `INVALID_ARGUMENT` with one field
@@ -2139,9 +2170,13 @@ row and announces it again, so a repeated call is safe.
 size read on the maintenance connection, and the product's `UsageCounters`
 from `TenantHooks::usage`. `describe(id)` returns the product's
 `Description` from `TenantHooks::describe`. Both read the row as committed
-now, accept `active` and `suspended` tenants only (`TENANT_STATE`
-otherwise), take no lifecycle admission, and run the hook on the read-only
-lifecycle pool with its 5 s statement timeout.
+now and accept exactly the `active` and `suspended` states
+(`TENANT_STATE` for `provisioning`, `purging` and `purged`); a product that
+refuses a suspended tenant does so in its own adapter. They take no
+lifecycle admission. The hook runs on a warm entry's pool for a warm
+`active` tenant, otherwise on the read-only lifecycle pool with its 5 s
+statement timeout, which holds a slot of the tenant cache
+(`TENANT_BUSY` when it is full).
 
 ### Announcing
 
@@ -2356,6 +2391,17 @@ addresses no tenant; no foreign key, so a row outlives its tenant).
 the product's job; never prune rows younger than the token lifetime (60 s),
 or a token could be used again.
 
+The guard's two writes are public for a body a product runs outside
+`guard::run` (one that verified its claims elsewhere):
+
+| Call | Does |
+|---|---|
+| `record(&claims)` | **before the body**: the row with the audit clock's time, the operation, the subject and the tenant, outcome `started`. A second record of one token id is `ALREADY_EXISTS` / `ADMIN_TOKEN_REPLAYED` in the admin domain: the token was replayed and the body must not run. Any other failure is the database's error |
+| `finish(token_id, ok)` | **after the body**: the outcome `ok` or `failed`, on a row still `started` only (a second finish keeps the first outcome; an unknown id writes nothing). A failure to store it is a warning with the token id and the code |
+
+The time comes from the clock given to `AdminAudit::new`; a product with an
+injected clock passes it there.
+
 ## Call a product's admin API
 
 The `manager` module (facade feature `tenancy-manager`) is the operator side
@@ -2540,7 +2586,7 @@ reason.
 | A stored name or verifier outside its grammar, a role of another prefix, drift on an existing role or database, a refused drop (including SQLSTATE `42501` on its `SET ROLE` or `DROP`), a poisoned connection, a key id that is not configured or generation 0, an empty key list; a control row the crate cannot decode (the cause names the column) | `INTERNAL` | |
 | A preflight finding, a server older than Postgres 16; `Listener::run` on a fixed `Tenants` | `FAILED_PRECONDITION` | |
 | A refused adoption | `FAILED_PRECONDITION` | `ADOPTION_REFUSED`, metadata `check`: `missing`, `template`, `owner`, `grantee`, `owns_more`, `foreign_object` or `session` |
-| The permit, connect, operation, close or preflight bound passed; `Registry::admit` found no lifecycle permit within 10 s; the listener's control pool was closed | `UNAVAILABLE` | |
+| The permit, connect, operation, close or preflight bound passed; `Registry::admit` found no lifecycle permit within its admission wait; the listener's control pool was closed | `UNAVAILABLE` | |
 | Any other database error, the listener's first `LISTEN` or first load included | as `sekvent::db::to_app_error` maps it | |
 
 The lifecycle, the admin surface and the manager kit add:
@@ -2553,6 +2599,7 @@ The lifecycle, the admin surface and the manager kit add:
 | Provisioning or adopting a new id when the tenants that are not `purged` reach the cap | `RESOURCE_EXHAUSTED` | `TENANT_LIMIT_REACHED` |
 | An adoption refused by the handover's checks or by `TenantHooks::check_adoptable` (the default refuses with `check` = `not_checked`) | `FAILED_PRECONDITION` | `ADOPTION_REFUSED`, metadata `check` (the product's own refusal is its error, unchanged) |
 | A tenant that cannot be opened for a lifecycle operation; `check_adoptable` past 150 s | `UNAVAILABLE` | |
+| A lifecycle pool while every slot of the tenant cache is in use, being opened or reserved | `UNAVAILABLE`, retry after 1 s | `TENANT_BUSY` (no domain) |
 | Any failure of an admin token, its operation or its tenant | `UNAUTHENTICATED`, the constant end-user message | `ADMIN_TOKEN_INVALID`, admin domain |
 | A second call with one token id | `ALREADY_EXISTS` | `ADMIN_TOKEN_REPLAYED`, admin domain |
 | A stored cluster, role or database name changed by hand | `INTERNAL` | |
@@ -2572,7 +2619,7 @@ answers of an admin call ([The client](#the-client)).
 | Holder | Share |
 |---|---|
 | Request lookups (cache misses of `Tenants::select` and of `Tenants::get`'s state check) | `max(1, n / 2)` lookup permits, taken without waiting; one connection each, for one statement |
-| Lifecycle work (`Registry::admit`) | `max(1, (n - 1) / 2)` lifecycle permits; a call waits up to 10 s for one |
+| Lifecycle work (`Registry::admit`) | `max(1, (n - 1) / 2)` lifecycle permits; a call waits up to the admission wait (10 s by default, `Registry::with_admission_wait`) for one |
 | The invalidation listener | one connection for as long as it runs |
 | Internal reads by id without a permit (the two reads inside each creation, `Registry::tenant` and `tenant_now`; the product's own `Registry::tenant` calls), the sender, snapshot reloads, the walks' list reads, the migration sweep's writes, the product's own statements | one connection each, for one statement |
 
@@ -2606,10 +2653,15 @@ once it is reached.
 
 **A lifecycle call** holds one lifecycle permit and, while a step runs, one
 control connection with the row locked, one maintenance session at a time,
-and for a hook a lifecycle pool of at most two connections as the tenant's
-role (the read-only form opens one connection first to migrate). Those
-tenant connections count against the role's connection limit, so set
-`connection_limit` to at least `p × max_connections + 2`. The tenant cap
+and for a hook either the warm entry's pool of an `active` tenant this
+process holds (no new connection) or a lifecycle pool of at most two
+connections as the tenant's role (the read-only form opens one connection
+first to migrate). A lifecycle pool holds one slot of the tenant cache's
+`capacity` while it lives, so with `max_connections` of at least 2 the
+cache's `capacity × max_connections` stays the bound of this process's
+tenant connections. Those tenant connections count against the role's
+connection limit, so set `connection_limit` to at least
+`p × max_connections + 2`. The tenant cap
 counts every tenant that is not `purged`, `suspended` and `purging`
 included; at most `capacity` of them are open in one process.
 
@@ -2691,9 +2743,11 @@ there are.
   Changes take effect through the invalidation channel; a lost
   notification about a tenant's row is repaired by the next successful
   resync, a lost hint or product-defined change kind is not.
-- Lifecycle hooks never get a built scope: their pool is opened for the one
-  operation as the tenant's derived role, outside the tenant cache. Opening
-  a tenant that is not `active` takes a crate-private capability that only
+- Lifecycle hooks never get a built scope: their pool is a warm `active`
+  tenant's cache pool, held for the operation, or one opened for the one
+  operation as the tenant's derived role, outside the tenant cache and
+  within its capacity. Only an `active` tenant is ever warm; opening a
+  tenant that is not `active` takes a crate-private capability that only
   provisioning, adoption, suspend, resume, usage and describe construct; a
   purge never opens the tenant.
 - The seed's handover secret is returned once, by the call that ran the
