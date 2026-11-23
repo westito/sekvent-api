@@ -785,6 +785,16 @@ Rules of every maintenance session:
   the database's own `search_path`, which a product's statements need.
   The pool is therefore used only after `handover::prepare` found no
   object of a third role in that database.
+- **One role.** `connect` and `connect_to` read `session_user` and
+  `CURRENT_USER` once per session, within the connect bound and before
+  any operation, and close and refuse a session where they differ with
+  `FAILED_PRECONDITION` naming the database and both roles. The startup
+  preflight is not enough: it reads the maintenance database once at
+  startup, while a handover's sessions open on the candidate database
+  (whose own `role` setting, or the maintenance role's setting in it, the
+  preflight never sees) and any session may open after a setting changed.
+  A `pool_on` session is not checked itself; `prepare`'s session on the
+  same database, with the same login and options, was.
 - **Poisoning.** A session-level `SET ROLE` marks the connection poisoned
   until its `RESET ROLE` succeeded; an operation that ran out of time
   poisons it for good. Every function of `roles`, `databases` and
@@ -1023,11 +1033,14 @@ pub enum Finding {
     TenantOwner(String),
     TenantMayConnect(String),
     RoleMayConnect(String),
+    RoleSwitched { session_user: String, current_user: String },
 }
 
 pub fn protected_facts(owner: String, grants: Vec<DatabaseGrant>, roles: &[ConnectingRole],
                        allowed: &[String], maintenance: Option<&str>, names: &ObjectNames) -> ProtectedFacts;
 pub fn findings(facts: &ProtectedFacts, allowed: &[String], names: &ObjectNames) -> Vec<Finding>;
+/// The maintenance session's rule: `RoleSwitched` unless both are one role.
+pub fn session_findings(session_user: &str, current_user: &str) -> Vec<Finding>;
 pub async fn facts(conn: &mut PgConnection, database: &str, allowed: &[String],
                    maintenance: Option<&str>, names: &ObjectNames) -> Result<Option<ProtectedFacts>, AppError>;
 pub async fn check(conn: &mut PgConnection, protected: &Protected,
@@ -1052,6 +1065,18 @@ A protected database passes when:
 3. Every other `LOGIN` role that may connect is its owner, an allowed role
    or a superuser. A superuser is the cluster operator's and not a
    finding; a tenant-named superuser is one, by rule 2.
+
+The maintenance session passes only when its `CURRENT_USER` is its
+`session_user` (`RoleSwitched` otherwise). The crate names the maintenance
+role by the session user (the reach of rule 2, `check_tenant_role`) while
+the operations act as, and grant to, `CURRENT_USER`; the two differ only
+when a role setting switches the session at startup. The rule is the
+session's, not a database's: `check_control_and_maintenance` reads it once
+with the maintenance connection's session (a column of the session read,
+no statement of its own) and reports it first among the findings of the
+database that connection's check covers, the maintenance database or the
+shared one. Other pools are not held to it: their session role is only the
+allowed role of their own database.
 
 Further rules:
 
@@ -1137,9 +1162,9 @@ scenario):
 |---|---|
 | `tests/secrets.rs` | a role created with the verifier signs in with the derived password; the password of another generation is rejected (`28P01`); a `Connector` whose base carries a superuser's credentials yields a session whose `current_user` and `session_user` are the tenant role |
 | `tests/cluster_roles.rs` | a created role has exactly the four attributes, the limit, and the maintenance membership without `INHERIT`; a repeated `create` moves the verifier and the limit; an existing role is refused, and unchanged, for each widening attribute, a membership out of it, a membership into it from a third role, a chain into it, and a maintenance membership with `INHERIT`; the connection limit holds; `drop`; a refused argument is answered before the poisoned check (so before any statement) |
-| `tests/cluster_databases.rs` | a created database is owned by the role and opens only with its restriction: the tenant role connects, another `LOGIN` role and the maintenance role do not; a create interrupted after `CREATE DATABASE` converges on the next call; an existing database is refused, and unchanged, for another owner, a template, a grant to a third role, a grant to the maintenance role, `CREATE` to `PUBLIC`; `size` without a superuser; `drop` with sessions connected; `drop` refuses a database of another existing role, the maintenance role's, a template; a database of another owner once the role is gone is left alone and answered `Ok`; a failed drop leaves the session as the maintenance role; a poisoned connection refuses every operation |
+| `tests/cluster_databases.rs` | a created database is owned by the role and opens only with its restriction: the tenant role connects, another `LOGIN` role and the maintenance role do not; a create interrupted after `CREATE DATABASE` converges on the next call; an existing database is refused, and unchanged, for another owner, a template, a grant to a third role, a grant to the maintenance role, `CREATE` to `PUBLIC`; `size` without a superuser; `drop` with sessions connected; `drop` refuses a database of another existing role, the maintenance role's, a template; a database of another owner once the role is gone is left alone and answered `Ok`; a failed drop leaves the session as the maintenance role; a poisoned connection refuses every operation; a session switched to another role by the role's or the database's setting is refused when it opens |
 | `tests/privileges.rs` | chains of two and three edges in both directions; effective `CONNECT` through an own grant, `PUBLIC`, an inherited membership and a superuser; a database without an ACL read as its defaults |
-| `tests/preflight.rs` | a protected database passes; each finding of 8.10 alone; the maintenance database is checked on its own connection; one shared database; three hundred tenant-named roles checked by one call |
+| `tests/preflight.rs` | a protected database passes; each finding of 8.10 alone; the maintenance database is checked on its own connection; one shared database; three hundred tenant-named roles checked by one call; a maintenance session switched to another role by the role's or the database's setting is refused |
 | `tests/handover.rs` | a handover moves the database and a table, a sequence, a function, a type and a schema; afterwards the membership is without `INHERIT` and the maintenance role cannot connect; each refusal of 8.11 with its `check`; a refusal leaves only `PUBLIC`'s `CONNECT` revoked; a repeated call converges; a database the role already owns takes the `Restrict` path |
 
 ### 8.13 Left to the product, and the consumer check
@@ -2486,6 +2511,11 @@ Examples are outside coverage.
     character, stored as given; labels and hosts are canonicalised (hosts
     sorted and de-duplicated) before they are stored or compared with a
     row (10.2).
+41. **A maintenance session acts as the role it signed in as**: the
+    preflight refuses a maintenance session whose `CURRENT_USER` is not
+    its `session_user` (`RoleSwitched`), and every `connect` and
+    `connect_to` session is checked the same way when it opens (owner's
+    decision; 8.10, 8.6).
 
 ## 15. Open questions for the repository owner
 

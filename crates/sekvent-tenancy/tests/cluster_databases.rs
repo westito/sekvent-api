@@ -965,3 +965,96 @@ async fn a_pool_on_session_is_read_only() {
     }))
     .await;
 }
+
+/// A maintenance session that a role setting switches to another role at
+/// startup is closed and refused when it opens, before any operation: as
+/// the role's setting on the maintenance database, and as the setting of a
+/// database the handover connects to.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_session_that_switched_role_is_refused_when_it_opens() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance_role = common::quote(cluster.maintenance_role());
+        let stand_in = cluster.create_role("stand_in", "").await;
+        let switched = format!(
+            "the maintenance session runs as role {stand_in}, not as its session role {}",
+            cluster.maintenance_role()
+        );
+        let candidate = maintenance_owned_database(&cluster).await;
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!("GRANT {} TO {maintenance_role}", common::quote(&stand_in)),
+            )
+            .await;
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!(
+                    "ALTER ROLE {maintenance_role} SET role = {}",
+                    common::quote(&stand_in)
+                ),
+            )
+            .await;
+        let maintenance = cluster.maintenance();
+        let error = maintenance
+            .connect()
+            .await
+            .expect_err("the session acts as another role");
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition, "{error:?}");
+        assert_eq!(error.reason(), None);
+        assert!(
+            error.message().contains(&format!(
+                "maintenance session on database {}",
+                cluster.maintenance_database()
+            )),
+            "{}",
+            error.message()
+        );
+        assert!(error.message().contains(&switched), "{}", error.message());
+        assert!(
+            !format!("{error:?}").contains(cluster.maintenance_password().expose()),
+            "no credential is printed"
+        );
+        sekvent_testing::await_until!(cluster.sessions_of(cluster.maintenance_role()).await == 0);
+
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!("ALTER ROLE {maintenance_role} RESET role"),
+            )
+            .await;
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!(
+                    "ALTER DATABASE {} SET role = {}",
+                    common::quote(&candidate),
+                    common::quote(&stand_in)
+                ),
+            )
+            .await;
+        let error = maintenance
+            .connect_to(&name(&candidate))
+            .await
+            .expect_err("the candidate's setting switches the session");
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition, "{error:?}");
+        assert!(
+            error
+                .message()
+                .contains(&format!("maintenance session on database {candidate}")),
+            "{}",
+            error.message()
+        );
+        assert!(error.message().contains(&switched), "{}", error.message());
+
+        // The permit came back each time, and the maintenance database's
+        // sessions act as the maintenance role again.
+        let conn = maintenance.connect().await.expect("connected");
+        conn.close().await.expect("closed");
+    }))
+    .await;
+}

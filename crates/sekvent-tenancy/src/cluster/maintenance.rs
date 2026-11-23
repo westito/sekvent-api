@@ -5,6 +5,15 @@
 //! every tenant role `WITH INHERIT FALSE, SET TRUE`: it can switch to a
 //! tenant role and has none of its privileges until it does. Postgres 16 or
 //! later is required.
+//!
+//! Every session is checked once when it opens, before any operation runs
+//! on it: its `CURRENT_USER` must be its `session_user`. The operations name
+//! the maintenance role by the session user and grant to `CURRENT_USER`, and
+//! a role setting at startup (`ALTER ROLE … [IN DATABASE …] SET role`,
+//! `ALTER DATABASE … SET role`, a `role` startup option) would make the two
+//! differ. The startup preflight sees only the maintenance database at
+//! startup; a session of the handover opens on another database, and any
+//! session may open after the settings changed.
 
 use std::fmt;
 use std::sync::Arc;
@@ -18,6 +27,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 
+use crate::cluster::preflight;
 use crate::{DatabaseName, ObjectNames, TenantRole};
 
 /// The client-side bound of one public operation of `roles`, `databases` or
@@ -57,6 +67,9 @@ const OUT_OF_TIME: &str = "the maintenance operation did not finish in time";
 const POISONED: &str = "the maintenance connection is poisoned and can only be closed";
 /// The source of the refusal of a connection whose session is gone.
 const DETACHED: &str = "the maintenance connection has no session";
+
+/// The role a session signed in as and the role its statements act as.
+const SESSION_ROLES: &str = "SELECT session_user::text, current_user::text";
 
 /// The options of a maintenance session: the product's server settings with
 /// the session rules applied (the safe `search_path`, the server-side
@@ -221,9 +234,9 @@ impl Maintenance {
     /// A session with `options`, holding the permit.
     async fn open(&self, options: PgConnectOptions) -> Result<MaintenanceConn, AppError> {
         let permit = self.permit().await?;
-        let conn = match timeout(CONNECT_TIMEOUT, PgConnection::connect_with(&options)).await {
+        let conn = match timeout(CONNECT_TIMEOUT, connect_checked(&options)).await {
             Ok(Ok(conn)) => conn,
-            Ok(Err(error)) => return Err(to_app_error(error)),
+            Ok(Err(error)) => return Err(error),
             Err(_) => return Err(AppError::unavailable(NO_ANSWER)),
         };
         Ok(MaintenanceConn {
@@ -236,6 +249,41 @@ impl Maintenance {
             _permit: permit,
         })
     }
+}
+
+/// A session with `options` whose statements act as the role it signed in
+/// as; a session that switched role at startup is closed and refused.
+async fn connect_checked(options: &PgConnectOptions) -> Result<PgConnection, AppError> {
+    let mut conn = PgConnection::connect_with(options)
+        .await
+        .map_err(to_app_error)?;
+    let (session_user, current_user): (String, String) = sqlx::query_as(SESSION_ROLES)
+        .fetch_one(&mut conn)
+        .await
+        .map_err(to_app_error)?;
+    let database = options
+        .get_database()
+        .unwrap_or_else(|| options.get_username());
+    if let Err(error) = same_role(database, &session_user, &current_user) {
+        // The refusal is the answer whether or not the close succeeds.
+        let _ = conn.close().await;
+        return Err(error);
+    }
+    Ok(conn)
+}
+
+/// `FAILED_PRECONDITION` naming the database and both roles when a session
+/// on `database` acts as `current_user` instead of its `session_user`.
+fn same_role(database: &str, session_user: &str, current_user: &str) -> Result<(), AppError> {
+    let found = preflight::session_findings(session_user, current_user);
+    if found.is_empty() {
+        return Ok(());
+    }
+    let described: Vec<String> = found.iter().map(preflight::describe).collect();
+    Err(AppError::failed_precondition(format!(
+        "the maintenance session on database {database} is refused: {}",
+        described.join("; ")
+    )))
 }
 
 impl fmt::Debug for Maintenance {
@@ -745,6 +793,21 @@ mod tests {
             "a reset does not lift a timeout's poison"
         );
         conn.close().await.expect("a dropped session closes Ok");
+    }
+
+    #[test]
+    fn a_session_acting_as_another_role_is_refused() {
+        same_role("orders_upkeep", "orders_maintenance", "orders_maintenance")
+            .expect("the session acts as the role it signed in as");
+        let error = same_role("orders_upkeep", "orders_maintenance", "orders_reader")
+            .expect_err("a switched role is refused");
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(error.reason(), None);
+        assert_eq!(
+            error.message(),
+            "the maintenance session on database orders_upkeep is refused: the maintenance \
+             session runs as role orders_reader, not as its session role orders_maintenance"
+        );
     }
 
     #[test]

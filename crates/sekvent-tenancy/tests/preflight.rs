@@ -1,4 +1,4 @@
-//! The startup preflight on a real server: a clean fixture passes, each finding alone, one shared database, many roles in one call.
+//! The startup preflight on a real server: a clean fixture passes, each finding alone, one shared database, many roles in one call, a maintenance session that switched role.
 #![cfg(feature = "serving")]
 
 mod common;
@@ -751,6 +751,128 @@ async fn a_refused_maintenance_sign_in_prints_no_credential() {
         let printed = format!("{error:?} {error}");
         assert!(!printed.contains(wrong.expose()));
         assert!(!printed.contains(cluster.maintenance_password().expose()));
+        pool.close().await;
+    })
+    .await;
+}
+
+/// A maintenance session whose role setting switches it to another role at
+/// startup acts as that role: the preflight refuses it, as the role's
+/// setting and as the database's, on the maintenance database and on a
+/// shared one.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+#[allow(clippy::too_many_lines)]
+async fn a_maintenance_session_that_switched_role_is_refused() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(async {
+        let maintenance = quote(cluster.maintenance_role());
+        let maintenance_db = quote(cluster.maintenance_database());
+        let stand_in = cluster.create_role("stand_in", "").await;
+        let switched = format!(
+            "the maintenance session runs as role {stand_in}, not as its session role {}",
+            cluster.maintenance_role()
+        );
+        admin_sql(
+            &cluster,
+            &format!("GRANT {} TO {maintenance}", quote(&stand_in)),
+        )
+        .await;
+        admin_sql(
+            &cluster,
+            &format!("ALTER ROLE {maintenance} SET role = {}", quote(&stand_in)),
+        )
+        .await;
+        let pool = cluster.control_pool().await;
+        let error = preflight::check_control_and_maintenance(
+            &pool,
+            &cluster.maintenance_options(),
+            cluster.names(),
+        )
+        .await
+        .unwrap_err();
+        assert_refused(
+            &cluster,
+            &error,
+            "maintenance",
+            cluster.maintenance_database(),
+            &switched,
+        );
+        wait_for_no_sessions(&cluster, cluster.maintenance_database()).await;
+
+        // On a database shared with the control pool, the one check reports it.
+        admin_sql(
+            &cluster,
+            &format!(
+                "GRANT CONNECT ON DATABASE {} TO {maintenance}",
+                quote(cluster.control_database())
+            ),
+        )
+        .await;
+        let shared = cluster.options_for(
+            cluster.maintenance_role(),
+            cluster.maintenance_password(),
+            cluster.control_database(),
+        );
+        let error = preflight::check_control_and_maintenance(&pool, &shared, cluster.names())
+            .await
+            .unwrap_err();
+        assert_refused(
+            &cluster,
+            &error,
+            "control and maintenance",
+            cluster.control_database(),
+            &switched,
+        );
+        admin_sql(
+            &cluster,
+            &format!(
+                "REVOKE CONNECT ON DATABASE {} FROM {maintenance}",
+                quote(cluster.control_database())
+            ),
+        )
+        .await;
+
+        // The database's setting switches it just the same.
+        admin_sql(&cluster, &format!("ALTER ROLE {maintenance} RESET role")).await;
+        admin_sql(
+            &cluster,
+            &format!(
+                "ALTER DATABASE {maintenance_db} SET role = {}",
+                quote(&stand_in)
+            ),
+        )
+        .await;
+        let error = preflight::check_control_and_maintenance(
+            &pool,
+            &cluster.maintenance_options(),
+            cluster.names(),
+        )
+        .await
+        .unwrap_err();
+        assert_refused(
+            &cluster,
+            &error,
+            "maintenance",
+            cluster.maintenance_database(),
+            &switched,
+        );
+        wait_for_no_sessions(&cluster, cluster.maintenance_database()).await;
+
+        admin_sql(
+            &cluster,
+            &format!("ALTER DATABASE {maintenance_db} RESET role"),
+        )
+        .await;
+        preflight::check_control_and_maintenance(
+            &pool,
+            &cluster.maintenance_options(),
+            cluster.names(),
+        )
+        .await
+        .expect("without the setting the session acts as itself");
         pool.close().await;
     })
     .await;

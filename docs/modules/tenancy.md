@@ -517,6 +517,19 @@ statement logging off, because role statements carry verifiers. Catalog
 reads are static SQL with bound names; utility statements are built only
 from the checked `TenantRole`, `DatabaseName` and `ScramVerifier`.
 
+`connect` and `connect_to` check each session once, within the 10 s
+connect bound and before any operation runs on it: its `CURRENT_USER` must
+be its `session_user`. A session that a role setting switched at startup
+(`ALTER ROLE … [IN DATABASE …] SET role`, `ALTER DATABASE … SET role`, a
+`role` startup option in the options) is closed and refused with
+`FAILED_PRECONDITION`, naming the database and both roles (`the maintenance
+session on database billing_maintenance is refused: the maintenance session
+runs as role …, not as its session role billing_maintenance`). The
+operations name the maintenance role by the session user and grant to
+`CURRENT_USER`, so they must be one role. The startup preflight sees only
+the maintenance database at startup; the handover's sessions open on
+another database, and any session may open after a setting changed.
+
 ### Poisoning
 
 A session-level `SET ROLE` poisons the connection until its `RESET ROLE`
@@ -540,7 +553,9 @@ adoption. It holds the permit from the call until `MaintenancePool::close`,
 its sessions start read-only (`default_transaction_read_only = on`), keep
 the lock and statement bounds, and use the database's own `search_path`, so
 use it only after `handover::prepare` found no object of a third role
-there.
+there. Its sessions are not checked for a switched role themselves:
+`prepare`'s session on the same database, with the same login and options,
+was.
 
 ```rust
 let pool = maintenance.pool_on(&candidate).await?; // candidate: DatabaseName
@@ -685,6 +700,16 @@ the maintenance database, and any other the product names. It passes when:
    or a superuser. A superuser is the cluster operator's and not a finding;
    a superuser whose name has the prefix is a tenant role and is one.
 
+The maintenance session itself passes only when its `CURRENT_USER` is its
+`session_user`. The crate names the maintenance role by the session user
+while its statements act as the current user; the two differ when a role
+setting switches the session at startup (`ALTER ROLE … SET role`,
+`ALTER DATABASE … SET role`, a `role` startup option). The rule belongs to
+the maintenance connection of `check_control_and_maintenance`, read once
+with its session, and is reported with the findings of the database that
+connection's check covers (the maintenance database, or the shared one).
+Other pools' sessions are not held to it.
+
 "May connect" is the effective `CONNECT` as Postgres computes it: an own
 grant, `PUBLIC`'s, an inherited membership's, or a superuser's. A database
 without an ACL is read as its defaults (the owner's privileges, `PUBLIC`'s
@@ -697,6 +722,7 @@ without an ACL is read as its defaults (the owner's privileges, `PUBLIC`'s
 | `TenantOwner(role)` | a tenant role owns the database | give the database to the service's role |
 | `TenantMayConnect(role)` | a tenant role (by prefix or by the maintenance role's reach) may connect | revoke its grant or the membership that gives it one |
 | `RoleMayConnect(role)` | another `LOGIN` role may connect and is neither owner, allowed nor a superuser | revoke the grant, or add the role to the allowed list |
+| `RoleSwitched { session_user, current_user }` | the maintenance session acts as another role than the one it signed in as | remove the role setting (`ALTER ROLE … RESET role`, `ALTER DATABASE … RESET role`) or the `role` startup option |
 
 Nothing is repaired. A finding is `FAILED_PRECONDITION` without a reason,
 its message naming the label, the database and every finding (`preflight of

@@ -15,6 +15,17 @@
 //! roles and the maintenance role itself. A superuser is the cluster
 //! operator's and not a finding, unless its name is tenant-named.
 //!
+//! The maintenance session itself passes only when its `CURRENT_USER` is
+//! its `session_user`. The crate names the maintenance role by the session
+//! user (the reach above, the tenant-role checks) while its statements act
+//! as the current user, and the two differ only when the session switched
+//! role at startup (a `role` startup option, `ALTER ROLE … SET role`,
+//! `ALTER DATABASE … SET role`). The rule belongs to the session, not to a
+//! database: it is read once on the maintenance connection and reported
+//! with the findings of the database that connection's check covers (the
+//! maintenance database, or the shared one). Other pools are not held to
+//! it: their session role is only the allowed role of their own database.
+//!
 //! The reads take a fixed number of statements per database however many
 //! roles the cluster holds; the rules ([`protected_facts`], [`findings`])
 //! are pure. Nothing is repaired: a finding is `FAILED_PRECONDITION` naming
@@ -91,6 +102,14 @@ pub enum Finding {
     /// This `LOGIN` role, neither the owner, an allowed role nor a
     /// superuser, may connect.
     RoleMayConnect(String),
+    /// The maintenance session acts as `current_user`, not as the
+    /// `session_user` it signed in as.
+    RoleSwitched {
+        /// The role it signed in as.
+        session_user: String,
+        /// The role its statements act as.
+        current_user: String,
+    },
 }
 
 /// Every role with an effective `CONNECT` on the database (`LOGIN` or not),
@@ -117,11 +136,12 @@ WHERE d.datname = $1";
 /// The server's version as `server_version_num` (`170002` for 17.2).
 const SERVER_VERSION: &str = "SELECT pg_catalog.current_setting('server_version_num')::int4";
 
-/// The session's role, its database and what identifies that database
-/// across connections: its oid and the server's start time in
-/// microseconds. Two sessions with the same three are on one database.
+/// The session's role, the role its statements act as, its database and
+/// what identifies that database across connections: its oid and the
+/// server's start time in microseconds. Two sessions with the same three
+/// are on one database.
 const SESSION: &str = "\
-SELECT session_user::text, d.datname::text, d.oid::int8,
+SELECT session_user::text, current_user::text, d.datname::text, d.oid::int8,
        (extract(epoch FROM pg_catalog.pg_postmaster_start_time()) * 1000000)::int8
 FROM pg_catalog.pg_database d
 WHERE d.datname = pg_catalog.current_database()";
@@ -157,6 +177,18 @@ pub fn protected_facts(
         connecting,
         tenants_connecting,
     }
+}
+
+/// Pure: the rule of the maintenance session: its statements act as the
+/// role it signed in as. A [`Finding::RoleSwitched`] when they do not.
+pub fn session_findings(session_user: &str, current_user: &str) -> Vec<Finding> {
+    if session_user == current_user {
+        return Vec::new();
+    }
+    vec![Finding::RoleSwitched {
+        session_user: session_user.to_owned(),
+        current_user: current_user.to_owned(),
+    }]
 }
 
 /// Pure: every rule the facts break, in order: `PUBLIC`'s `CONNECT` and
@@ -259,7 +291,11 @@ pub async fn check(
 ) -> Result<(), AppError> {
     bounded(
         &protected.label,
-        tokio::time::timeout(TIMEOUT, run_check(conn, protected, maintenance, names)).await,
+        tokio::time::timeout(
+            TIMEOUT,
+            run_check(conn, protected, maintenance, names, Vec::new()),
+        )
+        .await,
     )
 }
 
@@ -279,7 +315,7 @@ pub async fn check_session_database(
             database: session.database,
             allowed: vec![session.role],
         };
-        run_check(&mut conn, &protected, maintenance, names).await
+        run_check(&mut conn, &protected, maintenance, names, Vec::new()).await
     };
     bounded(label, tokio::time::timeout(TIMEOUT, work).await)
 }
@@ -289,7 +325,9 @@ pub async fn check_session_database(
 ///
 /// The control database allows the control pool's session role, the
 /// maintenance database the maintenance role. When both are one database,
-/// one check runs and allows both roles. Within one [`TIMEOUT`] for all of
+/// one check runs and allows both roles. A maintenance session whose
+/// `CURRENT_USER` is not its `session_user` is a finding of the database
+/// its check covers. Within one [`TIMEOUT`] for all of
 /// it; the check's error wins over a failed close.
 pub async fn check_control_and_maintenance(
     control: &PgPool,
@@ -351,20 +389,24 @@ async fn enveloped<T>(
     bounded(stage.get(), outcome)
 }
 
-/// One session's role and database, and the database's identity.
+/// One session's role, the role it acts as, its database, and the
+/// database's identity.
 struct Session {
     role: String,
+    current_role: String,
     database: String,
     identity: (i64, i64),
 }
 
 async fn read_session(conn: &mut PgConnection) -> Result<Session, AppError> {
-    let (role, database, oid, started): (String, String, i64, i64) = sqlx::query_as(SESSION)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(to_app_error)?;
+    let (role, current_role, database, oid, started): (String, String, String, i64, i64) =
+        sqlx::query_as(SESSION)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(to_app_error)?;
     Ok(Session {
         role,
+        current_role,
         database,
         identity: (oid, started),
     })
@@ -381,6 +423,7 @@ async fn check_both(
 ) -> Result<(), AppError> {
     let maintenance_session = read_session(maintenance).await?;
     let maintenance_role = maintenance_session.role.clone();
+    let switched = session_findings(&maintenance_session.role, &maintenance_session.current_role);
     let shared = control_session.database == maintenance_session.database
         && control_session.identity == maintenance_session.identity;
     if shared {
@@ -390,7 +433,14 @@ async fn check_both(
             database: control_session.database,
             allowed: vec![control_session.role, maintenance_session.role],
         };
-        return run_check(control, &protected, Some(maintenance_role.as_str()), names).await;
+        return run_check(
+            control,
+            &protected,
+            Some(maintenance_role.as_str()),
+            names,
+            switched,
+        )
+        .await;
     }
     stage.set(CONTROL);
     let protected = Protected {
@@ -398,7 +448,14 @@ async fn check_both(
         database: control_session.database,
         allowed: vec![control_session.role],
     };
-    run_check(control, &protected, Some(maintenance_role.as_str()), names).await?;
+    run_check(
+        control,
+        &protected,
+        Some(maintenance_role.as_str()),
+        names,
+        Vec::new(),
+    )
+    .await?;
     stage.set(MAINTENANCE);
     let protected = Protected {
         label: MAINTENANCE.to_owned(),
@@ -410,34 +467,40 @@ async fn check_both(
         &protected,
         Some(maintenance_role.as_str()),
         names,
+        switched,
     )
     .await
 }
 
-/// [`check`] without its envelope.
+/// [`check`] without its envelope; `session` are the findings of the
+/// maintenance session the check covers, reported first.
 async fn run_check(
     conn: &mut PgConnection,
     protected: &Protected,
     maintenance: Option<&str>,
     names: &ObjectNames,
+    session: Vec<Finding>,
 ) -> Result<(), AppError> {
     let version: i32 = sqlx::query_scalar(SERVER_VERSION)
         .fetch_one(&mut *conn)
         .await
         .map_err(to_app_error)?;
     supported_server(&protected.label, version)?;
-    let found = match facts(
-        conn,
-        &protected.database,
-        &protected.allowed,
-        maintenance,
-        names,
-    )
-    .await?
-    {
-        Some(facts) => findings(&facts, &protected.allowed, names),
-        None => vec![Finding::Missing],
-    };
+    let mut found = session;
+    found.extend(
+        match facts(
+            conn,
+            &protected.database,
+            &protected.allowed,
+            maintenance,
+            names,
+        )
+        .await?
+        {
+            Some(facts) => findings(&facts, &protected.allowed, names),
+            None => vec![Finding::Missing],
+        },
+    );
     verdict(protected, &found)
 }
 
@@ -495,7 +558,7 @@ fn verdict(protected: &Protected, found: &[Finding]) -> Result<(), AppError> {
     )))
 }
 
-fn describe(finding: &Finding) -> String {
+pub(crate) fn describe(finding: &Finding) -> String {
     match finding {
         Finding::Missing => "it does not exist".to_owned(),
         Finding::Public(privilege) => format!("PUBLIC holds {}", privilege.sql_name()),
@@ -503,6 +566,13 @@ fn describe(finding: &Finding) -> String {
         Finding::TenantMayConnect(role) => format!("tenant role {role} may connect"),
         Finding::RoleMayConnect(role) => format!(
             "role {role} may connect and is neither its owner, an allowed role nor a superuser"
+        ),
+        Finding::RoleSwitched {
+            session_user,
+            current_user,
+        } => format!(
+            "the maintenance session runs as role {current_user}, not as its session role \
+             {session_user}"
         ),
     }
 }
@@ -815,6 +885,35 @@ mod tests {
                 Finding::TenantMayConnect(other),
                 Finding::RoleMayConnect("billing_reader".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_maintenance_session_acting_as_another_role_is_a_finding() {
+        assert_eq!(
+            session_findings(MAINTENANCE_ROLE, MAINTENANCE_ROLE),
+            [] as [Finding; 0]
+        );
+        let found = session_findings(MAINTENANCE_ROLE, "orders_reader");
+        assert_eq!(
+            found,
+            [Finding::RoleSwitched {
+                session_user: MAINTENANCE_ROLE.to_owned(),
+                current_user: "orders_reader".to_owned(),
+            }]
+        );
+        let protected = Protected {
+            label: MAINTENANCE.to_owned(),
+            database: "orders_upkeep".to_owned(),
+            allowed: vec![MAINTENANCE_ROLE.to_owned()],
+        };
+        let error = verdict(&protected, &found).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(error.reason(), None);
+        assert_eq!(
+            error.message(),
+            "preflight of the maintenance database orders_upkeep: the maintenance session \
+             runs as role orders_reader, not as its session role orders_maintenance"
         );
     }
 
