@@ -6,14 +6,34 @@
 //! tenant role and has none of its privileges until it does. Postgres 16 or
 //! later is required.
 //!
-//! Every session is checked once when it opens, before any operation runs
-//! on it: its `CURRENT_USER` must be its `session_user`. The operations name
-//! the maintenance role by the session user and grant to `CURRENT_USER`, and
-//! a role setting at startup (`ALTER ROLE … [IN DATABASE …] SET role`,
-//! `ALTER DATABASE … SET role`, a `role` startup option) would make the two
-//! differ. The startup preflight sees only the maintenance database at
-//! startup; a session of the handover opens on another database, and any
-//! session may open after the settings changed.
+//! Every session asks for its rules as startup options and is confirmed
+//! once when it opens, before anything else runs on it, by one statement
+//! that reads them back. A session of [`Maintenance::connect`] and
+//! [`Maintenance::connect_to`] must act as its `session_user` (its
+//! `CURRENT_USER` is its session user) and hold the `search_path`
+//! `pg_catalog, pg_temp`, a `lock_timeout` of 10 s, a `statement_timeout`
+//! of 120 s and `client_min_messages` `warning`. A connection of a
+//! [`MaintenancePool`] must hold the same role rule, bounds and
+//! `client_min_messages` and read-only transactions; it keeps the
+//! database's own `search_path`. The statement that reads them back
+//! qualifies every function and type and compares nothing in SQL, so it
+//! calls no object of the database whatever the `search_path` is.
+//!
+//! The operations name the maintenance role by the session user and grant
+//! to `CURRENT_USER`, and a role setting at startup (`ALTER ROLE … [IN
+//! DATABASE …] SET role`, `ALTER DATABASE … SET role`, a `role` startup
+//! option) would make the two differ. Something between the crate and the
+//! server that drops startup options would leave a session the database's
+//! own `search_path` and no server-side bounds. The startup preflight sees
+//! only the maintenance database at startup; a session of the handover
+//! opens on another database, and any session may open after the settings
+//! changed.
+//!
+//! A refused session is closed and its connect is `INTERNAL` without a
+//! reason, what it held in the error's source. A refused pool connection
+//! is closed and the refusal logged by the driver, which tries again until
+//! the pool's 10 s acquire bound; the acquire then fails with the driver's
+//! timeout, which names nothing.
 
 use std::fmt;
 use std::sync::Arc;
@@ -21,6 +41,7 @@ use std::time::Duration;
 
 use sekvent_db::to_app_error;
 use sekvent_error::AppError;
+use sekvent_telemetry::truncate_for_log;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{ConnectOptions, Connection, PgConnection, Postgres, Transaction};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -52,9 +73,15 @@ const APPLICATION_NAME_MAX: usize = 63;
 const LOCK_TIMEOUT: &str = "10s";
 /// The server-side `statement_timeout` of every maintenance session.
 const STATEMENT_TIMEOUT: &str = "120s";
+/// The `client_min_messages` of every maintenance session: a role or
+/// database setting of `log` together with statement logging would send a
+/// statement (a `CREATE ROLE … PASSWORD` among them) back as a message.
+const CLIENT_MIN_MESSAGES: &str = "warning";
 /// No object of the connected database stands in for a catalog operator or
 /// function.
 const SAFE_SEARCH_PATH: &str = "pg_catalog,pg_temp";
+/// The `transaction_read_only` of a [`MaintenancePool`] connection.
+const READ_ONLY: &str = "on";
 
 /// `UNAVAILABLE` past [`PERMIT_WAIT`].
 const BUSY: &str = "the maintenance connection is busy";
@@ -68,12 +95,27 @@ const POISONED: &str = "the maintenance connection is poisoned and can only be c
 /// The source of the refusal of a connection whose session is gone.
 const DETACHED: &str = "the maintenance connection has no session";
 
-/// The role a session signed in as and the role its statements act as.
-const SESSION_ROLES: &str = "SELECT session_user::text, current_user::text";
+/// What a session reports about itself when it opens: the role it signed in
+/// as, the role its statements act as, and the settings its rules name.
+/// Every function and type is qualified and nothing is compared in SQL, so
+/// no object of the database is called whatever the `search_path` is.
+const SESSION_STATE: &str = "SELECT session_user::pg_catalog.text, \
+     current_user::pg_catalog.text, \
+     pg_catalog.current_setting('search_path'), \
+     pg_catalog.current_setting('lock_timeout'), \
+     pg_catalog.current_setting('statement_timeout'), \
+     pg_catalog.current_setting('client_min_messages'), \
+     pg_catalog.current_setting('transaction_read_only')";
+
+/// Every catalog statement of this module, by name, for the scan of
+/// `cluster::tests`.
+#[cfg(test)]
+pub(super) const STATEMENTS: [(&str, &str); 1] = [("SESSION_STATE", SESSION_STATE)];
 
 /// The options of a maintenance session: the product's server settings with
 /// the session rules applied (the safe `search_path`, the server-side
-/// bounds, the application name, no statement logging).
+/// bounds, `client_min_messages`, the application name, no statement
+/// logging).
 fn session_options(base: &PgConnectOptions, application_name: &str) -> PgConnectOptions {
     base.clone()
         .application_name(application_name)
@@ -81,12 +123,14 @@ fn session_options(base: &PgConnectOptions, application_name: &str) -> PgConnect
             ("search_path", SAFE_SEARCH_PATH),
             ("lock_timeout", LOCK_TIMEOUT),
             ("statement_timeout", STATEMENT_TIMEOUT),
+            ("client_min_messages", CLIENT_MIN_MESSAGES),
         ])
         .disable_statement_logging()
 }
 
 /// The options of a [`MaintenancePool`] session on `database`: the server
-/// bounds and read-only transactions, the database's own `search_path`.
+/// bounds, read-only transactions and `client_min_messages`, the
+/// database's own `search_path`.
 fn pool_options(
     base: &PgConnectOptions,
     database: &DatabaseName,
@@ -98,7 +142,8 @@ fn pool_options(
         .options([
             ("lock_timeout", LOCK_TIMEOUT),
             ("statement_timeout", STATEMENT_TIMEOUT),
-            ("default_transaction_read_only", "on"),
+            ("default_transaction_read_only", READ_ONLY),
+            ("client_min_messages", CLIENT_MIN_MESSAGES),
         ])
         .disable_statement_logging()
 }
@@ -204,13 +249,21 @@ impl Maintenance {
     /// read-only and keep the database's own `search_path`.
     ///
     /// The pool is lazy: nothing connects before its first use, and the
-    /// permit is held from here until [`MaintenancePool::close`].
+    /// permit is held from here until [`MaintenancePool::close`]. Each
+    /// connection is confirmed when it opens (the module's rules); one that
+    /// is refused is closed and logged by the driver, and the acquire fails
+    /// with the driver's timeout after 10 s.
     pub async fn pool_on(&self, database: &DatabaseName) -> Result<MaintenancePool, AppError> {
         let permit = self.permit().await?;
+        let name = database.as_str().to_owned();
         let pool = PgPoolOptions::new()
             .min_connections(0)
             .max_connections(1)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .after_connect(move |conn, _meta| {
+                let database = name.clone();
+                Box::pin(async move { confirm_pool_connection(conn, &database).await })
+            })
             .connect_lazy_with(pool_options(
                 &self.options,
                 database,
@@ -251,39 +304,224 @@ impl Maintenance {
     }
 }
 
-/// A session with `options` whose statements act as the role it signed in
-/// as; a session that switched role at startup is closed and refused.
+/// A session with `options` that holds the session rules; any other is
+/// closed and refused `INTERNAL`, what it held in the error's source.
 async fn connect_checked(options: &PgConnectOptions) -> Result<PgConnection, AppError> {
     let mut conn = PgConnection::connect_with(options)
         .await
         .map_err(to_app_error)?;
-    let (session_user, current_user): (String, String) = sqlx::query_as(SESSION_ROLES)
-        .fetch_one(&mut conn)
-        .await
-        .map_err(to_app_error)?;
+    let state = read_state(&mut conn).await.map_err(to_app_error)?;
     let database = options
         .get_database()
         .unwrap_or_else(|| options.get_username());
-    if let Err(error) = same_role(database, &session_user, &current_user) {
+    if let Some(refusal) = refusal(database, &state, Rules::Session) {
         // The refusal is the answer whether or not the close succeeds.
         let _ = conn.close().await;
-        return Err(error);
+        return Err(AppError::internal(refusal));
     }
     Ok(conn)
 }
 
-/// `FAILED_PRECONDITION` naming the database and both roles when a session
-/// on `database` acts as `current_user` instead of its `session_user`.
-fn same_role(database: &str, session_user: &str, current_user: &str) -> Result<(), AppError> {
-    let found = preflight::session_findings(session_user, current_user);
-    if found.is_empty() {
-        return Ok(());
+/// The `after_connect` of a [`MaintenancePool`] on `database`: `Ok` when
+/// the connection holds the pool's rules. A refusal is an error the driver
+/// logs before it closes the connection; it never reaches the caller of an
+/// acquire.
+async fn confirm_pool_connection(
+    conn: &mut PgConnection,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    let state = read_state(conn).await?;
+    match refusal(database, &state, Rules::Pool) {
+        None => Ok(()),
+        Some(refusal) => Err(sqlx::Error::Configuration(refusal.into())),
     }
-    let described: Vec<String> = found.iter().map(preflight::describe).collect();
-    Err(AppError::failed_precondition(format!(
-        "the maintenance session on database {database} is refused: {}",
-        described.join("; ")
-    )))
+}
+
+/// What a session reported about itself when it opened ([`SESSION_STATE`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionState {
+    /// The role it signed in as.
+    session_user: String,
+    /// The role its statements act as.
+    current_user: String,
+    /// `search_path` as Postgres shows it.
+    search_path: String,
+    /// `lock_timeout` as Postgres shows it (`10s`).
+    lock_timeout: String,
+    /// `statement_timeout` as Postgres shows it (`2min`).
+    statement_timeout: String,
+    /// `client_min_messages`.
+    client_min_messages: String,
+    /// `transaction_read_only`, `on` or `off`.
+    transaction_read_only: String,
+}
+
+/// The one statement of [`SESSION_STATE`] on `conn`.
+async fn read_state(conn: &mut PgConnection) -> Result<SessionState, sqlx::Error> {
+    let (
+        session_user,
+        current_user,
+        search_path,
+        lock_timeout,
+        statement_timeout,
+        client_min_messages,
+        transaction_read_only,
+    ) = sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
+        SESSION_STATE,
+    )
+    .fetch_one(conn)
+    .await?;
+    Ok(SessionState {
+        session_user,
+        current_user,
+        search_path,
+        lock_timeout,
+        statement_timeout,
+        client_min_messages,
+        transaction_read_only,
+    })
+}
+
+/// The rules a kind of maintenance connection is held to, besides the role
+/// rule, the server-side bounds and `client_min_messages` every kind holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rules {
+    /// A session of `connect` or `connect_to`: the safe `search_path`.
+    Session,
+    /// A connection of a [`MaintenancePool`]: read-only transactions, the
+    /// database's own `search_path`.
+    Pool,
+}
+
+impl Rules {
+    /// The subject of a refusal.
+    const fn subject(self) -> &'static str {
+        match self {
+            Self::Session => "the maintenance session",
+            Self::Pool => "the maintenance pool session",
+        }
+    }
+}
+
+/// The text of the refusal of a connection on `database` whose `state`
+/// breaks `rules`, naming each broken rule; `None` when it holds them.
+fn refusal(database: &str, state: &SessionState, rules: Rules) -> Option<String> {
+    let found = session_refusals(state, rules);
+    if found.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} on database {database} is refused: {}",
+        rules.subject(),
+        found.join("; ")
+    ))
+}
+
+/// Pure: every rule of `rules` that `state` breaks, described, in order:
+/// the role switch, the `search_path`, the two bounds,
+/// `client_min_messages`, read-only transactions. Values are compared as
+/// Postgres shows them: the `search_path` as a list, the bounds in
+/// milliseconds, the words without regard to case.
+fn session_refusals(state: &SessionState, rules: Rules) -> Vec<String> {
+    let mut found: Vec<String> =
+        preflight::session_findings(&state.session_user, &state.current_user)
+            .iter()
+            .map(preflight::describe)
+            .collect();
+    if rules == Rules::Session && !same_search_path(&state.search_path, SAFE_SEARCH_PATH) {
+        found.push(differs("search_path", &state.search_path, SAFE_SEARCH_PATH));
+    }
+    if !same_duration(&state.lock_timeout, LOCK_TIMEOUT) {
+        found.push(differs("lock_timeout", &state.lock_timeout, LOCK_TIMEOUT));
+    }
+    if !same_duration(&state.statement_timeout, STATEMENT_TIMEOUT) {
+        found.push(differs(
+            "statement_timeout",
+            &state.statement_timeout,
+            STATEMENT_TIMEOUT,
+        ));
+    }
+    if !state
+        .client_min_messages
+        .eq_ignore_ascii_case(CLIENT_MIN_MESSAGES)
+    {
+        found.push(differs(
+            "client_min_messages",
+            &state.client_min_messages,
+            CLIENT_MIN_MESSAGES,
+        ));
+    }
+    if rules == Rules::Pool && !state.transaction_read_only.eq_ignore_ascii_case(READ_ONLY) {
+        found.push(differs(
+            "transaction_read_only",
+            &state.transaction_read_only,
+            READ_ONLY,
+        ));
+    }
+    found
+}
+
+/// `its <setting> is <shown>, not <asked>`, the shown value cut for the
+/// log.
+fn differs(setting: &str, shown: &str, asked: &str) -> String {
+    format!(
+        "its {setting} is {}, not {asked}",
+        truncate_for_log(shown, 128)
+    )
+}
+
+/// Whether the `search_path` Postgres shows names the schemas of `asked`,
+/// in order: entries split at commas, spaces trimmed, a quoted entry
+/// unquoted, an unquoted one folded to lower case as Postgres folds it.
+fn same_search_path(shown: &str, asked: &str) -> bool {
+    search_path_entries(shown) == search_path_entries(asked)
+}
+
+/// The schema names of a `search_path` value.
+fn search_path_entries(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|entry| {
+            let entry = entry.trim();
+            match entry
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+            {
+                Some(quoted) => quoted.replace("\"\"", "\""),
+                None => entry.to_ascii_lowercase(),
+            }
+        })
+        .collect()
+}
+
+/// Whether two time settings as Postgres shows them are the same number of
+/// milliseconds; a value that does not parse is never the same.
+fn same_duration(shown: &str, asked: &str) -> bool {
+    matches!(
+        (duration_ms(shown), duration_ms(asked)),
+        (Some(shown), Some(asked)) if shown == asked
+    )
+}
+
+/// A time setting of millisecond base unit in milliseconds: a whole number
+/// with no unit (milliseconds) or one of `ms`, `s`, `min`, `h`, `d`,
+/// spaces allowed around the unit; `None` for anything else.
+fn duration_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let digits = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(digits);
+    let number: u64 = number.parse().ok()?;
+    let factor: u64 = match unit.trim() {
+        "" | "ms" => 1,
+        "s" => 1_000,
+        "min" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    number.checked_mul(factor)
 }
 
 impl fmt::Debug for Maintenance {
@@ -575,6 +813,7 @@ mod tests {
 
     use super::*;
     use crate::TenantId;
+    use crate::cluster::testing;
 
     const TENANT: Uuid = Uuid::from_u128(0x0b9c_2f4e_51a8_4d3b_9e6f_7c1d_2a3b_4c5d);
 
@@ -654,7 +893,7 @@ mod tests {
             session.get_options(),
             Some(
                 "-c work_mem=4MB -c search_path=pg_catalog,pg_temp -c lock_timeout=10s \
-                 -c statement_timeout=120s"
+                 -c statement_timeout=120s -c client_min_messages=warning"
             )
         );
     }
@@ -670,7 +909,7 @@ mod tests {
             pool.get_options(),
             Some(
                 "-c lock_timeout=10s -c statement_timeout=120s \
-                 -c default_transaction_read_only=on"
+                 -c default_transaction_read_only=on -c client_min_messages=warning"
             )
         );
     }
@@ -795,19 +1034,192 @@ mod tests {
         conn.close().await.expect("a dropped session closes Ok");
     }
 
+    /// What a session that holds every rule of both kinds reports, as
+    /// Postgres shows it.
+    fn held() -> SessionState {
+        SessionState {
+            session_user: "orders_maintenance".to_owned(),
+            current_user: "orders_maintenance".to_owned(),
+            search_path: "pg_catalog, pg_temp".to_owned(),
+            lock_timeout: "10s".to_owned(),
+            statement_timeout: "2min".to_owned(),
+            client_min_messages: "warning".to_owned(),
+            transaction_read_only: "on".to_owned(),
+        }
+    }
+
     #[test]
     fn a_session_acting_as_another_role_is_refused() {
-        same_role("orders_upkeep", "orders_maintenance", "orders_maintenance")
-            .expect("the session acts as the role it signed in as");
-        let error = same_role("orders_upkeep", "orders_maintenance", "orders_reader")
-            .expect_err("a switched role is refused");
-        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
-        assert_eq!(error.reason(), None);
+        assert_eq!(refusal("orders_upkeep", &held(), Rules::Session), None);
+        let switched = SessionState {
+            current_user: "orders_reader".to_owned(),
+            ..held()
+        };
         assert_eq!(
-            error.message(),
-            "the maintenance session on database orders_upkeep is refused: the maintenance \
-             session runs as role orders_reader, not as its session role orders_maintenance"
+            refusal("orders_upkeep", &switched, Rules::Session).as_deref(),
+            Some(
+                "the maintenance session on database orders_upkeep is refused: the maintenance \
+                 session runs as role orders_reader, not as its session role orders_maintenance"
+            )
         );
+        assert_eq!(
+            refusal("orders_candidate", &switched, Rules::Pool).as_deref(),
+            Some(
+                "the maintenance pool session on database orders_candidate is refused: the \
+                 maintenance session runs as role orders_reader, not as its session role \
+                 orders_maintenance"
+            )
+        );
+    }
+
+    #[test]
+    fn a_session_that_holds_its_rules_passes_in_any_display_form() {
+        for (search_path, lock_timeout, statement_timeout, client_min_messages) in [
+            ("pg_catalog,pg_temp", "10s", "120s", "warning"),
+            ("pg_catalog, pg_temp", "10000ms", "2min", "WARNING"),
+            (
+                "\"pg_catalog\", \"pg_temp\"",
+                "10000",
+                "120000ms",
+                "Warning",
+            ),
+            ("PG_CATALOG , pg_temp", "10 s", "120000", "warning"),
+        ] {
+            let state = SessionState {
+                search_path: search_path.to_owned(),
+                lock_timeout: lock_timeout.to_owned(),
+                statement_timeout: statement_timeout.to_owned(),
+                client_min_messages: client_min_messages.to_owned(),
+                ..held()
+            };
+            assert_eq!(
+                session_refusals(&state, Rules::Session),
+                [] as [String; 0],
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_broken_rule_of_a_session_is_named_in_order() {
+        let state = SessionState {
+            current_user: "orders_reader".to_owned(),
+            search_path: "public, pg_catalog".to_owned(),
+            lock_timeout: "0".to_owned(),
+            statement_timeout: "1min".to_owned(),
+            client_min_messages: "log".to_owned(),
+            transaction_read_only: "off".to_owned(),
+            ..held()
+        };
+        assert_eq!(
+            session_refusals(&state, Rules::Session),
+            [
+                "the maintenance session runs as role orders_reader, not as its session role \
+                 orders_maintenance",
+                "its search_path is public, pg_catalog, not pg_catalog,pg_temp",
+                "its lock_timeout is 0, not 10s",
+                "its statement_timeout is 1min, not 120s",
+                "its client_min_messages is log, not warning",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pool_session_keeps_its_search_path_and_must_read_only() {
+        let own_path = SessionState {
+            search_path: "\"$user\", public".to_owned(),
+            ..held()
+        };
+        assert_eq!(session_refusals(&own_path, Rules::Pool), [] as [String; 0]);
+        assert_eq!(
+            session_refusals(&own_path, Rules::Session),
+            ["its search_path is \"$user\", public, not pg_catalog,pg_temp"]
+        );
+        let writable = SessionState {
+            transaction_read_only: "off".to_owned(),
+            ..own_path
+        };
+        assert_eq!(
+            session_refusals(&writable, Rules::Pool),
+            ["its transaction_read_only is off, not on"]
+        );
+        assert_eq!(
+            session_refusals(&writable, Rules::Session),
+            ["its search_path is \"$user\", public, not pg_catalog,pg_temp"],
+            "a session's transactions may write"
+        );
+    }
+
+    #[test]
+    fn a_long_shown_value_is_cut() {
+        let state = SessionState {
+            search_path: "s".repeat(500),
+            ..held()
+        };
+        let found = session_refusals(&state, Rules::Session);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].len() < 300, "{}", found[0]);
+    }
+
+    #[test]
+    fn a_search_path_is_compared_as_a_list() {
+        assert!(same_search_path("pg_catalog,pg_temp", SAFE_SEARCH_PATH));
+        assert!(same_search_path("pg_catalog, pg_temp", SAFE_SEARCH_PATH));
+        assert!(same_search_path(
+            "\"pg_catalog\",\"pg_temp\"",
+            SAFE_SEARCH_PATH
+        ));
+        assert!(same_search_path(" Pg_Catalog ,PG_TEMP ", SAFE_SEARCH_PATH));
+        for other in [
+            "public, pg_catalog",
+            "pg_catalog",
+            "pg_temp, pg_catalog",
+            "pg_catalog, pg_temp, public",
+            "\"PG_CATALOG\", pg_temp",
+            "\"\"",
+            "",
+        ] {
+            assert!(!same_search_path(other, SAFE_SEARCH_PATH), "{other}");
+        }
+        assert_eq!(
+            search_path_entries("\"$user\", public, \"a\"\"b\""),
+            ["$user", "public", "a\"b"]
+        );
+    }
+
+    #[test]
+    fn a_time_setting_is_read_in_every_unit_postgres_shows() {
+        for (value, ms) in [
+            ("0", 0),
+            ("1500", 1_500),
+            ("1500ms", 1_500),
+            ("10s", 10_000),
+            ("10 s", 10_000),
+            ("2min", 120_000),
+            ("120000ms", 120_000),
+            ("1h", 3_600_000),
+            ("2d", 172_800_000),
+        ] {
+            assert_eq!(duration_ms(value), Some(ms), "{value}");
+        }
+        for value in [
+            "",
+            "s",
+            "10x",
+            "-1",
+            "+10s",
+            "1.5s",
+            "10us",
+            "18446744073709551615d",
+        ] {
+            assert_eq!(duration_ms(value), None, "{value}");
+        }
+        assert!(same_duration("2min", STATEMENT_TIMEOUT));
+        assert!(same_duration("10s", LOCK_TIMEOUT));
+        assert!(!same_duration("10s", STATEMENT_TIMEOUT));
+        assert!(!same_duration("later", LOCK_TIMEOUT));
+        assert_eq!(duration_ms(LOCK_TIMEOUT), Some(10_000));
+        assert_eq!(duration_ms(STATEMENT_TIMEOUT), Some(120_000));
     }
 
     #[test]
@@ -947,6 +1359,123 @@ mod tests {
         assert!(conn.is_poisoned());
         let error = conn.live().expect_err("poisoned");
         assert_eq!(source(&error), POISONED);
+    }
+
+    /// A `public.current_setting(text)` that raises and a type
+    /// `public.text`: what an unqualified read-back would reach first on a
+    /// database whose own `search_path` puts `public` first.
+    fn hostile_settings(_database: &str) -> String {
+        format!(
+            "CREATE FUNCTION public.current_setting(text) RETURNS text {}; \
+             CREATE TYPE public.text AS (hostile integer)",
+            testing::RAISES
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+    async fn a_session_without_its_rules_is_refused_when_it_opens() {
+        let Some((options, database)) = testing::public_first(hostile_settings).await else {
+            return;
+        };
+        timeout(testing::SCENARIO_TIMEOUT, async {
+            // No startup options, as through something that drops them: the
+            // database's own settings, read back without calling its objects.
+            let error = connect_checked(&options)
+                .await
+                .expect_err("the database's own settings are refused");
+            assert_eq!(error.code(), ErrorCode::Internal);
+            assert_eq!(error.reason(), None);
+            assert_eq!(error.message(), "internal error");
+            let why = source(&error);
+            assert!(
+                why.starts_with(&format!(
+                    "the maintenance session on database {database} is refused: "
+                )),
+                "{why}"
+            );
+            for broken in [
+                "its search_path is public",
+                "its lock_timeout is ",
+                "its statement_timeout is ",
+                "its client_min_messages is ",
+            ] {
+                assert!(why.contains(broken), "{why}");
+            }
+            assert!(!why.contains("hostile"), "{why}");
+
+            let mut conn = PgConnection::connect_with(&options)
+                .await
+                .expect("the superuser connected");
+            let refused = confirm_pool_connection(&mut conn, &database)
+                .await
+                .expect_err("the pool's rules are not held either");
+            let text = refused.to_string();
+            assert!(
+                text.contains(&format!(
+                    "the maintenance pool session on database {database} is refused: "
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains("its transaction_read_only is off, not on"),
+                "{text}"
+            );
+            assert!(!text.contains("search_path"), "{text}");
+            conn.close().await.expect("the session closed");
+
+            let held = connect_checked(&session_options(&options, APPLICATION_NAME))
+                .await
+                .expect("the asked settings outrank the database's");
+            held.close().await.expect("the session closed");
+        })
+        .await
+        .expect("the scenario finished within its 30 s guard");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+    async fn every_kind_of_connection_holds_its_rules_on_a_real_server() {
+        let Some((options, database)) = testing::public_first(hostile_settings).await else {
+            return;
+        };
+        timeout(testing::SCENARIO_TIMEOUT, async {
+            let database = DatabaseName::parse(&database).expect("a harness name is valid");
+            let maintenance = Maintenance::new(options, names());
+            let conn = maintenance
+                .connect()
+                .await
+                .expect("a session holds its rules");
+            conn.close().await.expect("the session closed");
+            let conn = maintenance
+                .connect_to(&database)
+                .await
+                .expect("a handover session holds its rules");
+            conn.close().await.expect("the session closed");
+
+            let pool = maintenance.pool_on(&database).await.expect("a lazy pool");
+            let mut conn = pool
+                .pool()
+                .acquire()
+                .await
+                .expect("the pool's connection holds its rules");
+            let (search_path, statement_timeout, read_only): (String, String, String) =
+                sqlx::query_as(
+                    "SELECT pg_catalog.current_setting('search_path'), \
+                     pg_catalog.current_setting('statement_timeout'), \
+                     pg_catalog.current_setting('transaction_read_only')",
+                )
+                .fetch_one(&mut *conn)
+                .await
+                .expect("the settings were read");
+            assert!(search_path.starts_with("public"), "{search_path}");
+            assert_eq!(statement_timeout, "2min", "120 s as Postgres shows it");
+            assert_eq!(read_only, "on");
+            std::mem::drop(conn);
+            pool.close().await;
+        })
+        .await
+        .expect("the scenario finished within its 30 s guard");
     }
 
     #[test]

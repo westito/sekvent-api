@@ -20,17 +20,22 @@
 //! user (the reach above, the tenant-role checks) while its statements act
 //! as the current user, and the two differ only when the session switched
 //! role at startup (a `role` startup option, `ALTER ROLE … SET role`,
-//! `ALTER DATABASE … SET role`). The rule belongs to the session, not to a
-//! database: it is read once on the maintenance connection and reported
-//! with the findings of the database that connection's check covers (the
-//! maintenance database, or the shared one). Other pools are not held to
-//! it: their session role is only the allowed role of their own database.
+//! `ALTER DATABASE … SET role`). The maintenance role itself (the session
+//! user) passes only when it holds none of `SUPERUSER`, `REPLICATION` and
+//! `BYPASSRLS`. These rules belong to the session, not to a database: they
+//! are read once on the maintenance connection and reported, the role
+//! switch first, with the findings of the database that connection's check
+//! covers (the maintenance database, or the shared one). Other pools are
+//! not held to them: their session role is only the allowed role of their
+//! own database.
 //!
 //! The reads take a fixed number of statements per database however many
-//! roles the cluster holds; the rules ([`protected_facts`], [`findings`])
-//! are pure. Nothing is repaired: a finding is `FAILED_PRECONDITION` naming
-//! the label, the database and the roles at fault, never a URL or a
-//! credential.
+//! roles the cluster holds; the rules ([`protected_facts`], [`findings`],
+//! [`session_findings`], [`maintenance_role_findings`]) are pure. Every
+//! comparison has an operator of exactly its two types in `pg_catalog`,
+//! and every cast, function and other operator is qualified. Nothing is
+//! repaired: a finding is `FAILED_PRECONDITION` naming the label, the
+//! database and the roles at fault, never a URL or a credential.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -42,7 +47,7 @@ use sqlx::{Connection, PgConnection};
 use tokio::time::error::Elapsed;
 
 use crate::ObjectNames;
-use crate::cluster::privileges::{self, DatabaseGrant, DatabasePrivilege, Grantee};
+use crate::cluster::privileges::{self, DatabaseGrant, DatabasePrivilege, Grantee, RoleAttributes};
 
 /// The longest a preflight of one pool may take.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
@@ -110,6 +115,9 @@ pub enum Finding {
         /// The role its statements act as.
         current_user: String,
     },
+    /// The maintenance role holds this attribute (its SQL name:
+    /// `SUPERUSER`, `REPLICATION` or `BYPASSRLS`).
+    MaintenanceAttribute(&'static str),
 }
 
 /// Every role with an effective `CONNECT` on the database (`LOGIN` or not),
@@ -126,7 +134,7 @@ WITH RECURSIVE reached(oid) AS (
     FROM pg_catalog.pg_auth_members m
     JOIN reached x ON m.member = x.oid
 )
-SELECT r.rolname::text, r.rolcanlogin, r.rolsuper,
+SELECT r.rolname::pg_catalog.text, r.rolcanlogin, r.rolsuper,
        EXISTS (SELECT 1 FROM reached x WHERE x.oid = r.oid)
 FROM pg_catalog.pg_database d
 JOIN pg_catalog.pg_roles r
@@ -134,17 +142,38 @@ JOIN pg_catalog.pg_roles r
 WHERE d.datname = $1";
 
 /// The server's version as `server_version_num` (`170002` for 17.2).
-const SERVER_VERSION: &str = "SELECT pg_catalog.current_setting('server_version_num')::int4";
+const SERVER_VERSION: &str =
+    "SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4";
 
 /// The session's role, the role its statements act as, its database and
 /// what identifies that database across connections: its oid and the
 /// server's start time in microseconds. Two sessions with the same three
-/// are on one database.
+/// are on one database. The product is `numeric` by `numeric` with
+/// `pg_catalog`'s operator, named.
 const SESSION: &str = "\
-SELECT session_user::text, current_user::text, d.datname::text, d.oid::int8,
-       (extract(epoch FROM pg_catalog.pg_postmaster_start_time()) * 1000000)::int8
+SELECT session_user::pg_catalog.text, current_user::pg_catalog.text,
+       d.datname::pg_catalog.text, d.oid::pg_catalog.int8,
+       (extract(epoch FROM pg_catalog.pg_postmaster_start_time())
+           OPERATOR(pg_catalog.*) 1000000::pg_catalog.numeric)::pg_catalog.int8
 FROM pg_catalog.pg_database d
 WHERE d.datname = pg_catalog.current_database()";
+
+/// The attributes of the session's role, the role it signed in as.
+const SESSION_ROLE_ATTRIBUTES: &str = "\
+SELECT r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb,
+       r.rolcanlogin, r.rolreplication, r.rolbypassrls
+FROM pg_catalog.pg_roles r
+WHERE r.rolname = session_user";
+
+/// Every catalog statement of this module, by name, for the scan of
+/// `cluster::tests`.
+#[cfg(test)]
+pub(super) const STATEMENTS: [(&str, &str); 4] = [
+    ("CONNECTING_ROLES", CONNECTING_ROLES),
+    ("SERVER_VERSION", SERVER_VERSION),
+    ("SESSION", SESSION),
+    ("SESSION_ROLE_ATTRIBUTES", SESSION_ROLE_ATTRIBUTES),
+];
 
 /// Pure: the facts of one protected database from its owner, its ACL and
 /// the roles that may connect to it. `connecting` keeps the `LOGIN` roles;
@@ -189,6 +218,46 @@ pub fn session_findings(session_user: &str, current_user: &str) -> Vec<Finding> 
         session_user: session_user.to_owned(),
         current_user: current_user.to_owned(),
     }]
+}
+
+/// Pure: the rule of the maintenance role's own attributes: it holds none
+/// of `SUPERUSER`, `REPLICATION` and `BYPASSRLS`. A
+/// [`Finding::MaintenanceAttribute`] for each it holds, in that order.
+pub fn maintenance_role_findings(attributes: &RoleAttributes) -> Vec<Finding> {
+    [
+        (attributes.superuser, "SUPERUSER"),
+        (attributes.replication, "REPLICATION"),
+        (attributes.bypass_rls, "BYPASSRLS"),
+    ]
+    .into_iter()
+    .filter_map(|(held, name)| held.then_some(Finding::MaintenanceAttribute(name)))
+    .collect()
+}
+
+/// The attributes of the session's role (`session_user`, the role it signed
+/// in as, whatever role it acts as), in one statement.
+pub async fn session_role_attributes(conn: &mut PgConnection) -> Result<RoleAttributes, AppError> {
+    let (superuser, inherit, create_role, create_db, login, replication, bypass_rls): (
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+    ) = sqlx::query_as(SESSION_ROLE_ATTRIBUTES)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(to_app_error)?;
+    Ok(RoleAttributes {
+        superuser,
+        inherit,
+        create_role,
+        create_db,
+        login,
+        replication,
+        bypass_rls,
+    })
 }
 
 /// Pure: every rule the facts break, in order: `PUBLIC`'s `CONNECT` and
@@ -326,9 +395,10 @@ pub async fn check_session_database(
 /// The control database allows the control pool's session role, the
 /// maintenance database the maintenance role. When both are one database,
 /// one check runs and allows both roles. A maintenance session whose
-/// `CURRENT_USER` is not its `session_user` is a finding of the database
-/// its check covers. Within one [`TIMEOUT`] for all of
-/// it; the check's error wins over a failed close.
+/// `CURRENT_USER` is not its `session_user`, and a maintenance role that
+/// holds `SUPERUSER`, `REPLICATION` or `BYPASSRLS`, are findings of the
+/// database its check covers. Within one [`TIMEOUT`] for all of it; the
+/// check's error wins over a failed close.
 pub async fn check_control_and_maintenance(
     control: &PgPool,
     maintenance: &PgConnectOptions,
@@ -423,7 +493,10 @@ async fn check_both(
 ) -> Result<(), AppError> {
     let maintenance_session = read_session(maintenance).await?;
     let maintenance_role = maintenance_session.role.clone();
-    let switched = session_findings(&maintenance_session.role, &maintenance_session.current_role);
+    let mut switched =
+        session_findings(&maintenance_session.role, &maintenance_session.current_role);
+    let attributes = session_role_attributes(maintenance).await?;
+    switched.extend(maintenance_role_findings(&attributes));
     let shared = control_session.database == maintenance_session.database
         && control_session.identity == maintenance_session.identity;
     if shared {
@@ -574,6 +647,9 @@ pub(crate) fn describe(finding: &Finding) -> String {
             "the maintenance session runs as role {current_user}, not as its session role \
              {session_user}"
         ),
+        Finding::MaintenanceAttribute(attribute) => {
+            format!("the maintenance role holds {attribute}")
+        }
     }
 }
 
@@ -914,6 +990,81 @@ mod tests {
             error.message(),
             "preflight of the maintenance database orders_upkeep: the maintenance session \
              runs as role orders_reader, not as its session role orders_maintenance"
+        );
+    }
+
+    #[test]
+    fn a_maintenance_role_without_widening_attributes_has_no_finding() {
+        let usual = RoleAttributes {
+            inherit: true,
+            create_role: true,
+            create_db: true,
+            login: true,
+            ..RoleAttributes::default()
+        };
+        assert_eq!(maintenance_role_findings(&usual), [] as [Finding; 0]);
+        assert_eq!(
+            maintenance_role_findings(&RoleAttributes::default()),
+            [] as [Finding; 0]
+        );
+    }
+
+    #[test]
+    fn each_widening_attribute_of_the_maintenance_role_is_a_finding_in_order() {
+        type Case = (fn(&mut RoleAttributes), &'static str);
+        let cases: [Case; 3] = [
+            (|a| a.superuser = true, "SUPERUSER"),
+            (|a| a.replication = true, "REPLICATION"),
+            (|a| a.bypass_rls = true, "BYPASSRLS"),
+        ];
+        for (set, name) in cases {
+            let mut attributes = RoleAttributes::default();
+            set(&mut attributes);
+            assert_eq!(
+                maintenance_role_findings(&attributes),
+                [Finding::MaintenanceAttribute(name)],
+                "{name}"
+            );
+        }
+        let all = RoleAttributes {
+            superuser: true,
+            replication: true,
+            bypass_rls: true,
+            ..RoleAttributes::default()
+        };
+        assert_eq!(
+            maintenance_role_findings(&all),
+            [
+                Finding::MaintenanceAttribute("SUPERUSER"),
+                Finding::MaintenanceAttribute("REPLICATION"),
+                Finding::MaintenanceAttribute("BYPASSRLS"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_maintenance_attribute_is_described_and_named_by_the_verdict() {
+        let finding = Finding::MaintenanceAttribute("REPLICATION");
+        assert_eq!(describe(&finding), "the maintenance role holds REPLICATION");
+        let protected = Protected {
+            label: MAINTENANCE.to_owned(),
+            database: "orders_upkeep".to_owned(),
+            allowed: vec![MAINTENANCE_ROLE.to_owned()],
+        };
+        let found = [
+            Finding::RoleSwitched {
+                session_user: MAINTENANCE_ROLE.to_owned(),
+                current_user: "orders_reader".to_owned(),
+            },
+            finding,
+        ];
+        let error = verdict(&protected, &found).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "preflight of the maintenance database orders_upkeep: the maintenance session \
+             runs as role orders_reader, not as its session role orders_maintenance; the \
+             maintenance role holds REPLICATION"
         );
     }
 

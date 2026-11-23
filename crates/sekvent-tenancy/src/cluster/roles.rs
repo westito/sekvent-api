@@ -16,6 +16,11 @@ const CONNECTION_LIMIT_MAX: u32 = i32::MAX.unsigned_abs();
 /// Whether a role of the name exists.
 const ROLE_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)";
 
+/// Every catalog statement of this module, by name, for the scan of
+/// `cluster::tests`.
+#[cfg(test)]
+pub(super) const STATEMENTS: [(&str, &str); 1] = [("ROLE_EXISTS", ROLE_EXISTS)];
+
 /// Whether `role` exists.
 pub async fn exists(conn: &mut MaintenanceConn, role: &TenantRole) -> Result<bool, AppError> {
     own_role(conn.names(), role)?;
@@ -131,7 +136,10 @@ mod tests {
     use super::*;
     use crate::{ObjectNames, TenantId};
 
-    const VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdHNhbHRzYWx0c2FsdA==$a2V5:a2V5";
+    /// The verifier of RFC 7677's example: a 16-byte salt, two 32-byte keys.
+    const VERIFIER: &str = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
+                            WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:\
+                            wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
 
     fn names() -> ObjectNames {
         ObjectNames::new("app_t_").expect("the prefix is valid")

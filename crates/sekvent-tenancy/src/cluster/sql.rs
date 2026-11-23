@@ -174,7 +174,10 @@ mod tests {
 
     /// `app_t_` and the 32 hex digits of the sample tenant.
     const NAME: &str = "app_t_0b9c2f4e51a84d3b9e6f7c1d2a3b4c5d";
-    const VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdHNhbHRzYWx0c2FsdA==$a2V5:a2V5";
+    /// The verifier of RFC 7677's example: a 16-byte salt, two 32-byte keys.
+    const VERIFIER: &str = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
+                            WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:\
+                            wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
 
     fn tenant() -> TenantId {
         TenantId::from_uuid(Uuid::from_u128(0x0b9c_2f4e_51a8_4d3b_9e6f_7c1d_2a3b_4c5d))
@@ -211,13 +214,17 @@ mod tests {
             create_role(&role(), &verifier(), 5).expose(),
             "CREATE ROLE \"app_t_0b9c2f4e51a84d3b9e6f7c1d2a3b4c5d\" LOGIN NOINHERIT NOCREATEDB \
              NOCREATEROLE CONNECTION LIMIT 5 PASSWORD \
-             'SCRAM-SHA-256$4096:c2FsdHNhbHRzYWx0c2FsdA==$a2V5:a2V5'"
+             'SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
+             WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:\
+             wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU='"
         );
         assert_eq!(
             alter_role(&role(), &verifier(), 2_147_483_647).expose(),
             "ALTER ROLE \"app_t_0b9c2f4e51a84d3b9e6f7c1d2a3b4c5d\" LOGIN NOINHERIT NOCREATEDB \
              NOCREATEROLE CONNECTION LIMIT 2147483647 PASSWORD \
-             'SCRAM-SHA-256$4096:c2FsdHNhbHRzYWx0c2FsdA==$a2V5:a2V5'"
+             'SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
+             WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:\
+             wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU='"
         );
         let printed = format!(
             "{:?} {}",

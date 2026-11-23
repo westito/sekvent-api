@@ -21,6 +21,9 @@ const HEAD: &str = "SCRAM-SHA-256$";
 /// The bytes of a random salt.
 const SALT_BYTES: usize = 16;
 
+/// The bytes of a decoded `StoredKey` or `ServerKey`: one SHA-256.
+const KEY_BYTES: usize = 32;
+
 /// A SCRAM-SHA-256 verifier as Postgres stores it. `Debug` prints the type
 /// name only.
 #[derive(Clone)]
@@ -81,15 +84,14 @@ impl ScramVerifier {
         }
     }
 
-    /// A verifier made elsewhere, after the syntax check of
-    /// [`is_scram_verifier`]. `INTERNAL` otherwise.
+    /// A verifier made elsewhere, after the check of [`is_scram_verifier`]:
+    /// its grammar, a salt that decodes and two keys of 32 bytes each.
+    /// `INTERNAL` otherwise, naming nothing of the text.
     pub fn parse(text: Secret) -> Result<Self, AppError> {
         if is_scram_verifier(text.expose()) {
             Ok(Self { text })
         } else {
-            Err(AppError::internal(
-                "a SCRAM verifier failed the syntax check",
-            ))
+            Err(AppError::internal("a SCRAM verifier failed the check"))
         }
     }
 
@@ -121,8 +123,10 @@ impl fmt::Debug for ScramVerifier {
 /// `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`, each part standard
 /// base64 (`[A-Za-z0-9+/]+={0,2}`), nothing before or after.
 ///
-/// A syntax check only: the parts are not decoded and their lengths are not
-/// checked.
+/// Each part is also decoded (standard base64, canonical padding): the salt
+/// must give at least one byte and both keys exactly 32. Postgres stores any
+/// other text as a plaintext password and hashes it, so a text that fails
+/// here would not act as a verifier there.
 pub fn is_scram_verifier(text: &str) -> bool {
     let Some(rest) = text.strip_prefix(HEAD) else {
         return false;
@@ -141,7 +145,13 @@ pub fn is_scram_verifier(text: &str) -> bool {
     let Some((stored, server)) = keys.split_once(':') else {
         return false;
     };
-    [salt, stored, server].into_iter().all(is_base64_part)
+    if ![salt, stored, server].into_iter().all(is_base64_part) {
+        return false;
+    }
+    let decoded_len = |part: &str| STANDARD.decode(part).ok().map(|bytes| bytes.len());
+    decoded_len(salt).is_some_and(|len| len > 0)
+        && decoded_len(stored) == Some(KEY_BYTES)
+        && decoded_len(server) == Some(KEY_BYTES)
 }
 
 /// `[A-Za-z0-9+/]+={0,2}`.
@@ -169,6 +179,16 @@ mod tests {
     const DERIVED_PASSWORD: &str = "OYf0aWaTG6covLgwbEBL-T_7D3AQj2pe2UOV6g1yxFo";
     const DERIVED_VERIFIER: &str = "SCRAM-SHA-256$4096:AAECAwQFBgcICQoLDA0ODw==$\
         98uW697Y8lEucGv5BzeBdlex6wb8cVY3PbJ/KqnRVrA=:m1OgrUNfxaT6SaLMHrRbz5EIbQTeQ7sD4+gsA35RlMM=";
+    /// 31, 32 and 33 bytes, standard base64.
+    const KEY_31: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHg==";
+    const KEY_32: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const KEY_33: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g";
+    /// [`KEY_32`] without its padding: the right alphabet, no valid decoding.
+    const KEY_32_UNPADDED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+    fn verifier(salt: &str, stored: &str, server: &str) -> String {
+        format!("SCRAM-SHA-256$4096:{salt}${stored}:{server}")
+    }
 
     fn decode(text: &str) -> Vec<u8> {
         STANDARD.decode(text).expect("test base64")
@@ -254,15 +274,43 @@ mod tests {
     }
 
     #[test]
-    fn the_check_accepts_verifiers_of_its_grammar() {
+    fn the_check_accepts_verifiers_of_its_grammar_with_32_byte_keys() {
         for text in [
-            RFC_VERIFIER,
-            DERIVED_VERIFIER,
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:c2FsdHNhbHRzYWx0c2FsdA==$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a+/=$Zg==:Z",
+            RFC_VERIFIER.to_owned(),
+            DERIVED_VERIFIER.to_owned(),
+            // Salts of 1, 3, 5 and 12 bytes: any decodable salt will do.
+            verifier("AA==", KEY_32, KEY_32),
+            verifier("a2V5", KEY_32, KEY_32),
+            verifier("AAECAwQ=", KEY_32, KEY_32),
+            verifier("c2FsdHNhbHRzYWx0", KEY_32, KEY_32),
+            verifier("c2FsdHNhbHRzYWx0c2FsdA==", KEY_32, KEY_32),
         ] {
-            assert!(is_scram_verifier(text), "{text}");
+            assert!(is_scram_verifier(&text), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_check_refuses_parts_that_do_not_decode_to_their_lengths() {
+        for text in [
+            // Short keys: the grammar holds, the lengths do not.
+            verifier("a2V5", "a2V5", "a2V5"),
+            verifier("c2FsdHNhbHRzYWx0c2FsdA==", "a2V5", "a2V5"),
+            verifier("a+/=", "Zg==", "Z"),
+            // Each key of the wrong length on its own.
+            verifier("a2V5", KEY_31, KEY_32),
+            verifier("a2V5", KEY_32, KEY_31),
+            verifier("a2V5", KEY_33, KEY_32),
+            verifier("a2V5", KEY_32, KEY_33),
+            verifier("a2V5", "a2V5", KEY_32),
+            verifier("a2V5", KEY_32, "a2V5"),
+            // The alphabet holds, the decoding fails.
+            verifier("a2V", KEY_32, KEY_32),
+            verifier("Zg=", KEY_32, KEY_32),
+            verifier("Zh==", KEY_32, KEY_32),
+            verifier("a2V5", KEY_32_UNPADDED, KEY_32),
+            verifier("a2V5", KEY_32, KEY_32_UNPADDED),
+        ] {
+            assert!(!is_scram_verifier(&text), "{text}");
         }
     }
 
@@ -313,13 +361,19 @@ mod tests {
         let parsed = ScramVerifier::parse(Secret::new(RFC_VERIFIER)).expect("a valid verifier");
         assert_eq!(parsed.text.expose(), RFC_VERIFIER);
 
-        let refused = "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5'";
-        let error = ScramVerifier::parse(Secret::new(refused)).expect_err("refused");
-        assert_eq!(error.code(), ErrorCode::Internal);
-        assert_eq!(error.reason(), None);
-        let source = error.source().map(ToString::to_string).unwrap_or_default();
-        let shown = format!("{error} {error:?} {source}");
-        assert!(!shown.contains("a2V5"));
+        for refused in [
+            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5'".to_owned(),
+            verifier("a2V5", KEY_31, KEY_32),
+            verifier("a2V5", KEY_32, KEY_32_UNPADDED),
+        ] {
+            let error = ScramVerifier::parse(Secret::new(refused)).expect_err("refused");
+            assert_eq!(error.code(), ErrorCode::Internal);
+            assert_eq!(error.reason(), None);
+            let source = error.source().map(ToString::to_string).unwrap_or_default();
+            let shown = format!("{error} {error:?} {source}");
+            assert!(!shown.contains("a2V5"));
+            assert!(!shown.contains("AAECAw"));
+        }
     }
 
     #[test]

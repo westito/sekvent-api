@@ -4,9 +4,9 @@
 //! the tenant cache, and closed when the operation ends; while it exists it holds one slot of the
 //! cache's capacity, so the cache's connection budget covers it.
 //!
-//! Review rule: [`LifecycleCapability::new`] is called only in `provision.rs`, `state.rs`,
-//! `adopt.rs` and `usage.rs`. `select`, the resolver, the tenant cache, `purge.rs` and the admin
-//! surface never call it; a purge never opens the tenant.
+//! Review rule: [`LifecycleCapability::new`] is called only in `provision.rs`, `state.rs` and
+//! `usage.rs` (and in this file's tests). `select`, the resolver, the tenant cache, `adopt.rs`,
+//! `purge.rs` and the admin surface never call it; a purge never opens the tenant.
 
 use std::error::Error as StdError;
 use std::fmt;

@@ -2,8 +2,11 @@
 //! privileges.
 //!
 //! Every read is static SQL with bound names on the connection it is given,
-//! changes nothing and needs only catalog access. Any membership edge is a
-//! path, whatever its options, and chains are followed to their end.
+//! changes nothing and needs only catalog access. Every comparison has an
+//! operator of exactly its two types in `pg_catalog` (`oid`, `name` with
+//! `text`, `text`), and every cast and function is qualified. Any membership
+//! edge is a path, whatever its options, and chains are followed to their
+//! end.
 //!
 //! The reads ([`role_facts`], [`database_facts`], [`role_may_connect`],
 //! [`roles_that_may_connect`], [`public_may_connect`]) are one statement
@@ -192,22 +195,22 @@ reached(oid) AS (
     UNION
     SELECT m.roleid FROM pg_catalog.pg_auth_members m JOIN reached x ON m.member = x.oid
 )
-SELECT 0::int4, r.rolname::text, session_user::text,
+SELECT 0::pg_catalog.int4, r.rolname::pg_catalog.text, session_user::pg_catalog.text,
        r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb,
        r.rolcanlogin, r.rolreplication, r.rolbypassrls
 FROM pg_catalog.pg_roles r JOIN target t ON r.oid = t.oid
 UNION ALL
-SELECT 1, g.rolname::text, u.rolname::text,
+SELECT 1, g.rolname::pg_catalog.text, u.rolname::pg_catalog.text,
        m.admin_option, m.inherit_option, m.set_option, false, false, false, false
 FROM pg_catalog.pg_auth_members m
 JOIN target t ON t.oid IN (m.roleid, m.member)
 JOIN pg_catalog.pg_roles g ON g.oid = m.roleid
 JOIN pg_catalog.pg_roles u ON u.oid = m.member
 UNION ALL
-SELECT 2, r.rolname::text, NULL, false, false, false, false, false, false, false
+SELECT 2, r.rolname::pg_catalog.text, NULL, false, false, false, false, false, false, false
 FROM reaching x JOIN pg_catalog.pg_roles r ON r.oid = x.oid
 UNION ALL
-SELECT 3, r.rolname::text, NULL, false, false, false, false, false, false, false
+SELECT 3, r.rolname::pg_catalog.text, NULL, false, false, false, false, false, false, false
 FROM reached x JOIN pg_catalog.pg_roles r ON r.oid = x.oid";
 
 /// One row of [`ROLE_FACTS`].
@@ -229,9 +232,10 @@ type RoleRow = (
 /// privileges and `PUBLIC`'s `CONNECT` and `TEMPORARY`. An empty ACL gives
 /// one row without a privilege. A NULL grantee name is `PUBLIC`.
 const DATABASE_FACTS: &str = "\
-SELECT d.datname::text, pg_catalog.pg_get_userbyid(d.datdba)::text, d.datistemplate,
-       CASE WHEN a.grantee = 0::oid THEN NULL
-            ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END,
+SELECT d.datname::pg_catalog.text, pg_catalog.pg_get_userbyid(d.datdba)::pg_catalog.text,
+       d.datistemplate,
+       CASE WHEN a.grantee = 0::pg_catalog.oid THEN NULL
+            ELSE pg_catalog.pg_get_userbyid(a.grantee)::pg_catalog.text END,
        a.privilege_type, a.is_grantable
 FROM pg_catalog.pg_database d
 LEFT JOIN LATERAL pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba)))
@@ -260,7 +264,7 @@ WHERE r.rolname = $1 AND d.datname = $2";
 /// Every `LOGIN` role with an effective `CONNECT`; one NULL row when the
 /// database exists and none may connect, no row when it is missing.
 const ROLES_THAT_MAY_CONNECT: &str = "\
-SELECT r.rolname::text
+SELECT r.rolname::pg_catalog.text
 FROM pg_catalog.pg_database d
 LEFT JOIN pg_catalog.pg_roles r
     ON r.rolcanlogin AND pg_catalog.has_database_privilege(r.oid, d.oid, 'CONNECT')
@@ -271,10 +275,21 @@ const PUBLIC_MAY_CONNECT: &str = "\
 SELECT EXISTS (
     SELECT 1
     FROM pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a
-    WHERE a.grantee = 0::oid AND a.privilege_type = 'CONNECT'
+    WHERE a.grantee = 0::pg_catalog.oid AND a.privilege_type = 'CONNECT'
 )
 FROM pg_catalog.pg_database d
 WHERE d.datname = $1";
+
+/// Every catalog statement of this module, by name, for the scan of
+/// `cluster::tests`.
+#[cfg(test)]
+pub(super) const STATEMENTS: [(&str, &str); 5] = [
+    ("ROLE_FACTS", ROLE_FACTS),
+    ("DATABASE_FACTS", DATABASE_FACTS),
+    ("ROLE_MAY_CONNECT", ROLE_MAY_CONNECT),
+    ("ROLES_THAT_MAY_CONNECT", ROLES_THAT_MAY_CONNECT),
+    ("PUBLIC_MAY_CONNECT", PUBLIC_MAY_CONNECT),
+];
 
 /// The facts of `role`, `None` when there is no such role. One statement.
 pub async fn role_facts(

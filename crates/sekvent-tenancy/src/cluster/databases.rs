@@ -9,36 +9,52 @@ use tokio::time::timeout;
 use crate::cluster::maintenance::{
     Failure, OPERATION_TIMEOUT, begin, end_transaction, own_database, own_role,
 };
+use crate::cluster::privileges::{
+    DatabaseFacts, DatabaseFinding, DatabasePrivilege, Grantee, tenant_database_findings,
+};
 use crate::cluster::{MaintenanceConn, privileges, sql};
 use crate::{DatabaseName, ObjectNames, TenantRole};
 
 /// The owner of a database, no row when there is none.
-const DATABASE_OWNER: &str = "SELECT pg_catalog.pg_get_userbyid(datdba)::text \
+const DATABASE_OWNER: &str = "SELECT pg_catalog.pg_get_userbyid(datdba)::pg_catalog.text \
      FROM pg_catalog.pg_database WHERE datname = $1";
 
 /// Everything the drop decides from, in one read: the owner, whether it is a
 /// template, whether it is the session's own database, the session's role,
 /// whether the expected owner (`$2`) exists.
-const DROP_FACTS: &str = "SELECT pg_catalog.pg_get_userbyid(d.datdba)::text, d.datistemplate, \
-     d.datname = pg_catalog.current_database(), CURRENT_USER::text, \
+const DROP_FACTS: &str = "SELECT pg_catalog.pg_get_userbyid(d.datdba)::pg_catalog.text, \
+     d.datistemplate, d.datname = pg_catalog.current_database(), \
+     CURRENT_USER::pg_catalog.text, \
      EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = $2) \
      FROM pg_catalog.pg_database d WHERE d.datname = $1";
 
 /// The owner of a database and the session's role.
-const SIZE_FACTS: &str = "SELECT pg_catalog.pg_get_userbyid(datdba)::text, CURRENT_USER::text \
+const SIZE_FACTS: &str = "SELECT pg_catalog.pg_get_userbyid(datdba)::pg_catalog.text, \
+     CURRENT_USER::pg_catalog.text \
      FROM pg_catalog.pg_database WHERE datname = $1";
 
 /// The owner of a database and whether its ACL (or the default one) gives
 /// `PUBLIC` `CONNECT`, in one row; no row when there is no such database.
-const DATABASE_ACCESS: &str = "SELECT pg_catalog.pg_get_userbyid(d.datdba)::text, \
+const DATABASE_ACCESS: &str = "SELECT pg_catalog.pg_get_userbyid(d.datdba)::pg_catalog.text, \
      EXISTS (SELECT 1 \
      FROM pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a \
-     WHERE a.grantee = 0::oid AND a.privilege_type = 'CONNECT') \
+     WHERE a.grantee = 0::pg_catalog.oid AND a.privilege_type = 'CONNECT') \
      FROM pg_catalog.pg_database d WHERE d.datname = $1";
 
 /// The size of a database, no row when it is gone.
 const DATABASE_SIZE: &str = "SELECT pg_catalog.pg_database_size(oid) \
      FROM pg_catalog.pg_database WHERE datname = $1";
+
+/// Every catalog statement of this module, by name, for the scan of
+/// `cluster::tests`.
+#[cfg(test)]
+pub(super) const STATEMENTS: [(&str, &str); 5] = [
+    ("DATABASE_OWNER", DATABASE_OWNER),
+    ("DROP_FACTS", DROP_FACTS),
+    ("SIZE_FACTS", SIZE_FACTS),
+    ("DATABASE_ACCESS", DATABASE_ACCESS),
+    ("DATABASE_SIZE", DATABASE_SIZE),
+];
 
 /// SQLSTATE `insufficient_privilege`.
 const INSUFFICIENT_PRIVILEGE: &str = "42501";
@@ -47,10 +63,14 @@ const INSUFFICIENT_PRIVILEGE: &str = "42501";
 /// owns, and in either case applies the CONNECT restriction and opens it.
 /// `database` must be an object name of the connection's names.
 ///
-/// A new database is created closed (`ALLOW_CONNECTIONS false`) and opens
-/// only together with its restriction, so a call resumed after a failure at
-/// any point converges. An existing database with drift is refused and left
-/// as it was.
+/// `owner` is checked first (`privileges::check_tenant_role`). A new
+/// database is created closed (`ALLOW_CONNECTIONS false`) and opens only
+/// together with its restriction, so a call resumed after a failure at any
+/// point converges. An existing database with drift is refused and left as
+/// it was. After the restriction the database is read once more: a finding
+/// of `privileges::tenant_database_findings` for `owner`, or a `CONNECT`
+/// of `PUBLIC`, is `INTERNAL` with the findings in the error's source, and
+/// nothing is repaired (the restriction stays).
 pub async fn create(
     conn: &mut MaintenanceConn,
     database: &DatabaseName,
@@ -156,6 +176,61 @@ async fn restrict_steps(
     Ok(())
 }
 
+/// After [`restrict_connect`], in one read: `database` has no finding of
+/// [`tenant_database_findings`] for `owner` and `PUBLIC` holds no
+/// `CONNECT`. Anything else, and a missing database, is `INTERNAL` naming
+/// every finding in its source; nothing is repaired.
+pub(crate) async fn check_restricted(
+    conn: &mut PgConnection,
+    database: &DatabaseName,
+    owner: &TenantRole,
+) -> Result<(), AppError> {
+    let facts = privileges::database_facts(conn, database.as_str()).await?;
+    restricted_verdict(database.as_str(), owner.as_str(), facts.as_ref())
+}
+
+/// Pure: what is wrong with a database `owner` owns after its restriction:
+/// every finding of [`tenant_database_findings`], then each `CONNECT` of
+/// `PUBLIC` that rule lets pass (one without grant option).
+fn restricted_findings(facts: &DatabaseFacts, owner: &str) -> Vec<DatabaseFinding> {
+    let mut found = tenant_database_findings(facts, owner);
+    found.extend(
+        facts
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.grantee == Grantee::Public
+                    && grant.privilege == DatabasePrivilege::Connect
+                    && !grant.grantable
+            })
+            .cloned()
+            .map(DatabaseFinding::Grant),
+    );
+    found
+}
+
+/// The outcome of [`check_restricted`] for what was read.
+fn restricted_verdict(
+    database: &str,
+    owner: &str,
+    facts: Option<&DatabaseFacts>,
+) -> Result<(), AppError> {
+    let Some(facts) = facts else {
+        return Err(AppError::internal(format!(
+            "tenant database {database} does not exist after its restriction"
+        )));
+    };
+    let found = restricted_findings(facts, owner);
+    if found.is_empty() {
+        return Ok(());
+    }
+    let described: Vec<String> = found.iter().map(ToString::to_string).collect();
+    Err(AppError::internal(format!(
+        "tenant database {database} is not as expected after its restriction: {}",
+        described.join("; ")
+    )))
+}
+
 /// The owner of `database`, `None` when there is no such database.
 async fn database_owner(
     session: &mut PgConnection,
@@ -206,7 +281,9 @@ async fn create_on(
             .into());
         }
     }
-    restrict_connect(session, database, owner).await
+    restrict_connect(session, database, owner).await?;
+    check_restricted(session, database, owner).await?;
+    Ok(())
 }
 
 /// What the drop's one catalog read found about an existing database.
@@ -414,10 +491,13 @@ mod tests {
     use std::error::Error as _;
 
     use sekvent_error::ErrorCode;
+    use sqlx::Connection;
     use uuid::Uuid;
 
     use super::*;
     use crate::TenantId;
+    use crate::cluster::privileges::DatabaseGrant;
+    use crate::cluster::testing;
 
     const OWNER: &str = "app_t_0b9c2f4e51a84d3b9e6f7c1d2a3b4c5d";
     const MAINTENANCE: &str = "orders_maintenance";
@@ -572,6 +652,201 @@ mod tests {
             assert_eq!(error.code(), ErrorCode::Internal);
             assert_eq!(error.reason(), None);
         }
+    }
+
+    fn entry(grantee: Grantee, privilege: DatabasePrivilege, grantable: bool) -> DatabaseGrant {
+        DatabaseGrant {
+            grantee,
+            privilege,
+            grantable,
+        }
+    }
+
+    fn owner_entry(privilege: DatabasePrivilege) -> DatabaseGrant {
+        entry(Grantee::Role(OWNER.to_owned()), privilege, true)
+    }
+
+    /// A database `owner` owns with `grants` as its ACL.
+    fn owned(owner: &str, grants: Vec<DatabaseGrant>) -> DatabaseFacts {
+        DatabaseFacts {
+            name: OWNER.to_owned(),
+            owner: owner.to_owned(),
+            template: false,
+            grants,
+        }
+    }
+
+    /// The ACL the restriction leaves: the owner's privileges and `PUBLIC`'s
+    /// `TEMPORARY`.
+    fn restricted_acl() -> Vec<DatabaseGrant> {
+        vec![
+            entry(Grantee::Public, DatabasePrivilege::Temporary, false),
+            owner_entry(DatabasePrivilege::Create),
+            owner_entry(DatabasePrivilege::Temporary),
+            owner_entry(DatabasePrivilege::Connect),
+        ]
+    }
+
+    #[test]
+    fn a_restricted_database_passes_its_read() {
+        let facts = owned(OWNER, restricted_acl());
+        assert_eq!(
+            restricted_findings(&facts, OWNER),
+            [] as [DatabaseFinding; 0]
+        );
+        restricted_verdict(OWNER, OWNER, Some(&facts)).expect("as the restriction left it");
+    }
+
+    #[test]
+    fn public_connect_after_the_restriction_is_a_finding() {
+        let left = entry(Grantee::Public, DatabasePrivilege::Connect, false);
+        let mut grants = restricted_acl();
+        grants.push(left.clone());
+        let facts = owned(OWNER, grants);
+        assert_eq!(
+            tenant_database_findings(&facts, OWNER),
+            [] as [DatabaseFinding; 0],
+            "the tenant rules allow it"
+        );
+        assert_eq!(
+            restricted_findings(&facts, OWNER),
+            [DatabaseFinding::Grant(left)]
+        );
+        let error = restricted_verdict(OWNER, OWNER, Some(&facts)).expect_err("PUBLIC may connect");
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.reason(), None);
+        assert_eq!(error.message(), "internal error");
+        assert_eq!(
+            source(&error),
+            format!(
+                "tenant database {OWNER} is not as expected after its restriction: PUBLIC holds \
+                 CONNECT"
+            )
+        );
+    }
+
+    #[test]
+    fn every_finding_of_the_tenant_rules_counts_after_the_restriction() {
+        let mut grants = restricted_acl();
+        grants.push(entry(Grantee::Public, DatabasePrivilege::Create, false));
+        grants.push(entry(
+            Grantee::Role("orders_reader".to_owned()),
+            DatabasePrivilege::Connect,
+            true,
+        ));
+        let facts = DatabaseFacts {
+            template: true,
+            ..owned(MAINTENANCE, grants)
+        };
+        let error = restricted_verdict(OWNER, OWNER, Some(&facts)).expect_err("drift");
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.reason(), None);
+        let why = source(&error);
+        for part in [
+            "it is owned by orders_maintenance",
+            "it is a template",
+            "PUBLIC holds CREATE",
+            "role orders_reader holds CONNECT with grant option",
+        ] {
+            assert!(why.contains(part), "{why}");
+        }
+        assert!(!why.contains("PUBLIC holds CONNECT"), "{why}");
+    }
+
+    #[test]
+    fn a_public_grant_option_is_named_once() {
+        let mut grants = restricted_acl();
+        let option = entry(Grantee::Public, DatabasePrivilege::Connect, true);
+        grants.push(option.clone());
+        assert_eq!(
+            restricted_findings(&owned(OWNER, grants), OWNER),
+            [DatabaseFinding::Grant(option)]
+        );
+    }
+
+    #[test]
+    fn a_database_gone_after_its_restriction_is_internal() {
+        let error = restricted_verdict(OWNER, OWNER, None).expect_err("gone");
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.reason(), None);
+        assert!(
+            source(&error).contains("does not exist"),
+            "{}",
+            source(&error)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+    async fn the_read_after_the_restriction_sees_what_the_owners_revoke_leaves() {
+        let tenant = TenantId::from_uuid(Uuid::new_v4());
+        let role = names().role(tenant);
+        let database = names().database(tenant);
+        let grantor = format!("{}_grantor", role.as_str());
+        let roles = format!("CREATE ROLE {}; CREATE ROLE \"{grantor}\"", role.quoted());
+        let Some((options, _)) = testing::public_first(|_| roles).await else {
+            return;
+        };
+        timeout(testing::SCENARIO_TIMEOUT, async {
+            let mut admin = PgConnection::connect_with(&options)
+                .await
+                .expect("the superuser connected");
+            testing::execute(
+                &mut admin,
+                &format!(
+                    "CREATE DATABASE {} OWNER {}",
+                    database.quoted(),
+                    role.quoted()
+                ),
+            )
+            .await;
+            let error = check_restricted(&mut admin, &database, &role)
+                .await
+                .expect_err("the default ACL gives PUBLIC CONNECT");
+            assert_eq!(error.code(), ErrorCode::Internal);
+            assert!(
+                source(&error).ends_with(": PUBLIC holds CONNECT"),
+                "{}",
+                source(&error)
+            );
+
+            testing::execute(&mut admin, &sql::revoke_connect_from_public(&database)).await;
+            check_restricted(&mut admin, &database, &role)
+                .await
+                .expect("the owner's revoke restricted it");
+
+            // A role with a grant option grants PUBLIC a CONNECT of its own,
+            // which the owner's revoke leaves in place.
+            testing::execute(
+                &mut admin,
+                &format!(
+                    "GRANT CONNECT ON DATABASE {} TO \"{grantor}\" WITH GRANT OPTION",
+                    database.quoted()
+                ),
+            )
+            .await;
+            testing::execute(
+                &mut admin,
+                &format!(
+                    "SET ROLE \"{grantor}\"; GRANT CONNECT ON DATABASE {} TO PUBLIC; RESET ROLE",
+                    database.quoted()
+                ),
+            )
+            .await;
+            testing::execute(&mut admin, &sql::revoke_connect_from_public(&database)).await;
+            let error = check_restricted(&mut admin, &database, &role)
+                .await
+                .expect_err("PUBLIC keeps the grantor's CONNECT");
+            let why = source(&error);
+            assert!(
+                why.contains(&format!("role {grantor} holds CONNECT with grant option")),
+                "{why}"
+            );
+            assert!(why.ends_with("; PUBLIC holds CONNECT"), "{why}");
+            admin.close().await.expect("the session closed");
+        })
+        .await
+        .expect("the scenario finished within its 30 s guard");
     }
 
     #[tokio::test]

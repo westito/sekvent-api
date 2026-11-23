@@ -877,3 +877,46 @@ async fn a_maintenance_session_that_switched_role_is_refused() {
     })
     .await;
 }
+
+/// A maintenance role that holds `REPLICATION` or `BYPASSRLS` is refused
+/// with the maintenance database's findings, each attribute named; without
+/// them the same cluster passes.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_maintenance_role_with_a_widening_attribute_is_refused() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(async {
+        let maintenance = quote(cluster.maintenance_role());
+        let pool = cluster.control_pool().await;
+        for attribute in ["REPLICATION", "BYPASSRLS"] {
+            admin_sql(&cluster, &format!("ALTER ROLE {maintenance} {attribute}")).await;
+            let error = preflight::check_control_and_maintenance(
+                &pool,
+                &cluster.maintenance_options(),
+                cluster.names(),
+            )
+            .await
+            .unwrap_err();
+            assert_refused(
+                &cluster,
+                &error,
+                "maintenance",
+                cluster.maintenance_database(),
+                &format!("the maintenance role holds {attribute}"),
+            );
+            wait_for_no_sessions(&cluster, cluster.maintenance_database()).await;
+            admin_sql(&cluster, &format!("ALTER ROLE {maintenance} NO{attribute}")).await;
+        }
+        preflight::check_control_and_maintenance(
+            &pool,
+            &cluster.maintenance_options(),
+            cluster.names(),
+        )
+        .await
+        .expect("without the attributes the maintenance role passes");
+        pool.close().await;
+    })
+    .await;
+}

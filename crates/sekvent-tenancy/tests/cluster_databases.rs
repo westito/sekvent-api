@@ -966,12 +966,34 @@ async fn a_pool_on_session_is_read_only() {
     .await;
 }
 
+/// The refusal of a maintenance session when it opens: `INTERNAL` without a
+/// reason, the generic message, what was wrong in the source only, no
+/// credential anywhere.
+fn assert_refused_when_opened(cluster: &Cluster, error: &AppError, database: &str, why: &str) {
+    assert_eq!(error.code(), ErrorCode::Internal, "{error:?}");
+    assert_eq!(error.reason(), None);
+    assert_eq!(error.message(), "internal error");
+    let text = source(error);
+    assert!(
+        text.contains(&format!("maintenance session on database {database}")),
+        "{text}"
+    );
+    assert!(text.contains(why), "{text}");
+    assert!(
+        !format!("{error:?}").contains(cluster.maintenance_password().expose()),
+        "no credential is printed"
+    );
+}
+
 /// A maintenance session that a role setting switches to another role at
 /// startup is closed and refused when it opens, before any operation: as
 /// the role's setting on the maintenance database, and as the setting of a
-/// database the handover connects to.
+/// database the handover connects to. A pool connection is refused the same
+/// way, and its acquire fails with the driver's timeout, which names
+/// nothing.
 #[tokio::test]
 #[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+#[allow(clippy::too_many_lines)]
 async fn a_session_that_switched_role_is_refused_when_it_opens() {
     let Some(cluster) = Cluster::start().await else {
         return;
@@ -1004,21 +1026,30 @@ async fn a_session_that_switched_role_is_refused_when_it_opens() {
             .connect()
             .await
             .expect_err("the session acts as another role");
-        assert_eq!(error.code(), ErrorCode::FailedPrecondition, "{error:?}");
-        assert_eq!(error.reason(), None);
-        assert!(
-            error.message().contains(&format!(
-                "maintenance session on database {}",
-                cluster.maintenance_database()
-            )),
-            "{}",
-            error.message()
-        );
-        assert!(error.message().contains(&switched), "{}", error.message());
-        assert!(
-            !format!("{error:?}").contains(cluster.maintenance_password().expose()),
-            "no credential is printed"
-        );
+        assert_refused_when_opened(&cluster, &error, cluster.maintenance_database(), &switched);
+        sekvent_testing::await_until!(cluster.sessions_of(cluster.maintenance_role()).await == 0);
+
+        // A pool connection is refused, closed and tried again until the
+        // acquire's 10 s bound; the caller sees only the driver's timeout.
+        let pool = maintenance
+            .pool_on(&name(cluster.maintenance_database()))
+            .await
+            .expect("the pool holds the permit");
+        let refused = pool
+            .pool()
+            .acquire()
+            .await
+            .expect_err("no pool connection acts as the maintenance role");
+        assert!(matches!(refused, sqlx::Error::PoolTimedOut), "{refused:?}");
+        let shown = format!("{refused} {refused:?}");
+        for named in [
+            stand_in.as_str(),
+            cluster.maintenance_role(),
+            cluster.maintenance_database(),
+        ] {
+            assert!(!shown.contains(named), "{shown}");
+        }
+        pool.close().await;
         sekvent_testing::await_until!(cluster.sessions_of(cluster.maintenance_role()).await == 0);
 
         cluster
@@ -1041,19 +1072,62 @@ async fn a_session_that_switched_role_is_refused_when_it_opens() {
             .connect_to(&name(&candidate))
             .await
             .expect_err("the candidate's setting switches the session");
-        assert_eq!(error.code(), ErrorCode::FailedPrecondition, "{error:?}");
-        assert!(
-            error
-                .message()
-                .contains(&format!("maintenance session on database {candidate}")),
-            "{}",
-            error.message()
-        );
-        assert!(error.message().contains(&switched), "{}", error.message());
+        assert_refused_when_opened(&cluster, &error, &candidate, &switched);
 
         // The permit came back each time, and the maintenance database's
         // sessions act as the maintenance role again.
         let conn = maintenance.connect().await.expect("connected");
+        conn.close().await.expect("closed");
+    }))
+    .await;
+}
+
+/// The closest a database can come to keeping a `PUBLIC` `CONNECT` through
+/// its owner's revoke is a grant of another grantor, which needs a grant
+/// option of that grantor's own: the check of an existing database refuses
+/// that entry before the restriction, `INTERNAL`, and changes nothing.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_public_connect_of_another_grantor_is_refused_before_the_restriction() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let mut conn = cluster.maintenance().connect().await.expect("connected");
+        let tenant = tenant_role(&cluster, &mut conn).await;
+        cluster
+            .create_database_named(tenant.database.as_str(), tenant.role.as_str())
+            .await;
+        let grantor = cluster.create_role("grantor", "").await;
+        let database = common::quote(tenant.database.as_str());
+        let grantor_quoted = common::quote(&grantor);
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!(
+                    "GRANT CONNECT ON DATABASE {database} TO {grantor_quoted} WITH GRANT OPTION; \
+                     SET ROLE {grantor_quoted}; \
+                     GRANT CONNECT ON DATABASE {database} TO PUBLIC; \
+                     RESET ROLE"
+                ),
+            )
+            .await;
+        let before = database_state(&cluster, tenant.database.as_str()).await;
+        let error = databases::create(&mut conn, &tenant.database, &tenant.role)
+            .await
+            .expect_err("the grantor's entry is refused");
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.reason(), None);
+        assert!(
+            source(&error).contains(&format!("role {grantor} holds CONNECT with grant option")),
+            "{}",
+            source(&error)
+        );
+        assert!(!conn.is_poisoned());
+        assert_eq!(
+            database_state(&cluster, tenant.database.as_str()).await,
+            before
+        );
         conn.close().await.expect("closed");
     }))
     .await;

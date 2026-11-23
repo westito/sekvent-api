@@ -1,11 +1,13 @@
 //! The listener of the invalidation channel and its periodic resync.
 //!
 //! The listener holds one `LISTEN` session on the control pool. A change forgets the tenant's
-//! lookups, reloads the host snapshot (and with it the tenant's entry in the baseline the resync
-//! compares with), then retires the tenant's scope and tells the sink; a hint goes to the sink
+//! lookups and retires the tenant's scope at once, so a cached scope (one a lookup without a
+//! row read would still hand out) is gone before anything is awaited; it then reloads the host
+//! snapshot (and with it the tenant's entry in the baseline the resync compares with), retires
+//! the scope again, also when the reload failed, and tells the sink; a hint goes to the sink
 //! alone. Periodically it resyncs: it clears every lookup, reloads the active tenants, retires
 //! the scope of each one that changed, joined or left since the baseline, and tells the sink.
-//! Because a scope is retired only after the read that becomes the baseline, a scope opened
+//! Because a scope is retired again after the read that becomes the baseline, a scope opened
 //! before that read never survives it, so a later change whose notification is lost still
 //! differs from the baseline at the next successful resync (unless another change restored what
 //! the baseline holds).
@@ -535,10 +537,14 @@ impl<T: Target> State<'_, T> {
         }
     }
 
-    /// Forget, reload, retire, tell. The scope is retired after the read that becomes the
-    /// tenant's baseline, so no scope opened before that read outlives it.
+    /// Forget, retire, reload, retire again, tell. The first retirement takes the scope out
+    /// before the reload is awaited, so the cache stops handing out the scope of a tenant that
+    /// changed while the control database is read. The second comes after the read that
+    /// becomes the tenant's baseline, so no scope opened before that read outlives it; it runs
+    /// also when the reload failed.
     async fn change(&mut self, tenant: TenantId, kind: &ChangeKind) {
         self.target.forget(tenant);
+        self.target.invalidate(tenant);
         match self.target.refresh().await {
             Ok(load) => {
                 if let Some(info) = load.into_iter().find(|info| info.id == tenant) {
@@ -663,6 +669,8 @@ mod tests {
         Fail,
         /// Reads the world once the gate opens.
         Gated(oneshot::Receiver<()>),
+        /// Fails once the gate opens.
+        GatedFail(oneshot::Receiver<()>),
         /// Reads the world after this long.
         Slow(Duration),
         /// Waits for `before`, reads the world, tells `read`, waits for `after`, returns.
@@ -707,6 +715,10 @@ mod tests {
                 Load::Fail => return Err(AppError::unavailable("the control database is away")),
                 Load::Gated(gate) => {
                     let _ = gate.await;
+                }
+                Load::GatedFail(gate) => {
+                    let _ = gate.await;
+                    return Err(AppError::unavailable("the control database is away"));
                 }
                 Load::Slow(after) => tokio::time::sleep(after).await,
                 Load::Around {
@@ -982,7 +994,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_change_forgets_reloads_invalidates_and_then_tells_the_sink() {
+    async fn a_change_forgets_retires_reloads_retires_again_and_then_tells_the_sink() {
         let a = tenant(1);
         let (rig, source, mut s) = rig(vec![one_host(1)], vec![]);
         let (result, rest) = play(source, rig, EVERY, async move {
@@ -990,8 +1002,68 @@ mod tests {
             s.expect(Call::Ready).await;
             s.payload(format!("t:{a}:state"));
             s.expect(Call::Forget(a)).await;
+            s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Refresh).await;
             s.expect(Call::Invalidate(a)).await;
+            s.expect(Call::Change(a, ChangeKind::STATE)).await;
+            s.stop();
+            s
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(rest, Vec::<Call>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_retires_the_scope_before_the_reload_and_again_after_it() {
+        let a = tenant(1);
+        let (open, gate) = oneshot::channel();
+        let (rig, source, mut s) = rig(vec![one_host(1)], vec![Load::World, Load::Gated(gate)]);
+        let (result, rest) = play(source, rig, EVERY, async move {
+            s.reopen(a);
+            s.expect(Call::Refresh).await;
+            s.expect(Call::Ready).await;
+            s.payload(format!("t:{a}:state"));
+            s.expect(Call::Forget(a)).await;
+            s.expect(Call::Invalidate(a)).await;
+            s.expect(Call::Refresh).await;
+            // The reload is still waiting and the scope is already out.
+            assert_eq!(s.scope(a), None);
+            // A request reopens it while the control database is read.
+            s.reopen(a);
+            assert_eq!(s.scope(a), Some(one_host(1)));
+            open.send(()).unwrap();
+            s.expect(Call::Invalidate(a)).await;
+            assert_eq!(s.scope(a), None);
+            s.expect(Call::Change(a, ChangeKind::STATE)).await;
+            s.stop();
+            s
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(rest, Vec::<Call>::new());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_whose_reload_fails_retires_the_scope_before_and_after_it() {
+        let a = tenant(1);
+        let (open, gate) = oneshot::channel();
+        let loads = vec![Load::World, Load::GatedFail(gate)];
+        let (rig, source, mut s) = rig(vec![one_host(1)], loads);
+        let (result, rest) = play(source, rig, EVERY, async move {
+            s.reopen(a);
+            s.expect(Call::Refresh).await;
+            s.expect(Call::Ready).await;
+            s.payload(format!("t:{a}:state"));
+            s.expect(Call::Forget(a)).await;
+            s.expect(Call::Invalidate(a)).await;
+            s.expect(Call::Refresh).await;
+            assert_eq!(s.scope(a), None);
+            s.reopen(a);
+            open.send(()).unwrap();
+            // The reload fails; the scope reopened during it is retired all the same.
+            s.expect(Call::Invalidate(a)).await;
+            assert_eq!(s.scope(a), None);
             s.expect(Call::Change(a, ChangeKind::STATE)).await;
             s.stop();
             s
@@ -1012,6 +1084,7 @@ mod tests {
             s.expect(Call::Ready).await;
             s.payload(format!("t:{a}:plan"));
             s.expect(Call::Forget(a)).await;
+            s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Refresh).await;
             s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Change(a, plan)).await;
@@ -1042,6 +1115,7 @@ mod tests {
             ]);
             s.payload(format!("t:{a}:hosts"));
             s.expect(Call::Forget(a)).await;
+            s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Refresh).await;
             s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Change(a, ChangeKind::HOSTS)).await;
@@ -1067,6 +1141,7 @@ mod tests {
             s.set_world(vec![one_host(2)]);
             s.payload(format!("t:{a}:state"));
             s.expect(Call::Forget(a)).await;
+            s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Refresh).await;
             s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Change(a, ChangeKind::STATE)).await;
@@ -1200,6 +1275,7 @@ mod tests {
             s.expect(Call::Ready).await;
             s.payload(format!("t:{a}:state"));
             s.expect(Call::Forget(a)).await;
+            s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Refresh).await;
             tokio::time::advance(EVERY * 3 + EVERY / 2).await;
             open.send(()).unwrap();
@@ -1318,20 +1394,23 @@ mod tests {
             s.set_world(vec![version(2)]);
             s.payload(format!("t:{a}:state"));
             s.expect(Call::Forget(a)).await;
+            s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Refresh).await;
+            // The scope opened before the change is out before the reload reads.
+            assert_eq!(s.scope(a), None);
             // Before the read: a request reopens the scope, then a change commits whose
             // notification is lost.
             s.reopen(a);
             s.set_world(vec![version(3)]);
             open_before.send(()).unwrap();
             was_read.await.unwrap();
-            // After the read, before the scope is retired: the same again.
+            // After the read, before the scope is retired again: the same again.
             s.reopen(a);
             s.set_world(vec![version(4)]);
             open_after.send(()).unwrap();
             s.expect(Call::Invalidate(a)).await;
             s.expect(Call::Change(a, ChangeKind::STATE)).await;
-            // No scope opened before the retirement survives it.
+            // No scope opened before the second retirement survives it.
             assert_eq!(s.scope(a), None);
             // After it: a request opens the scope, and a change whose notification is lost
             // leaves that scope stale.

@@ -50,7 +50,10 @@ impl Minter {
     /// A token for the product instance `audience`, the RPC `op` (its path without the leading
     /// slash), at most one `tenant`, on behalf of `subject`, with the product's `extra` claims
     /// flattened: lifetime [`TOKEN_LIFETIME`], a fresh random id. Absent optional claims are
-    /// omitted, never `null`.
+    /// omitted, never `null`, and an extra claim that serializes to `null` is refused
+    /// (`INVALID_ARGUMENT`): the verifier refuses a token with any top-level `null` claim. Skip
+    /// such a field instead (`#[serde(skip_serializing_if = "Option::is_none")]`); a `null`
+    /// nested inside an extra claim's value is kept.
     pub fn mint<X: Serialize>(
         &self,
         audience: &str,
@@ -113,7 +116,8 @@ struct AdminCustom<'a> {
 }
 
 /// `extra` as the object flattened into the token. `INVALID_ARGUMENT` when it does not serialize
-/// to an object, or names a claim the minter sets.
+/// to an object, names a claim the minter sets, or has a member that is `null` (the verifier
+/// refuses a token with a top-level `null` claim). The messages name no claim and no value.
 fn extra_claims<X: Serialize>(extra: &X) -> Result<Map<String, Value>, AppError> {
     let Ok(Value::Object(object)) = serde_json::to_value(extra) else {
         return Err(AppError::invalid_argument(
@@ -126,6 +130,11 @@ fn extra_claims<X: Serialize>(extra: &X) -> Result<Map<String, Value>, AppError>
     {
         return Err(AppError::invalid_argument(
             "the extra admin claims name a claim the minter sets",
+        ));
+    }
+    if object.values().any(Value::is_null) {
+        return Err(AppError::invalid_argument(
+            "an extra admin claim is null; omit it instead",
         ));
     }
     Ok(object)
@@ -282,6 +291,55 @@ mod tests {
         let (_, payload) = parts(&minted.token);
         assert_eq!(payload["ticket"], "T-2");
         assert_eq!(payload["level"], 2);
+    }
+
+    #[derive(Serialize)]
+    struct Nullable {
+        ticket: &'static str,
+        reviewer: Option<&'static str>,
+    }
+
+    #[test]
+    fn an_extra_claim_that_is_null_is_refused_and_a_nested_null_is_kept() {
+        let signer = minter();
+        let refused = [
+            json!({ "ticket": null }),
+            json!({ "ticket": "T-3", "reviewer": null }),
+        ];
+        for extra in refused {
+            let error = signer
+                .mint("orders-eu", None, OP, "operator-1", &extra)
+                .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert!(!error.message().contains("reviewer"));
+            assert!(!error.message().contains("ticket"));
+        }
+        let error = signer
+            .mint(
+                "orders-eu",
+                None,
+                OP,
+                "operator-1",
+                &Nullable {
+                    ticket: "T-4",
+                    reviewer: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+
+        let minted = signer
+            .mint(
+                "orders-eu",
+                None,
+                OP,
+                "operator-1",
+                &json!({ "ticket": { "reviewer": null }, "list": [null] }),
+            )
+            .unwrap();
+        let (_, payload) = parts(&minted.token);
+        assert_eq!(payload["ticket"], json!({ "reviewer": null }));
+        assert_eq!(payload["list"], json!([null]));
     }
 
     #[test]

@@ -4,8 +4,9 @@
 mod common;
 
 use std::borrow::Cow;
+use std::error::Error as _;
 
-use common::Cluster;
+use common::{Cluster, quote};
 use sekvent_config::Secret;
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_tenancy::cluster::handover::{self, Adoption};
@@ -189,6 +190,24 @@ fn sqlstate(err: &sqlx::Error) -> Option<String> {
     sekvent_db::sqlstate(err).map(Cow::into_owned)
 }
 
+fn source(err: &AppError) -> String {
+    err.source().map(ToString::to_string).unwrap_or_default()
+}
+
+/// The refusal of a tenant role that fails its check: `INTERNAL` without a
+/// reason, the generic message, the role and `finding` in the source.
+fn assert_role_refused(err: &AppError, role: &TenantRole, finding: &str) {
+    assert_eq!(err.code(), ErrorCode::Internal, "{err:?}");
+    assert_eq!(err.reason(), None);
+    assert_eq!(err.message(), "internal error");
+    let text = source(err);
+    assert!(
+        text.contains(&format!("tenant role {} is not as expected", role.as_str())),
+        "{text}"
+    );
+    assert!(text.contains(finding), "{text}");
+}
+
 /// The maintenance role is refused on `database` for lack of `CONNECT`.
 async fn maintenance_cannot_connect(cluster: &Cluster, database: &str) {
     let err = cluster
@@ -322,13 +341,23 @@ async fn a_missing_database_is_refused() {
     };
     common::guard(Box::pin(async {
         let maintenance = cluster.maintenance();
-        let role = cluster.names().role(common::new_tenant());
+        let absent_role = cluster.names().role(common::new_tenant());
         let database =
             DatabaseName::parse(&cluster.unique_name("absent")).expect("a database name");
-        let prepared = run_prepare(&maintenance, &database, &role)
+        let prepared = run_prepare(&maintenance, &database, &absent_role)
             .await
             .expect_err("nothing to adopt");
         assert_eq!(refused_check(&prepared), "missing");
+
+        // The adoption checks its role before anything else.
+        let err = run_adopt(&maintenance, &database, &absent_role)
+            .await
+            .expect_err("the role does not exist");
+        assert_eq!(err.code(), ErrorCode::Internal, "{err:?}");
+        assert_eq!(err.reason(), None);
+        assert!(source(&err).contains("does not exist"), "{}", source(&err));
+
+        let (role, _) = tenant_role(&cluster, &maintenance).await;
         let adopted = run_adopt(&maintenance, &database, &role)
             .await
             .expect_err("nothing to adopt");
@@ -884,6 +913,353 @@ async fn a_default_privileges_entry_of_the_maintenance_role_stays_after_a_handov
         assert_eq!(entries, [cluster.maintenance_role()]);
         let after = state(&cluster, database.as_str(), role.as_str()).await;
         assert_eq!(after.owner, role.as_str());
+    }))
+    .await;
+}
+
+/// Objects of the candidate that an unqualified or type-inexact statement
+/// would reach on a `search_path` that puts `public` first, each function
+/// raising: `public."="(oid, regclass)` and `public."~"(name, name)`, the
+/// comparisons the object scan once made without a `pg_catalog` operator
+/// of exactly their types, and the `public.current_setting(text)` and type
+/// `public.text` an unqualified read of a session's settings would reach.
+/// The maintenance role creates them, so the object scan allows them as its
+/// own.
+const HOSTILE: &str = "
+CREATE FUNCTION public.hostile_eq(oid, pg_catalog.regclass) RETURNS boolean
+    LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'a hostile object was called'; END $$;
+CREATE OPERATOR public.= (
+    LEFTARG = oid, RIGHTARG = pg_catalog.regclass, FUNCTION = public.hostile_eq);
+CREATE FUNCTION public.hostile_match(name, name) RETURNS boolean
+    LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'a hostile object was called'; END $$;
+CREATE OPERATOR public.~ (LEFTARG = name, RIGHTARG = name, FUNCTION = public.hostile_match);
+CREATE FUNCTION public.current_setting(text) RETURNS text
+    LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'a hostile object was called'; END $$;
+CREATE TYPE public.text AS (hostile integer);
+CREATE TABLE public.orders (id bigint)";
+
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn no_operator_or_function_of_the_candidate_is_called() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance = cluster.maintenance();
+        let (role, _) = tenant_role(&cluster, &maintenance).await;
+        let database = candidate(&cluster).await;
+        as_maintenance(&cluster, database.as_str(), HOSTILE).await;
+        as_maintenance(
+            &cluster,
+            database.as_str(),
+            &format!(
+                "ALTER DATABASE {} SET search_path = public, pg_catalog",
+                quote(database.as_str())
+            ),
+        )
+        .await;
+        // A session without the crate's startup options gets that path.
+        let mut raw = cluster
+            .connect_as(
+                cluster.maintenance_role(),
+                cluster.maintenance_password(),
+                database.as_str(),
+            )
+            .await
+            .expect("the maintenance role connected");
+        let search_path: String =
+            sqlx::query_scalar("SELECT pg_catalog.current_setting('search_path')")
+                .fetch_one(&mut raw)
+                .await
+                .expect("the setting was read");
+        assert!(search_path.starts_with("public"), "{search_path}");
+        raw.close().await.expect("the session closed");
+        no_sessions(&cluster, database.as_str()).await;
+
+        assert_eq!(
+            run_prepare(&maintenance, &database, &role)
+                .await
+                .expect("prepared without calling an object of the candidate"),
+            Adoption::Reassign
+        );
+        run_adopt(&maintenance, &database, &role)
+            .await
+            .expect("adopted without calling an object of the candidate");
+        let after = state(&cluster, database.as_str(), role.as_str()).await;
+        assert_eq!(after.owner, role.as_str());
+        assert!(!after.public_connect);
+    }))
+    .await;
+}
+
+/// Every membership of the maintenance role in the tenant role is without
+/// `INHERIT`, and one of them lets it switch (`SET`). The role's creation
+/// may leave more than one row: the grant a role's creator receives and the
+/// crate's own.
+fn assert_no_inheriting_membership(state: &State) {
+    assert!(
+        state
+            .memberships
+            .iter()
+            .all(|edge| edge.starts_with("false:")),
+        "no membership inherits: {:?}",
+        state.memberships
+    );
+    assert!(
+        state.memberships.iter().any(|edge| edge == "false:true"),
+        "the maintenance role may switch: {:?}",
+        state.memberships
+    );
+}
+
+/// An adoption resumed at its database step, after the tenant role made by
+/// the role step gained a membership, is refused before anything changes:
+/// the owner, `PUBLIC`'s `CONNECT` and the maintenance role's membership
+/// (`INHERIT FALSE`) stay as they were. Without the membership it goes
+/// through.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn an_adoption_whose_role_gained_a_membership_is_refused_and_changes_nothing() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance = cluster.maintenance();
+        let (role, _) = tenant_role(&cluster, &maintenance).await;
+        let database = candidate(&cluster).await;
+        as_maintenance(
+            &cluster,
+            database.as_str(),
+            "CREATE TABLE public.orders (id bigint)",
+        )
+        .await;
+        let third = cluster.create_role("third", "").await;
+        let (role_quoted, third_quoted) = (quote(role.as_str()), quote(&third));
+        let before = state(&cluster, database.as_str(), role.as_str()).await;
+        assert!(before.public_connect);
+        assert_no_inheriting_membership(&before);
+        for (grant, revoke, finding) in [
+            (
+                format!("GRANT {third_quoted} TO {role_quoted}"),
+                format!("REVOKE {third_quoted} FROM {role_quoted}"),
+                format!("it reaches role {third}"),
+            ),
+            (
+                format!("GRANT {role_quoted} TO {third_quoted}"),
+                format!("REVOKE {role_quoted} FROM {third_quoted}"),
+                format!("role {third} reaches it"),
+            ),
+        ] {
+            cluster.admin_execute("postgres", &grant).await;
+            let err = run_adopt(&maintenance, &database, &role)
+                .await
+                .expect_err("the role is checked before anything else");
+            assert_role_refused(&err, &role, &finding);
+            assert_eq!(
+                state(&cluster, database.as_str(), role.as_str()).await,
+                before,
+                "nothing changed"
+            );
+            cluster.admin_execute("postgres", &revoke).await;
+        }
+        run_adopt(&maintenance, &database, &role)
+            .await
+            .expect("without the membership the adoption goes through");
+        let after = state(&cluster, database.as_str(), role.as_str()).await;
+        assert_eq!(after.owner, role.as_str());
+        assert_no_inheriting_membership(&after);
+    }))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn the_restrict_path_is_refused_before_the_restriction_when_the_role_changed() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance = cluster.maintenance();
+        let (role, _) = tenant_role(&cluster, &maintenance).await;
+        let name = cluster.create_database("owned", role.as_str()).await;
+        let database = DatabaseName::parse(&name).expect("a database name");
+        let third = cluster.create_role("third", "").await;
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!("GRANT {} TO {}", quote(&third), quote(role.as_str())),
+            )
+            .await;
+        let before = state(&cluster, &name, role.as_str()).await;
+        assert!(before.public_connect);
+        assert_eq!(
+            run_prepare(&maintenance, &database, &role)
+                .await
+                .expect("prepare does not check the role"),
+            Adoption::Restrict
+        );
+        let err = run_adopt(&maintenance, &database, &role)
+            .await
+            .expect_err("the role is checked before the restriction");
+        assert_role_refused(&err, &role, &format!("it reaches role {third}"));
+        assert_eq!(
+            state(&cluster, &name, role.as_str()).await,
+            before,
+            "nothing was restricted"
+        );
+    }))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+#[allow(clippy::too_many_lines)]
+async fn a_membership_that_appears_before_the_transfer_is_refused_in_its_transaction() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance = cluster.maintenance();
+        let (role, _) = tenant_role(&cluster, &maintenance).await;
+        let database = candidate(&cluster).await;
+        as_maintenance(
+            &cluster,
+            database.as_str(),
+            "CREATE TABLE public.orders (id bigint)",
+        )
+        .await;
+        let third = cluster.create_role("third", "").await;
+        let before = state(&cluster, database.as_str(), role.as_str()).await;
+
+        // Step 2's revoke waits on this lock while its session holds the
+        // maintenance permit.
+        let mut lock = cluster.admin().await;
+        common::execute(&mut lock, "BEGIN").await;
+        common::execute(&mut lock, "LOCK TABLE pg_catalog.pg_database IN SHARE MODE").await;
+        let adopting = run_adopt(&maintenance, &database, &role);
+        tokio::pin!(adopting);
+        tokio::select! {
+            outcome = &mut adopting => {
+                panic!("the handover finished under the lock: {:?}", outcome.map_err(|e| e.code()));
+            }
+            () = async { sekvent_testing::await_until!(lock_waiters(&cluster).await > 0) } => {}
+        }
+        // Queued for the permit behind step 2, so ahead of step 3: the
+        // permit is fair.
+        let queued = maintenance.connect();
+        tokio::pin!(queued);
+        tokio::select! {
+            biased;
+            _ = &mut queued => panic!("the permit is held by step 2"),
+            () = std::future::ready(()) => {}
+        }
+        common::execute(&mut lock, "ROLLBACK").await;
+        lock.close().await.expect("the admin session closed");
+        let held = tokio::select! {
+            outcome = &mut adopting => {
+                panic!("the handover went on past a queued permit: {:?}", outcome.map_err(|e| e.code()));
+            }
+            conn = &mut queued => conn.expect("the permit came after step 2"),
+        };
+
+        // Step 2 passed. The tenant role gains a membership before step 3.
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!("GRANT {} TO {}", quote(&third), quote(role.as_str())),
+            )
+            .await;
+        held.close().await.expect("the permit went on to step 3");
+        let err = adopting
+            .await
+            .expect_err("step 3 checks the role in its transaction");
+        assert_role_refused(&err, &role, &format!("it reaches role {third}"));
+        let after = state(&cluster, database.as_str(), role.as_str()).await;
+        assert!(!after.public_connect, "step 2's revoke stays");
+        assert_eq!(
+            State {
+                public_connect: true,
+                ..after
+            },
+            before,
+            "step 3 rolled back: owner, objects and the membership's INHERIT FALSE unchanged"
+        );
+    }))
+    .await;
+}
+
+/// A `CREATE` of `PUBLIC`, which the read after the restriction would
+/// refuse once the database had changed hands, is refused by step 1 before
+/// anything changes.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_public_create_is_refused_before_the_handover() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance = cluster.maintenance();
+        let (role, _) = tenant_role(&cluster, &maintenance).await;
+        let database = candidate(&cluster).await;
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!(
+                    "GRANT CREATE ON DATABASE {} TO PUBLIC",
+                    quote(database.as_str())
+                ),
+            )
+            .await;
+        let before = state(&cluster, database.as_str(), role.as_str()).await;
+        let err = run_adopt(&maintenance, &database, &role)
+            .await
+            .expect_err("PUBLIC may create schemas");
+        assert_eq!(refused_check(&err), "grantee");
+        assert_eq!(
+            state(&cluster, database.as_str(), role.as_str()).await,
+            before,
+            "nothing changed"
+        );
+    }))
+    .await;
+}
+
+/// A `PUBLIC` `CONNECT` that the owner's revoke would leave in place is one
+/// another grantor made, which needs a grant option of its own; step 1
+/// refuses that grantee first, so the read after the restriction never sees
+/// such an entry on this path.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_public_connect_of_another_grantor_is_refused_before_the_handover() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance = cluster.maintenance();
+        let (role, _) = tenant_role(&cluster, &maintenance).await;
+        let database = candidate(&cluster).await;
+        let grantor = quote(&cluster.create_role("grantor", "").await);
+        let quoted = quote(database.as_str());
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!(
+                    "GRANT CONNECT ON DATABASE {quoted} TO {grantor} WITH GRANT OPTION; \
+                     SET ROLE {grantor}; \
+                     GRANT CONNECT ON DATABASE {quoted} TO PUBLIC; \
+                     RESET ROLE"
+                ),
+            )
+            .await;
+        let before = state(&cluster, database.as_str(), role.as_str()).await;
+        let err = run_adopt(&maintenance, &database, &role)
+            .await
+            .expect_err("the grantor is a third grantee");
+        assert_eq!(refused_check(&err), "grantee");
+        assert_eq!(
+            state(&cluster, database.as_str(), role.as_str()).await,
+            before
+        );
     }))
     .await;
 }
