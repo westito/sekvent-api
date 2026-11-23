@@ -12,9 +12,10 @@ publish = false
 # A path dependency so `default-features = false` is honoured (see the
 # facade's own manifest for the edition 2024 rule). `component-grpc` checks
 # that the gRPC binding builds from the facade alone; `tenancy` that a scope
-# factory and the tenant resolver do.
+# factory and the tenant resolver do; `tenancy-lifecycle` and `tenancy-admin`
+# that lifecycle hooks and a guarded admin method do.
 [dependencies]
-sekvent-api = { path = "../sekvent", default-features = false, features = ["config", "component", "component-grpc", "tenancy"] }
+sekvent-api = { path = "../sekvent", default-features = false, features = ["config", "component", "component-grpc", "tenancy", "tenancy-lifecycle", "tenancy-admin"] }
 # `#[derive(prost::Message)]` names `::prost`, so a crate with protobuf
 # messages depends on prost itself.
 prost = { workspace = true }

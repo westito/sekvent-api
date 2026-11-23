@@ -8,11 +8,14 @@
 //! depend on, this crate stops compiling. The facade's `component-grpc`
 //! feature is on, so the gRPC binding and serving are checked through the
 //! facade as well. With `tenancy`, [`tenancy`] builds a scope factory and
-//! the tenant resolver from `sekvent::tenancy` alone. It is not published.
+//! the tenant resolver from `sekvent::tenancy` alone; with
+//! `tenancy-lifecycle` and `tenancy-admin`, [`lifecycle`] implements the
+//! lifecycle hooks and runs an admin body in the guard. It is not published.
 
 #![forbid(unsafe_code)]
 
 pub mod component;
+pub mod lifecycle;
 pub mod tenancy;
 
 use sekvent::EnvConfig;

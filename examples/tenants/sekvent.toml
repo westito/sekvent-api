@@ -1,0 +1,18 @@
+# cargo sekvent — configuration of the example billing product.
+#
+# The example's crates are members of the root manifest, so the gate runs
+# from the repository root; this file configures the contract baselines of
+# the product's two services.
+
+[project]
+name = "tenants"
+
+[contract]
+# Every service declared in the .proto files below these directories is a
+# contract: the public `billing.invoices.v1.Invoices` and the product's own
+# `billing.admin.v1.TenantAdmin`. `cargo sekvent contract check` compares
+# each with its baseline.
+roots = ["billing-api/proto"]
+# Committed baselines, one JSON file per service, written by
+# `cargo sekvent contract emit`.
+baseline = "contracts"

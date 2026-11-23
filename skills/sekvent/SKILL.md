@@ -49,9 +49,9 @@ speed and flakes: the `rust-testing` skill.
 | A tenant (or another per-request value) resolved from the request head before authentication | `component` (`ScopeResolver`, `AppBuilder::scope_resolver`, `App::resolve_scope`, `admit_end_user`), `context::RequestScope`, `cx.scoped::<T>()` | `component`; `component-grpc` to serve |
 | Bounding what served calls cost before authentication (one serve admission per App with a per-client cap, request size and read timeout, a cheap credential precheck) | `component` (`ServeAdmission`, `AppBuilder::serve_admission`, `EndUserPrecheck`, `BearerShape`, `AppBuilder::end_user_precheck`) | `component`; `component-grpc` to serve |
 | Tenants on a Postgres database and a role each: tenant ids and object names, hosts and labels, role passwords derived instead of stored, the startup check that no tenant role reaches the service's own databases; the control registry, the tenant of a request, a cached scope per tenant, changes followed across processes | `tenancy` (`TenantId`, `ObjectNames`, `RoleSecrets`, `Connector`, `cluster::preflight`, `Registry`, `control::verify_schema`, `SelectorRules`, `Tenants`, `ScopeFactory`, `TenantResolver`, `hosts`, `invalidation::{Sender, Listener}`) | `tenancy`; `runtime` for `into_unit` |
-| Create, check and drop tenant roles and databases as a non-superuser maintenance role; hand an existing database over to a tenant role (provisioning and the other tenant operations arrive with slice 1c) | `tenancy` (`cluster::{Maintenance, roles, databases, handover}`, `ScramVerifier`) | `tenancy-lifecycle` |
-| Guard a product's admin RPCs with single-use operator tokens (the admin guard; arrives with slice 1c) | `tenancy` (admin surface) | `tenancy-admin` |
-| Mint operator tokens and call a product's admin RPC from another service, without a database (the manager kit; arrives with slice 1c) | `tenancy` (manager kit) | `tenancy-manager` with `default-features = false` |
+| Create, check and drop tenant roles and databases as a non-superuser maintenance role; hand an existing database over to a tenant role; provision, adopt, suspend, resume, re-host, purge, measure and describe tenants with the product's hooks | `tenancy` (`cluster::{Maintenance, roles, databases, handover}`, `ScramVerifier`, `lifecycle::{Provisioner, TenantHooks, ProvisionRequest, AdoptRequest, HostsChange}`) | `tenancy-lifecycle` |
+| Serve a product's admin RPCs to an operator service with single-use operator tokens | `tenancy` (`admin::{Verifier, parse_keys, authenticator, AdminAudit, guard, AdminClaims}`) | `tenancy-admin` |
+| Mint operator tokens and call a product's admin RPC from another service, without a database | `tenancy` (`manager::{Minter, AdminClient, CallOutcome}`) | `tenancy-manager` with `default-features = false` |
 | Postgres/MySQL/MinIO test containers, `await_until!` | crate `sekvent-testing` | `[dev-dependencies]` (features `postgres`, `mysql`, `minio`) |
 | protobuf codegen in `build.rs` | crate `sekvent-proto-build` | `[build-dependencies]` |
 
@@ -1767,6 +1767,161 @@ let tenants = Tenants::fixed_with_bypass(BillingScope { pool }, BYPASS);
   did not end the listener, once it listens again and has resynced (also
   when that resync failed): treat every waiter as stale there.
 
+### Tenant lifecycle: hooks and the provisioner
+
+Facade feature `tenancy-lifecycle`. One `Provisioner` runs every tenant
+operation; the product's side is a `TenantHooks` implementation:
+
+```rust
+use std::sync::Arc;
+
+use sekvent::config::Secret;
+use sekvent::tenancy::invalidation::{Channel, Sender};
+use sekvent::tenancy::lifecycle::{
+    AdoptCandidate, HookFuture, HostsChange, ProvisionRequest, Provisioner, SeedOutcome, TenantHooks,
+};
+use sekvent::tenancy::{TenantId, TenantInfo};
+use sqlx::PgPool;
+
+pub struct BillingSeed { pub owner_email: String }        // not stored: a repeated call sends the same
+
+struct BillingHooks;
+impl TenantHooks for BillingHooks {
+    type Seed = BillingSeed;
+
+    fn seed<'a>(&'a self, tenant: &'a TenantInfo, pool: &'a PgPool, seed: &'a BillingSeed)
+        -> HookFuture<'a, SeedOutcome> {
+        Box::pin(async move {                                // pool: migrated, the tenant's role, 2 connections
+            let inserted = sqlx::query("INSERT INTO owners (email) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM owners)")
+                .bind(&seed.owner_email)
+                .execute(pool).await.map_err(sekvent::db::to_app_error)?
+                .rows_affected();
+            if inserted == 0 {
+                return Ok(SeedOutcome::default());           // seeded before: idempotent, no handover
+            }
+            Ok(SeedOutcome::with_handover(Secret::new(first_sign_in_token(tenant, pool).await?)))
+        })
+    }
+
+    // Only a product that adopts databases: the default refuses (ADOPTION_REFUSED, check=not_checked).
+    fn check_adoptable<'a>(&'a self, _candidate: &'a AdoptCandidate, pool: &'a PgPool) -> HookFuture<'a, ()> {
+        Box::pin(async move {                                // the maintenance role, read-only sessions
+            let ours: bool = sqlx::query_scalar("SELECT to_regclass('public.invoices') IS NOT NULL")
+                .fetch_one(pool).await.map_err(sekvent::db::to_app_error)?;
+            if ours { Ok(()) } else { Err(AppError::failed_precondition("not a billing database")) }
+        })
+    }
+    // adopted, before_suspend, before_resume, describe, usage: defaults do nothing and succeed.
+}
+
+let provisioner = Provisioner::builder(
+    registry.clone(), maintenance.clone(), connector.clone(), &TENANT_MIGRATOR,
+    Sender::new(control.clone(), Channel::new("app_changes")?), BillingHooks,
+)
+.role_key_id("k1")                                          // required; a key of the connector's secrets
+.connection_limit(20)                                       // required; per tenant role, all processes
+.tenant_cap(500)                                            // required; tenants that are not purged
+.tenants(tenants.clone())                                   // retire this process's scope on each change
+.build()?;                                                  // no I/O
+
+let done = provisioner.provision(ProvisionRequest {
+    tenant: TenantId::from_uuid(Uuid::new_v4()),            // the caller's id: repeat with the same to resume
+    subdomain: "orders".into(),
+    display_name: "Orders Ltd".into(),                      // 1..=255 bytes, not blank, no control character
+    hosts: vec!["orders.example.com".into()],
+    primary_host: "orders.example.com".into(),
+    seed: BillingSeed { owner_email: "owner@example.com".into() },
+}).await?;
+if let Some(secret) = done.handover { hand_to_owner(secret).await?; } // once: None on any repeat
+
+provisioner.suspend(id).await?;                             // before_suspend first; strict
+provisioner.resume(id).await?;
+provisioner.set_hosts(id, HostsChange { subdomain, hosts, primary_host }).await?;
+provisioner.purge(id).await?;                               // suspended only; drops database and role
+let usage = provisioner.usage(id).await?;                   // active or suspended; read-only, 5 s timeout
+```
+
+- Every step commits on its own: a failure leaves the work before it, and
+  the same call again resumes (`TENANT_STATE` when the request differs from
+  the row). Make `seed` and `adopted` idempotent.
+- `TENANT_LIMIT_REACHED` at the cap, `TENANT_NOT_FOUND` for an unknown id,
+  `TENANT_STATE` for a state the call refuses; a hook's error is the
+  answer unchanged. No lifecycle error carries a domain.
+- Hooks never get a built scope: their pool is opened for the one operation
+  and closed after it. Do not reach into the tenant cache from a hook.
+
+### Admin RPCs: the guard and the admin App
+
+Facade feature `tenancy-admin`. Declare the admin service in your own proto
+and serve it from an App of its own (`register_as`), `SERVE_AUTH=bearer`:
+
+```rust
+use sekvent::tenancy::ErrorDomains;
+use sekvent::tenancy::admin::{AdminAudit, AdminClaims, NoExtra, Verifier, authenticator, guard, parse_keys};
+
+const DOMAINS: ErrorDomains = ErrorDomains::new().with_admin("billing.admin.v1");
+
+let verifier = Verifier::<NoExtra>::new("ops-console", "billing-eu", parse_keys(&admin_keys)?) // "kid:<b64url>,…"
+    .with_subject_check(|sub| sub.starts_with("operator:"))
+    .with_domains(DOMAINS);
+let audit = AdminAudit::new(control.clone(), Arc::new(SystemClock)).with_domains(DOMAINS);
+let mut admin = App::builder(&admin_keys_source);          // SEKVENT_COMPONENT_TENANT_ADMIN_SERVE_AUTH=bearer
+admin.end_user_authenticator(authenticator(verifier, &["billing.admin.v1.TenantAdmin"], Arc::new(SystemClock))?)?;
+TenantAdminHandle::install(&mut admin, move |_| Ok(TenantAdmin { provisioner, audit }))?;
+let runtime = admin.build()?.register_as("admin-components", runtime);
+
+// Every admin RPC body runs inside guard::run with its exact op and tenant.
+async fn suspend(&self, cx: &CallContext, req: SuspendRequest) -> Result<SuspendReply, AppError> {
+    let tenant = TenantId::parse(&req.tenant_id).ok_or_else(|| AppError::invalid_argument("not a tenant id"))?;
+    guard::run(&self.audit, cx, "billing.admin.v1.TenantAdmin/Suspend", Some(tenant), |_claims: AdminClaims| async move {
+        let row = self.provisioner.suspend(tenant).await?;  // TENANT_STATE gets the admin domain
+        Ok(SuspendReply { state: row.info.state.as_str().into() })
+    })
+    .await
+}
+```
+
+- The token is checked against the op and tenant you pass: pass the RPC's
+  own path and the tenant the request addresses (`None` only for a call
+  that addresses no tenant).
+- The guard records the token id before the body runs; a replay is
+  `ADMIN_TOKEN_REPLAYED`. Prune `admin_audit` only for rows older than
+  60 s.
+- Tests: `guard::end_user(claims)` on a `CallContext` calls a body without
+  a token.
+
+### Call admin RPCs: the manager kit
+
+Facade feature `tenancy-manager` (with `default-features = false` to keep
+the database driver out):
+
+```rust
+use sekvent::auth::{EdDsaSigningKey, NoClaims};
+use sekvent::tenancy::manager::{AdminClient, CallOutcome, Minter};
+
+let key = EdDsaSigningKey::from_pkcs8_pem("ops-1", &config.admin_signing_key)?; // Secret PEM
+let minter = Minter::new("ops-console", key, Arc::new(SystemClock));
+publish(minter.public_key_entry());                         // "ops-1:<b64url>": the product's key list
+let client = AdminClient::new("https://billing-admin.example.com", "billing-eu", minter)?; // in_cluster: http too
+
+match client.call::<_, ProvisionReply, _>(
+    "billing.admin.v1.TenantAdmin/Provision", Some(tenant), "operator:ada", &NoClaims {},
+    Duration::from_secs(30), &ProvisionRequest { /* … */ },
+).await {
+    CallOutcome::Replied(reply) => record(reply),            // the product acted
+    CallOutcome::NotSent(_) => retry_later(),                // nothing left this process: safe to repeat
+    CallOutcome::Refused(error) => show(error.reason()),     // the product decided (TENANT_STATE, …)
+    CallOutcome::Unknown(_) => read_back(tenant).await?,     // may have acted: read the tenant first
+    _ => {}                                                  // non_exhaustive
+}
+```
+
+- One fresh 60 s token per call, no retry, no redirect. Repeat after
+  `Unknown` only an operation that converges (provisioning with the same
+  id and request does; the handover secret is then `None`).
+- Never format or log `Minted::token` or the bearer header; errors of the
+  client never carry the URL, a body or the token.
+
 ## Pitfalls
 
 - **Secrets in logs.** Never log, `format!`, `Debug`-print or return a
@@ -1837,6 +1992,15 @@ let tenants = Tenants::fixed_with_bypass(BillingScope { pool }, BYPASS);
   `ObjectNames`, `parse_role` and `DatabaseName::parse` make the checked
   types the cluster operations take) and never store a tenant credential:
   store the `RoleKey`, derive the password with `RoleSecrets`.
+- **Tenant lifecycle.** The seed's handover secret comes back once, in
+  `Provisioned::handover` of the call that ran the seed; a repeat returns
+  `None`, so hand it on before anything else can fail and never log or
+  store it. Adoption needs your own `TenantHooks::check_adoptable`: the
+  default refuses every database.
+- **Admin tokens.** Never format, log or store an admin token (`Minted`'s
+  `token` or the bearer header); pass `guard::run` the RPC's exact op and
+  the tenant the request addresses, and treat `CallOutcome::Unknown` as
+  "may have happened": read the tenant back before repeating.
 - **Tests.** No fixed sleeps: completion signals, `RuntimeHandle::wait`,
   `tokio::time::pause`. Servers bind port 0.
 - **Thin `main`.** Telemetry, config, `serve`; everything else in the

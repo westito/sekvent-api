@@ -13,8 +13,11 @@ On the request path it keeps one row per tenant in a control database the
 product owns, picks the tenant a request names from the request head before
 the caller is authenticated, opens and caches each tenant's pool and scope,
 and follows the changes other processes make through a Postgres `NOTIFY`
-channel. Provisioning, suspend, resume, purge, the admin surface and the
-manager kit are not built yet.
+channel. On top of both, a `Provisioner` provisions, adopts, suspends,
+resumes, re-hosts and purges tenants with the product's hooks; an admin
+surface lets a product serve those operations to an operator service with
+one-use signed tokens, and a manager kit is what that operator service calls
+them with.
 
 The crate reads no configuration keys and runs on Postgres 16 or later.
 
@@ -22,7 +25,7 @@ The crate reads no configuration keys and runs on Postgres 16 or later.
 
 | | |
 |---|---|
-| Facade feature | `tenancy`; `tenancy-lifecycle` for the maintenance connection, roles, databases and the handover; `tenancy-admin` and `tenancy-manager` (not built yet) |
+| Facade feature | `tenancy`; `tenancy-lifecycle` for the maintenance connection, roles, databases, the handover and the tenant lifecycle; `tenancy-admin` for the admin surface; `tenancy-manager` for the operator's minter and client |
 | Module | `use sekvent::tenancy::…;` |
 | Internal crate | `sekvent-tenancy` (features `serving` (default), `lifecycle`, `admin`, `manager`, `runtime`) |
 | Test container | `sekvent-testing` feature `postgres` ([testing](testing.md)) |
@@ -30,9 +33,9 @@ The crate reads no configuration keys and runs on Postgres 16 or later.
 | Facade feature | Crate feature | Adds |
 |---|---|---|
 | `tenancy` | `serving` | Tenant ids, object names, hosts and labels, role secrets, the connector, privilege inspection and the startup preflight; the control schema and the `Registry`, `SelectorRules`, the `TenantResolver`, the host snapshot and its CORS predicate, the tenant cache `Tenants`, the invalidation channel |
-| `tenancy-lifecycle` | `lifecycle` (with `serving`) | The maintenance connection, roles, databases, the SCRAM verifier, the ownership handover |
-| `tenancy-admin` | `admin` (with `serving`) | Nothing of the admin surface is built yet; with it on, `control::verify_schema` also requires the `admin_audit` table and its key `admin_audit_pkey`. The facade's `full` feature turns it on |
-| `tenancy-manager` | `manager` | Not built yet; needs no database driver |
+| `tenancy-lifecycle` | `lifecycle` (with `serving`) | The maintenance connection, roles, databases, the SCRAM verifier, the ownership handover; the `lifecycle` module: `Provisioner` and the product's `TenantHooks` |
+| `tenancy-admin` | `admin` (with `serving`) | The `admin` module: `Verifier`, `parse_keys`, `AdminClaims`, the `authenticator`, `AdminAudit`, `guard`; with it on, `control::verify_schema` also requires the `admin_audit` table and its key `admin_audit_pkey`. The facade's `full` feature turns it on |
+| `tenancy-manager` | `manager` | The `manager` module: `Minter`, `AdminClient`, `CallOutcome`; needs no database driver |
 | `runtime` (default) | `runtime` (with `serving`) | `Tenants::into_unit` and `invalidation::Listener::into_unit`: the tenant cache and the invalidation listener as runtime units |
 
 `tenancy-manager` keeps sqlx and `sekvent-db` out of the build only when the
@@ -65,9 +68,10 @@ every value from its own configuration and owns every database:
   [Roles and databases](#roles-and-databases).
 - **A control database** whose schema the product migrates itself from
   `control::REFERENCE_SCHEMA`, and a pool on it of at least 3 connections
-  ([The control schema](#the-control-schema)). The product records each
-  tenant's row with `control::rows` and sets it `active` once its role and
-  database exist.
+  ([The control schema](#the-control-schema)). A `Provisioner` writes each
+  tenant's row ([Provision a tenant](#provision-a-tenant)); a product that
+  runs its own steps records it with `control::rows` and sets it `active`
+  once its role and database exist.
 - **The object-name prefix** (`app_t_` below), **the master secrets** with
   their context string, and **base connect options** for the tenant server
   ([Role credentials](#role-credentials)).
@@ -80,6 +84,13 @@ every value from its own configuration and owns every database:
 - **A CORS policy** for the methods and headers, and **a channel name** for
   the invalidation channel ([CORS](#cors),
   [Follow changes from other processes](#follow-changes-from-other-processes)).
+- For the lifecycle: **`TenantHooks`** (the seed, the adoption check, the
+  state hooks), the key id new role passwords are derived under, a role
+  connection limit and a cap on tenants
+  ([Provision a tenant](#provision-a-tenant)).
+- For the admin surface: **an admin service** in the product's own proto,
+  served from an App of its own, and the operator's **Ed25519 public keys**,
+  issuer and audience ([The admin surface](#the-admin-surface)).
 
 A single-tenant deployment needs none of this: `Tenants::fixed(scope)`
 serves one scope through the same calls ([The two forms](#the-two-forms)).
@@ -1018,6 +1029,11 @@ the caller's `&mut PgConnection` and never begins, commits or rolls back:
 | `set_state` | the state and `updated_at`; whether a row changed |
 | `set_hosts` | in the caller's transaction (three statements): the whole host set and the subdomain, with `insert`'s host checks and conflicts; `NOT_FOUND` without a reason for a missing row |
 | `store_schema_version` | raises `schema_version`, never lowers it, never touches `updated_at`, and takes the row `FOR UPDATE SKIP LOCKED`: a locked row, and a missing one, answer `VersionStored::Busy` at once |
+| `set_step` | the `ProvisionStep` and `updated_at`; whether a row changed |
+| `set_role_key` | the role key id and generation and `updated_at`; a generation outside 1 to 2147483647 is `INVALID_ARGUMENT` before any statement; whether a row changed |
+| `clear_hosts` | in the caller's transaction (two statements): every host removed and `updated_at` set, the subdomain kept; whether the row exists |
+| `count_live` | the number of tenants that are not `purged` |
+| `page` | at most `limit` rows in any state with their hosts, ordered by id, after `after` when given; a `limit` of 0 reads nothing |
 
 ### The registry
 
@@ -1035,7 +1051,7 @@ production) dates the lookup cache's entries.
 | `active()` | every active tenant with its hosts (`rows::list_active`): one active row that cannot be decoded fails the whole read, and with it every caller of the active list: the walks, the sweep, `refresh_hosts` and the invalidation listener's loads |
 | `store_schema_version(id, version)` | the row function of that name |
 | `forget(id)`, `clear_lookups()` | drop cached lookups, no I/O |
-| `admit()` | a lifecycle permit for the product's own lifecycle work: waits up to 10 s, then `UNAVAILABLE` without a reason |
+| `admit()` | a lifecycle permit: every `Provisioner` call that changes a row takes one, and so may the product's own lifecycle work; waits up to 10 s, then `UNAVAILABLE` without a reason |
 | `pool()` | the control pool |
 
 Each read holds one control connection for one statement and gives it back
@@ -1784,23 +1800,631 @@ let runtime = runtime
 
 ## Provision a tenant
 
-Arrives with the lifecycle slice (1c).
+The `lifecycle` module (facade feature `tenancy-lifecycle`) runs every
+operation on a tenant through one `Provisioner`: provision, adopt, suspend,
+resume, set hosts, purge, usage and describe. The product's side of each is
+a `TenantHooks` implementation.
+
+### The provisioner
+
+```rust
+use std::sync::Arc;
+
+use sekvent::tenancy::invalidation::{Channel, Sender};
+use sekvent::tenancy::lifecycle::Provisioner;
+
+let sender = Sender::new(control_pool.clone(), Channel::new("app_changes")?);
+let provisioner = Provisioner::builder(
+    registry.clone(),             // the Registry on the control pool
+    maintenance.clone(),          // the Maintenance connection; its ObjectNames are the tenants'
+    connector.clone(),            // the Connector the tenant cache uses
+    &TENANT_MIGRATOR,             // the tenant schema, never built with ignore_missing
+    sender,
+    BillingHooks::new(mailer),
+)
+.role_key_id("k1")                // required: a key id of the connector's secrets
+.connection_limit(20)             // required: every tenant role's connection limit
+.tenant_cap(500)                  // required: the most tenants that are not purged
+.labels(label_rules.clone())     // the LabelRules the SelectorRules were given
+.tenants(tenants.clone())         // this process's tenant cache, told of every change
+.sink(Arc::clone(&sink))          // the sink the listener has too
+.build()?;
+```
+
+| Builder call | Default | Refused |
+|---|---|---|
+| `role_key_id(id)` | required | missing, or not a key of the connector's secrets |
+| `connection_limit(n)` | required | missing, 0, or above 2147483647 |
+| `tenant_cap(n)` | required | missing or 0 |
+| `labels(LabelRules)` | `LabelRules::new()` | |
+| `tenants(Tenants<S>)` | none: only the registry's lookups are dropped on a change | |
+| `sink(impl Sink)` | none | |
+| `clock(Arc<dyn Clock>)` | the system clock | |
+
+`build` does no I/O; a refusal is `INVALID_ARGUMENT` naming the setting.
+Clones share everything; `Debug` prints `Provisioner(..)`. Every operation
+but `usage`, `describe`, `tenant` and `list` takes the registry's lifecycle
+admission (`Registry::admit`) before its first control connection and holds
+it to its end, then locks the tenant's control row (`FOR UPDATE`) and
+decides from the locked row.
+
+### The hooks
+
+```rust
+use sekvent::config::Secret;
+use sekvent::tenancy::TenantInfo;
+use sekvent::tenancy::lifecycle::{AdoptCandidate, HookFuture, SeedOutcome, TenantHooks};
+use sqlx::PgPool;
+
+struct BillingSeed {
+    owner_email: String,
+}
+
+impl TenantHooks for BillingHooks {
+    type Seed = BillingSeed;
+
+    fn seed<'a>(
+        &'a self,
+        tenant: &'a TenantInfo,
+        pool: &'a PgPool,
+        seed: &'a BillingSeed,
+    ) -> HookFuture<'a, SeedOutcome> {
+        Box::pin(async move {
+            // Idempotent: a second run after a committed first changes nothing.
+            let inserted = sqlx::query(
+                "INSERT INTO owners (email) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM owners)",
+            )
+            .bind(seed.owner_email.as_str())
+            .execute(pool)
+            .await
+            .map_err(sekvent::db::to_app_error)?
+            .rows_affected();
+            if inserted == 0 {
+                return Ok(SeedOutcome::default());
+            }
+            let token = self.first_sign_in_token(tenant, pool).await?;
+            Ok(SeedOutcome::with_handover(Secret::new(token)))
+        })
+    }
+
+    fn check_adoptable<'a>(
+        &'a self,
+        _candidate: &'a AdoptCandidate,
+        pool: &'a PgPool,
+    ) -> HookFuture<'a, ()> {
+        Box::pin(async move {
+            // Read-only sessions of the maintenance role on the candidate database.
+            let ours: bool = sqlx::query_scalar(
+                "SELECT to_regclass('public.invoices') IS NOT NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(sekvent::db::to_app_error)?;
+            if ours {
+                Ok(())
+            } else {
+                Err(AppError::failed_precondition("not a billing database"))
+            }
+        })
+    }
+}
+```
+
+Every method has a default; each default does nothing and succeeds, except
+`check_adoptable`, which refuses (fail closed). A hook's error is the call's
+answer, unchanged. A hook runs within the call: a failure leaves the work
+committed before it in place, and a repeated call runs the hook again.
+
+| Hook | Runs | Pool | Default |
+|---|---|---|---|
+| `seed(tenant, pool, seed)` | provisioning's `seeded` step | the tenant's, read-write | no data, no handover |
+| `check_adoptable(candidate, pool)` | an adoption, before its row and again in its `database` step | the maintenance role's on the candidate database, read-only | refuses: `FAILED_PRECONDITION` / `ADOPTION_REFUSED`, metadata `check` = `not_checked` (`NOT_CHECKED`) |
+| `adopted(tenant, pool)` | an adoption's `seeded` step, instead of the seed | the tenant's, read-write | nothing |
+| `before_suspend(tenant, pool)` | `suspend`, before the state changes | the tenant's, read-write | nothing |
+| `before_resume(tenant, pool)` | `resume`, before the state changes | the tenant's, read-write | nothing |
+| `describe(tenant, pool)` | `describe` | the tenant's, read-only | the display name, no attribute |
+| `usage(tenant, pool)` | `usage` | the tenant's, read-only | no counter, no activity |
+
+The tenant's pool is a lifecycle pool, opened for that one operation:
+
+- at most two connections as the tenant's derived role, outside the tenant
+  cache, so a hook never gets a built scope and no scope is built to seed,
+  suspend or measure a tenant;
+- the tenant migrator runs on it first; its first connection is made when it
+  opens, within 10 s, and it is closed when the operation ends (within
+  10 s, then dropped);
+- it opens in any state but `purging` and `purged`; a failure to connect or
+  to migrate is `UNAVAILABLE` without a reason ("the tenant's database could
+  not be opened"), its source the stage (`connect` or `migrate`) and at most
+  a SQLSTATE;
+- the read-only form (`usage`, `describe`) migrates on a read-write pool of
+  one connection first, closes it, and returns a pool whose sessions start
+  with `default_transaction_read_only = on` and `statement_timeout = 5s`, so
+  a write fails with SQLSTATE `25006`.
+
+`SeedOutcome`, `Description { display_name, attributes }` and
+`UsageCounters { counters, last_activity }` are what the hooks return;
+`AdoptCandidate::new` and `Usage::new` build the inputs and results for a
+product's own tests. `HookFuture<'a, T>` is a boxed `Send` future of
+`Result<T, AppError>`.
+
+### Provisioning
+
+`Provisioner::provision(ProvisionRequest)` creates a tenant: its control
+row, its role, its database, its schema and the product's first data, then
+marks it `active`. It returns `Provisioned { row, handover }`.
+
+```rust
+use sekvent::tenancy::TenantId;
+use sekvent::tenancy::lifecycle::ProvisionRequest;
+
+let done = provisioner
+    .provision(ProvisionRequest {
+        tenant: TenantId::from_uuid(Uuid::new_v4()),
+        subdomain: "orders".to_owned(),
+        display_name: "Orders Ltd".to_owned(),
+        hosts: vec!["orders.example.com".to_owned()],
+        primary_host: "orders.example.com".to_owned(),
+        seed: BillingSeed { owner_email: "owner@example.com".to_owned() },
+    })
+    .await?;
+```
+
+The tenant id is the caller's: a repeated call names the same id and
+resumes. `ProvisionRequest`'s `Debug` leaves the seed out.
+
+Before anything is written:
+
+1. **Validation**, with no I/O: the label must pass the provisioner's
+   `LabelRules`; the display name is 1 to 255 bytes (`DISPLAY_NAME_MAX`),
+   not blank, without a control character; every host and the primary host
+   are canonical; the host set is not empty and holds the primary. Every
+   problem is one field violation of an `INVALID_ARGUMENT` ("the request is
+   invalid"): `subdomain`, `display_name`, `hosts`, `hosts[<index>]`,
+   `primary_host`; a host is named by its position from 0, never by its
+   text. The label and the hosts are canonicalised, and the hosts sorted and
+   de-duplicated, before they are stored or compared; the display name is
+   stored as given.
+2. **The lifecycle admission**, held to the end of the call.
+3. **The row**, when the id has none: inserted in a control transaction
+   under a transaction-level advisory lock, so the cap check and the insert
+   of concurrent calls are ordered. A new id when the tenants that are not
+   `purged` already reach the cap is `RESOURCE_EXHAUSTED` /
+   `TENANT_LIMIT_REACHED`, and no row is written. A host, role or database
+   name another tenant holds is `FAILED_PRECONDITION` / `TENANT_STATE`, and
+   no row is written. An id that already has a row never counts against the
+   cap.
+
+Then the steps. Each runs in a control transaction of its own: the row is
+locked and re-read, the step's work is done, the step is recorded in
+`tenants.provision_step`, and the transaction commits. The work of every
+step is idempotent, so a step that ran but was not recorded runs again
+harmlessly.
+
+| Step recorded | Work |
+|---|---|
+| `role` | the role password derived under the configured key id at generation 1; its SCRAM verifier computed on the blocking pool; the role created (or converged) on the maintenance connection with the configured connection limit; the key stored on the row |
+| `database` | `databases::create`: the database created closed, owned by the role, `CONNECT` restricted, then opened |
+| `migrated` | the tenant opened for the operation, which runs the tenant migrator as the tenant's role; the migrator's highest version stored as `schema_version` |
+| `seeded` | `TenantHooks::seed` on a lifecycle pool of the tenant |
+| `active` | the step and the state `active` written together; the change [announced](#announcing) |
+
+The announce makes this process's tenant cache and registry forget what they
+held of the tenant and tells the other processes, so a request that was told
+`TENANT_PROVISIONING` is served right after the call returns.
+
+### Resuming
+
+A failure leaves the steps committed before it in place: provisioning is
+resumable, not one transaction. Call `provision` again with the same
+request; it continues after the last recorded step. Two calls for one tenant
+run one after the other on the row lock.
+
+A call for an existing id must match its row: the same label, display name,
+host set, primary host and database. Anything else is `TENANT_STATE` and
+changes nothing; so is a tenant that is `suspended`, `purging` or `purged`.
+A tenant already `active` that matches is returned as it is and announced
+again; the provisioner never runs the seed twice for it.
+
+| Failure | Answer | Recorded step |
+|---|---|---|
+| an existing role with drift (a widening attribute, a membership) | `INTERNAL` | none yet |
+| a database of that name owned by another role | `INTERNAL` | `role` |
+| the tenant's database cannot be connected to or migrated | `UNAVAILABLE`, no reason | `database` |
+| the seed hook fails | the hook's error, unchanged | `migrated` |
+| the stored cluster, role or database name was changed by hand | `INTERNAL`, naming the column, before any statement | unchanged |
+
+The cause of an `INTERNAL` or `UNAVAILABLE` answer is in the error's
+source, which is logged and never sent; it never holds a password, a
+verifier or connect options.
+
+### The handover secret
+
+`TenantHooks::seed` may return a `SeedOutcome` with a handover secret (an
+owner's first sign-in token, say). `Provisioned::handover` carries it once:
+from the call that ran the seed. A call that resumes after the seed
+committed, or finds the tenant `active`, returns `None`; the product's admin
+reply then says the secret is withheld, and the product offers its own way
+to issue a new one. The seed must be idempotent: a second run after a
+committed first changes nothing and hands nothing over. `Provisioned` and
+`SeedOutcome` print whether they hold a handover, never the value.
+
+### Reading tenants
+
+`Provisioner::tenant(id)` returns the row as committed, in any state
+(`NOT_FOUND` / `TENANT_NOT_FOUND` without one). `Provisioner::list(after,
+limit)` returns at most `limit` rows in any state ordered by id, after
+`after` when given, in one statement; a `limit` of 0 reads nothing. Neither
+takes the lifecycle admission.
 
 ## Suspend, resume, change hosts, purge
 
-Arrives with the lifecycle slice (1c).
+A tenant's state moves through `Provisioner` calls. Every call that changes
+a row first takes the lifecycle admission, then locks the tenant's control
+row and decides from what it finds there. A missing row is `NOT_FOUND` /
+`TENANT_NOT_FOUND`; a state the call does not accept is
+`FAILED_PRECONDITION` / `TENANT_STATE`. Lifecycle errors carry no domain.
+
+| Call | From | To | Before the row changes |
+|---|---|---|---|
+| `suspend(id)` | `active` | `suspended` | `TenantHooks::before_suspend` on the tenant opened for the call |
+| `resume(id)` | `suspended` | `active` | `TenantHooks::before_resume`, likewise |
+| `set_hosts(id, HostsChange)` | `active`, `suspended` | unchanged | the label and hosts validated after the lock; the set replaced whole |
+| `purge(id)` | `suspended`, `purging` | `purging`, then `purged` | nothing of the product runs |
+
+A call that finds its target state already set changes nothing, returns the
+row and announces it again, so a repeated call is safe.
+
+- **Suspend and resume are strict.** If the tenant's database cannot be
+  opened (`UNAVAILABLE`) or the hook fails, the transaction is rolled back,
+  the tenant keeps its state and the error reaches the caller unchanged. The
+  pool opened for the hook is closed whatever happened.
+- **`set_hosts`** canonicalises the label by the provisioner's `LabelRules`
+  and the hosts (sorted, without duplicates, the primary among them);
+  problems come back together as `INVALID_ARGUMENT` with one field
+  violation each (`subdomain`, `hosts`, `hosts[<index>]`, `primary_host`),
+  never echoing a host. A host another tenant holds is `TENANT_STATE`. The
+  change is announced as `ChangeKind::HOSTS`.
+- **`purge`** marks a suspended tenant `purging`, commits and announces,
+  then locks the row again and holds it across the destructive phase: the
+  stored names are checked (`INTERNAL` for a role that is not the derived
+  one, before any connection); on one maintenance connection the database
+  is dropped as its role (a database another role owns is refused while the
+  tenant role exists, and left alone once it is gone, so a reused name is
+  never touched), then the role. The hosts are cleared and the row
+  committed as `purged`: it stays as a tombstone, its database name is free
+  for a new tenant, its role name never is. A failure after the first commit
+  leaves `purging`, and calling `purge` again continues from there.
+  `active` and `provisioning` tenants cannot be purged; suspend first. A
+  purge never opens the tenant.
+
+### Usage and describe
+
+`usage(id)` returns `Usage { database_bytes, counters }`: the database's
+size read on the maintenance connection, and the product's `UsageCounters`
+from `TenantHooks::usage`. `describe(id)` returns the product's
+`Description` from `TenantHooks::describe`. Both read the row as committed
+now, accept `active` and `suspended` tenants only (`TENANT_STATE`
+otherwise), take no lifecycle admission, and run the hook on the read-only
+lifecycle pool with its 5 s statement timeout.
+
+### Announcing
+
+Every committed change, and every repeat that finds the state already set,
+is announced before the call returns, in a task of its own that the call
+awaits: a caller that goes away after the commit still announces. In order:
+the registry forgets the tenant's lookups; the tenant cache given with
+`ProvisionerBuilder::tenants` retires the tenant's scope; the sink given
+with `ProvisionerBuilder::sink` hears `Sink::change`; the invalidation
+`Sender` sends the change (`ChangeKind::STATE` or `ChangeKind::HOSTS`) to
+the other processes, whose `Listener` drops what they hold; the cache's
+host snapshot is reloaded. A failed reload is logged as a warning naming the
+tenant and the error's code and is never the call's error. Share one sink
+between the provisioner and the listener through an `Arc` (`Sink` is
+implemented for `Arc<T>`).
 
 ## Adopt an existing database
 
-Arrives with the lifecycle slice (1c).
+`Provisioner::adopt(AdoptRequest)` makes an existing database a tenant's:
+the database, everything in it and its data move to the tenant's derived
+role, and the tenant becomes `active` like a provisioned one. It returns the
+committed `TenantRow`. The request names the tenant id, label, display
+name, hosts and primary host as a provisioning does, plus `database`.
+
+**Validation** comes first and reports every problem at once
+(`INVALID_ARGUMENT` with field violations): the label, display name and
+hosts as for a provisioning, and `database`, which must pass
+`is_adoptable_name` (so never `postgres`, `template0` or `template1`, and
+only lower-case letters, digits and underscores), must not carry the tenant
+object-name prefix, and must be neither the control database nor the
+maintenance database. A violation describes the problem and never repeats
+the name. Then the call takes the lifecycle admission.
+
+**Checks before anything is created.** When the tenant has no control row
+yet, the call runs the handover's checks (`handover::prepare`: `missing`,
+`template`, `owner`, `grantee`, `owns_more`, `foreign_object`, `session`;
+see [Adopting a database](#adopting-a-database)) and then, while the
+maintenance role still owns the database, the product's
+`TenantHooks::check_adoptable` on a pool of the maintenance role on that
+database (`Maintenance::pool_on`). Its sessions start read-only, so a write
+in the check fails with SQLSTATE `25006`; the check is bounded like a
+maintenance operation (150 s, then `UNAVAILABLE`) and its pool is closed
+whatever it answers. The default `check_adoptable` refuses every database
+(`ADOPTION_REFUSED`, `check` = `not_checked`): a product that adopts
+implements it and says which databases it accepts. A refusal, the
+handover's or the product's, is the call's answer unchanged and leaves no
+control row and no role; the only change it can leave is `PUBLIC`'s
+`CONNECT` revoked on the database.
+
+**Steps.** The row is inserted (a new id at the tenant cap is
+`TENANT_LIMIT_REACHED`, still without a role), then the steps of a
+provisioning run:
+
+| Step recorded | Work |
+|---|---|
+| `role` | the tenant's role with its derived password, as for a provisioning |
+| `database` | the handover's checks and `check_adoptable` again (the hook only while the maintenance role still owns the database), then `handover::adopt` to the tenant's role |
+| `migrated` | the tenant opened as its role, the tenant migrator run, its version stored |
+| `seeded` | `TenantHooks::adopted` on that pool, instead of the seed |
+| `active` | step and state together, then the change announced |
+
+So a fresh adoption asks `check_adoptable` twice (before the row and in the
+`database` step) and runs `adopted` once. No handover secret exists. After
+the handover the maintenance role can no longer connect to the database.
+
+**Resuming and repeats.** A call for an id that has a row skips the checks
+before the row and resumes at the recorded step: after a failed `adopted`
+the repeat runs `adopted` again without a second handover. A repeat of an
+`active` adoption that matches the row returns it and runs no hook. A
+repeat that names another database, label, display name or host set is
+`TENANT_STATE`.
 
 ## The admin surface
 
-Arrives with the lifecycle slice (1c).
+The `admin` module (facade feature `tenancy-admin`) is what a product needs
+to serve its lifecycle operations to an operator service. The product
+declares its own admin service in its own proto (no contract ships from
+sekvent) and serves it from an App of its own (`App::register_as`) on a
+listener of its own, with `SERVE_AUTH=bearer`. sekvent provides the token
+verifier, that App's end-user authenticator, the audit record that refuses a
+replayed token, and the guard each admin RPC body runs in.
+
+```rust
+use std::sync::Arc;
+
+use sekvent::component::App;
+use sekvent::context::SystemClock;
+use sekvent::tenancy::ErrorDomains;
+use sekvent::tenancy::admin::{AdminAudit, NoExtra, Verifier, authenticator, parse_keys};
+
+const DOMAINS: ErrorDomains = ErrorDomains::new().with_admin("billing.admin.v1");
+
+// admin_keys: the operator's key list, read from the product's own setting.
+let verifier = Verifier::<NoExtra>::new("ops-console", "billing-eu", parse_keys(&admin_keys)?)
+    .with_subject_check(|sub| sub.starts_with("operator:"))
+    .with_domains(DOMAINS);
+let audit = AdminAudit::new(control_pool.clone(), Arc::new(SystemClock)).with_domains(DOMAINS);
+
+// The admin App: SEKVENT_COMPONENT_TENANT_ADMIN_SERVE_AUTH=bearer in its keys.
+let mut admin_app = App::builder(&admin_keys_source);
+admin_app.end_user_authenticator(authenticator(
+    verifier,
+    &["billing.admin.v1.TenantAdmin"],
+    Arc::new(SystemClock),
+)?)?;
+TenantAdminHandle::install(&mut admin_app, move |_| Ok(TenantAdmin::new(provisioner, audit)))?;
+let admin_app = admin_app.build()?;
+// … its grpc_routes on a listener of their own; admin_app.register_as("admin-components", runtime) …
+```
+
+### Admin tokens
+
+`Verifier::new(issuer, audience, keys)` accepts EdDSA tokens signed by one
+of `keys`. `parse_keys("k1:<base64url key>,k2:<…>")` reads a key list in
+the form the manager kit's `Minter::public_key_entry` writes; two keys
+verify side by side during a rotation. A refused entry is
+`INVALID_ARGUMENT` naming its position only (`admin key entry 2 …`), never
+a key id or a key. `Verifier::refusing()` accepts nothing: what a process
+that serves a fixed scope installs. `with_subject_check(f)` adds the
+product's rule on `sub`; `with_domains` picks the admin domain of the
+refusal. `Debug` prints the key ids and whether it refuses, never a key.
+
+| Claim | Rule |
+|---|---|
+| header | `alg: EdDSA`, a `kid` the verifier knows |
+| `iss`, `aud` | exactly the verifier's; `aud` is one string |
+| `iat`, `exp` | `iat <= now < exp`, no leeway; `0 < exp - iat <= 60 s` (`MAX_LIFETIME`) |
+| `nbf` | optional; `<= now` |
+| `sub` | not empty, accepted by the subject check |
+| `jti` | required; a lower-case hyphenated UUID: the token id |
+| `tid` | absent for a call that addresses no tenant, else a tenant id; the nil id is refused |
+| `op` | the RPC path without its leading slash, `<package>.<Service>/<Rpc>`; equal to the RPC called |
+| extra | the product's type `X` (default `NoExtra`), flattened beside the claims above |
+| any claim | JSON `null` is refused, not read as absent |
+
+`verify(&token, op, now)` returns `AdminClaims { token_id, subject, tenant,
+op, expires_at, extra }`. Every failure, whatever the cause, is the one
+answer `UNAUTHENTICATED` / `ADMIN_TOKEN_INVALID` with the constant end-user
+message, in the admin domain. The cause is logged at `debug` as a fixed
+text, never the token.
+
+### The authenticator
+
+`admin::authenticator(verifier, services, clock)` is the admin App's
+`EndUserAuthenticator` (`INVALID_ARGUMENT` for an empty list or a service
+name outside `[A-Za-z0-9_.]`). The routed path must be `/<service>/<Rpc>`
+of a listed service (a server path prefix is stripped before the component
+sees the path), the token is the request's one `Bearer` token, and the
+verifier checks it for the path without its leading slash at the clock's
+time. The accepted end user has the subject `sub`, no tenant, and the
+`AdminClaims` as its extension. It names no tenant because the admin App
+has no scope resolver; the tenant a call addresses is checked by the guard
+against the claims. Every refusal is an `EndUserRejection` with
+`ADMIN_TOKEN_INVALID` in the admin domain. A call without a well-formed
+bearer header is refused earlier by the App's default precheck
+(`BearerShape`), with the constant `UNAUTHENTICATED` answer and no reason.
+
+### The guard
+
+`guard::run(&audit, cx, op, tenant, body)` runs in this order:
+
+1. The claims from the call's end user (`guard::claims::<X>(cx)`); none is
+   `ADMIN_TOKEN_INVALID`.
+2. `claims.op == op` and `claims.tenant == tenant` exactly, else
+   `ADMIN_TOKEN_INVALID`. Nothing is recorded for steps 1 and 2.
+3. The token id is recorded in `admin_audit`, outcome `started`. A second
+   record of the same id is `ALREADY_EXISTS` / `ADMIN_TOKEN_REPLAYED` in the
+   admin domain, and the body does not run.
+4. The body, with the claims.
+5. The outcome is stored, `ok` or `failed`; a failure to store it is a
+   warning. A cancelled call leaves `started`.
+6. A body error with a reason and no domain gets the admin domain (so the
+   lifecycle's `TENANT_STATE` reaches the operator in it); an error without
+   a reason, or with a domain of its own, passes unchanged.
+
+`guard::end_user(claims)` builds the end user the authenticator would, for
+a product's tests of its admin bodies.
+
+```rust
+use sekvent::context::CallContext;
+use sekvent::error::AppError;
+use sekvent::tenancy::TenantId;
+use sekvent::tenancy::admin::{AdminClaims, guard};
+
+impl TenantAdminService for TenantAdmin {
+    async fn suspend(&self, cx: &CallContext, req: SuspendRequest) -> Result<SuspendReply, AppError> {
+        let tenant = TenantId::parse(&req.tenant_id)
+            .ok_or_else(|| AppError::invalid_argument("not a tenant id"))?;
+        guard::run(
+            &self.audit,
+            cx,
+            "billing.admin.v1.TenantAdmin/Suspend",
+            Some(tenant),
+            |_claims: AdminClaims| async move {
+                let row = self.provisioner.suspend(tenant).await?;
+                Ok(SuspendReply { state: row.info.state.as_str().to_owned() })
+            },
+        )
+        .await
+    }
+}
+```
+
+### The audit table
+
+`AdminAudit::new(control_pool, clock)` writes `admin_audit` on the control
+database: `token_id` (primary key `admin_audit_pkey`, the replay refusal),
+`occurred_at` (the clock's time), `operation` (`op`), `actor` (`sub`),
+`outcome` (`started`, `ok`, `failed`) and `tenant_id` (null for a call that
+addresses no tenant; no foreign key, so a row outlives its tenant).
+`with_domains` sets the domain the guard answers in. Pruning the table is
+the product's job; never prune rows younger than the token lifetime (60 s),
+or a token could be used again.
 
 ## Call a product's admin API
 
-Arrives with the lifecycle slice (1c).
+The `manager` module (facade feature `tenancy-manager`) is the operator side
+of the admin surface: a token minter and a client that calls one admin RPC
+of a product instance over gRPC-Web. It needs no database driver and builds
+without `serving`.
+
+### Minting
+
+```rust
+use std::sync::Arc;
+
+use sekvent::auth::{EdDsaSigningKey, NoClaims};
+use sekvent::context::SystemClock;
+use sekvent::tenancy::manager::Minter;
+
+// private_key_pem: a Secret read from the operator service's own setting.
+let key = EdDsaSigningKey::from_pkcs8_pem("ops-1", &private_key_pem)?;
+let minter = Minter::new("ops-console", key, Arc::new(SystemClock));
+let minted = minter.mint(
+    "billing-eu",                             // aud: the product instance
+    Some(tenant),                             // tid, omitted when None
+    "billing.admin.v1.TenantAdmin/Suspend",   // op: the RPC path without its leading slash
+    "operator:ada",                           // sub
+    &NoClaims {},                             // the product's extra claims, flattened
+)?;
+```
+
+A token is an EdDSA JWT with the key id in its header and the claims `sub`,
+`iat`, `exp` (`iat + 60`, `TOKEN_LIFETIME`), `iss`, `aud`, `jti` (a fresh
+random UUID, lower-case hyphenated), `op`, `tid` when a tenant is named, and
+the extra claims. Absent claims are omitted, never `null`. The extra claims
+must serialize to a JSON object that defines none of `sub`, `iss`, `aud`,
+`iat`, `exp`, `nbf`, `jti`, `tid`, `op`; anything else is
+`INVALID_ARGUMENT`. A clock before the Unix epoch is `INTERNAL`. `Minted`
+holds the token as a `Secret`, its id and its expiry; its `Debug` never
+prints the token, and `Minter`'s prints the issuer and the key id only.
+
+`minter.public_key_entry()` is `<key id>:<unpadded base64url of the 32-byte
+Ed25519 public key>`, one entry of the list the product's `parse_keys`
+reads. To rotate, the product lists both keys, the operator service switches
+its signing key, then the product drops the old one.
+
+### The client
+
+```rust
+use std::time::Duration;
+
+use sekvent::tenancy::manager::{AdminClient, CallOutcome};
+
+let client = AdminClient::new("https://billing-admin.example.com", "billing-eu", minter)?;
+match client
+    .call::<_, SuspendReply, _>(
+        "billing.admin.v1.TenantAdmin/Suspend",
+        Some(tenant),
+        "operator:ada",
+        &NoClaims {},
+        Duration::from_secs(10),
+        &SuspendRequest { tenant_id: tenant.to_string() },
+    )
+    .await
+{
+    CallOutcome::Replied(reply) => { /* the product acted */ }
+    CallOutcome::NotSent(error) => { /* nothing happened: try again */ }
+    CallOutcome::Refused(error) => { /* the product decided: act on error.reason() */ }
+    CallOutcome::Unknown(error) => { /* read the tenant back before anything else */ }
+    _ => {}
+}
+```
+
+`call` checks `op` (`<package>.<Service>/<Rpc>`, names of `[A-Za-z0-9_]`),
+mints one fresh token, sends one gRPC-Web frame to `<base URL>/<op>` with
+`authorization: Bearer <token>` (a sensitive header value) and
+`grpc-timeout`, and reads the whole answer (at most 4 MiB), all within the
+deadline. There is no automatic retry and no redirect. `CallOutcome` is
+`#[non_exhaustive]`.
+
+| Outcome | When | What the caller may assume |
+|---|---|---|
+| `Replied(reply)` | status OK with exactly one message that decodes as the reply | the product acted |
+| `NotSent(error)` | an invalid `op`, minting or encoding failed, or no connection was made (`UNAVAILABLE`) | nothing happened; safe to try again |
+| `Refused(error)` | a status other than OK, except `UNAVAILABLE` without a reason | the product decided; not proof that nothing changed |
+| `Unknown(error)` | the deadline (`DEADLINE_EXCEEDED`), a transport failure after sending, an HTTP status other than 200, a malformed, compressed or oversized reply, or `UNAVAILABLE` without a reason | anything; read the tenant back and repeat only an operation that converges |
+
+A refusal carries the product's code, its message, and from
+`grpc-status-details-bin` the reason, domain, metadata, retry hint and field
+violations, as sekvent's gRPC error mapping writes them. Errors the client
+makes itself carry fixed messages and never a reply body, a header value,
+the token or the URL. `CallOutcome::into_result` gives the reply or the
+error of any other outcome.
+
+### Transport rules
+
+- `AdminClient::new` accepts `https` for any host and `http` only for a
+  loopback host. `AdminClient::in_cluster` also accepts `http` for any host,
+  for an admin listener reached inside one cluster network only.
+- Both refuse another scheme, user info, a query and a fragment with
+  `INVALID_ARGUMENT`, without echoing the URL. A trailing `/` of the base
+  URL is dropped; a path prefix is kept.
+- The HTTP stack is `sekvent::client::reqwest_builder()` (rustls,
+  certificates verified) with redirects off, driven directly so a failure
+  before the request left (`NotSent`) is told apart from one after
+  (`Unknown`); one client is built per `AdminClient` and reused.
+- The product serves its admin service with gRPC-Web on its admin listener.
 
 ## Configuration keys
 
@@ -1827,6 +2451,16 @@ in:
 | the error domains | `TenantsBuilder::domains` (`ErrorDomains`) | `sekvent.tenancy.v1`, `sekvent.tenancy.admin.v1` |
 | the channel name | `Channel::new` | none |
 | the resync interval | `Listener::resync_every` (zero refused; above 100 years never ticks) | 60 s |
+| the key id new tenants' role passwords are derived under | `ProvisionerBuilder::role_key_id` | none |
+| every tenant role's connection limit | `ProvisionerBuilder::connection_limit` | none |
+| the most tenants that are not `purged` | `ProvisionerBuilder::tenant_cap` | none |
+| the label rules of lifecycle requests | `ProvisionerBuilder::labels` | `LabelRules::new()` |
+| the admin issuer, audience and public keys (`key_id:<base64url>`, comma-separated) | `Verifier::new`, `parse_keys` | none |
+| the admin services | `admin::authenticator` | none |
+| the admin domain | `Verifier::with_domains`, `AdminAudit::with_domains` | `sekvent.tenancy.admin.v1` |
+| the operator's issuer and signing key (a `Secret` PEM) | `Minter::new` with `EdDsaSigningKey::from_pkcs8_pem` | none |
+| a product instance's admin URL and audience | `AdminClient::new` or `AdminClient::in_cluster` | none |
+| an admin call's deadline | `AdminClient::call` | none |
 
 ## Errors and reasons
 
@@ -1837,8 +2471,9 @@ both `&'static str`: `serving` (default `ErrorDomains::DEFAULT_SERVING`,
 product's own. `reasons` holds every reason as a constant whose value is its
 own name; reasons and their codes are wire contract, messages are not.
 
-Serving refusals carry one of eight reasons under the serving domain;
-everything else carries no domain:
+Serving refusals carry one of eight reasons under the serving domain, admin
+token refusals one of two under the admin domain; everything else carries no
+domain until the admin guard gives a reasoned error the admin domain:
 
 | Reason | Code | When |
 |---|---|---|
@@ -1872,11 +2507,26 @@ reason.
 | The permit, connect, operation, close or preflight bound passed; `Registry::admit` found no lifecycle permit within 10 s; the listener's control pool was closed | `UNAVAILABLE` | |
 | Any other database error, the listener's first `LISTEN` or first load included | as `sekvent::db::to_app_error` maps it | |
 
+The lifecycle, the admin surface and the manager kit add:
+
+| Situation | Code | Reason |
+|---|---|---|
+| A lifecycle request with an invalid label, display name, host set, primary host or adoption database (one field violation each); a `ProvisionerBuilder` setting missing or out of range; an admin key list entry, an empty service list or a refused service name; extra claims that are not an object or name a minter claim; an admin URL with another scheme, user info, a query or a fragment | `INVALID_ARGUMENT` | |
+| A lifecycle call for an id without a control row | `NOT_FOUND` | `TENANT_NOT_FOUND` |
+| A state the call does not accept; a lifecycle request that does not match an existing row; a host, role or database name another tenant holds | `FAILED_PRECONDITION` | `TENANT_STATE` |
+| Provisioning or adopting a new id when the tenants that are not `purged` reach the cap | `RESOURCE_EXHAUSTED` | `TENANT_LIMIT_REACHED` |
+| An adoption refused by the handover's checks or by `TenantHooks::check_adoptable` (the default refuses with `check` = `not_checked`) | `FAILED_PRECONDITION` | `ADOPTION_REFUSED`, metadata `check` (the product's own refusal is its error, unchanged) |
+| A tenant that cannot be opened for a lifecycle operation; `check_adoptable` past 150 s | `UNAVAILABLE` | |
+| Any failure of an admin token, its operation or its tenant | `UNAUTHENTICATED`, the constant end-user message | `ADMIN_TOKEN_INVALID`, admin domain |
+| A second call with one token id | `ALREADY_EXISTS` | `ADMIN_TOKEN_REPLAYED`, admin domain |
+| A stored cluster, role or database name changed by hand | `INTERNAL` | |
+
 Hosts and labels answer with their own error enums (`HostError`,
-`LabelError`). Cluster operations, `control::verify_schema` and the row
-functions attach no domain. The admin reasons (`ADMIN_TOKEN_INVALID`,
-`ADMIN_TOKEN_REPLAYED`, `TENANT_NOT_FOUND`, `TENANT_LIMIT_REACHED`) are
-defined in `reasons` and not returned by anything built yet.
+`LabelError`). Cluster operations, `control::verify_schema`, the row
+functions and the lifecycle attach no domain; `guard::run` gives a body
+error with a reason and no domain the admin domain. A hook's error is the
+lifecycle call's answer, unchanged. The manager's `CallOutcome` sorts the
+answers of an admin call ([The client](#the-client)).
 
 ## Sizing
 
@@ -1917,6 +2567,18 @@ check it against anything. As arithmetic: `p` processes, each with a tenant
 pool of at most `max_connections`, can hold up to `p × max_connections`
 connections of that role at once, so a lower limit makes connects fail
 once it is reached.
+
+**A lifecycle call** holds one lifecycle permit and, while a step runs, one
+control connection with the row locked, one maintenance session at a time,
+and for a hook a lifecycle pool of at most two connections as the tenant's
+role (the read-only form opens one connection first to migrate). Those
+tenant connections count against the role's connection limit, so set
+`connection_limit` to at least `p × max_connections + 2`. The tenant cap
+counts every tenant that is not `purged`, `suspended` and `purging`
+included; at most `capacity` of them are open in one process.
+
+**The admin audit** grows by one row per admin call; the product prunes
+rows older than the token lifetime (60 s) at the earliest.
 
 **The sender's queue** has no fixed limit: while a send is stalled (the
 control pool exhausted, a statement hanging) it keeps one entry per
@@ -1993,6 +2655,32 @@ there are.
   Changes take effect through the invalidation channel; a lost
   notification about a tenant's row is repaired by the next successful
   resync, a lost hint or product-defined change kind is not.
+- Lifecycle hooks never get a built scope: their pool is opened for the one
+  operation as the tenant's derived role, outside the tenant cache. Opening
+  a tenant that is not `active` takes a crate-private capability that only
+  provisioning, adoption, suspend, resume, usage and describe construct; a
+  purge never opens the tenant.
+- The seed's handover secret is returned once, by the call that ran the
+  seed, and never stored; `Provisioned` and `SeedOutcome` print only whether
+  they hold one. A product never logs it and hands it on only over a
+  protected channel.
+- Adoption fails closed: the default `check_adoptable` refuses every
+  database, and the product's check sees the candidate only through
+  read-only sessions of the maintenance role, before any role or row
+  exists.
+- Lifecycle refusals never repeat a host, a label or a database name the
+  caller sent: field violations name the field and a host's position.
+- Admin tokens are EdDSA, live at most 60 s, name one operation and at most
+  one tenant, and act once: the guard records the token id before the body
+  runs and refuses a second record. The admin App's end user names no
+  tenant; the guard compares the call's tenant with the token's exactly.
+- Every admin token refusal is one constant answer (`ADMIN_TOKEN_INVALID`);
+  the cause is a fixed text at `debug`. Tokens live in `Secret`: `Minted`
+  and `Minter` never print one, the client sends it as a sensitive header,
+  and a product never formats or logs one.
+- The admin client speaks `https`, or `http` to a loopback host
+  (`in_cluster` widens that to one cluster network), follows no redirect,
+  retries nothing and puts no URL, header, body or token in its errors.
 
 ## Testing
 
@@ -2026,13 +2714,31 @@ For the serving half a product's tests:
   test waits for a build to arrive instead of sleeping;
 - serve `Tenants::fixed(scope)` where a test needs no database at all.
 
+For the lifecycle and the admin surface a product's tests:
+
+- build the `Provisioner` with a `ManualClock`, a small `tenant_cap` to
+  reach `TENANT_LIMIT_REACHED`, and hooks that a test can fail once and
+  count, then repeat the call and assert it resumes (the seed's handover
+  only from the run that seeded);
+- test their own `check_adoptable` with `AdoptCandidate::new` on a database
+  the fixture made as the maintenance role, and keep a test that the
+  default refuses;
+- call admin bodies with a `CallContext` carrying `guard::end_user(claims)`,
+  and serve the admin App on `127.0.0.1:0` to drive it with the manager
+  kit's `AdminClient` and a `Minter` whose key the `Verifier` was given.
+
 ## See also
 
 - [db](db.md): `KeyedPools` and `ConnectCandidates`, which the tenant
   cache and the connector build on.
-- [components](components.md): the request scope and the end-user
-  authenticator.
+- [components](components.md): the request scope, the end-user
+  authenticator and precheck, and several Apps on one runtime
+  (`App::register_as`).
+- [auth](auth.md): EdDSA keys and JWTs, which the admin tokens use.
+- [client](client.md): `reqwest_builder`, the admin client's HTTP stack.
 - [server](server.md#configure-cors): `Cors` and `Cors::origin_predicate`.
 - [runtime](runtime.md): units, stages and policies for the tenant cache and
   the listener.
+- [`examples/tenants`](../../examples/tenants): a product with tenants, its
+  admin service and an operator calling it.
 - [design/tenancy.md](../design/tenancy.md): the decisions and the slices.

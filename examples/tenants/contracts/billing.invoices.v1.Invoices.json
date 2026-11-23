@@ -1,0 +1,110 @@
+{
+  "format": 2,
+  "service": "billing.invoices.v1.Invoices",
+  "file": "billing/invoices/v1/invoices.proto",
+  "rpcs": {
+    "CreateInvoice": {
+      "request": "billing.invoices.v1.CreateInvoiceRequest",
+      "reply": "billing.invoices.v1.Invoice",
+      "client_streaming": false,
+      "server_streaming": false
+    },
+    "ListInvoices": {
+      "request": "billing.invoices.v1.ListInvoicesRequest",
+      "reply": "billing.invoices.v1.ListInvoicesReply",
+      "client_streaming": false,
+      "server_streaming": false
+    }
+  },
+  "messages": {
+    "billing.invoices.v1.CreateInvoiceRequest": {
+      "fields": {
+        "1": {
+          "name": "customer",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "2": {
+          "name": "amount_cents",
+          "type": "int64",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    },
+    "billing.invoices.v1.Invoice": {
+      "fields": {
+        "1": {
+          "name": "number",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "2": {
+          "name": "customer",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "3": {
+          "name": "amount_cents",
+          "type": "int64",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "4": {
+          "name": "currency",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    },
+    "billing.invoices.v1.ListInvoicesReply": {
+      "fields": {
+        "1": {
+          "name": "invoices",
+          "type": "message:billing.invoices.v1.Invoice",
+          "cardinality": "repeated",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    },
+    "billing.invoices.v1.ListInvoicesRequest": {
+      "fields": {
+        "1": {
+          "name": "page_size",
+          "type": "uint32",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    }
+  },
+  "enums": {}
+}

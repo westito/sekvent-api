@@ -729,3 +729,5 @@ but no closing one.
   that runs in-process today and in its own service later, by configuration.
 - [examples/shop](../examples/shop/README.md): a complete three-component
   example, including a split topology over gRPC and contract baselines.
+- [examples/tenants](../examples/tenants/README.md): tenants on a database
+  and a role each, provisioned through the product's own admin service.

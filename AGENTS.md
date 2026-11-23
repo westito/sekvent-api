@@ -69,7 +69,7 @@ repository; describe behaviour in your own words and use neutral examples
 | `sekvent-storage` | S3-compatible object storage: SigV4 presigned uploads and downloads, head, delete, copy, bucket probe | config, error, context, client, resilience, runtime (optional) |
 | `sekvent-db` | named pools, a keyed resource cache with a pool per key, migrations (directory or embedded), distinct-target check, sea-query execution, sea-orm filters, probes, leases | config, error, runtime (optional) |
 | `sekvent-component` | components, App builder, local, serialized and gRPC bindings, server-streaming methods | config, error, context, resilience, link (optional), macros, runtime (optional), telemetry (optional) |
-| `sekvent-tenancy` | tenants on a database and a role each: ids and object names, derived role credentials, cluster operations and the startup preflight; the control registry, tenant selection and the scope resolver, the tenant cache and cross-process invalidation; lifecycle operations, admin tokens and the manager kit (slice 1c) | config, error, context, db, component, telemetry, runtime (optional), auth (optional), client (optional) |
+| `sekvent-tenancy` | tenants on a database and a role each: ids and object names, derived role credentials, cluster operations and the startup preflight; the control registry, tenant selection and the scope resolver, the tenant cache and cross-process invalidation; tenant lifecycle operations with the product's hooks, the admin surface (token verifier, authenticator, audit, guard) and the manager kit (minter, admin client) | config, error, context, db, component, telemetry, runtime (optional), auth (optional), client (optional) |
 | `sekvent-testing` | Postgres/MySQL/MinIO containers, reaper, `await_until!` | — |
 | `sekvent-proto-build` | build.rs codegen helpers, component service-contract constants and RPC type aliases | — |
 | `sekvent-api` (lib `sekvent`) | facade re-exporting the above behind features | all |
@@ -204,7 +204,8 @@ tooling) are not started.
 - `cargo sekvent contract emit` writes baselines (format 2) into the tree:
   run it on the Mac, like other in-tree codegen, and commit the JSON.
   `contract check` runs in-process (protox, no `protoc`, no build) and is
-  part of the gate when `[contract]` has roots; `examples/shop` dogfoods it.
+  part of the gate when `[contract]` has roots; `examples/shop` and
+  `examples/tenants` dogfood it.
 
 ## Tests
 
@@ -247,6 +248,7 @@ In-tree codegen (Mac only, after the code compiles):
 INSTA_UPDATE=always cargo test -p sekvent-macros --lib          # expansion snapshots
 TRYBUILD=overwrite cargo test -p sekvent-macros --test ui        # ui .stderr
 (cd examples/shop && cargo run -p cargo-sekvent -- sekvent contract emit)
+(cd examples/tenants && cargo run -p cargo-sekvent -- sekvent contract emit)
 ```
 
 Review every regenerated snapshot, `.stderr` and baseline before committing.

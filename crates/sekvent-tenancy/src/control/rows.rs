@@ -191,6 +191,23 @@ const SET_SUBDOMAIN: &str = "UPDATE tenants SET subdomain = $2, updated_at = $3 
 
 const DELETE_HOSTS: &str = "DELETE FROM tenant_hosts WHERE tenant_id = $1";
 
+const SET_STEP: &str = "UPDATE tenants SET provision_step = $2, updated_at = $3 WHERE id = $1";
+
+const SET_ROLE_KEY: &str = "UPDATE tenants SET db_role_key_id = $2, db_role_generation = $3, \
+     updated_at = $4 WHERE id = $1";
+
+const TOUCH: &str = "UPDATE tenants SET updated_at = $2 WHERE id = $1";
+
+const COUNT_LIVE: &str = "SELECT count(*) FROM tenants WHERE state <> 'purged'";
+
+const PAGE: &str = concat!(
+    "SELECT ",
+    tenant_columns!(),
+    ", ",
+    host_columns!(),
+    " FROM tenants t WHERE ($1::uuid IS NULL OR t.id > $1) ORDER BY t.id LIMIT $2"
+);
+
 const STORE_VERSION: &str = "WITH locked AS ( \
          SELECT id, schema_version FROM tenants WHERE id = $1 FOR UPDATE SKIP LOCKED \
      ), moved AS ( \
@@ -336,14 +353,19 @@ fn checked_hosts(hosts: &[String], primary_host: &str) -> Result<Vec<String>, Ap
 /// The validated host set and the stored generation of `tenant`.
 fn checked_tenant(tenant: &NewTenant) -> Result<(Vec<String>, i32), AppError> {
     let hosts = checked_hosts(&tenant.hosts, &tenant.primary_host)?;
-    let generation = i32::try_from(tenant.role_key.generation)
+    let generation = stored_generation(tenant.role_key.generation)?;
+    Ok((hosts, generation))
+}
+
+/// `generation` as stored: 1 to 2147483647, else `INVALID_ARGUMENT`.
+fn stored_generation(generation: u32) -> Result<i32, AppError> {
+    i32::try_from(generation)
         .ok()
         .filter(|generation| *generation >= 1)
         .ok_or_else(|| {
             AppError::invalid_argument("the role key's generation is out of range")
                 .with_field_violation("role_key.generation", "from 1 to 2147483647")
-        })?;
-    Ok((hosts, generation))
+        })
 }
 
 /// A failed write: `TENANT_STATE` when another tenant holds a host, the role or the database
@@ -558,6 +580,97 @@ pub async fn store_schema_version(
     } else {
         VersionStored::Stored
     })
+}
+
+/// Records `step` as the tenant's provisioning step and sets `updated_at`; whether a row was
+/// changed.
+pub async fn set_step(
+    conn: &mut PgConnection,
+    id: TenantId,
+    step: ProvisionStep,
+    now: SystemTime,
+) -> Result<bool, AppError> {
+    let done = sqlx::query(SET_STEP)
+        .bind(Uuid::from(id))
+        .bind(step.as_str())
+        .bind(DateTime::<Utc>::from(now))
+        .execute(conn)
+        .await
+        .map_err(to_app_error)?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Stores the key the tenant's role password is derived under and sets `updated_at`; whether a
+/// row was changed. `INVALID_ARGUMENT` before any statement for a generation outside 1 to
+/// 2147483647.
+pub async fn set_role_key(
+    conn: &mut PgConnection,
+    id: TenantId,
+    key: &RoleKey,
+    now: SystemTime,
+) -> Result<bool, AppError> {
+    let generation = stored_generation(key.generation)?;
+    let done = sqlx::query(SET_ROLE_KEY)
+        .bind(Uuid::from(id))
+        .bind(key.key_id.as_str())
+        .bind(generation)
+        .bind(DateTime::<Utc>::from(now))
+        .execute(conn)
+        .await
+        .map_err(to_app_error)?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Removes every host of the tenant and sets `updated_at`; whether the tenant's row exists. Call
+/// it inside a transaction (two statements). The subdomain stays.
+pub async fn clear_hosts(
+    conn: &mut PgConnection,
+    id: TenantId,
+    now: SystemTime,
+) -> Result<bool, AppError> {
+    let done = sqlx::query(TOUCH)
+        .bind(Uuid::from(id))
+        .bind(DateTime::<Utc>::from(now))
+        .execute(&mut *conn)
+        .await
+        .map_err(to_app_error)?;
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query(DELETE_HOSTS)
+        .bind(Uuid::from(id))
+        .execute(conn)
+        .await
+        .map_err(to_app_error)?;
+    Ok(true)
+}
+
+/// The number of tenants that are not `purged`, with one statement.
+pub async fn count_live(conn: &mut PgConnection) -> Result<u64, AppError> {
+    let count: i64 = sqlx::query_scalar(COUNT_LIVE)
+        .fetch_one(conn)
+        .await
+        .map_err(to_app_error)?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// At most `limit` tenants in any state, ordered by id, starting after `after` (from the first
+/// when `None`), with one statement. A `limit` of 0 reads nothing.
+pub async fn page(
+    conn: &mut PgConnection,
+    after: Option<TenantId>,
+    limit: u32,
+) -> Result<Vec<TenantRow>, AppError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let stored: Vec<StoredRow> = sqlx::query_as(PAGE)
+        .bind(after.map(Uuid::from))
+        .bind(i64::from(limit))
+        .fetch_all(conn)
+        .await
+        .map_err(to_app_error)?;
+    stored.into_iter().map(StoredRow::decode).collect()
 }
 
 #[cfg(test)]
@@ -892,6 +1005,31 @@ mod tests {
         );
         for generation in [0, 2_147_483_648, u32::MAX] {
             let error = checked_tenant(&tenant(generation)).expect_err("out of range");
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert_eq!(error.field_violations()[0].field, "role_key.generation");
+        }
+    }
+
+    #[test]
+    fn only_set_step_writes_the_step_and_no_statement_writes_the_cluster() {
+        assert!(SET_STEP.contains("provision_step = $2"));
+        for statement in [SET_ROLE_KEY, TOUCH, PAGE, COUNT_LIVE] {
+            assert!(!statement.contains("provision_step ="), "{statement}");
+            assert!(!statement.contains("db_cluster ="), "{statement}");
+        }
+        assert!(PAGE.contains("t.provision_step") && PAGE.contains("ARRAY(SELECT h.host"));
+        assert!(COUNT_LIVE.contains("state <> 'purged'"));
+    }
+
+    #[test]
+    fn stored_generation_admits_one_to_the_largest_integer() {
+        assert_eq!(stored_generation(1).expect("1 fits"), 1);
+        assert_eq!(
+            stored_generation(2_147_483_647).expect("the largest fits"),
+            i32::MAX
+        );
+        for generation in [0, 2_147_483_648, u32::MAX] {
+            let error = stored_generation(generation).expect_err("out of range");
             assert_eq!(error.code(), ErrorCode::InvalidArgument);
             assert_eq!(error.field_violations()[0].field, "role_key.generation");
         }

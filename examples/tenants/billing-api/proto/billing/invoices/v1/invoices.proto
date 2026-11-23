@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+// Contract of the billing product's public API: what an end user of one
+// tenant calls. The tenant is chosen from the request (its host, or the
+// tenant header on the shared API host), never from a field of a message.
+// The Rust trait `billing_api::Invoices` is checked against the service at
+// compile time.
+package billing.invoices.v1;
+
+// The invoices of the tenant the request names.
+service Invoices {
+  // Issue an invoice under the tenant's default series.
+  rpc CreateInvoice(CreateInvoiceRequest) returns (Invoice);
+  // The tenant's invoices, oldest first.
+  rpc ListInvoices(ListInvoicesRequest) returns (ListInvoicesReply);
+}
+
+// An invoice to issue.
+message CreateInvoiceRequest {
+  // Who is billed; not blank, at most 200 characters.
+  string customer = 1;
+  // The amount in the series' currency, in cents; not negative.
+  int64 amount_cents = 2;
+}
+
+// An issued invoice.
+message Invoice {
+  // The number the series gave it, such as `INV-000001`.
+  string number = 1;
+  string customer = 2;
+  int64 amount_cents = 3;
+  // The series' currency, such as `EUR`.
+  string currency = 4;
+}
+
+// Which invoices to list.
+message ListInvoicesRequest {
+  // At most this many, from 1 to 100; 0 means 50.
+  uint32 page_size = 1;
+}
+
+// The invoices, oldest first.
+message ListInvoicesReply {
+  repeated Invoice invoices = 1;
+}

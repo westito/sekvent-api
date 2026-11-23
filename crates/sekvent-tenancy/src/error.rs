@@ -3,8 +3,9 @@
 //! Reasons and their codes are wire contract; the messages are not. Cluster
 //! operations attach a reason without a domain, because they know no
 //! product. The tenant cache (`Tenants`) adds the serving domain taken from
-//! the product's [`ErrorDomains`]; the admin domain is for the admin
-//! surface, which is not built yet.
+//! the product's [`ErrorDomains`]; the admin guard gives a reasoned error
+//! without a domain the admin domain. Lifecycle operations answer without
+//! a domain, like the cluster operations.
 
 /// The domains of this crate's reasons.
 ///
@@ -213,6 +214,47 @@ pub(crate) mod serving {
 pub(crate) fn tenant_state() -> sekvent_error::AppError {
     sekvent_error::AppError::failed_precondition("the tenant's state does not allow this")
         .with_reason(reasons::TENANT_STATE)
+}
+
+/// `NOT_FOUND` / `TENANT_NOT_FOUND` ("no such tenant"), no domain: a
+/// lifecycle call for an id without a control row.
+#[cfg(feature = "lifecycle")]
+pub(crate) fn tenant_not_found() -> sekvent_error::AppError {
+    sekvent_error::AppError::not_found("no such tenant").with_reason(reasons::TENANT_NOT_FOUND)
+}
+
+/// `RESOURCE_EXHAUSTED` / `TENANT_LIMIT_REACHED` ("the tenant limit is
+/// reached"), no domain: provisioning a new id at the product's cap.
+#[cfg(feature = "lifecycle")]
+pub(crate) fn tenant_limit_reached() -> sekvent_error::AppError {
+    sekvent_error::AppError::resource_exhausted("the tenant limit is reached")
+        .with_reason(reasons::TENANT_LIMIT_REACHED)
+}
+
+/// The admin surface's two reasons, in the product's admin domain.
+#[cfg(feature = "admin")]
+pub(crate) mod admin {
+    use sekvent_component::END_USER_REJECTED_MESSAGE;
+    use sekvent_error::AppError;
+
+    use super::reasons;
+
+    /// `UNAUTHENTICATED` / `ADMIN_TOKEN_INVALID` with the component layer's
+    /// constant rejection message, in `domain`: every failure of an admin
+    /// token, whatever the cause.
+    pub(crate) fn token_invalid(domain: &'static str) -> AppError {
+        AppError::unauthenticated(END_USER_REJECTED_MESSAGE)
+            .with_reason(reasons::ADMIN_TOKEN_INVALID)
+            .with_domain(domain)
+    }
+
+    /// `ALREADY_EXISTS` / `ADMIN_TOKEN_REPLAYED` ("the admin token was used
+    /// before"), in `domain`.
+    pub(crate) fn token_replayed(domain: &'static str) -> AppError {
+        AppError::already_exists("the admin token was used before")
+            .with_reason(reasons::ADMIN_TOKEN_REPLAYED)
+            .with_domain(domain)
+    }
 }
 
 #[cfg(test)]

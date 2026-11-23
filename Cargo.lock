@@ -494,6 +494,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "billing"
+version = "0.1.0"
+dependencies = [
+ "billing-api",
+ "chrono",
+ "sekvent-api",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "billing-api"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "sekvent-api",
+ "sekvent-proto-build",
+]
+
+[[package]]
+name = "billing-svc"
+version = "0.1.0"
+dependencies = [
+ "billing",
+ "billing-api",
+ "http",
+ "prost",
+ "reqwest",
+ "sekvent-api",
+ "sekvent-testing",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4419,6 +4456,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "prost",
+ "reqwest",
  "sekvent-auth",
  "sekvent-client",
  "sekvent-component",

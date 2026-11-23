@@ -1,0 +1,19 @@
+[package]
+name = "billing-api"
+description = "Contracts of the example billing product: the public invoices service and its own tenant admin service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+prost = { workspace = true }
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component"] }
+
+[build-dependencies]
+sekvent-proto-build = { path = "../../../crates/sekvent-proto-build" }
+
+[lints]
+workspace = true

@@ -65,11 +65,13 @@ can describe APIs the project does not have yet.
 | Serve many tenants from one process: the control registry and its schema check, a scope per tenant opened on demand and cached (`Tenants`, `ScopeFactory`), walks and the migration sweep | `docs/modules/tenancy.md` ("The control schema", "Lookups and their admission", "The tenant cache", "Sizing") |
 | Select the tenant of a request (id header, path label, a tenant's own host) with `TenantResolver`; allow the tenants' origins in CORS | `docs/modules/tenancy.md` ("Select the tenant", "CORS") |
 | Follow tenant changes made on other processes (`LISTEN`/`NOTIFY` with a periodic resync) and announce your own | `docs/modules/tenancy.md` ("Follow changes from other processes") |
-| Provision, suspend and purge tenants, guard admin RPCs, call them from an operator service (slice 1c) | `docs/modules/tenancy.md` ("Provision a tenant", "The admin surface"), `docs/design/tenancy.md` |
+| Provision, adopt, suspend, resume, re-host and purge tenants with your hooks (`Provisioner`, `TenantHooks`) | `docs/modules/tenancy.md` ("Provision a tenant", "Suspend, resume, change hosts, purge", "Adopt an existing database") |
+| Serve those operations as admin RPCs guarded by one-use operator tokens, and call them from an operator service (`guard::run`, `Minter`, `AdminClient`) | `docs/modules/tenancy.md` ("The admin surface", "Call a product's admin API"), `examples/tenants` |
 | `build.rs` protobuf codegen without `protoc` | `docs/modules/proto-build.md` |
 | Container-backed DB and MinIO tests, deterministic tests, coverage | `docs/modules/testing.md` |
 | Why something is designed the way it is | `docs/design/*.md` (decisions; the module pages describe current behaviour) |
 | A complete multi-component example | `examples/shop/` |
+| A complete multi-tenant product with its admin service and an operator client | `examples/tenants/` |
 
 Every module page has the same shape: *Enable it* (feature + import path),
 *Quick example*, *Concepts*, *How to …* sections, configuration keys, error
@@ -157,9 +159,9 @@ this shape; read it before restructuring.
 | Service-to-service tokens | `link` (+ `link-axum` / `link-tonic`) |
 | Components | `component` (+ `component-grpc` for the gRPC binding, also for serving streams; `runtime-grpc-web` for browsers) |
 | Tenants on a database and a role each (names, derived credentials, the startup preflight, selection and the resolver, the tenant cache, invalidation) | `tenancy` (with `runtime`: the cache's and the listener's units) |
-| Tenant roles and databases through a maintenance role, adopting a database | `tenancy-lifecycle` |
-| Guard a product's admin RPCs with operator tokens (slice 1c) | `tenancy-admin` |
-| Mint operator tokens and call a product's admin RPC, no database (slice 1c) | `tenancy-manager` with `default-features = false` (the default `runtime` pulls in the database driver) |
+| Tenant roles and databases through a maintenance role; provisioning, adoption, suspend, resume and purge (`Provisioner`) | `tenancy-lifecycle` |
+| Guard a product's admin RPCs with operator tokens | `tenancy-admin` |
+| Mint operator tokens and call a product's admin RPC, no database | `tenancy-manager` with `default-features = false` (the default `runtime` pulls in the database driver) |
 
 A browser frontend: in development run Vite's dev server with
 `server.proxy` sending `/api` to the backend (one origin, no CORS); in

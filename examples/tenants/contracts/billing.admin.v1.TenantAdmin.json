@@ -1,0 +1,227 @@
+{
+  "format": 2,
+  "service": "billing.admin.v1.TenantAdmin",
+  "file": "billing/admin/v1/admin.proto",
+  "rpcs": {
+    "GetTenant": {
+      "request": "billing.admin.v1.TenantRequest",
+      "reply": "billing.admin.v1.GetTenantReply",
+      "client_streaming": false,
+      "server_streaming": false
+    },
+    "ProvisionTenant": {
+      "request": "billing.admin.v1.ProvisionTenantRequest",
+      "reply": "billing.admin.v1.ProvisionTenantReply",
+      "client_streaming": false,
+      "server_streaming": false
+    },
+    "PurgeTenant": {
+      "request": "billing.admin.v1.TenantRequest",
+      "reply": "billing.admin.v1.Tenant",
+      "client_streaming": false,
+      "server_streaming": false
+    },
+    "ResumeTenant": {
+      "request": "billing.admin.v1.TenantRequest",
+      "reply": "billing.admin.v1.Tenant",
+      "client_streaming": false,
+      "server_streaming": false
+    },
+    "SuspendTenant": {
+      "request": "billing.admin.v1.TenantRequest",
+      "reply": "billing.admin.v1.Tenant",
+      "client_streaming": false,
+      "server_streaming": false
+    }
+  },
+  "messages": {
+    "billing.admin.v1.GetTenantReply": {
+      "fields": {
+        "1": {
+          "name": "tenant",
+          "type": "message:billing.admin.v1.Tenant",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "2": {
+          "name": "measured",
+          "type": "bool",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "3": {
+          "name": "database_bytes",
+          "type": "uint64",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "4": {
+          "name": "invoices",
+          "type": "int64",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    },
+    "billing.admin.v1.ProvisionTenantReply": {
+      "fields": {
+        "1": {
+          "name": "tenant",
+          "type": "message:billing.admin.v1.Tenant",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "2": {
+          "name": "owner_token",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "3": {
+          "name": "owner_token_withheld",
+          "type": "bool",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    },
+    "billing.admin.v1.ProvisionTenantRequest": {
+      "fields": {
+        "1": {
+          "name": "tenant_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "2": {
+          "name": "subdomain",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "3": {
+          "name": "display_name",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "4": {
+          "name": "hosts",
+          "type": "string",
+          "cardinality": "repeated",
+          "oneof": null,
+          "default": null
+        },
+        "5": {
+          "name": "primary_host",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "6": {
+          "name": "owner_email",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "7": {
+          "name": "currency",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    },
+    "billing.admin.v1.Tenant": {
+      "fields": {
+        "1": {
+          "name": "tenant_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "2": {
+          "name": "subdomain",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "3": {
+          "name": "display_name",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "4": {
+          "name": "state",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "5": {
+          "name": "primary_host",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        },
+        "6": {
+          "name": "hosts",
+          "type": "string",
+          "cardinality": "repeated",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    },
+    "billing.admin.v1.TenantRequest": {
+      "fields": {
+        "1": {
+          "name": "tenant_id",
+          "type": "string",
+          "cardinality": "singular",
+          "oneof": null,
+          "default": null
+        }
+      },
+      "reserved": [],
+      "reserved_names": [],
+      "extension_ranges": [],
+      "extensions": {}
+    }
+  },
+  "enums": {}
+}

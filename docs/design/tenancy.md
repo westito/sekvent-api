@@ -1845,62 +1845,57 @@ every process) passes unchanged.
 
 ## 10. Slice 1c: lifecycle and admin
 
-What the serving half already gives this slice, so that no signature of 9
-changes:
+What the serving half gives this slice, with no signature of 9 changed:
 
 - `TenantRow::provision_step` is the typed `control::ProvisionStep` with
   the stored texts of 10.2, and `TenantRow::db_cluster` is read.
-  `control::rows` has no function yet that records a step, stores a role
-  key, clears the hosts, counts the rows that are not `purged` or pages a
-  list: 1c's step 0 adds them there; no existing one changes. Repository
+  `control::rows` records a step (`set_step`), stores a role key
+  (`set_role_key`), clears the hosts (`clear_hosts`), counts the rows that
+  are not `purged` (`count_live`) and pages a list (`page`). Repository
   writes that set a timestamp take `now: SystemTime`, which the
   provisioner takes from its `Clock`.
 - `admin_audit` is in `REFERENCE_SCHEMA`, and `verify_schema` checks it
-  with the feature `admin`; 1c adds only the statements that write it.
+  with the feature `admin`; the admin audit writes it.
 - `Registry::admit` with `LifecyclePermit` (10.5), `Registry::tenant_now`
-  (the committed row, no cache) and `Registry::forget` exist.
+  (the committed row, no cache) and `Registry::forget`.
 - A creation of the tenant cache never caches a tenant that is not
-  `active`, and `get` refuses one (9.6), so the
-  dedicated lifecycle pools of 10.1 are the only way to open one, and
-  `LifecycleCapability` gates those, not `Tenants`. The cache opens a
-  tenant only when its stored role is the derived one, its database name
-  parses and its cluster is `main`: provisioning and adoption store
-  exactly that.
-- `Tenants::invalidate` already forgets the tenant's lookups; `Sink` is
-  object-safe and implemented for `Arc<T>`, so the listener and the
-  announce of 10.5 share one sink; `ChangeKind::STATE` and
-  `ChangeKind::HOSTS` are the kinds the announce sends.
-- A fixed `Tenants` names `TenantId::LOCAL` as the scope's tenant, so an
-  end user of a fixed-scope product carries that tenant text; the admin
-  authenticator's `tid` rule (10.6) must allow for it.
+  `active`, and `get` refuses one (9.6), so the lifecycle pools of 10.1 are
+  the only way to open one, and `LifecycleCapability` gates those, not
+  `Tenants`. The cache opens a tenant only when its stored role is the
+  derived one, its database name parses and its cluster is `main`:
+  provisioning and adoption store exactly that.
+- `Tenants::invalidate` forgets the tenant's lookups; `Sink` is object-safe
+  and implemented for `Arc<T>`, so the listener and the announce of 10.5
+  share one sink; `ChangeKind::STATE` and `ChangeKind::HOSTS` are the kinds
+  the announce sends.
+- The admin App has no scope resolver and the admin authenticator's end
+  user names no tenant (10.6), so a fixed `Tenants` naming
+  `TenantId::LOCAL` never meets an admin end user; a process that serves a
+  fixed scope installs `Verifier::refusing()`.
 
-### 10.1 File ownership
+### 10.1 Files
 
-| Writer | Files | Module-page section |
-|---|---|---|
-| A | `src/lifecycle/hooks.rs`, `provisioner.rs`, `open.rs`, `provision.rs`, `tests/provision.rs` | "Provision a tenant" |
-| B | `src/lifecycle/state.rs`, `purge.rs`, `announce.rs`, `usage.rs`, `tests/lifecycle.rs`, `tests/purge.rs` | "Suspend, resume, change hosts, purge" |
-| C | `src/lifecycle/adopt.rs`, `tests/adopt.rs` | "Adopt an existing database" |
-| D | `src/admin/*.rs` except `mod.rs`, `tests/admin.rs` | "The admin surface" |
-| E | `src/manager/*.rs` except `mod.rs`, `tests/manager.rs` | "Call a product's admin API" |
-
-`examples/tenants` and the facade check follow in a second wave by one
-writer, once the five are verified.
+| Files | Module-page section |
+|---|---|
+| `src/lifecycle/hooks.rs`, `provisioner.rs`, `open.rs`, `provision.rs`, `tests/provision.rs` | "Provision a tenant" |
+| `src/lifecycle/state.rs`, `purge.rs`, `announce.rs`, `usage.rs`, `tests/lifecycle.rs`, `tests/purge.rs` | "Suspend, resume, change hosts, purge" |
+| `src/lifecycle/adopt.rs`, `tests/adopt.rs` | "Adopt an existing database" |
+| `src/admin/*.rs`, `tests/admin.rs` | "The admin surface" |
+| `src/manager/*.rs`, `tests/manager.rs` | "Call a product's admin API" |
 
 #### Hooks, the capability and the handle
 
 ```rust
 pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 
-/// The product's side of the lifecycle. Every method has a default that does nothing.
+/// The `check` of the default adoption refusal.
+pub const NOT_CHECKED: &str = "not_checked";
+
+/// The product's side of the lifecycle. Every method has a default; each does
+/// nothing and succeeds, except `check_adoptable`, which refuses.
 pub trait TenantHooks: Send + Sync + 'static {
-    /// The product's seed payload.
     type Seed: Send + Sync + 'static;
-    /// Fill a new tenant's database. Must be idempotent: a second call
-    /// after a committed first returns no handover.
     fn seed<'a>(&'a self, tenant: &'a TenantInfo, pool: &'a PgPool, seed: &'a Self::Seed) -> HookFuture<'a, SeedOutcome>;
-    /// Whether a candidate database is the product's and may be adopted.
-    /// Read-only; `pool` is the maintenance role's, before the handover.
     fn check_adoptable<'a>(&'a self, candidate: &'a AdoptCandidate, pool: &'a PgPool) -> HookFuture<'a, ()>;
     fn adopted<'a>(&'a self, tenant: &'a TenantInfo, pool: &'a PgPool) -> HookFuture<'a, ()>;
     fn before_suspend<'a>(&'a self, tenant: &'a TenantInfo, pool: &'a PgPool) -> HookFuture<'a, ()>;
@@ -1909,63 +1904,92 @@ pub trait TenantHooks: Send + Sync + 'static {
     fn usage<'a>(&'a self, tenant: &'a TenantInfo, pool: &'a PgPool) -> HookFuture<'a, UsageCounters>;
 }
 
-/// What a seed hands back once.
-pub struct SeedOutcome { pub handover: Option<Secret> }
-```
+/// What a seed hands back once. `Debug` prints whether there is a handover.
+#[derive(Clone, Default)]
+pub struct SeedOutcome { pub handover: Option<Secret> }   // SeedOutcome::with_handover(secret)
 
-(† the hook signatures are pinned in step 0; the shape above is binding:
-async, fallible, a pool and the tenant's info, a `Secret` for a handover.)
+#[non_exhaustive]
+pub struct AdoptCandidate { pub tenant: TenantId, pub database: DatabaseName, pub subdomain: String, pub display_name: String }
+pub struct Description { pub display_name: String, pub attributes: BTreeMap<String, String> }
+pub struct UsageCounters { pub counters: BTreeMap<String, i64>, pub last_activity: Option<SystemTime> }
+```
 
 - **Hooks get a pool, never a scope.** Every hook but `check_adoptable`
   receives a pool on the tenant's **migrated** database, opened as the
-  tenant's role for this one operation (at most two connections, closed
-  when the operation ends) and outside the tenant cache: a provisioning
-  or suspended tenant never gets a cached scope, and an expensive scope is
-  never built to seed, suspend or measure.
-- `check_adoptable` is the exception and is named as such: its pool is
-  `Maintenance::pool_on` on the candidate database, before the handover
-  and before any migration of ours; its sessions start read-only and keep
-  the server-side bounds of 8.6.
-- **`LifecycleCapability`**†: opening a tenant that is not `active`
-  requires one. Its constructor is crate-private, and the review rule is
-  that it is called only in `provision.rs`, `state.rs`, `adopt.rs` and
-  `usage.rs`; `select`, `resolver`, `tenants`, `purge.rs` and `admin`
-  never call it. A purge never opens the tenant.
-- `Provisioner<H>`† is the handle: the registry, the `Maintenance`, the
-  `Connector` and `ObjectNames`, the tenant migrator, the hooks, the key
-  id for new tenants, the role connection limit, the tenant cap, the
-  `LabelRules`, the invalidation `Sender`, a `Clock`, and the cache to
-  invalidate as a trait object (it is not generic over the scope type): a
-  crate-private object-safe trait over `Tenants::invalidate` and
-  `Tenants::refresh_hosts`, added in `tenants/keyed.rs` by 1c's step 0.
+  tenant's role for this one operation (at most two connections, its
+  first connected within 10 s, closed within 10 s when the operation ends)
+  and outside the tenant cache: a provisioning or suspended tenant never
+  gets a cached scope, and an expensive scope is never built to seed,
+  suspend or measure. A failure to open is `UNAVAILABLE` without a reason;
+  its source is a stage text (`connect`, `migrate`) and at most a SQLSTATE.
+- `check_adoptable` is the exception: its pool is `Maintenance::pool_on`
+  on the candidate database, before the handover and before any migration
+  of ours; its sessions start read-only and keep the server-side bounds of
+  8.6. The default refuses every database (decision 36).
+- The hooks' defaults: `seed` writes nothing and returns no handover,
+  `describe` returns the display name and no attribute, `usage` no counter;
+  the others do nothing.
+- **`LifecycleCapability`** (crate-private): opening a tenant that is not
+  `active` requires one. Its constructor is called only in
+  `provision.rs`, `state.rs`, `adopt.rs` and `usage.rs`; `select`,
+  `resolver`, `tenants`, `purge.rs` and `admin` never call it. A purge
+  never opens the tenant.
+- `Provisioner<H: TenantHooks>` is the handle, cloned cheaply, built by
+  `Provisioner::builder(registry, maintenance, connector, migrator: &'static
+  Migrator, sender, hooks) -> ProvisionerBuilder<H>` with the required
+  `role_key_id(&str)` (a key of the connector's secrets),
+  `connection_limit(u32)` (1 to 2147483647) and `tenant_cap(u64)` (at
+  least 1), and the optional `labels(LabelRules)`, `tenants(Tenants<S>)`,
+  `sink(impl Sink)` and `clock(Arc<dyn Clock>)`; `build()` does no I/O and
+  refuses a missing or out-of-range setting with `INVALID_ARGUMENT`. The
+  cache it announces to is held as a crate-private object-safe trait over
+  `Tenants::invalidate` and `Tenants::refresh_hosts` (`tenants/keyed.rs`),
+  so the provisioner is not generic over the scope type. It also offers
+  `tenant(id) -> Result<TenantRow, AppError>` (`TENANT_NOT_FOUND` without a
+  row), `list(after: Option<TenantId>, limit: u32) -> Result<Vec<TenantRow>,
+  AppError>`, `registry()`, `hooks()` and `names()`.
 
 ### 10.2 Provisioning
 
-`provision(&self, ProvisionRequest<H::Seed>) -> Result<Provisioned, AppError>`†,
-with `Provisioned { row: TenantRow, handover: Option<Secret> }`.
+```rust
+pub async fn provision(&self, request: ProvisionRequest<H::Seed>) -> Result<Provisioned, AppError>;
+
+pub struct ProvisionRequest<S> {
+    pub tenant: TenantId,
+    pub subdomain: String,
+    pub display_name: String,          // 1 to DISPLAY_NAME_MAX (255) bytes, not blank, no control character
+    pub hosts: Vec<String>,
+    pub primary_host: String,
+    pub seed: S,                       // not stored; Debug leaves it out
+}
+pub struct Provisioned { pub row: TenantRow, pub handover: Option<Secret> }
+```
 
 Before the steps: the request is validated (the label by the product's
-`LabelRules`; hosts canonical, sorted, without duplicates, the primary
-among them; violations as field violations); the lifecycle admission is
-taken; under a transaction-level advisory lock the row is inserted when
-the id is new, and a new id at the tenant cap (rows not `purged`) is
-`TENANT_LIMIT_REACHED`. A host, role or database name another tenant
-holds is `TENANT_STATE`.
+`LabelRules`; the display name; hosts canonical, sorted, without
+duplicates, the primary among them; every violation as a field violation of
+one `INVALID_ARGUMENT`, a host named by its position); the lifecycle
+admission is taken; under a transaction-level advisory lock the row is
+inserted when the id is new, and a new id at the tenant cap (rows not
+`purged`) is `TENANT_LIMIT_REACHED`. A host, role or database name another
+tenant holds is `TENANT_STATE`.
 
 Each step locks the row (`FOR UPDATE`), re-reads it, does its work,
 records the step and commits. A call for an existing id resumes at the
 recorded step when the request matches the row (label, display name,
-hosts, primary host), and is `TENANT_STATE` when it does not. The steps
-are `control::ProvisionStep` (9.2): `Inserted` (the empty stored text,
-a new row) and the five of the table below, in that order; an unknown
-stored text is `INTERNAL`.
+hosts, primary host, database name), and is `TENANT_STATE` when it does
+not, or when the tenant is `suspended`, `purging` or `purged`. The steps
+are `control::ProvisionStep` (9.2): `Inserted` (the empty stored text, a
+new row) and the five of the table below, in that order; an unknown stored
+text is `INTERNAL`. Before each step the stored cluster, role and database
+name are checked (`INTERNAL`, naming the column, when changed by hand).
 
 | Step recorded | Connection | Work |
 |---|---|---|
-| `role` | maintenance; control | derive the password under the configured key id, generation 1; `ScramVerifier::new` on the blocking pool; `roles::create`; store the key id and generation |
+| `role` | maintenance; control | derive the password under the configured key id, generation 1; `ScramVerifier::new` on the blocking pool; `roles::create` with the connection limit; store the key id and generation |
 | `database` | maintenance | `databases::create` |
 | `migrated` | a lifecycle pool as the tenant | the tenant migrator; store the schema version |
-| `seeded` | the same pool | `TenantHooks::seed` |
+| `seeded` | a lifecycle pool as the tenant | `TenantHooks::seed` |
 | `active` | control | step and state together; then announce (10.5) |
 
 - **The handover secret is returned once.** A call that resumes after the
@@ -1978,60 +2002,88 @@ stored text is `INTERNAL`.
 
 ### 10.3 Suspend, resume, set hosts, purge, usage
 
-All take the lifecycle admission first, then the row lock, and decide from
-the locked row. A missing row is `TENANT_NOT_FOUND`; a state the table
-does not list is `TENANT_STATE`.
+```rust
+pub async fn suspend(&self, tenant: TenantId) -> Result<TenantRow, AppError>;
+pub async fn resume(&self, tenant: TenantId) -> Result<TenantRow, AppError>;
+pub async fn set_hosts(&self, tenant: TenantId, change: HostsChange) -> Result<TenantRow, AppError>;
+pub async fn purge(&self, tenant: TenantId) -> Result<TenantRow, AppError>;
+pub async fn usage(&self, tenant: TenantId) -> Result<Usage, AppError>;
+pub async fn describe(&self, tenant: TenantId) -> Result<Description, AppError>;
+
+pub struct HostsChange { pub subdomain: String, pub hosts: Vec<String>, pub primary_host: String }
+#[non_exhaustive]
+pub struct Usage { pub database_bytes: u64, pub counters: UsageCounters }   // Usage::new(bytes, counters)
+```
+
+All but `usage` and `describe` take the lifecycle admission first, then the
+row lock, and decide from the locked row. A missing row is
+`TENANT_NOT_FOUND`; a state the table does not list is `TENANT_STATE`.
 
 | Call | From | To | Before the row changes |
 |---|---|---|---|
-| `suspend` | `active` | `suspended` | `before_suspend` on a lifecycle pool. Strict: a tenant whose database cannot be opened stays `active` |
+| `suspend` | `active` | `suspended` | `before_suspend` on a lifecycle pool. Strict: a tenant whose database cannot be opened, or whose hook fails, stays `active` |
 | `resume` | `suspended` | `active` | `before_resume` on a lifecycle pool, same strictness |
-| `set_hosts` | `active`, `suspended` | unchanged | validation after the lock; the host set is replaced whole |
+| `set_hosts` | `active`, `suspended` | unchanged | validation after the lock; the host set is replaced whole; announced as `ChangeKind::HOSTS` |
 | `purge` | `suspended`, `purging` | `purging`, then `purged` | nothing of the product runs |
 
 A call that finds the target state already set changes nothing and
 announces again. **Purge**: mark `purging`, commit, announce; lock again;
-the stored role must equal the derived one (`INTERNAL` otherwise); on the
+the stored role must equal the derived one (`INTERNAL` otherwise); on one
 maintenance connection `databases::drop(database, role)` then
 `roles::drop(role)`; clear the hosts, commit `purged` (the row stays as a
 tombstone, its database name free again), announce. A failure after the
 first commit resumes at `purging`. `active` and `provisioning` cannot be
 purged.
 
-`usage`† returns the database's size (`databases::size`) and the
-product's `UsageCounters` (named `i64` counters and a last-activity time)
-read on a lifecycle pool in a read-only transaction with a 5 s statement
-timeout. `describe`† returns the product's `Description` (a display name
-and string attributes) for an operator's view. Neither takes the lifecycle
-admission.
+`usage` returns the database's size (`databases::size` on the maintenance
+connection) and the product's `UsageCounters`; `describe` returns the
+product's `Description` for an operator's view. Both read the row as
+committed now, accept only `active` and `suspended` tenants, take no
+lifecycle admission, and run the hook on a read-only lifecycle pool: the
+migrator runs first on a read-write pool of one connection, closed before
+the pool with `default_transaction_read_only = on` and `statement_timeout =
+5s` is opened (decision 39).
 
 ### 10.4 Adopt
 
-`adopt(&self, AdoptRequest) -> Result<TenantRow, AppError>`†: an existing
-database becomes a tenant's. The request names the database
-(`is_adoptable_name`, not a tenant object name, not the control or the
-maintenance database).
+```rust
+pub async fn adopt(&self, request: AdoptRequest) -> Result<TenantRow, AppError>;
 
-1. Validation, then the lifecycle admission.
-2. Without a row yet: `handover::prepare`, then `check_adoptable` on the
-   maintenance pool. A refusal leaves **no control row and no role**
-   (only `PUBLIC`'s `CONNECT`, 8.11).
-3. The row is inserted; the steps of 10.2 run with the `database` step
-   replaced by `handover::adopt`, and the `seeded` step by
+pub struct AdoptRequest {
+    pub tenant: TenantId,
+    pub subdomain: String,
+    pub display_name: String,
+    pub database: String,     // is_adoptable_name, no tenant prefix, not the control or maintenance database
+    pub hosts: Vec<String>,
+    pub primary_host: String,
+}
+```
+
+1. Validation (the `database` field among the violations, never echoed),
+   then the lifecycle admission.
+2. Without a row yet: `handover::prepare`, then, while the maintenance role
+   still owns the database, `check_adoptable` on the maintenance pool,
+   bounded by a maintenance operation's 150 s (`UNAVAILABLE` past it). A
+   refusal leaves **no control row and no role** (only `PUBLIC`'s
+   `CONNECT`, 8.11).
+3. The row is inserted (the cap applies); the steps of 10.2 run with the
+   `database` step replaced by the checks of step 2 again
+   (`check_adoptable` only while the maintenance role still owns the
+   database) and `handover::adopt`, and the `seeded` step by
    `TenantHooks::adopted`. No handover secret exists.
 
 ### 10.5 The lifecycle admission and announcing
 
-- **Admission first, then the row lock.** Every lifecycle call takes
-  `Registry::admit()` before its first control connection and holds it to
-  its end: one semaphore of `max(1, (control max_connections − 1) / 2)`
-  permits, a wait of 10 s, then `UNAVAILABLE` without a reason. A
-  lifecycle call holds a control connection while it waits on the
-  maintenance connection or a tenant open; the admission keeps such calls
-  from holding the whole pool.
+- **Admission first, then the row lock.** Every lifecycle call that
+  changes a row takes `Registry::admit()` before its first control
+  connection and holds it to its end: one semaphore of `max(1, (control
+  max_connections − 1) / 2)` permits, a wait of 10 s, then `UNAVAILABLE`
+  without a reason. A lifecycle call holds a control connection while it
+  waits on the maintenance connection, a tenant open or a hook; the
+  admission keeps such calls from holding the whole pool.
 - **Brief holders never wait while holding.** Every other holder of a
-  control connection (lookups, the sender, the sweep, a product's jobs)
-  holds it for one statement.
+  control connection (lookups, the sender, the sweep, `tenant`, `list`, a
+  product's jobs) holds it for one statement.
 - **Announcing a committed change** runs in a spawned task the call
   awaits, so a caller that goes away still announces, in this order:
   forget the tenant's lookups; invalidate its scope; `Sink::change` on
@@ -2041,13 +2093,17 @@ maintenance database).
 ### 10.6 The admin surface (feature `admin`)
 
 The product declares its admin service in its own proto, serves it from a
-second App (`App::register_as`) on a listener of its own, registers the
-authenticator below as that App's one end-user authenticator, and wraps
-each RPC body in the guard.
+second App (`App::register_as`) on a listener of its own with
+`SERVE_AUTH=bearer`, registers the authenticator below as that App's one
+end-user authenticator, and wraps each RPC body in the guard.
 
 ```rust
-/// What a verified admin token says. `X` is the product's extra claims.
-#[derive(Clone, Debug)]
+pub const MAX_LIFETIME: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoExtra {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminClaims<X = NoExtra> {
     pub token_id: Uuid,
     pub subject: String,
@@ -2056,76 +2112,127 @@ pub struct AdminClaims<X = NoExtra> {
     pub expires_at: SystemTime,
     pub extra: X,
 }
-```
 
-`Verifier<X>`†: `new(issuer, audience, keys)`, `with_subject_check(f)`,
-`refusing()` (accepts nothing: a process that serves a fixed scope),
-`parse_keys(text)` for a list `key_id:<base64url Ed25519 public key>[,…]`,
-and `verify(&Secret, op, now)`.
+impl<X: DeserializeOwned + Send + Sync + 'static> Verifier<X> {
+    pub fn new(issuer: &str, audience: &str, keys: EdDsaVerificationKeys) -> Self;
+    pub fn refusing() -> Self;
+    pub fn with_subject_check(self, check: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self;
+    pub fn with_domains(self, domains: ErrorDomains) -> Self;
+    pub fn verify(&self, token: &Secret, op: &str, now: SystemTime) -> Result<AdminClaims<X>, AppError>;
+}
+pub fn parse_keys(text: &str) -> Result<EdDsaVerificationKeys, AppError>;   // "kid:<base64url>[,…]"
+```
 
 | Claim | Rule |
 |---|---|
 | header | EdDSA; `kid` required and known (`EdDsaVerificationKeys`) |
 | `iss`, `aud` | equal the verifier's, each one string |
-| `iat`, `exp` | `iat <= now < exp`; `exp − iat <= 60 s`; leeway 0 |
+| `iat`, `exp` | `iat <= now < exp`; `0 < exp − iat <= 60 s`; leeway 0 |
 | `nbf` | optional; `<= now` |
 | `sub` | a non-empty string that passes the product's subject check |
 | `jti` | required; a lower-case hyphenated UUID: the token id |
-| `tid` | a `TenantId` text; absent only for a call that addresses no tenant |
+| `tid` | a `TenantId` text, not the nil id; absent only for a call that addresses no tenant |
 | `op` | the RPC path without its leading slash, `<package>.<Service>/<Rpc>`; equal to the path called |
 | extra | the product's type, flattened |
 
 An optional claim given as `null` is a refusal, not an absence. **Every
 failure, whatever the cause, is the one answer** `UNAUTHENTICATED` /
-`ADMIN_TOKEN_INVALID`; the cause is logged at `debug` without the token.
+`ADMIN_TOKEN_INVALID` with the constant end-user message in the admin
+domain; the cause is logged at `debug` without the token. `parse_keys`
+refuses an entry with `INVALID_ARGUMENT` naming its position only.
 
-`admin::authenticator(verifier, services, clock)`† is an
-`EndUserAuthenticator`: the routed path must belong to one of `services`;
-the token is `BearerShape::token`; the claims become an extension of the
-`EndUser` whose subject is `sub`. Its rejection is an `EndUserRejection`
-with the reason and the admin domain.
+```rust
+pub fn authenticator<X>(verifier: Verifier<X>, services: &[&str], clock: Arc<dyn Clock>)
+    -> Result<AdminAuthenticator<X>, AppError>;
+```
 
-`guard::run(audit, cx, op, tenant, body)`†, in this order:
+`AdminAuthenticator<X>` is an `EndUserAuthenticator`: the routed path must
+be `/<service>/<Rpc>` of one of `services` (names of `[A-Za-z0-9_.]`, at
+least one); the token is `BearerShape::token`; the claims become an
+extension of an `EndUser` whose subject is `sub` and which names no tenant
+(decision 37). Its rejection is an `EndUserRejection` with
+`ADMIN_TOKEN_INVALID` and the admin domain. A call without a bearer never
+reaches it: the App's default `BearerShape` precheck answers the plain
+constant `UNAUTHENTICATED`.
+
+```rust
+impl AdminAudit {
+    pub fn new(control: PgPool, clock: Arc<dyn Clock>) -> Self;
+    pub fn with_domains(self, domains: ErrorDomains) -> Self;
+}
+
+pub mod guard {
+    pub async fn run<X, T, F, Fut>(audit: &AdminAudit, cx: &CallContext, op: &str,
+        tenant: Option<TenantId>, body: F) -> Result<T, AppError>
+    where X: Clone + Send + Sync + 'static, F: FnOnce(AdminClaims<X>) -> Fut,
+          Fut: Future<Output = Result<T, AppError>>;
+    pub fn claims<X: Send + Sync + 'static>(cx: &CallContext) -> Option<&AdminClaims<X>>;
+    pub fn end_user<X: Clone + Send + Sync + 'static>(claims: AdminClaims<X>) -> EndUser;
+}
+```
+
+`guard::run`, in this order:
 
 1. The claims from the context; none is `ADMIN_TOKEN_INVALID`.
-2. `claims.op == op`, else `ADMIN_TOKEN_INVALID`.
-3. `claims.tenant == tenant` exactly (`None` only for a call that
-   addresses no tenant), else `ADMIN_TOKEN_INVALID`.
-4. **The token id is recorded before the body runs**: a row in
+2. `claims.op == op` and `claims.tenant == tenant` exactly (`None` only
+   for a call that addresses no tenant), else `ADMIN_TOKEN_INVALID`.
+3. **The token id is recorded before the body runs**: a row in
    `admin_audit` with the time, operation, tenant and subject, outcome
    `started`. A second insert of the same id violates `admin_audit_pkey`
-   and is `ADMIN_TOKEN_REPLAYED`; the body does not run.
-5. The body, with the claims. It never checks the token again.
-6. The outcome is stored (`ok` or `failed`); a failure to store it is a
+   and is `ALREADY_EXISTS` / `ADMIN_TOKEN_REPLAYED`; the body does not run.
+4. The body, with the claims. It never checks the token again.
+5. The outcome is stored (`ok` or `failed`); a failure to store it is a
    warning; a cancelled call leaves `started`.
-7. An error with a reason and no domain gets the admin domain.
+6. An error with a reason and no domain gets the admin domain.
 
 Which subjects an operation accepts stays the operation's rule. Pruning
 `admin_audit` is the product's, never below the token lifetime.
 
 ### 10.7 The manager kit (feature `manager`)
 
-`Minter`†: `new(key: EdDsaSigningKey, clock)`;
-`mint(target, tenant, op, subject, extra) -> Minted { token: Secret, token_id, expires_at }`;
-`public_key_entry()` in the list format `Verifier::parse_keys` reads. A
-token lives 60 s, has a fresh random id, and names one operation and at
-most one tenant; absent optional claims are omitted, never `null`.
+```rust
+pub const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
-`AdminClient`†: one unary call to a product's admin RPC by its path,
-`call(op, tenant, subject, extra, deadline, &request)`, with request and
-reply as `prost` messages. A fresh token per attempt; **no automatic
-retry**, no redirects.
+impl Minter {
+    pub fn new(issuer: &str, key: EdDsaSigningKey, clock: Arc<dyn Clock>) -> Self;
+    pub fn mint<X: Serialize>(&self, audience: &str, tenant: Option<TenantId>, op: &str,
+        subject: &str, extra: &X) -> Result<Minted, AppError>;
+    pub fn public_key_entry(&self) -> String;   // "kid:<base64url>", what parse_keys reads
+}
+pub struct Minted { pub token: Secret, pub token_id: Uuid, pub expires_at: SystemTime }
+
+impl AdminClient {
+    pub fn new(base_url: &str, audience: &str, minter: Minter) -> Result<Self, AppError>;
+    pub fn in_cluster(base_url: &str, audience: &str, minter: Minter) -> Result<Self, AppError>;
+    pub async fn call<Req: prost::Message, Rep: prost::Message + Default, X: Serialize>(
+        &self, op: &str, tenant: Option<TenantId>, subject: &str, extra: &X,
+        deadline: Duration, request: &Req) -> CallOutcome<Rep>;
+}
+
+#[non_exhaustive]
+pub enum CallOutcome<T> { Replied(T), NotSent(AppError), Refused(AppError), Unknown(AppError) }
+// CallOutcome::into_result(self) -> Result<T, AppError>
+```
+
+A token lives 60 s, has a fresh random id, and names one operation and at
+most one tenant; absent optional claims are omitted, never `null`; extra
+claims must be an object that names none of the minter's claims. One call
+mints one token, sends one gRPC-Web frame to `<base URL>/<op>` and reads
+at most 4 MiB, all within `deadline`; **no automatic retry**, no
+redirects. `new` accepts `https`, and `http` for a loopback host only;
+`in_cluster` accepts `http` for any host (decision 38).
 
 | `CallOutcome` | When | What the caller may assume |
 |---|---|---|
-| `NotSent` | encoding or minting failed, or no connection was made | nothing happened; safe to try again |
-| `Refused` | the product answered a status other than OK | the product decided; not proof that nothing changed (a step may have committed before the refusal) |
-| `Unknown` | a failure after sending, a malformed reply, the deadline, or `UNAVAILABLE` without a reason | anything; read the tenant back, and repeat only an operation that converges |
+| `Replied` | status OK with exactly one message that decodes as the reply | the product acted |
+| `NotSent` | an invalid `op`, encoding or minting failed, or no connection was made | nothing happened; safe to try again |
+| `Refused` | the product answered a status other than OK, except `UNAVAILABLE` without a reason | the product decided; not proof that nothing changed (a step may have committed before the refusal) |
+| `Unknown` | a failure after sending, an HTTP status other than 200, a malformed, compressed or oversized reply, the deadline, or `UNAVAILABLE` without a reason | anything; read the tenant back, and repeat only an operation that converges |
 
-A refusal carries the product's reason, domain and field violations.
-Transport: gRPC-Web over the `sekvent-client` HTTP stack (15, question 5);
-a URL that leaves the cluster must be `https`, and the certificate is
-verified.
+A refusal carries the product's code, message, reason, domain, metadata,
+retry hint and field violations from `grpc-status-details-bin`. Transport:
+gRPC-Web over `sekvent_client::reqwest_builder()` (rustls, certificates
+verified), driven directly (decision 38).
 
 ### 10.8 Tests
 
@@ -2135,22 +2242,22 @@ returned once); the cap; a mismatching repeat; the state table of 10.3
 with idempotent repeats; a strict suspend with the tenant's database
 closed; a purge resumed after each step, one that refuses a database its
 role does not own, one that leaves a reused name alone; adoption with each
-refusal leaving no row and no role; the lifecycle admission (permits
-exhausted waits, then `UNAVAILABLE`, on a paused wait seam; a blocked call
-observed on `pg_stat_activity`); every committed change invalidates this
-process before the call returns and reaches a second `Tenants`; a dropped
-call still announces. Admin, without a server: a verifier table with one
-row per rule above, each failure the one answer; `null` claims; two keys
-during a rotation. With a server: the guard's order (a wrong `op` or
-tenant writes no audit row; a replay does not run the body; the outcome is
-stored); an admin App served on `127.0.0.1:0` and called by `AdminClient`
-with each `CallOutcome` (a listener at `127.0.0.1:1` for `NotSent`, a
-server that closes after reading for `Unknown`).
+refusal leaving no row and no role, the default `check_adoptable`
+refusing; the lifecycle admission (permits exhausted waits, then
+`UNAVAILABLE`); every committed change invalidates this process before the
+call returns and reaches a second `Tenants`; a dropped call still
+announces. Admin, without a server: a verifier table with one row per rule
+above, each failure the one answer; `null` claims; two keys during a
+rotation. With a server: the guard's order (a wrong `op` or tenant writes
+no audit row; a replay does not run the body; the outcome is stored); an
+admin App served on `127.0.0.1:0` and called by `AdminClient` with each
+`CallOutcome` (`127.0.0.1:1` for `NotSent`, a server that closes after
+reading for `Unknown`).
 
-**Consumer check.** The product's lifecycle and its admin RPC bodies run
-on `Provisioner` and the guard, with its wire contracts untouched; its
-full suite passes, and an operator service built on the manager kit
-provisions, suspends, resumes and purges a tenant against it.
+**Consumer check.** A product's lifecycle and its admin RPC bodies run on
+`Provisioner` and the guard, with its wire contracts untouched; its full
+suite passes, and an operator service built on the manager kit provisions,
+suspends, resumes and purges a tenant against it.
 
 ## 11. Tests on Docker
 
@@ -2238,16 +2345,18 @@ also". Step 0's index rows link to these headings.
 
 ### 12.3 `examples/tenants`
 
-Lands with 1c. A neutral product, `billing`, in three members added to the
-root manifest: `billing-api` (its proto: a public `Invoices` service and
-its own `TenantAdmin` service), `billing` (the scope, the factory, the
-hooks, the tenant migrations, the control migration made from
-`REFERENCE_SCHEMA`), `billing-svc` (two Apps on one runtime, the units,
-its own configuration keys, hosts under `example.com`, the prefix
-`app_t_`). Its `sekvent.toml` carries `[contract]` roots and baselines for
-the example's own services, emitted on the Mac. One Docker test provisions
-a tenant through the manager kit and calls it. Examples are outside
-coverage.
+A neutral product, `billing`, in three members of the root manifest:
+
+| Member | Holds |
+|---|---|
+| `billing-api` | the proto: the public `Invoices` service (`billing.invoices.v1`) and the product's own `TenantAdmin` service (`billing.admin.v1`) |
+| `billing` | the scope and its `ScopeFactory`, `BillingHooks` (the seed hands an owner invitation over once; `usage` counts invoices; `describe` names the tenant), the tenant migrations and the control migration copied from `REFERENCE_SCHEMA`, `InvoicesService` on the call's scope, and `TenantAdminService`, each body in `guard::run` calling the `Provisioner` |
+| `billing-svc` | the service: the public App and the admin App on one runtime, the tenant cache and listener units, its own configuration keys, hosts under `example.com`, the prefix `app_t_` |
+
+Its `sekvent.toml` carries `[contract]` roots, and `contracts/` the
+baselines of both services. One Docker test in `billing-svc` provisions a
+tenant through the manager kit, calls `Invoices` for it and suspends it.
+Examples are outside coverage.
 
 ## 13. Relation to existing notes
 
@@ -2350,6 +2459,33 @@ coverage.
     resync is one interval after the previous one ended, so a slow resync
     never starves the notifications; an interval above 100 years never
     ticks (9.7).
+35. **The minter carries its issuer**: `Minter::new(issuer, key, clock)`,
+    so every token of one operator service names the same `iss` and a call
+    site cannot mint under another (10.7).
+36. **The default `check_adoptable` refuses** every database
+    (`ADOPTION_REFUSED`, `check` = `not_checked`): adoption fails closed
+    until the product says which databases are its own. The check runs
+    again when a resumed adoption reaches its `database` step, while the
+    maintenance role still owns the database (10.1, 10.4).
+37. **The admin authenticator's end user names no tenant**: the admin App
+    has no scope resolver, and the guard compares the call's tenant with
+    the token's `tid` exactly; a nil `tid` is refused. A call without a
+    bearer gets the plain constant `UNAUTHENTICATED` of the App's
+    `BearerShape` precheck, not `ADMIN_TOKEN_INVALID` (10.6).
+38. **The admin client drives `reqwest` directly**, built by
+    `sekvent_client::reqwest_builder` with redirects off, so a failure
+    before the request left (`NotSent`) is told apart from one after
+    (`Unknown`); `CallOutcome<T>` is `Replied`, `NotSent`, `Refused`,
+    `Unknown`, and `UNAVAILABLE` without a reason counts as `Unknown`
+    (10.7).
+39. **Read-only lifecycle pools migrate first**: `usage` and `describe`
+    run the migrator on a read-write pool of one connection, then serve
+    the hook read-only sessions with a 5 s statement timeout; both answer
+    only for `active` or `suspended` tenants (10.3).
+40. **Display names are 1 to 255 bytes**, not blank, without a control
+    character, stored as given; labels and hosts are canonicalised (hosts
+    sorted and de-duplicated) before they are stored or compared with a
+    row (10.2).
 
 ## 15. Open questions for the repository owner
 

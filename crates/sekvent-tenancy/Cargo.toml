@@ -1,6 +1,6 @@
 [package]
 name = "sekvent-tenancy"
-description = "Tenants on a Postgres database and a role each: names, derived role credentials, cluster operations, the startup preflight, tenant selection, the tenant cache and cross-process invalidation."
+description = "Tenants on a Postgres database and a role each: names, derived role credentials, cluster operations, the startup preflight, tenant selection, the tenant cache, cross-process invalidation, lifecycle operations, admin tokens and the manager kit."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -25,7 +25,7 @@ admin = ["serving", "dep:sekvent-auth", "dep:serde", "dep:serde_json"]
 manager = [
     "dep:sekvent-auth", "dep:sekvent-client", "dep:sekvent-context",
     "dep:serde", "dep:serde_json", "dep:prost", "dep:bytes",
-    "dep:base64", "dep:tokio",
+    "dep:base64", "dep:tokio", "dep:reqwest",
 ]
 # Runtime units for the tenant cache and the listener.
 runtime = ["serving", "dep:sekvent-runtime", "sekvent-db/runtime"]
@@ -53,6 +53,9 @@ getrandom = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
+# The manager's HTTP stack: sekvent-client's rustls builder, driven directly so
+# a failure before the request left is told apart from one after.
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }

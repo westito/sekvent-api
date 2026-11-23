@@ -411,6 +411,33 @@ impl<S: Send + Sync + 'static> Tenants<S> {
     }
 }
 
+/// What a lifecycle operation needs of a tenant cache, whatever its scope type: the
+/// [`Provisioner`](crate::lifecycle::Provisioner) holds the cache it announces to as this trait
+/// object, so it is not generic over the scope.
+#[cfg(feature = "lifecycle")]
+pub(crate) trait TenantCache: Send + Sync + 'static {
+    /// [`Tenants::invalidate`].
+    fn invalidate(&self, id: TenantId) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+
+    /// [`Tenants::refresh_hosts`].
+    fn refresh_hosts(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TenantInfo>, AppError>> + Send + '_>>;
+}
+
+#[cfg(feature = "lifecycle")]
+impl<S: Send + Sync + 'static> TenantCache for Tenants<S> {
+    fn invalidate(&self, id: TenantId) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(Tenants::invalidate(self, id))
+    }
+
+    fn refresh_hosts(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TenantInfo>, AppError>> + Send + '_>> {
+        Box::pin(Tenants::refresh_hosts(self))
+    }
+}
+
 impl<S> Cache<S> {
     /// The keyed `select`, before the domain is added.
     async fn select(&self, request: &Parts) -> Result<Option<TenantId>, AppError> {

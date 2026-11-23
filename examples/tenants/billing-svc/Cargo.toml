@@ -1,0 +1,29 @@
+[package]
+name = "billing-svc"
+description = "The example billing service: a public App serving every tenant and an admin App for an operator service, on one runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+billing = { path = "../billing" }
+billing-api = { path = "../billing-api" }
+# `SelectorRules::id_header` takes an `http::HeaderName`.
+http = { workspace = true }
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component", "component-grpc", "config", "context", "db", "db-sqlx-postgres", "runtime", "runtime-grpc-web", "tenancy", "tenancy-lifecycle", "tenancy-admin"] }
+sqlx = { workspace = true, features = ["postgres"] }
+tokio = { workspace = true }
+
+[dev-dependencies]
+prost = { workspace = true }
+reqwest = { workspace = true }
+# The operator's side of the test: the minter and the admin client.
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["tenancy-manager"] }
+sekvent-testing = { path = "../../../crates/sekvent-testing", features = ["postgres"] }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

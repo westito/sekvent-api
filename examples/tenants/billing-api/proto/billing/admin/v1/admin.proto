@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+// Contract of the billing product's admin API: what an operator service
+// calls, on a listener of its own, with a short-lived admin token minted for
+// one RPC and at most one tenant. sekvent ships no admin service; each
+// product declares its own. The Rust trait `billing_api::TenantAdmin` is
+// checked against the service at compile time.
+package billing.admin.v1;
+
+// The lifecycle of the billing product's tenants.
+service TenantAdmin {
+  // Create a tenant (its role, its database, its schema and its first
+  // data) and make it active. Repeating the call with the same request
+  // resumes an interrupted provisioning and changes nothing once it is done.
+  rpc ProvisionTenant(ProvisionTenantRequest) returns (ProvisionTenantReply);
+  // Stop serving an active tenant; its data stays.
+  rpc SuspendTenant(TenantRequest) returns (Tenant);
+  // Serve a suspended tenant again.
+  rpc ResumeTenant(TenantRequest) returns (Tenant);
+  // Drop a suspended tenant's database and role; the tenant row stays as a
+  // tombstone.
+  rpc PurgeTenant(TenantRequest) returns (Tenant);
+  // A tenant in any state, with its usage when its database is there.
+  rpc GetTenant(TenantRequest) returns (GetTenantReply);
+}
+
+// A tenant to provision.
+message ProvisionTenantRequest {
+  // The tenant's id, chosen by the caller: a lower-case hyphenated UUID.
+  string tenant_id = 1;
+  // The tenant's label, such as `acme`.
+  string subdomain = 2;
+  // The name people see.
+  string display_name = 3;
+  // Every host the tenant answers on, the primary included.
+  repeated string hosts = 4;
+  // One of `hosts`.
+  string primary_host = 5;
+  // Who is invited to take the tenant over.
+  string owner_email = 6;
+  // The currency of the tenant's default invoice series: three capital
+  // letters, such as `EUR`.
+  string currency = 7;
+}
+
+// A provisioned tenant.
+message ProvisionTenantReply {
+  Tenant tenant = 1;
+  // The owner's one-time invitation token. Only the call that seeded the
+  // tenant returns it; never log this message.
+  string owner_token = 2;
+  // True when this call did not seed the tenant (an earlier call did), so
+  // the token is withheld rather than made up.
+  bool owner_token_withheld = 3;
+}
+
+// The tenant a call addresses.
+message TenantRequest {
+  // A lower-case hyphenated UUID.
+  string tenant_id = 1;
+}
+
+// A tenant as the control database holds it.
+message Tenant {
+  string tenant_id = 1;
+  string subdomain = 2;
+  string display_name = 3;
+  // `provisioning`, `active`, `suspended`, `purging` or `purged`.
+  string state = 4;
+  string primary_host = 5;
+  repeated string hosts = 6;
+}
+
+// A tenant and its usage.
+message GetTenantReply {
+  Tenant tenant = 1;
+  // True when the usage below was measured: the tenant is active or
+  // suspended.
+  bool measured = 2;
+  // The size of the tenant's database in bytes.
+  uint64 database_bytes = 3;
+  // The number of the tenant's invoices.
+  int64 invoices = 4;
+}

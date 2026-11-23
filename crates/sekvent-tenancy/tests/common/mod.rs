@@ -604,3 +604,70 @@ impl Cluster {
         .max_connections(2)
     }
 }
+
+#[cfg(feature = "serving")]
+impl Cluster {
+    /// The test's invalidation channel, `fx_<stem>_changes`.
+    pub fn channel(&self) -> sekvent_tenancy::invalidation::Channel {
+        sekvent_tenancy::invalidation::Channel::new(&format!("fx_{}_changes", self.stem))
+            .expect("the fixture channel name is valid")
+    }
+}
+
+#[cfg(feature = "lifecycle")]
+impl Cluster {
+    /// A provisioner over the test product's hooks: the registry's control
+    /// pool, the fixture's maintenance connection and connector, key id `k1`,
+    /// connection limit 20, a cap of 100 tenants, a sender on the test's
+    /// channel and the [`manual_clock`]. No tenant cache and no sink: add
+    /// them with [`ProvisionerBuilder::tenants`] and `sink`.
+    pub fn provisioner_builder(
+        &self,
+        registry: &Registry,
+        hooks: &product::hooks::OrdersHooks,
+    ) -> sekvent_tenancy::lifecycle::ProvisionerBuilder<product::hooks::OrdersHooks> {
+        let sender =
+            sekvent_tenancy::invalidation::Sender::new(registry.pool().clone(), self.channel());
+        sekvent_tenancy::lifecycle::Provisioner::builder(
+            registry.clone(),
+            self.maintenance(),
+            self.connector(),
+            &product::TENANT_MIGRATOR,
+            sender,
+            hooks.clone(),
+        )
+        .role_key_id("k1")
+        .connection_limit(20)
+        .tenant_cap(100)
+        .clock(Arc::new(manual_clock()))
+    }
+
+    /// [`provisioner_builder`](Self::provisioner_builder), built.
+    pub fn provisioner(
+        &self,
+        registry: &Registry,
+        hooks: &product::hooks::OrdersHooks,
+    ) -> sekvent_tenancy::lifecycle::Provisioner<product::hooks::OrdersHooks> {
+        self.provisioner_builder(registry, hooks)
+            .build()
+            .expect("the fixture's provisioner settings are valid")
+    }
+}
+
+/// A provisioning request for a new tenant labelled `label` on `hosts`
+/// (`hosts[0]` the primary), display name `label` and the seed item `first`.
+#[cfg(feature = "lifecycle")]
+pub fn provision_request(
+    label: &str,
+    hosts: &[&str],
+) -> sekvent_tenancy::lifecycle::ProvisionRequest<product::hooks::OrdersSeed> {
+    let hosts: Vec<String> = hosts.iter().map(|host| (*host).to_owned()).collect();
+    sekvent_tenancy::lifecycle::ProvisionRequest {
+        tenant: new_tenant(),
+        subdomain: label.to_owned(),
+        display_name: label.to_owned(),
+        primary_host: hosts.first().expect("a request has a host").clone(),
+        hosts,
+        seed: product::hooks::OrdersSeed::new("first"),
+    }
+}

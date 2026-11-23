@@ -1,0 +1,25 @@
+[package]
+name = "billing"
+description = "The example billing product's components on sekvent-tenancy: the tenant scope, its factory and hooks, the migrations, the invoices and tenant admin components."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+billing-api = { path = "../billing-api" }
+chrono = { workspace = true }
+sekvent-api = { path = "../../../crates/sekvent", default-features = false, features = ["component", "config", "context", "db", "db-sqlx-postgres", "tenancy", "tenancy-lifecycle", "tenancy-admin"] }
+# The scope, the hooks and the factory name `sqlx::PgPool`, and the
+# migrations are embedded with `sqlx::migrate!`: the facade re-exports
+# neither.
+sqlx = { workspace = true, features = ["postgres"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

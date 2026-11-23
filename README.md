@@ -31,7 +31,7 @@ sqlx 0.9, sea-orm 2.0 and sea-query 1.0.
 | `sekvent-db` | `db`; `db-sqlx-postgres`, `db-sqlx-mysql`, `db-sea-orm-postgres`, `db-sea-orm-mysql`, `db-sea-query-postgres`, `db-sea-query-mysql`, `db-migrate`, `db-sea-orm-migrate`, `db-lease`, `db-keyed` | Named pools, a keyed cache with a pool per key, migrations (directory or embedded), distinct-target check, sea-query execution, list filters, readiness probes per pool, leases with fencing tokens for singleton jobs |
 | `sekvent-sso` | `sso` | Browser single sign-on: OAuth 2.0 authorization code flow with a signed state cookie, a Bitbucket Cloud provider (workspace members only), one-time handoff codes |
 | `sekvent-storage` | `storage` | S3-compatible object storage: presigned browser uploads and downloads, server-side head, delete and copy, a bucket readiness probe; own SigV4 signer on the rustls/ring stack |
-| `sekvent-tenancy` | `tenancy`, `tenancy-lifecycle`, `tenancy-admin`, `tenancy-manager` | Tenants on a database and a role each: ids and object names, derived role credentials, cluster operations and the startup preflight; the control registry, tenant selection and the scope resolver, the tenant cache and cross-process invalidation; lifecycle operations, admin tokens and the manager kit (slice 1c) |
+| `sekvent-tenancy` | `tenancy`, `tenancy-lifecycle`, `tenancy-admin`, `tenancy-manager` | Tenants on a database and a role each: ids and object names, derived role credentials, cluster operations and the startup preflight; the control registry, tenant selection and the scope resolver, the tenant cache and cross-process invalidation; tenant lifecycle operations (provision, adopt, suspend, resume, purge) with the product's hooks, the admin surface with one-use admin tokens, and the operator's manager kit |
 | `sekvent-component` | `component`; `component-grpc` | Components with `local`, `local-serialized` and `grpc` bindings, unary and server-streaming methods, the fail-closed `App` builder, lifecycle, deadlines, bulkheads, retries and circuit breakers, serving components over gRPC |
 | `sekvent-testing` | not re-exported (`[dev-dependencies]`) | Postgres, MySQL and MinIO test containers, a reaper, `await_until!` |
 | `sekvent-proto-build` | not re-exported (`[build-dependencies]`) | `build.rs` protobuf codegen on top of `tonic-prost-build`; protos compile in-process with protox, so no `protoc` is needed |
@@ -255,6 +255,9 @@ leases, [docs/design/p8-service-essentials.md](docs/design/p8-service-essentials
 tests run under `monolith-local`, `monolith-serialized` and a `split-grpc`
 topology where inventory runs as its own service
 ([split topology](examples/shop/README.md#split-topology)).
+[examples/tenants](examples/tenants) is a product that serves each tenant
+from a Postgres database and a role of its own, with its own admin service
+called through the manager kit.
 
 ## License
 
