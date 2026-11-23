@@ -1999,7 +1999,7 @@ not write. A tenant that is not `active` is never warm.
   10 s, then dropped);
 - it opens in any state but `purging` and `purged`; a failure to connect or
   to migrate, or a closed tenant cache, is `UNAVAILABLE` without a reason
-  ("the tenant's database could not be opened"), its source the stage
+  ("the tenant's database could not be opened", `messages::TENANT_OPEN_FAILED`), its source the stage
   (`reserve`, `connect` or `migrate`) and at most a SQLSTATE;
 - the read-only form (`usage`, `describe`) migrates on a read-write pool of
   one connection first, closes it, and returns a pool whose sessions start
@@ -2040,8 +2040,9 @@ resumes. `ProvisionRequest`'s `Debug` leaves the seed out.
 Before anything is written:
 
 1. **Validation**, with no I/O: the label must pass the provisioner's
-   `LabelRules`; the display name is 1 to 255 bytes (`DISPLAY_NAME_MAX`),
-   not blank, without a control character; every host and the primary host
+   `LabelRules`; the display name is 1 to the provisioner's maximum in bytes
+   (`ProvisionerBuilder::display_name_max_bytes`, default 255,
+   `DISPLAY_NAME_MAX`), not blank, without a control character; every host and the primary host
    are canonical; the host set is not empty and holds the primary. Every
    problem is one field violation of an `INVALID_ARGUMENT` ("the request is
    invalid"): `subdomain`, `display_name`, `hosts`, `hosts[<index>]`,
@@ -2537,6 +2538,7 @@ in:
 | every tenant role's connection limit | `ProvisionerBuilder::connection_limit` | none |
 | the most tenants that are not `purged` | `ProvisionerBuilder::tenant_cap` | none |
 | the label rules of lifecycle requests | `ProvisionerBuilder::labels` | `LabelRules::new()` |
+| the longest display name of provisioning and adoption requests, in bytes (zero refused; a limit in characters is up to four bytes each) | `ProvisionerBuilder::display_name_max_bytes` | 255 (`DISPLAY_NAME_MAX`) |
 | the admin issuer, audience and public keys (`key_id:<base64url>`, comma-separated) | `Verifier::new`, `parse_keys` | none |
 | the admin services | `admin::authenticator` | none |
 | the admin domain | `Verifier::with_domains`, `AdminAudit::with_domains` | `sekvent.tenancy.admin.v1` |
@@ -2551,7 +2553,14 @@ both `&'static str`: `serving` (default `ErrorDomains::DEFAULT_SERVING`,
 `sekvent.tenancy.v1`) and `admin` (default `ErrorDomains::DEFAULT_ADMIN`,
 `sekvent.tenancy.admin.v1`); `with_serving` and `with_admin` set the
 product's own. `reasons` holds every reason as a constant whose value is its
-own name; reasons and their codes are wire contract, messages are not.
+own name; reasons and their codes are wire contract, messages are not,
+except the two answers below that carry no reason: their texts are stable
+constants in `messages`, so a caller can tell them apart.
+
+| Constant | Text | Answer |
+|---|---|---|
+| `messages::LIFECYCLE_BUSY` | `the server is busy, try again shortly` | `UNAVAILABLE`, no reason: `Registry::admit` found no lifecycle permit within its admission wait (`TENANT_BUSY` carries the same text with its reason) |
+| `messages::TENANT_OPEN_FAILED` | `the tenant's database could not be opened` | `UNAVAILABLE`, no reason: a tenant that cannot be opened for a lifecycle operation |
 
 Serving refusals carry one of eight reasons under the serving domain, admin
 token refusals one of two under the admin domain; everything else carries no

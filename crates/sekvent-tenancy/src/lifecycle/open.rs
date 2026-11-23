@@ -23,6 +23,7 @@ use tokio::time::timeout;
 use super::hooks::TenantHooks;
 use super::provisioner::Provisioner;
 use crate::error::serving;
+use crate::messages::TENANT_OPEN_FAILED as OPEN_FAILED;
 use crate::tenants::{PoolLease, TenantCache};
 use crate::{TenantRow, TenantState};
 
@@ -40,9 +41,6 @@ const READ_ONLY_SETTINGS: [(&str, &str); 2] = [
     ("default_transaction_read_only", "on"),
     ("statement_timeout", "5s"),
 ];
-
-/// The answer to a tenant that could not be opened for a lifecycle operation.
-const OPEN_FAILED: &str = "the tenant's database could not be opened";
 
 /// Permission to open a tenant that is not `active`. Only lifecycle operations make one.
 pub(crate) struct LifecycleCapability(());

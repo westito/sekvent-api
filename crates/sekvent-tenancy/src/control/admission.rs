@@ -8,11 +8,9 @@ use std::time::Duration;
 use sekvent_error::AppError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::messages::LIFECYCLE_BUSY;
 /// How long a lifecycle call waits for a permit by default.
 const LIFECYCLE_WAIT: Duration = Duration::from_secs(10);
-
-/// The message of a lifecycle call that found no permit in time.
-const LIFECYCLE_BUSY: &str = "the server is busy, try again shortly";
 
 /// `n` as a permit count.
 fn permits(n: u32) -> usize {
@@ -216,6 +214,7 @@ mod tests {
         assert_eq!(started.elapsed(), LIFECYCLE_WAIT);
         assert_eq!(error.code(), ErrorCode::Unavailable);
         assert_eq!(error.message(), "the server is busy, try again shortly");
+        assert_eq!(error.message(), crate::messages::LIFECYCLE_BUSY);
         assert_eq!(error.reason(), None);
         assert_eq!(error.domain(), None);
         assert_eq!(error.retry_after(), None);

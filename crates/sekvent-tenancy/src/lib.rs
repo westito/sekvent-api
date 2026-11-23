@@ -25,7 +25,7 @@
 //!
 //! | Feature | Adds |
 //! |---|---|
-//! | (none) | [`TenantId`], [`ObjectNames`], [`TenantRole`], [`DatabaseName`], key ids, [`host`], [`label`], [`reasons`], [`ErrorDomains`] |
+//! | (none) | [`TenantId`], [`ObjectNames`], [`TenantRole`], [`DatabaseName`], key ids, [`host`], [`label`], [`reasons`], [`messages`], [`ErrorDomains`] |
 //! | `serving` (default) | role secrets ([`secrets`]: derivation), the [`Connector`], [`cluster::privileges`], [`cluster::preflight`]; [`TenantInfo`], the [`control`] registry and schema, [`SelectorRules`], the [`TenantResolver`], [`hosts`], the tenant cache [`Tenants`], the [`invalidation`] channel |
 //! | `lifecycle` | the SCRAM verifier, the maintenance connection, `cluster::roles`, `cluster::databases`, `cluster::handover`; the `lifecycle` module: `Provisioner` and `TenantHooks` (turns on `serving`) |
 //! | `admin` | the `admin` module: `Verifier`, `AdminClaims`, the authenticator, `AdminAudit`, `guard`; [`control::verify_schema`] then also requires the reference schema's `admin_audit` table (its six columns) and its key `admin_audit_pkey` (turns on `serving`, not `lifecycle`) |
@@ -43,7 +43,8 @@
 //! reason; the cause is in the error's source, which is logged and never
 //! sent. Database errors map through `sekvent_db::to_app_error`. A request
 //! refused by the serving half carries one of the [`reasons`] under the
-//! product's serving domain ([`ErrorDomains`]). No error carries a URL,
+//! product's serving domain ([`ErrorDomains`]). The two answers a caller
+//! can tell apart only by their text have stable [`messages`]. No error carries a URL,
 //! connect options, a role password or a verifier.
 
 #![forbid(unsafe_code)]
@@ -84,7 +85,7 @@ pub mod lifecycle;
 #[cfg(feature = "manager")]
 pub mod manager;
 
-pub use error::{ErrorDomains, reasons};
+pub use error::{ErrorDomains, messages, reasons};
 pub use id::TenantId;
 pub use names::{DatabaseName, KEY_ID_MAX, ObjectNames, TenantRole, is_adoptable_name, is_key_id};
 

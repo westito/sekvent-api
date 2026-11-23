@@ -237,6 +237,65 @@ async fn an_invalid_request_is_refused_before_any_row() {
 
 #[tokio::test]
 #[ignore = "needs Docker"]
+async fn the_display_name_maximum_is_the_builders() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let fx = fixture(&cluster).await;
+        // 150 two-byte characters: 300 bytes.
+        let long = "\u{e9}".repeat(150);
+        assert_eq!(long.len(), 300);
+        let longer = format!("{}x", "\u{e9}".repeat(200));
+        assert_eq!(longer.len(), 401);
+
+        let mut refused = request("orders");
+        refused.display_name.clone_from(&long);
+        let error = fx
+            .provisioner(&cluster)
+            .provision(refused)
+            .await
+            .expect_err("300 bytes are past the default");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.field_violations()[0].field, "display_name");
+        assert_eq!(
+            error.field_violations()[0].description,
+            "is longer than 255 bytes"
+        );
+
+        let provisioner = cluster
+            .provisioner_builder(&fx.registry, &fx.hooks)
+            .display_name_max_bytes(400)
+            .build()
+            .expect("the settings are valid");
+        let mut accepted = request("orders");
+        accepted.display_name.clone_from(&long);
+        let done = provisioner
+            .provision(accepted)
+            .await
+            .expect("300 bytes fit 400");
+        assert_eq!(done.row.info.display_name, long);
+
+        let mut too_long = request("billing");
+        let id = too_long.tenant;
+        too_long.display_name = longer;
+        let error = provisioner
+            .provision(too_long)
+            .await
+            .expect_err("401 bytes are past 400");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.field_violations()[0].field, "display_name");
+        assert_eq!(
+            error.field_violations()[0].description,
+            "is longer than 400 bytes"
+        );
+        assert_no_row(&provisioner, id).await;
+    }))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
 async fn the_role_step_resumes_after_drift_is_removed() {
     let Some(cluster) = Cluster::start().await else {
         return;
@@ -361,6 +420,10 @@ async fn the_migrated_step_resumes_after_a_conflicting_table_is_dropped() {
         assert_eq!(error.code(), ErrorCode::Unavailable);
         assert_eq!(error.reason(), None);
         assert_eq!(error.message(), "the tenant's database could not be opened");
+        assert_eq!(
+            error.message(),
+            sekvent_tenancy::messages::TENANT_OPEN_FAILED
+        );
         assert_eq!(
             StdError::source(&error).map(ToString::to_string).as_deref(),
             Some("opening the tenant for a lifecycle operation failed: migrate (sqlstate 42P07)")

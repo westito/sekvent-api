@@ -100,6 +100,20 @@ pub mod reasons {
     pub const CONTROL_SCHEMA_MISSING: &str = "CONTROL_SCHEMA_MISSING";
 }
 
+/// The messages of this crate's answers that carry no reason.
+///
+/// A caller that has to tell these answers apart can only go by the message,
+/// so these texts are stable: they change only as a breaking change.
+pub mod messages {
+    /// `UNAVAILABLE`, no reason, no domain: a lifecycle call found no
+    /// lifecycle admission permit in time. `TENANT_BUSY` carries the same
+    /// text with its reason.
+    pub const LIFECYCLE_BUSY: &str = "the server is busy, try again shortly";
+    /// `UNAVAILABLE`, no reason, no domain: a lifecycle operation could not
+    /// open the tenant's database.
+    pub const TENANT_OPEN_FAILED: &str = "the tenant's database could not be opened";
+}
+
 /// The serving errors of this crate, without a domain.
 ///
 /// Only the tenant cache (`Tenants`) adds the product's serving domain, with
@@ -155,7 +169,7 @@ pub(crate) mod serving {
 
     /// `UNAVAILABLE` / `TENANT_BUSY`, retry hint [`BUSY_RETRY_AFTER`].
     pub(crate) fn busy() -> AppError {
-        AppError::unavailable("the server is busy, try again shortly")
+        AppError::unavailable(super::messages::LIFECYCLE_BUSY)
             .with_reason(reasons::TENANT_BUSY)
             .with_retry_after(BUSY_RETRY_AFTER)
     }
@@ -316,6 +330,18 @@ mod tests {
         for (name, value) in all {
             assert_eq!(value, name);
         }
+    }
+
+    #[test]
+    fn the_reasonless_messages_are_stable() {
+        assert_eq!(
+            super::messages::LIFECYCLE_BUSY,
+            "the server is busy, try again shortly"
+        );
+        assert_eq!(
+            super::messages::TENANT_OPEN_FAILED,
+            "the tenant's database could not be opened"
+        );
     }
 
     #[cfg(feature = "serving")]

@@ -32,6 +32,7 @@ impl<H: TenantHooks> Provisioner<H> {
         let valid = collect_tenant(
             &mut violations,
             &inner.labels,
+            inner.display_name_max,
             &request.subdomain,
             &request.display_name,
             &request.hosts,

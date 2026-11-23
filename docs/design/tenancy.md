@@ -387,6 +387,10 @@ impl ErrorDomains {
     #[must_use] pub const fn with_admin(self, domain: &'static str) -> Self;
 }
 pub mod reasons { /* one `pub const NAME: &str = "NAME";` per row below */ }
+pub mod messages {
+    pub const LIFECYCLE_BUSY: &str = "the server is busy, try again shortly";
+    pub const TENANT_OPEN_FAILED: &str = "the tenant's database could not be opened";
+}
 ```
 
 Both are `&'static str` because `EndUserRejection` takes nothing else.
@@ -410,7 +414,11 @@ Both are `&'static str` because `EndUserRejection` takes nothing else.
 | `CONTROL_SCHEMA_MISSING` | `FAILED_PRECONDITION` | none | `the control schema is missing or incomplete` | `control::verify_schema` at startup; metadata `table` or `constraint` |
 
 - Reasons are wire contract; messages are not. Message text is fixed in
-  this milestone (15, question 6).
+  this milestone (15, question 6). The two lifecycle answers without a
+  reason (`UNAVAILABLE` when `Registry::admit` finds no permit in time, and
+  when a tenant cannot be opened for a lifecycle operation) have their
+  texts in `messages`, stable, so a caller can tell them apart (14,
+  decision 47).
 - Cluster operations and the control rows (`TENANT_STATE`,
   `CONTROL_SCHEMA_MISSING`) return reasons without a domain (they know no
   product); the guard gives a reasoned error without a domain the admin
@@ -1982,7 +1990,8 @@ pub struct UsageCounters { pub counters: BTreeMap<String, i64>, pub last_activit
   `role_key_id(&str)` (a key of the connector's secrets),
   `connection_limit(u32)` (1 to 2147483647) and `tenant_cap(u64)` (at
   least 1), and the optional `provision_lock(i64)` (default
-  `PROVISION_LOCK`), `labels(LabelRules)`, `tenants(Tenants<S>)`,
+  `PROVISION_LOCK`), `display_name_max_bytes(usize)` (default
+  `DISPLAY_NAME_MAX`, 255; zero refused), `labels(LabelRules)`, `tenants(Tenants<S>)`,
   `sink(impl Sink)` and `clock(Arc<dyn Clock>)`; `build()` does no I/O and
   refuses a missing or out-of-range setting with `INVALID_ARGUMENT`. The
   cache it announces to, borrows warm pools from and reserves slots in is
@@ -2002,7 +2011,7 @@ pub async fn provision(&self, request: ProvisionRequest<H::Seed>) -> Result<Prov
 pub struct ProvisionRequest<S> {
     pub tenant: TenantId,
     pub subdomain: String,
-    pub display_name: String,          // 1 to DISPLAY_NAME_MAX (255) bytes, not blank, no control character
+    pub display_name: String,          // 1 to display_name_max_bytes (default 255) bytes, not blank, no control character
     pub hosts: Vec<String>,
     pub primary_host: String,
     pub seed: S,                       // not stored; Debug leaves it out
@@ -2539,10 +2548,14 @@ Examples are outside coverage.
     run the migrator on a read-write pool of one connection, then serve
     the hook read-only sessions with a 5 s statement timeout; both answer
     only for `active` or `suspended` tenants (10.3).
-40. **Display names are 1 to 255 bytes**, not blank, without a control
-    character, stored as given; labels and hosts are canonicalised (hosts
-    sorted and de-duplicated) before they are stored or compared with a
-    row (10.2).
+40. **Display names are 1 to the provisioner's maximum in bytes**
+    (`ProvisionerBuilder::display_name_max_bytes`, default 255, zero
+    refused), not blank, without a control character, stored as given (the
+    reference schema's column is `text`); provisioning and adoption check
+    them with the same setting. A product whose own limit is in characters
+    sets the bytes they take in UTF-8. Labels and hosts are canonicalised
+    (hosts sorted and de-duplicated) before they are stored or compared
+    with a row (10.2).
 41. **A maintenance session acts as the role it signed in as**: the
     preflight refuses a maintenance session whose `CURRENT_USER` is not
     its `session_user` (`RoleSwitched`), and every `connect` and
@@ -2574,6 +2587,10 @@ Examples are outside coverage.
 46. **Admission tuning is per value, permits are shared**:
     `Registry::with_admission_wait` and `lifecycle_available` (10.5); the
     usage and describe states stay `active` and `suspended` (10.3).
+47. **The texts of the reason-less lifecycle answers are stable
+    constants**: `messages::LIFECYCLE_BUSY` and
+    `messages::TENANT_OPEN_FAILED`; they get no reason, which would change
+    the wire (7, 10.5).
 
 ## 15. Open questions for the repository owner
 

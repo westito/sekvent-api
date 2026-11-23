@@ -28,7 +28,8 @@ use crate::{
     Tenants,
 };
 
-/// The longest display name, in bytes.
+/// The longest display name, in bytes, unless the builder sets another
+/// ([`ProvisionerBuilder::display_name_max_bytes`]).
 pub const DISPLAY_NAME_MAX: usize = 255;
 
 /// A control transaction of a lifecycle call.
@@ -66,6 +67,8 @@ pub(crate) struct Inner<H> {
     /// The key of the advisory lock that orders the cap check and the insert of a new row.
     pub(crate) provision_lock: i64,
     pub(crate) labels: LabelRules,
+    /// The longest display name, in bytes.
+    pub(crate) display_name_max: usize,
     pub(crate) sender: Sender,
     pub(crate) sink: Arc<dyn Sink>,
     pub(crate) cache: Option<Arc<dyn TenantCache>>,
@@ -114,6 +117,7 @@ impl<H: TenantHooks> Provisioner<H> {
             tenant_cap: None,
             provision_lock: PROVISION_LOCK,
             labels: LabelRules::new(),
+            display_name_max: DISPLAY_NAME_MAX,
             sink: Arc::new(()),
             cache: None,
             clock: Arc::new(SystemClock),
@@ -240,6 +244,7 @@ pub struct ProvisionerBuilder<H> {
     tenant_cap: Option<u64>,
     provision_lock: i64,
     labels: LabelRules,
+    display_name_max: usize,
     sink: Arc<dyn Sink>,
     cache: Option<Arc<dyn TenantCache>>,
     clock: Arc<dyn Clock>,
@@ -296,6 +301,16 @@ impl<H: TenantHooks> ProvisionerBuilder<H> {
         self
     }
 
+    /// The longest display name a provisioning or adoption request may carry, in bytes (default
+    /// [`DISPLAY_NAME_MAX`], 255); at least 1. A product whose own rules allow longer names in
+    /// characters sets the bytes they take in UTF-8 (four per character at most). The other
+    /// display-name rules stay: not blank, no control character.
+    #[must_use]
+    pub fn display_name_max_bytes(mut self, max: usize) -> Self {
+        self.display_name_max = max;
+        self
+    }
+
     /// The tenant cache of this process, whose lookups and scope every committed change drops
     /// and whose host snapshot it reloads. Without one, only the registry's lookups are dropped.
     ///
@@ -346,6 +361,11 @@ impl<H: TenantHooks> ProvisionerBuilder<H> {
         let tenant_cap = self.tenant_cap.filter(|cap| *cap >= 1).ok_or_else(|| {
             AppError::invalid_argument("the provisioner needs tenant_cap, at least 1")
         })?;
+        if self.display_name_max == 0 {
+            return Err(AppError::invalid_argument(
+                "the provisioner needs display_name_max_bytes, at least 1",
+            ));
+        }
         let options = self.registry.pool().connect_options();
         let control_database = options
             .get_database()
@@ -365,6 +385,7 @@ impl<H: TenantHooks> ProvisionerBuilder<H> {
                 tenant_cap,
                 provision_lock: self.provision_lock,
                 labels: self.labels,
+                display_name_max: self.display_name_max,
                 sender: self.sender,
                 sink: self.sink,
                 cache: self.cache,
@@ -382,7 +403,8 @@ pub struct ProvisionRequest<S> {
     pub tenant: TenantId,
     /// The tenant's label; it must pass the provisioner's label rules.
     pub subdomain: String,
-    /// The name people see: 1 to 255 bytes, not blank, no control character.
+    /// The name people see: 1 to the provisioner's display-name maximum in bytes (default
+    /// [`DISPLAY_NAME_MAX`]), not blank, no control character.
     pub display_name: String,
     /// Every host the tenant answers on, the primary included; canonicalised, sorted and
     /// de-duplicated before they are stored.
@@ -592,31 +614,32 @@ pub(crate) fn collect_hosts(
     }
 }
 
-/// A display name's problem: not 1 to [`DISPLAY_NAME_MAX`] bytes, blank, or holding a control
-/// character.
-pub(crate) fn display_name_problem(display_name: &str) -> Option<&'static str> {
+/// A display name's problem: not 1 to `max` bytes, blank, or holding a control character.
+pub(crate) fn display_name_problem(display_name: &str, max: usize) -> Option<String> {
     if display_name.trim().is_empty() {
-        Some("is blank")
-    } else if display_name.len() > DISPLAY_NAME_MAX {
-        Some("is longer than 255 bytes")
+        Some("is blank".to_owned())
+    } else if display_name.len() > max {
+        Some(format!("is longer than {max} bytes"))
     } else if display_name.chars().any(char::is_control) {
-        Some("holds a control character")
+        Some("holds a control character".to_owned())
     } else {
         None
     }
 }
 
-/// [`collect_hosts`] and the display name into `violations`; `None` when anything was recorded.
+/// [`collect_hosts`] and the display name (at most `display_name_max` bytes) into `violations`;
+/// `None` when anything was recorded.
 pub(crate) fn collect_tenant(
     violations: &mut Violations,
     labels: &LabelRules,
+    display_name_max: usize,
     subdomain: &str,
     display_name: &str,
     hosts: &[String],
     primary_host: &str,
 ) -> Option<ValidTenant> {
     let hosts = collect_hosts(violations, labels, subdomain, hosts, primary_host);
-    if let Some(problem) = display_name_problem(display_name) {
+    if let Some(problem) = display_name_problem(display_name, display_name_max) {
         violations.push("display_name", problem);
         return None;
     }
@@ -645,9 +668,116 @@ pub(crate) fn validate_hosts(
 
 #[cfg(test)]
 mod tests {
+    use sekvent_context::ManualClock;
     use sekvent_error::ErrorCode;
+    use sqlx::PgPool;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
     use super::*;
+    use crate::RoleSecrets;
+    use crate::invalidation::Channel;
+
+    static MIGRATOR: Migrator = Migrator::DEFAULT;
+
+    struct Hooks;
+
+    impl TenantHooks for Hooks {
+        type Seed = ();
+    }
+
+    /// Options nobody listens on.
+    fn nowhere() -> PgConnectOptions {
+        PgConnectOptions::new_without_pgpass()
+            .host("127.0.0.1")
+            .port(1)
+    }
+
+    /// A pool that never connects until asked.
+    fn lazy_pool(max_connections: u32) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect_lazy_with(nowhere())
+    }
+
+    /// A builder with every required setting, built without I/O.
+    fn builder() -> ProvisionerBuilder<Hooks> {
+        let names = ObjectNames::new("app_t_").expect("a valid prefix");
+        let secrets = RoleSecrets::parse(
+            &Secret::new("k1:correct horse battery staple 936".to_owned()),
+            "example-app.role.v1",
+        )
+        .expect("the test secrets parse");
+        let clock = Arc::new(ManualClock::new(SystemTime::UNIX_EPOCH));
+        Provisioner::builder(
+            Registry::new(lazy_pool(3), clock).expect("three connections"),
+            Maintenance::new(nowhere(), names),
+            Connector::new(nowhere(), secrets),
+            &MIGRATOR,
+            Sender::new(
+                lazy_pool(1),
+                Channel::new("orders_changes").expect("a channel name"),
+            ),
+            Hooks,
+        )
+        .role_key_id("k1")
+        .connection_limit(2)
+        .tenant_cap(10)
+    }
+
+    /// `Ok` when `provisioner` takes `display_name` in a request.
+    fn takes(provisioner: &Provisioner<Hooks>, display_name: &str) -> Result<(), AppError> {
+        let mut violations = Violations::default();
+        collect_tenant(
+            &mut violations,
+            &provisioner.inner.labels,
+            provisioner.inner.display_name_max,
+            "orders",
+            display_name,
+            &strings(&["orders.example.com"]),
+            "orders.example.com",
+        );
+        violations.finish()
+    }
+
+    #[tokio::test]
+    async fn the_display_name_maximum_defaults_to_255_bytes() {
+        let provisioner = builder().build().expect("the settings are valid");
+        assert_eq!(provisioner.inner.display_name_max, DISPLAY_NAME_MAX);
+        assert_eq!(DISPLAY_NAME_MAX, 255);
+        assert!(takes(&provisioner, &"x".repeat(255)).is_ok());
+        let error = takes(&provisioner, &"x".repeat(256)).expect_err("past the default");
+        assert_eq!(fields(&error), ["display_name"]);
+    }
+
+    #[tokio::test]
+    async fn a_custom_display_name_maximum_is_used() {
+        let provisioner = builder()
+            .display_name_max_bytes(400)
+            .build()
+            .expect("the settings are valid");
+        assert!(takes(&provisioner, &"\u{e9}".repeat(150)).is_ok());
+        let error =
+            takes(&provisioner, &format!("{}x", "\u{e9}".repeat(200))).expect_err("401 bytes");
+        assert_eq!(fields(&error), ["display_name"]);
+        assert_eq!(
+            error.field_violations()[0].description,
+            "is longer than 400 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_display_name_maximum_is_refused() {
+        let error = builder()
+            .display_name_max_bytes(0)
+            .build()
+            .expect_err("zero is refused");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            error.message().contains("display_name_max_bytes"),
+            "{}",
+            error.message()
+        );
+    }
 
     fn strings(texts: &[&str]) -> Vec<String> {
         texts.iter().map(|text| (*text).to_owned()).collect()
@@ -743,22 +873,24 @@ mod tests {
 
     #[test]
     fn display_names_are_checked_with_the_hosts() {
-        assert_eq!(display_name_problem("Orders Ltd"), None);
-        assert_eq!(display_name_problem(" \t"), Some("is blank"));
-        assert_eq!(display_name_problem(""), Some("is blank"));
+        let problem = |name: &str| display_name_problem(name, DISPLAY_NAME_MAX);
+        assert_eq!(problem("Orders Ltd"), None);
+        assert_eq!(problem(" \t").as_deref(), Some("is blank"));
+        assert_eq!(problem("").as_deref(), Some("is blank"));
         assert_eq!(
-            display_name_problem(&"x".repeat(256)),
+            problem(&"x".repeat(256)).as_deref(),
             Some("is longer than 255 bytes")
         );
-        assert_eq!(display_name_problem(&"x".repeat(255)), None);
+        assert_eq!(problem(&"x".repeat(255)), None);
         assert_eq!(
-            display_name_problem("Orders\nLtd"),
+            problem("Orders\nLtd").as_deref(),
             Some("holds a control character")
         );
         let mut violations = Violations::default();
         let valid = collect_tenant(
             &mut violations,
             &LabelRules::new(),
+            DISPLAY_NAME_MAX,
             "orders",
             "",
             &[],
@@ -770,11 +902,33 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_maximum_bounds_the_display_name_in_bytes() {
+        // 100 four-byte characters: 400 bytes.
+        let wide = "\u{1F600}".repeat(100);
+        assert_eq!(wide.len(), 400);
+        assert_eq!(display_name_problem(&wide, 400), None);
+        assert_eq!(
+            display_name_problem(&format!("{wide}x"), 400).as_deref(),
+            Some("is longer than 400 bytes")
+        );
+        assert_eq!(
+            display_name_problem(&wide, DISPLAY_NAME_MAX).as_deref(),
+            Some("is longer than 255 bytes")
+        );
+        assert_eq!(display_name_problem(" ", 400).as_deref(), Some("is blank"));
+        assert_eq!(
+            display_name_problem("a\u{7}b", 400).as_deref(),
+            Some("holds a control character")
+        );
+    }
+
+    #[test]
     fn a_valid_tenant_keeps_its_display_name() {
         let mut violations = Violations::default();
         let valid = collect_tenant(
             &mut violations,
             &LabelRules::new(),
+            DISPLAY_NAME_MAX,
             "orders",
             " Orders Ltd ",
             &strings(&["orders.example.com"]),
