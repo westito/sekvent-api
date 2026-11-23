@@ -912,16 +912,17 @@ after:
 
 | Step | Session on | What |
 |---|---|---|
-| 1 | the maintenance database | for `adopt` first, the tenant-role check; the preconditions below up to `owns_more` |
+| 1 | the maintenance database | for `adopt` first, the tenant-role check of an existing role; the preconditions below up to `owns_more` |
 | 2, reassign only | the database | `foreign_object`; then `CONNECT` revoked from `PUBLIC`, on its own; then `session` |
 | 3, reassign only, `adopt` | the database | one transaction: the tenant-role check first, then every check of steps 1 and 2 again (the revoke too); the maintenance role's membership in the tenant role set to `INHERIT TRUE, SET TRUE`; the database's owner changed; `REASSIGN OWNED BY CURRENT_USER TO` the tenant role; the membership back to `INHERIT FALSE, SET TRUE`. An error rolls all of it back |
 | 4, `adopt` | the maintenance database | the tenant-role check; as the new owner, in one transaction: `CONNECT` revoked from `PUBLIC` and granted to the owner, connections allowed; then one read of the database: no finding of `privileges::tenant_database_findings` for the owner and no `CONNECT` of `PUBLIC` |
 
 A tenant role that fails its check, and a database that step 4's read finds
 not as expected, are `INTERNAL` without a reason, the findings in the
-error's source; nothing is repaired. The role check in step 1 comes before
-anything changes, the one in step 3 before the inheriting membership
-exists, the one in step 4 before the restriction. A database refused by
+error's source; nothing is repaired. The role check in step 1, of a role
+that exists, comes before anything changes; the one in step 3 before the
+inheriting membership exists (a missing role is refused there), the one in
+step 4 before the restriction. A database refused by
 step 4's read keeps its new owner and its restriction, and every later
 call refuses it again. `prepare` does not check the role.
 

@@ -8,7 +8,7 @@
 //!
 //! | Step | Session on | What |
 //! |---|---|---|
-//! | 1 | the maintenance database | for [`adopt`] first, the tenant role passes `privileges::check_tenant_role`; the database exists (`missing`), is no template (`template`), is owned by the maintenance role or already by the tenant role (`owner`), its ACL names no grantee but its owner and `PUBLIC`, and `PUBLIC` only with `CONNECT` or `TEMPORARY` without grant option (`grantee`); when the maintenance role owns it, that role owns no other database and no tablespace, which `REASSIGN OWNED` would move too (`owns_more`) |
+//! | 1 | the maintenance database | for [`adopt`] first, an existing tenant role passes `privileges::check_tenant_role`; the database exists (`missing`), is no template (`template`), is owned by the maintenance role or already by the tenant role (`owner`), its ACL names no grantee but its owner and `PUBLIC`, and `PUBLIC` only with `CONNECT` or `TEMPORARY` without grant option (`grantee`); when the maintenance role owns it, that role owns no other database and no tablespace, which `REASSIGN OWNED` would move too (`owns_more`) |
 //! | 2, reassign only | the database | no object of a role other than the maintenance role and the tenant role (`foreign_object`); `CONNECT` revoked from `PUBLIC`, on its own; no session of a role other than the maintenance role (`session`) |
 //! | 3, reassign only, [`adopt`] | the database | one transaction: the tenant-role check, then the checks of steps 1 and 2 again, the revoke included; the membership in the tenant role `WITH INHERIT TRUE, SET TRUE`; the database's owner changed; `REASSIGN OWNED BY CURRENT_USER`; the membership back to `INHERIT FALSE, SET TRUE` |
 //! | 4, [`adopt`] | the maintenance database | the tenant-role check; as the new owner: `CONNECT` revoked from `PUBLIC` and granted to the owner, connections allowed; then one read of the database: no finding of `privileges::tenant_database_findings` for the owner and no `CONNECT` of `PUBLIC` |
@@ -24,10 +24,11 @@
 //!
 //! A tenant role that fails its check, and a database that is not as
 //! expected after the restriction, are `INTERNAL` without a reason, the
-//! findings in the error's source, and nothing is repaired. The role is
-//! checked in step 1 before anything changes; again first in step 3's
-//! transaction, before the inheriting membership exists; and in step 4
-//! before the restriction. A database refused by step 4's read keeps its
+//! findings in the error's source, and nothing is repaired. An existing
+//! role is checked in step 1 before anything changes; the role is checked
+//! again first in step 3's transaction, before the inheriting membership
+//! exists, where a missing role is refused too; and in step 4 before the
+//! restriction. A database refused by step 4's read keeps its
 //! new owner and its restriction, and every later call refuses it again.
 //!
 //! A call made again after an interruption converges: a database the tenant
@@ -240,9 +241,10 @@ pub async fn prepare(
 /// restriction and the read of the restricted database.
 ///
 /// `role` must exist, pass the tenant-role check and be held by the
-/// maintenance role (as `roles::create` leaves it); otherwise the call is
-/// `INTERNAL` before anything changes. A call that failed at any point
-/// converges when it is made again.
+/// maintenance role (as `roles::create` leaves it). An existing role that
+/// fails the check is `INTERNAL` before anything changes; a missing role is
+/// `INTERNAL` at the transfer, after step 1's refusals and step 2. A call
+/// that failed at any point converges when it is made again.
 pub async fn adopt(
     maintenance: &Maintenance,
     database: &DatabaseName,
@@ -263,7 +265,7 @@ pub async fn adopt(
 /// Whether step 1 checks the tenant role before anything else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RoleCheck {
-    /// [`adopt`]: the role exists and is checked first.
+    /// [`adopt`]: an existing role is checked first.
     First,
     /// [`prepare`]: the role need not exist yet.
     Skipped,
@@ -377,7 +379,7 @@ async fn inspect_on(
     role_check: RoleCheck,
 ) -> Result<Adoption, AppError> {
     if role_check == RoleCheck::First {
-        privileges::check_tenant_role(&mut *conn, role).await?;
+        privileges::check_existing_tenant_role(&mut *conn, role).await?;
     }
     let facts = privileges::database_facts(&mut *conn, database.as_str()).await?;
     let adoption =

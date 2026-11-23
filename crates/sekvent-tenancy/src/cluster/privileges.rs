@@ -418,6 +418,19 @@ pub async fn check_tenant_role(conn: &mut PgConnection, role: &TenantRole) -> Re
     role_verdict(role.as_str(), read.as_ref())
 }
 
+/// [`check_tenant_role`] for a role that may not exist yet: a missing role
+/// passes, an existing one is held to the same rules.
+#[cfg(feature = "lifecycle")]
+pub(crate) async fn check_existing_tenant_role(
+    conn: &mut PgConnection,
+    role: &TenantRole,
+) -> Result<(), AppError> {
+    match read_role(conn, role.as_str()).await? {
+        None => Ok(()),
+        read => role_verdict(role.as_str(), read.as_ref()),
+    }
+}
+
 /// `INTERNAL` naming every finding in its source. A missing database is
 /// `INTERNAL` too.
 pub async fn check_tenant_database(

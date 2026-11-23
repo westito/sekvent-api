@@ -349,13 +349,11 @@ async fn a_missing_database_is_refused() {
             .expect_err("nothing to adopt");
         assert_eq!(refused_check(&prepared), "missing");
 
-        // The adoption checks its role before anything else.
-        let err = run_adopt(&maintenance, &database, &absent_role)
+        // A role that does not exist yet is no finding of step 1.
+        let adopted = run_adopt(&maintenance, &database, &absent_role)
             .await
-            .expect_err("the role does not exist");
-        assert_eq!(err.code(), ErrorCode::Internal, "{err:?}");
-        assert_eq!(err.reason(), None);
-        assert!(source(&err).contains("does not exist"), "{}", source(&err));
+            .expect_err("nothing to adopt");
+        assert_eq!(refused_check(&adopted), "missing");
 
         let (role, _) = tenant_role(&cluster, &maintenance).await;
         let adopted = run_adopt(&maintenance, &database, &role)

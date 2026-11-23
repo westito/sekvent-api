@@ -1180,7 +1180,7 @@ Each step runs on a connection of its own, one at a time, closed after.
 
 | Step | Connected to | What |
 |---|---|---|
-| 1 | the maintenance database | for `adopt` first, `role` passes `privileges::check_tenant_role`; the database exists (`missing`), is no template (`template`), is owned by the maintenance role or already by `role` (`owner`), its ACL names no grantee beyond its owner and `PUBLIC`, and `PUBLIC` only with `CONNECT` or `TEMPORARY` without grant option (`grantee`); on the reassign path the maintenance role owns no other database and no tablespace, which `REASSIGN OWNED` would move too (`owns_more`) |
+| 1 | the maintenance database | for `adopt` first, `role`, when it exists, passes `privileges::check_tenant_role`; the database exists (`missing`), is no template (`template`), is owned by the maintenance role or already by `role` (`owner`), its ACL names no grantee beyond its owner and `PUBLIC`, and `PUBLIC` only with `CONNECT` or `TEMPORARY` without grant option (`grantee`); on the reassign path the maintenance role owns no other database and no tablespace, which `REASSIGN OWNED` would move too (`owns_more`) |
 | 2, reassign only | the database | no object owned by a role other than the maintenance role and `role` (`foreign_object`); then `CONNECT` revoked from `PUBLIC`; then no session of another role connected (`session`) |
 | 3, reassign only | the database | one transaction: the tenant-role check first, then steps 1 and 2's checks again, then: the membership granted `WITH INHERIT TRUE`, the database's owner changed, `REASSIGN OWNED BY CURRENT_USER TO <role>`, the membership back to `INHERIT FALSE, SET TRUE`. An error rolls all of it back |
 | 4 | the maintenance database | the tenant-role check; the CONNECT restriction of 8.8 step 4, as the new owner; then the read of 8.8 step 5 |
@@ -1189,9 +1189,10 @@ Each step runs on a connection of its own, one at a time, closed after.
   `check` set to the name in brackets above.
 - A tenant role that fails its check, and a database that step 4's read
   finds not as expected, are `INTERNAL` without a reason, the findings in
-  the error's source; nothing is repaired. The role is checked in step 1
-  before anything changes, again first in step 3's transaction (before the
-  inheriting membership exists) and in step 4 before the restriction. A
+  the error's source; nothing is repaired. An existing role is checked in
+  step 1 before anything changes; the role is checked again first in step
+  3's transaction (before the inheriting membership exists; a missing role
+  is refused there) and in step 4 before the restriction. A
   database refused by step 4's read keeps its new owner and its
   restriction, and every later call refuses it again. `prepare` does not
   check the role, which need not exist yet.
