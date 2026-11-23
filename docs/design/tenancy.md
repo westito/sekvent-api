@@ -1339,12 +1339,15 @@ smaller one (the two admissions below each leave room for the other).
 
 ```rust
 /// Clones share one lookup cache with its reads in flight, one set of lookup permits and one
-/// set of lifecycle permits.
+/// set of lifecycle permits; each value keeps its own label rules.
 #[derive(Clone)]
 pub struct Registry { /* private */ }
 impl Registry {
     pub const MIN_CONNECTIONS: u32 = 3;
     pub fn new(control: PgPool, clock: Arc<dyn Clock>) -> Result<Self, AppError>; // no I/O
+    /// The product's label rules for path labels (default `LabelRules::new()`), the same as
+    /// `SelectorRules::labels`.
+    pub fn labels(self, rules: LabelRules) -> Self;
     pub fn pool(&self) -> &PgPool;
     /// A request's lookup: the cache, then a read under the lookup admission. Any state.
     pub async fn lookup(&self, selector: &Selector) -> Result<Option<TenantRow>, AppError>;
@@ -1369,7 +1372,7 @@ impl Registry {
 | Freshness on sight | an entry found not fresh (expired, or dated after now because the clock was set back) is removed when it is found and never served later; an answer already past its lifetime when its read ends goes to its caller and is not stored |
 | When a partition is full | expired entries are dropped, then only the partition that is still full is cleared, so not-found entries never push found entries out |
 | `forget(tenant)` | drops the tenant's id entry, its found host entries and every not-found host entry; `clear_lookups` drops everything. The cache has one epoch and both raise it, so no read already running, of any tenant or key, stores its answer (its caller still gets it) |
-| An invalid selector | a host that is not canonical, a segment that is no label, or a path label on a listener that is neither loopback nor one a host can be derived from: no row, without a read |
+| An invalid selector | a host that is not canonical, a segment the registry's `LabelRules` refuse (on every listener; with `Registry::labels` the product's reserved labels and lengths too), or a path label on a listener that is neither loopback nor one a host can be derived from: no row, without a permit and without a read |
 | **Lookup admission** | `max(1, control max_connections / 2)` permits for selector cache misses |
 | No permit | `TENANT_BUSY` at once, **before** any control connection is taken |
 | Same key in flight | the caller joins that read, then looks again; a caller that joined twice without an answer is `TENANT_BUSY`. Joiners are woken when the read ends, however it ends, and never receive its error. A finished read gives its permit back first, then leaves the reads in flight, and wakes its joiners last, so a same-key caller in between joins instead of getting `TENANT_BUSY` |
@@ -1449,8 +1452,13 @@ selects nothing, and a label the product's rules refuse causes no read. It
 stands for the host `path_label_host` derives from it. On a loopback
 listener, where `path_label_host` derives none, exactly one tenant that is
 not purged may carry the label, else nothing is selected; that tenant must
-have a registered loopback host (any port). That read is never cached and
-never joined, and spends a lookup permit.
+have a registered loopback host (any port) stored in its canonical
+spelling, so a stored host that `canonical_host` would change (such as
+`UPPER.localhost:5173`) never makes a tenant selectable. That read is never
+cached and never joined, and spends a lookup permit. The resolver checks
+the segment with `SelectorRules::labels`; `Registry::lookup` checks it again
+with the registry's own rules (`Registry::labels`), so a product that
+looks path labels up itself refuses the same segments without a read.
 
 A host may be in both lists only on loopback. The tenant's existence and
 state are checked before a header or origin comparison, so a mismatch

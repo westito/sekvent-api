@@ -478,7 +478,8 @@ pub async fn by_host(conn: &mut PgConnection, host: &str) -> Result<Option<Tenan
 
 /// The loopback path-label rule: with one statement reads at most two rows that are not `Purged`
 /// and whose `subdomain` is `label`; `Some` only when there is exactly one and it has at least one
-/// host for which `is_loopback_host` holds.
+/// host that is canonical (`canonical_host` returns it unchanged) and for which `is_loopback_host`
+/// holds. A stored host in another spelling never makes a row selectable.
 pub async fn by_loopback_label(
     conn: &mut PgConnection,
     label: &str,
@@ -496,8 +497,13 @@ pub async fn by_loopback_label(
         .info
         .hosts
         .iter()
-        .any(|host| is_loopback_host(host))
+        .any(|host| is_canonical_loopback(host))
         .then_some(row))
+}
+
+/// Whether `host` is exactly its canonical spelling and a loopback host.
+fn is_canonical_loopback(host: &str) -> bool {
+    canonical_host(host).is_ok_and(|canonical| canonical == host) && is_loopback_host(host)
 }
 
 /// Every `Active` tenant with its whole host set, ordered by id, with one statement.
@@ -1044,6 +1050,28 @@ mod tests {
         for statement in [INSERT_TENANT, SET_STATE, SET_SUBDOMAIN, STORE_VERSION] {
             assert!(!statement.contains("provision_step ="), "{statement}");
             assert!(!statement.contains("db_cluster ="), "{statement}");
+        }
+    }
+
+    #[test]
+    fn only_a_canonical_loopback_host_makes_a_label_selectable() {
+        for host in [
+            "localhost",
+            "orders.localhost:5173",
+            "127.0.0.1:8080",
+            "[::1]",
+        ] {
+            assert!(is_canonical_loopback(host), "{host:?}");
+        }
+        for host in [
+            "UPPER.localhost:5173",
+            "orders.localhost.",
+            "Localhost",
+            "[0:0:0:0:0:0:0:1]",
+            "orders.example.com",
+            "",
+        ] {
+            assert!(!is_canonical_loopback(host), "{host:?}");
         }
     }
 }

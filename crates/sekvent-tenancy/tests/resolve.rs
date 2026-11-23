@@ -14,6 +14,7 @@ use sekvent_component::ScopeResolver;
 use sekvent_context::{CallContext, RequestScope};
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_tenancy::hosts::{self, HostSnapshot};
+use sekvent_tenancy::label::LabelRules;
 use sekvent_tenancy::{
     ErrorDomains, Registry, SelectorRules, StreamTenant, TenantId, TenantLease, TenantResolver,
     TenantState, Tenants, reasons,
@@ -637,6 +638,68 @@ async fn a_loopback_path_label_selects_its_one_tenant_only() {
             )
             .await;
         assert_not_here(served.resolve(&request).await);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_loopback_path_label_needs_a_canonical_host_and_an_allowed_segment() {
+    let Some(cluster) = common::Cluster::start().await else {
+        return;
+    };
+    common::guard(async {
+        let rules = SelectorRules::new()
+            .path_label("/t/", [LOOPBACK.to_owned()])
+            .expect("the path-label rule is valid")
+            .labels(
+                LabelRules::new()
+                    .with_length(3, 20)
+                    .expect("valid lengths")
+                    .with_reserved(|label| label == "admin"),
+            );
+        let served = Served::start(&cluster, rules).await;
+        let path = |segment: &str| format!("/t/{segment}/billing.orders.v1.Orders/Get");
+        cluster
+            .insert_row(
+                &served.control,
+                "upper",
+                &["upper.localhost:5173"],
+                TenantState::Active,
+            )
+            .await;
+        cluster
+            .admin_execute(
+                cluster.control_database(),
+                "UPDATE tenant_hosts SET host = 'UPPER.localhost:5173' \
+                 WHERE host = 'upper.localhost:5173'",
+            )
+            .await;
+        assert_not_here(served.resolve(&head(LOOPBACK, &path("upper"), &[])).await);
+
+        for label in ["admin", "ab", "orders"] {
+            let host = format!("{label}.localhost:3000");
+            cluster
+                .insert_row(
+                    &served.control,
+                    label,
+                    &[host.as_str()],
+                    TenantState::Active,
+                )
+                .await;
+        }
+        // A closed pool fails every read: the refused segments never ask for a connection.
+        served.control.close().await;
+        for segment in ["admin", "Admin", "ab"] {
+            assert_not_here(served.resolve(&head(LOOPBACK, &path(segment), &[])).await);
+        }
+        let read = served
+            .resolve(&head(LOOPBACK, &path("orders"), &[]))
+            .await
+            .expect_err("the allowed segment reads the closed pool");
+        assert_ne!(read.reason(), Some(reasons::TENANT_NOT_HERE));
+        assert_eq!(served.tenants.stats().creations, 0);
+        assert_eq!(served.factory.built(), 0);
     })
     .await;
 }

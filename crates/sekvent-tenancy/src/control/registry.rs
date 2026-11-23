@@ -11,11 +11,13 @@ use sqlx::PgPool;
 use super::admission::{LifecycleAdmission, LifecyclePermit};
 use super::lookup::Lookups;
 use super::rows::{self, TenantRow, VersionStored};
+use crate::label::LabelRules;
 use crate::{Selector, TenantId, TenantInfo};
 
 /// The control database of this process: the pool, the lookup cache and the two admissions.
 /// Clones share everything: one lookup cache with its reads in flight, one set of lookup permits and
-/// one set of lifecycle permits, however many clones exist. `Debug` prints the type name only.
+/// one set of lifecycle permits, however many clones exist. Each value keeps its own label rules
+/// (`labels`), copied into the clones made after they are set. `Debug` prints the type name only.
 #[derive(Clone)]
 pub struct Registry {
     pool: PgPool,
@@ -43,6 +45,17 @@ impl Registry {
         })
     }
 
+    /// The product's label rules (default `LabelRules::new()`), the same as it gives
+    /// `SelectorRules::labels`: `lookup` answers `None` for a `Selector::PathLabel` whose segment
+    /// they refuse, on every listener host, before it takes a permit or a connection. The
+    /// resolver checks a request's segment with `SelectorRules::labels` before its lookup; set
+    /// these when `lookup` is also called with path labels from elsewhere.
+    #[must_use]
+    pub fn labels(mut self, rules: LabelRules) -> Self {
+        self.lookups.set_labels(rules);
+        self
+    }
+
     /// The control pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
@@ -50,6 +63,8 @@ impl Registry {
 
     /// A request's lookup: through the cache, a miss under the lookup admission. `TENANT_BUSY`
     /// (no domain) without a permit, before any connection is taken. Returns the row in any state.
+    /// A path label is checked with `labels` first; on a loopback listener host it selects the one
+    /// row not `Purged` of that subdomain that has a canonical loopback host.
     pub async fn lookup(&self, selector: &Selector) -> Result<Option<TenantRow>, AppError> {
         self.lookups.find(&self.pool, selector).await
     }
@@ -152,6 +167,36 @@ mod tests {
     async fn debug_prints_the_type_name_only() {
         let registry = Registry::new(lazy_pool(3), clock()).expect("three are enough");
         assert_eq!(format!("{registry:?}"), "Registry(..)");
+    }
+
+    #[tokio::test]
+    async fn a_path_label_the_label_rules_refuse_is_none_without_a_connection() {
+        let pool = lazy_pool(3);
+        let rules = LabelRules::new()
+            .with_length(3, 20)
+            .expect("valid lengths")
+            .with_reserved(|label| label == "admin");
+        let registry = Registry::new(pool.clone(), clock())
+            .expect("three are enough")
+            .labels(rules);
+        let lax = registry.clone().labels(LabelRules::new());
+        pool.close().await;
+        let on = |segment: &str, listener: &str| Selector::PathLabel {
+            segment: segment.to_owned(),
+            listener_host: listener.to_owned(),
+        };
+
+        for listener in ["localhost:8080", "app.example.com"] {
+            for segment in ["admin", "ADMIN", "ab"] {
+                let found = registry.lookup(&on(segment, listener)).await;
+                assert_eq!(found.expect("no connection is asked for"), None);
+            }
+            // A closed pool fails every read: the lookups above never asked it.
+            let read = registry.lookup(&on("billing", listener)).await;
+            assert!(read.is_err(), "{listener}: an allowed segment reads");
+            let read = lax.lookup(&on("admin", listener)).await;
+            assert!(read.is_err(), "{listener}: a clone keeps its own rules");
+        }
     }
 
     #[tokio::test(start_paused = true)]

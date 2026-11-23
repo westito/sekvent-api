@@ -85,8 +85,9 @@ enum Plan {
     Uncached(Read),
 }
 
-/// The plan of `selector`; pure, no I/O.
-fn plan(selector: &Selector) -> Plan {
+/// The plan of `selector`; pure, no I/O. A path segment `labels` refuses selects nothing on every
+/// listener host; a loopback listener reads by the label `labels` returns.
+fn plan(selector: &Selector, labels: &LabelRules) -> Plan {
     match selector {
         Selector::Id(id) => Plan::Cached(Key::Id(*id)),
         Selector::Host(host) => {
@@ -100,14 +101,13 @@ fn plan(selector: &Selector) -> Plan {
             segment,
             listener_host,
         } => {
-            if let Some(host) = path_label_host(segment, listener_host) {
+            let Ok(label) = labels.canonical(segment) else {
+                return Plan::Nothing;
+            };
+            if let Some(host) = path_label_host(&label, listener_host) {
                 Plan::Cached(Key::Host(host))
             } else if is_canonical(listener_host) && is_loopback_host(listener_host) {
-                LabelRules::new()
-                    .canonical(segment)
-                    .map_or(Plan::Nothing, |label| {
-                        Plan::Uncached(Read::LoopbackLabel(label))
-                    })
+                Plan::Uncached(Read::LoopbackLabel(label))
             } else {
                 Plan::Nothing
             }
@@ -483,11 +483,14 @@ fn control_reader(pool: PgPool) -> impl Fn(Read) -> ReadFuture + Send + Sync {
     }
 }
 
-/// The lookup cache, the lookup admission and the reads in flight. Clones share everything.
+/// The lookup cache, the lookup admission and the reads in flight. Clones share everything but
+/// the label rules.
 #[derive(Clone)]
 pub(super) struct Lookups {
     /// The cache, the permits and the reads in flight of every clone.
     shared: Arc<Shared>,
+    /// The product's label rules, applied to every path segment before any read.
+    labels: LabelRules,
 }
 
 impl Lookups {
@@ -499,7 +502,13 @@ impl Lookups {
                 admission: LookupAdmission::new(control_max),
                 state: Mutex::new(State::new()),
             }),
+            labels: LabelRules::new(),
         }
+    }
+
+    /// `Registry::labels`.
+    pub(super) fn set_labels(&mut self, rules: LabelRules) {
+        self.labels = rules;
     }
 
     /// `Registry::lookup`.
@@ -538,7 +547,7 @@ impl Lookups {
         selector: &Selector,
         reader: Reader<'_>,
     ) -> Result<Option<TenantRow>, AppError> {
-        match plan(selector) {
+        match plan(selector, &self.labels) {
             Plan::Nothing => Ok(None),
             Plan::Cached(key) => self.find_cached(key, reader).await,
             Plan::Uncached(read) => {
@@ -1155,6 +1164,53 @@ mod tests {
         }
         assert_eq!(fake.calls(), [] as [Read; 0]);
         assert_eq!(available(&lookups), 2);
+    }
+
+    #[tokio::test]
+    async fn a_segment_the_products_label_rules_refuse_answers_none_without_a_read() {
+        let clock = ManualClock::new(t0());
+        let mut lookups = new_lookups(4, &clock);
+        lookups.set_labels(
+            LabelRules::new()
+                .with_length(3, 20)
+                .unwrap()
+                .with_reserved(|label| label == "admin"),
+        );
+        let billing = row(1, "billing");
+        let fake = Fake::open(Outcome::answer(Some(billing.clone())));
+        let reader = fake.clone().reader();
+        let label = |segment: &str, listener: &str| Selector::PathLabel {
+            segment: segment.to_owned(),
+            listener_host: listener.to_owned(),
+        };
+        for listener in ["localhost:8080", "app.example.com"] {
+            for segment in ["admin", "Admin", "ab"] {
+                let selector = label(segment, listener);
+                assert_eq!(
+                    lookups.find_with(&selector, &reader).await.unwrap(),
+                    None,
+                    "{selector:?}"
+                );
+            }
+        }
+        assert_eq!(fake.calls(), [] as [Read; 0]);
+        assert_eq!(available(&lookups), 2);
+
+        let found = lookups
+            .find_with(&label("Billing", "localhost:8080"), &reader)
+            .await;
+        assert_eq!(found.unwrap().as_ref(), Some(&billing));
+        let found = lookups
+            .find_with(&label("billing", "app.example.com"), &reader)
+            .await;
+        assert_eq!(found.unwrap().as_ref(), Some(&billing));
+        assert_eq!(
+            fake.calls(),
+            [
+                Read::LoopbackLabel("billing".to_owned()),
+                Read::Host("billing.example.com".to_owned())
+            ]
+        );
     }
 
     #[tokio::test]

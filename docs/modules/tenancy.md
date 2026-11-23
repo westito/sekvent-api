@@ -137,11 +137,12 @@ impl ScopeFactory for BillingFactory {
 // base: PgConnectOptions of the tenant server (host, port, TLS); its credentials are never used.
 // master: the product's master-secret setting, a Secret read from its own key.
 control::verify_schema(&control_pool).await?;
-let registry = Registry::new(control_pool.clone(), Arc::new(SystemClock))?;
+let labels = LabelRules::new().with_reserved(|label| matches!(label, "admin" | "api" | "go"));
+let registry = Registry::new(control_pool.clone(), Arc::new(SystemClock))?.labels(labels.clone());
 let rules = SelectorRules::new()
     .id_header(HeaderName::from_static("x-tenant-id"), ["api.example.com".to_owned()])?
     .path_label("/t/", ["go.example.com".to_owned()])?
-    .labels(LabelRules::new().with_reserved(|label| matches!(label, "admin" | "api" | "go")))
+    .labels(labels)
     .tenant_hosts(true)
     .bypass(&["/billing.health.v1.Health/"]);
 let tenants = Tenants::builder(
@@ -251,8 +252,8 @@ assert_eq!(names.tenant_of(role.as_str()), Some(tenant));
 ### Hosts and origins
 
 `host::canonical_host` gives the one spelling of a host that the crate
-stores and compares, or a `HostError` (`Empty`, `TooLong`, `NotAscii`,
-`Malformed`):
+stores and compares, or a `HostError` (`Empty`, `TooLong` for an input
+over 255 bytes or a name over 253 bytes, `NotAscii`, `Malformed`):
 
 | Rule | |
 |---|---|
@@ -1050,7 +1051,7 @@ the caller's `&mut PgConnection` and never begins, commits or rolls back:
 | `insert` | in the caller's transaction (two statements): checks the `NewTenant`'s hosts before any statement (at least one, each canonical, the primary among them; sorted and de-duplicated) and its role key's generation (1 to 2147483647), inserts the row in `provisioning` with its hosts and returns `(row, true)`. A refused host is `INVALID_ARGUMENT` naming its position from 0, never its text (`host 2 is not a canonical host`, field violation `hosts[2]`). A repeated id changes nothing and returns `(the existing row, false)`. A host, role name or database name another tenant holds is `FAILED_PRECONDITION` / `TENANT_STATE`; a database name is free again once its tenant is `purged`, a role name never is |
 | `get`, `by_host` | one row with its hosts, in one statement |
 | `lock` | the row under `FOR UPDATE`, then its hosts by a second statement, so a caller that waited for the lock sees the hosts the holder committed |
-| `by_loopback_label` | the one tenant that is not `purged`, carries the label as its subdomain and has a loopback host; `None` when there is none or more than one carries the label |
+| `by_loopback_label` | the one tenant that is not `purged`, carries the label as its subdomain and has a loopback host stored in its canonical spelling (a stored host such as `UPPER.localhost:5173` does not count); `None` when there is none or more than one carries the label |
 | `list_active` | every `active` tenant with its hosts, in id order; one row that does not decode fails the whole read |
 | `set_state` | the state and `updated_at`; whether a row changed |
 | `set_hosts` | in the caller's transaction (three statements): the whole host set and the subdomain, with `insert`'s host checks and conflicts; `NOT_FOUND` without a reason for a missing row |
@@ -1072,6 +1073,7 @@ production) dates the lookup cache's entries.
 | Call | Reads |
 |---|---|
 | `lookup(&selector)` | a request's lookup, through the lookup cache and its admission ([Lookups and their admission](#lookups-and-their-admission)); the row in any state. `Tenants::select` and `Tenants::get`'s state check read through it |
+| `labels(rules)` | builder: the product's `LabelRules` (default `LabelRules::new()`), the ones it gives `SelectorRules::labels`; `lookup` answers `None` for a path label they refuse, without a permit or a connection. Each `Registry` value keeps its own rules and passes them to the clones made from it |
 | `tenant(id)` | an internal read by id through the same cache, without a permit |
 | `tenant_now(id)` | the row as committed now: no cache, no permit |
 | `active()` | every active tenant with its hosts (`rows::list_active`): one active row that cannot be decoded fails the whole read, and with it every caller of the active list: the walks, the sweep, `refresh_hosts` and the invalidation listener's loads |
@@ -1093,7 +1095,8 @@ use sekvent::tenancy::{Registry, Selector, control};
 
 // control_pool: the product's pool on its control database (max_connections >= 3).
 control::verify_schema(&control_pool).await?;
-let registry = Registry::new(control_pool, Arc::new(SystemClock))?;
+// label_rules: the LabelRules the product gives SelectorRules::labels.
+let registry = Registry::new(control_pool, Arc::new(SystemClock))?.labels(label_rules.clone());
 let row = registry.lookup(&Selector::Host("orders.example.com".to_owned())).await?;
 ```
 
@@ -1108,10 +1111,15 @@ of the control pool however many arrive.
 canonical host (`Selector::Host`, and a path label, which
 `label::path_label_host` turns into the host it stands for: the listener
 host with its first label replaced by the lowered segment). A host that is
-not exactly its canonical spelling, a path segment that is no DNS label, and
-a path label on a listener from which no host can be derived and that is
-not loopback (an IP address, a host of one label) answer "no tenant"
-without a read. Each key space has two separate
+not exactly its canonical spelling, a path segment the registry's
+`LabelRules` refuse (by default: one that is no DNS label; with the
+product's rules also a reserved label or one of the wrong length, on every
+listener), and a path label on a listener from which no host can be derived
+and that is not loopback (an IP address, a host of one label) answer "no
+tenant" without a permit and without a read. The resolver checks a
+request's segment with `SelectorRules::labels` before it looks up; a
+product that calls `Registry::lookup` with path labels itself gives the
+registry the same rules (`Registry::labels`). Each key space has two separate
 partitions: 4,096 found entries and 1,024 not-found entries. A found entry
 replaces a not-found entry of the same key and the reverse. A host lookup
 that finds a row also stores it in the id space; an id lookup stores
@@ -1187,7 +1195,8 @@ cache.
 `*.localhost`, `127.0.0.0/8`, `[::1]`, any port) a path label cannot be
 turned into a host. There the label selects a tenant only when exactly one
 tenant that is not purged carries it as its subdomain and that tenant has
-at least one loopback host (any port); otherwise nothing is selected. This
+at least one loopback host (any port) stored in its canonical spelling;
+otherwise nothing is selected. This
 read is never cached and never joined, and each one takes a lookup permit
 like any miss.
 
@@ -2460,6 +2469,7 @@ in:
 | Setting | Given to | Default |
 |---|---|---|
 | the control database URL (a `Secret`) and the control pool size (at least 3) | the product's `PgPool`, then `Registry::new` | none |
+| the label rules of `Registry::lookup` (the same `LabelRules` as `SelectorRules::labels`) | `Registry::labels` | `LabelRules::new()` |
 | the master secrets (a `Secret`) and their context string | `RoleSecrets::parse` | none |
 | the object-name prefix | `ObjectNames::new` | none |
 | the tenant server: host, port, TLS, application name | the base `PgConnectOptions` of `Connector::new` (their user, password and database are never used for a tenant) | none |

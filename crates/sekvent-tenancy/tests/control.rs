@@ -10,8 +10,9 @@ use std::time::{Duration, SystemTime};
 use common::Cluster;
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_tenancy::control::{self, MAIN_CLUSTER, NewTenant, VersionStored, rows};
+use sekvent_tenancy::label::LabelRules;
 use sekvent_tenancy::{
-    ProvisionStep, Registry, TenantId, TenantInfo, TenantRow, TenantState, reasons,
+    ProvisionStep, Registry, Selector, TenantId, TenantInfo, TenantRow, TenantState, reasons,
 };
 use sqlx::{Connection, PgPool};
 
@@ -1025,6 +1026,80 @@ async fn a_loopback_label_selects_its_one_live_tenant_with_a_loopback_host() {
             .await;
         assert_eq!(by_label(&pool, "reports").await, None);
         assert_eq!(by_label(&pool, "unknown").await, None);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_loopback_label_needs_a_canonical_host_and_a_segment_the_label_rules_allow() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(async {
+        let (registry, pool) = cluster.registry(Arc::new(common::manual_clock())).await;
+        let registry = registry.labels(
+            LabelRules::new()
+                .with_length(3, 20)
+                .expect("valid lengths")
+                .with_reserved(|label| label == "admin"),
+        );
+        let on_loopback = |segment: &str| Selector::PathLabel {
+            segment: segment.to_owned(),
+            listener_host: "localhost:8080".to_owned(),
+        };
+        let upper = cluster
+            .insert_row(
+                &pool,
+                "upper",
+                &["upper.localhost:5173"],
+                TenantState::Active,
+            )
+            .await;
+        drift(
+            &cluster,
+            "UPDATE tenant_hosts SET host = 'UPPER.localhost:5173' \
+             WHERE host = 'upper.localhost:5173'",
+        )
+        .await;
+        assert_eq!(by_label(&pool, "upper").await, None);
+        let found = registry.lookup(&on_loopback("upper")).await;
+        assert_eq!(found.expect("the lookup succeeded"), None);
+        let stored = get(&pool, upper.info.id).await.expect("readable");
+        assert_eq!(
+            stored.expect("the row exists").info.hosts,
+            ["UPPER.localhost:5173"]
+        );
+
+        let orders = cluster
+            .insert_row(
+                &pool,
+                "orders",
+                &["orders.localhost:3000"],
+                TenantState::Active,
+            )
+            .await;
+        for label in ["admin", "ab"] {
+            let host = format!("{label}.localhost:3000");
+            cluster
+                .insert_row(&pool, label, &[host.as_str()], TenantState::Active)
+                .await;
+            assert!(by_label(&pool, label).await.is_some(), "{label}");
+        }
+        let found = registry.lookup(&on_loopback("Orders")).await;
+        assert_eq!(found.expect("the lookup succeeded"), Some(orders));
+
+        // A closed pool fails every read: the refused segments never ask for a connection.
+        pool.close().await;
+        for segment in ["admin", "Admin", "ab"] {
+            let found = registry.lookup(&on_loopback(segment)).await;
+            assert_eq!(
+                found.expect("no connection is asked for"),
+                None,
+                "{segment}"
+            );
+        }
+        assert!(registry.lookup(&on_loopback("orders")).await.is_err());
     })
     .await;
 }
