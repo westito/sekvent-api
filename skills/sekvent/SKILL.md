@@ -1586,8 +1586,11 @@ conn.close().await?;
 ```
 
 - The maintenance role is no superuser: `LOGIN CREATEDB CREATEROLE`, no
-  database of its own, `CONNECT` on a maintenance database another role
-  owns. Postgres 16 or later.
+  `REPLICATION` or `BYPASSRLS`, no membership chain to a superuser or to
+  `pg_execute_server_program`, `pg_read_server_files` or
+  `pg_write_server_files` (the preflight refuses each), no database of its
+  own, `CONNECT` on a maintenance database another role owns. Postgres 16
+  or later.
 - The preflight is `FAILED_PRECONDITION` naming every finding; fix the
   grants, never skip it. A process without the maintenance credential
   checks its own databases with `preflight::check_session_database`.

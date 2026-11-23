@@ -19,10 +19,11 @@ impl<H: TenantHooks> Provisioner<H> {
     /// 1. Validation (`INVALID_ARGUMENT` with field violations; the database must pass
     ///    `is_adoptable_name`, must not be a tenant object name of the provisioner's names, nor
     ///    the control or the maintenance database), then the lifecycle admission.
-    /// 2. Without a row yet: `handover::prepare`, then, while the maintenance role still owns the
-    ///    database, `TenantHooks::check_adoptable` on `Maintenance::pool_on` of it (read-only
-    ///    sessions), bounded like a maintenance operation. A refusal leaves no control row and no
-    ///    role (only `PUBLIC`'s `CONNECT` revoked).
+    /// 2. Without a row yet: `handover::prepare` (an existing role of the tenant's name that fails
+    ///    the tenant-role check is refused first, before anything changes), then, while the
+    ///    maintenance role still owns the database, `TenantHooks::check_adoptable` on
+    ///    `Maintenance::pool_on` of it (read-only sessions), bounded like a maintenance operation.
+    ///    A refusal leaves no control row and no role (at most `PUBLIC`'s `CONNECT` revoked).
     /// 3. The row inserted (`provision::ensure_row`) and the steps of a provisioning run with
     ///    the database step replaced by [`hand_over`] and the seed by `TenantHooks::adopted`. No
     ///    handover secret exists.
@@ -99,10 +100,11 @@ pub(crate) async fn hand_over<H: TenantHooks>(
     handover::adopt(&provisioner.inner.maintenance, &database, &role).await
 }
 
-/// `handover::prepare` for the candidate and `role`; when the maintenance role still owns the
-/// database, the product's `check_adoptable` on a read-only maintenance pool of it, bounded by a
-/// maintenance operation's deadline. The pool is closed whatever the check answered; the hook's
-/// answer is returned unchanged.
+/// `handover::prepare` for the candidate and `role` (an existing `role` is checked first, so a
+/// drifted one is refused before step 2's revoke and before the hook); when the maintenance role
+/// still owns the database, the product's `check_adoptable` on a read-only maintenance pool of it,
+/// bounded by a maintenance operation's deadline. The pool is closed whatever the check answered;
+/// the hook's answer is returned unchanged.
 async fn check_before_handover<H: TenantHooks>(
     provisioner: &Provisioner<H>,
     candidate: &AdoptCandidate,

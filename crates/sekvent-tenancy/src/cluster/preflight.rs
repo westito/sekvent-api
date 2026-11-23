@@ -22,21 +22,35 @@
 //! role at startup (a `role` startup option, `ALTER ROLE … SET role`,
 //! `ALTER DATABASE … SET role`). The maintenance role itself (the session
 //! user) passes only when it holds none of `SUPERUSER`, `REPLICATION` and
-//! `BYPASSRLS`. These rules belong to the session, not to a database: they
-//! are read once on the maintenance connection and reported, the role
-//! switch first, with the findings of the database that connection's check
+//! `BYPASSRLS`, and when it reaches, through a membership chain of any
+//! edges whatever their options, no superuser and none of
+//! `pg_execute_server_program`, `pg_read_server_files` and
+//! `pg_write_server_files`. These rules belong to the session, not to a
+//! database: they are read once on the maintenance connection and
+//! reported, the role switch first, then the attributes, then the reached
+//! roles, before the findings of the database that connection's check
 //! covers (the maintenance database, or the shared one). Other pools are
 //! not held to them: their session role is only the allowed role of their
 //! own database.
 //!
+//! The preflight runs on the product's own connections, whose
+//! `search_path` is the database's: a `public."="(name, text)` there would
+//! outrank `pg_catalog`'s on a path that puts `public` first. Every
+//! comparison therefore names `pg_catalog`'s operator
+//! (`OPERATOR(pg_catalog.=)`), a list or a subquery is compared with
+//! `= ANY`, and every cast and function is qualified, so no object of the
+//! database is called. The preflight does not read back the maintenance
+//! session's startup settings (the maintenance connection does, on each
+//! session it opens).
+//!
 //! The reads take a fixed number of statements per database however many
 //! roles the cluster holds; the rules ([`protected_facts`], [`findings`],
-//! [`session_findings`], [`maintenance_role_findings`]) are pure. Every
-//! comparison has an operator of exactly its two types in `pg_catalog`,
-//! and every cast, function and other operator is qualified. Nothing is
-//! repaired: a finding is `FAILED_PRECONDITION` naming the label, the
-//! database and the roles at fault, never a URL or a credential.
+//! [`session_findings`], [`maintenance_role_findings`],
+//! [`maintenance_reach_findings`]) are pure. Nothing is repaired: a finding
+//! is `FAILED_PRECONDITION` naming the label, the database and the roles at
+//! fault, never a URL or a credential.
 
+use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -118,6 +132,17 @@ pub enum Finding {
     /// The maintenance role holds this attribute (its SQL name:
     /// `SUPERUSER`, `REPLICATION` or `BYPASSRLS`).
     MaintenanceAttribute(&'static str),
+    /// The maintenance role reaches this role, a superuser or one of
+    /// `pg_execute_server_program`, `pg_read_server_files` and
+    /// `pg_write_server_files`, through a membership chain.
+    MaintenanceReaches(String),
+}
+
+/// The finding's description, as the preflight's error names it.
+impl fmt::Display for Finding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&describe(self))
+    }
 }
 
 /// Every role with an effective `CONNECT` on the database (`LOGIN` or not),
@@ -127,19 +152,19 @@ const CONNECTING_ROLES: &str = "\
 WITH RECURSIVE reached(oid) AS (
     SELECT m.roleid
     FROM pg_catalog.pg_auth_members m
-    JOIN pg_catalog.pg_roles r ON r.oid = m.member
-    WHERE r.rolname = $2
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) m.member
+    WHERE r.rolname OPERATOR(pg_catalog.=) $2
     UNION
     SELECT m.roleid
     FROM pg_catalog.pg_auth_members m
-    JOIN reached x ON m.member = x.oid
+    JOIN reached x ON m.member OPERATOR(pg_catalog.=) x.oid
 )
 SELECT r.rolname::pg_catalog.text, r.rolcanlogin, r.rolsuper,
-       EXISTS (SELECT 1 FROM reached x WHERE x.oid = r.oid)
+       EXISTS (SELECT 1 FROM reached x WHERE x.oid OPERATOR(pg_catalog.=) r.oid)
 FROM pg_catalog.pg_database d
 JOIN pg_catalog.pg_roles r
     ON pg_catalog.has_database_privilege(r.oid, d.oid, 'CONNECT')
-WHERE d.datname = $1";
+WHERE d.datname OPERATOR(pg_catalog.=) $1";
 
 /// The server's version as `server_version_num` (`170002` for 17.2).
 const SERVER_VERSION: &str =
@@ -156,23 +181,49 @@ SELECT session_user::pg_catalog.text, current_user::pg_catalog.text,
        (extract(epoch FROM pg_catalog.pg_postmaster_start_time())
            OPERATOR(pg_catalog.*) 1000000::pg_catalog.numeric)::pg_catalog.int8
 FROM pg_catalog.pg_database d
-WHERE d.datname = pg_catalog.current_database()";
+WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()";
 
 /// The attributes of the session's role, the role it signed in as.
 const SESSION_ROLE_ATTRIBUTES: &str = "\
 SELECT r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb,
        r.rolcanlogin, r.rolreplication, r.rolbypassrls
 FROM pg_catalog.pg_roles r
-WHERE r.rolname = session_user";
+WHERE r.rolname OPERATOR(pg_catalog.=) session_user";
+
+/// Every role the session's role (`session_user`) reaches through a
+/// membership chain, any edge whatever its options, that is a superuser or
+/// one of the predefined roles that run the server's programs or read or
+/// write its files.
+const SESSION_ROLE_REACH: &str = "\
+WITH RECURSIVE reached(oid) AS (
+    SELECT m.roleid
+    FROM pg_catalog.pg_auth_members m
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) m.member
+    WHERE r.rolname OPERATOR(pg_catalog.=) session_user
+    UNION
+    SELECT m.roleid
+    FROM pg_catalog.pg_auth_members m
+    JOIN reached x ON m.member OPERATOR(pg_catalog.=) x.oid
+)
+SELECT r.rolname::pg_catalog.text
+FROM reached x
+JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) x.oid
+WHERE r.rolsuper
+   OR r.rolname OPERATOR(pg_catalog.=) ANY (ARRAY[
+       'pg_execute_server_program'::pg_catalog.name,
+       'pg_read_server_files'::pg_catalog.name,
+       'pg_write_server_files'::pg_catalog.name
+   ])";
 
 /// Every catalog statement of this module, by name, for the scan of
 /// `cluster::tests`.
 #[cfg(test)]
-pub(super) const STATEMENTS: [(&str, &str); 4] = [
+pub(super) const STATEMENTS: [(&str, &str); 5] = [
     ("CONNECTING_ROLES", CONNECTING_ROLES),
     ("SERVER_VERSION", SERVER_VERSION),
     ("SESSION", SESSION),
     ("SESSION_ROLE_ATTRIBUTES", SESSION_ROLE_ATTRIBUTES),
+    ("SESSION_ROLE_REACH", SESSION_ROLE_REACH),
 ];
 
 /// Pure: the facts of one protected database from its owner, its ACL and
@@ -232,6 +283,32 @@ pub fn maintenance_role_findings(attributes: &RoleAttributes) -> Vec<Finding> {
     .into_iter()
     .filter_map(|(held, name)| held.then_some(Finding::MaintenanceAttribute(name)))
     .collect()
+}
+
+/// Pure: the rule of the maintenance role's reach: it reaches no superuser
+/// and none of `pg_execute_server_program`, `pg_read_server_files` and
+/// `pg_write_server_files`. A [`Finding::MaintenanceReaches`] for each role
+/// of `reached` (what [`session_role_reach`] read), in the given order.
+pub fn maintenance_reach_findings(reached: &[String]) -> Vec<Finding> {
+    reached
+        .iter()
+        .cloned()
+        .map(Finding::MaintenanceReaches)
+        .collect()
+}
+
+/// The roles the session's role (`session_user`) reaches through a
+/// membership chain, any edge whatever its options, that are superusers or
+/// one of `pg_execute_server_program`, `pg_read_server_files` and
+/// `pg_write_server_files`; sorted by name, each once. One statement.
+pub async fn session_role_reach(conn: &mut PgConnection) -> Result<Vec<String>, AppError> {
+    let mut reached: Vec<String> = sqlx::query_scalar(SESSION_ROLE_REACH)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(to_app_error)?;
+    reached.sort();
+    reached.dedup();
+    Ok(reached)
 }
 
 /// The attributes of the session's role (`session_user`, the role it signed
@@ -395,10 +472,14 @@ pub async fn check_session_database(
 /// The control database allows the control pool's session role, the
 /// maintenance database the maintenance role. When both are one database,
 /// one check runs and allows both roles. A maintenance session whose
-/// `CURRENT_USER` is not its `session_user`, and a maintenance role that
-/// holds `SUPERUSER`, `REPLICATION` or `BYPASSRLS`, are findings of the
-/// database its check covers. Within one [`TIMEOUT`] for all of it; the
-/// check's error wins over a failed close.
+/// `CURRENT_USER` is not its `session_user`, a maintenance role that holds
+/// `SUPERUSER`, `REPLICATION` or `BYPASSRLS`, and each role of
+/// [`session_role_reach`] are findings of the database its check covers,
+/// in that order and before the database's own. The control database is
+/// checked first: a reached superuser may connect to it and is a tenant
+/// role there, so on separate databases its finding is the control
+/// database's. Within one [`TIMEOUT`] for all of it; the check's error wins
+/// over a failed close.
 pub async fn check_control_and_maintenance(
     control: &PgPool,
     maintenance: &PgConnectOptions,
@@ -497,6 +578,8 @@ async fn check_both(
         session_findings(&maintenance_session.role, &maintenance_session.current_role);
     let attributes = session_role_attributes(maintenance).await?;
     switched.extend(maintenance_role_findings(&attributes));
+    let reached = session_role_reach(maintenance).await?;
+    switched.extend(maintenance_reach_findings(&reached));
     let shared = control_session.database == maintenance_session.database
         && control_session.identity == maintenance_session.identity;
     if shared {
@@ -650,6 +733,7 @@ pub(crate) fn describe(finding: &Finding) -> String {
         Finding::MaintenanceAttribute(attribute) => {
             format!("the maintenance role holds {attribute}")
         }
+        Finding::MaintenanceReaches(role) => format!("the maintenance role reaches role {role}"),
     }
 }
 
@@ -658,6 +742,7 @@ mod tests {
     use sekvent_error::ErrorCode;
 
     use super::*;
+    use crate::cluster::testing;
 
     const OWNER: &str = "orders_owner";
     const MAINTENANCE_ROLE: &str = "orders_maintenance";
@@ -1066,6 +1151,226 @@ mod tests {
              runs as role orders_reader, not as its session role orders_maintenance; the \
              maintenance role holds REPLICATION"
         );
+    }
+
+    /// The operand types of the raising `=` operators of [`hostile_equals`]:
+    /// every pair the reads compare.
+    const HOSTILE_TYPES: [(&str, &str); 4] = [
+        ("pg_catalog.name", "pg_catalog.text"),
+        ("pg_catalog.name", "pg_catalog.name"),
+        ("pg_catalog.oid", "pg_catalog.oid"),
+        ("pg_catalog.text", "pg_catalog.text"),
+    ];
+
+    /// A raising `public."="` of exactly each pair of [`HOSTILE_TYPES`]: on
+    /// a `search_path` that puts `public` first, Postgres resolves an
+    /// unnamed `=` of those types to these, not to `pg_catalog`'s.
+    fn hostile_equals(_database: &str) -> String {
+        HOSTILE_TYPES
+            .iter()
+            .enumerate()
+            .map(|(n, (left, right))| {
+                format!(
+                    "CREATE FUNCTION public.hostile_eq_{n}({left}, {right}) RETURNS boolean \
+                     {raises}; \
+                     CREATE OPERATOR public.= (LEFTARG = {left}, RIGHTARG = {right}, \
+                     FUNCTION = public.hostile_eq_{n})",
+                    raises = testing::RAISES
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+    #[allow(clippy::too_many_lines)]
+    async fn the_reads_call_no_operator_of_the_database() {
+        let Some((options, database)) = testing::public_first(hostile_equals).await else {
+            return;
+        };
+        tokio::time::timeout(testing::SCENARIO_TIMEOUT, async {
+            // A raw session: the database's own search_path, public first.
+            let mut conn = PgConnection::connect_with(&options)
+                .await
+                .expect("the superuser connected");
+            let search_path: String =
+                sqlx::query_scalar("SELECT pg_catalog.current_setting('search_path')")
+                    .fetch_one(&mut conn)
+                    .await
+                    .expect("the setting was read");
+            assert!(search_path.starts_with("public"), "{search_path}");
+            for (left, right) in HOSTILE_TYPES {
+                let unnamed = format!("SELECT '1'::{left} = '1'::{right}");
+                let error = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(unnamed))
+                    .fetch_one(&mut conn)
+                    .await
+                    .expect_err("an unnamed = of these types is public's");
+                assert!(
+                    error.to_string().contains("a hostile object was called"),
+                    "{left} = {right}: {error}"
+                );
+            }
+
+            let user = options.get_username().to_owned();
+            let read = facts(&mut conn, &database, &[], Some(user.as_str()), &names())
+                .await
+                .expect("the facts were read without calling public's =")
+                .expect("the database exists");
+            assert!(
+                read.connecting.contains(&(user.clone(), true)),
+                "{:?}",
+                read.connecting
+            );
+            let attributes = session_role_attributes(&mut conn)
+                .await
+                .expect("the attributes were read without calling public's =");
+            assert!(attributes.superuser);
+            let reached = session_role_reach(&mut conn)
+                .await
+                .expect("the reach was read without calling public's =");
+            assert!(!reached.contains(&user), "{reached:?}");
+            let session = read_session(&mut conn)
+                .await
+                .expect("the session was read without calling public's =");
+            assert_eq!(session.database, database);
+            assert_eq!(session.role, user);
+
+            let role = privileges::role_facts(&mut conn, &user)
+                .await
+                .expect("the role was read without calling public's =")
+                .expect("the session's role exists");
+            assert_eq!(role.name, user);
+            let database_facts = privileges::database_facts(&mut conn, &database)
+                .await
+                .expect("the database was read without calling public's =")
+                .expect("the database exists");
+            assert_eq!(database_facts.name, database);
+            assert_eq!(
+                privileges::role_may_connect(&mut conn, &user, &database)
+                    .await
+                    .expect("the CONNECT was read without calling public's ="),
+                Some(true)
+            );
+            let connecting = privileges::roles_that_may_connect(&mut conn, &database)
+                .await
+                .expect("the roles were read without calling public's =")
+                .expect("the database exists");
+            assert!(connecting.contains(&user), "{connecting:?}");
+            assert_eq!(
+                privileges::public_may_connect(&mut conn, &database)
+                    .await
+                    .expect("PUBLIC's CONNECT was read without calling public's ="),
+                Some(true)
+            );
+
+            // The whole check runs every read and reports the database's
+            // default ACL, not an error of a called object.
+            let protected = Protected {
+                label: CONTROL.to_owned(),
+                database: database.clone(),
+                allowed: Vec::new(),
+            };
+            let error = check(&mut conn, &protected, Some(user.as_str()), &names())
+                .await
+                .expect_err("PUBLIC may connect to a database of the default ACL");
+            assert_eq!(error.code(), ErrorCode::FailedPrecondition, "{error:?}");
+            assert!(
+                error.message().contains("PUBLIC holds CONNECT"),
+                "{}",
+                error.message()
+            );
+            conn.close().await.expect("the session closed");
+        })
+        .await
+        .expect("the scenario finished within its 30 s guard");
+    }
+
+    #[test]
+    fn each_role_the_maintenance_role_reaches_is_a_finding_in_order() {
+        assert_eq!(maintenance_reach_findings(&[]), [] as [Finding; 0]);
+        let reached = strings(&["pg_read_server_files", "cluster_root"]);
+        assert_eq!(
+            maintenance_reach_findings(&reached),
+            [
+                Finding::MaintenanceReaches("pg_read_server_files".to_owned()),
+                Finding::MaintenanceReaches("cluster_root".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_session_findings_come_before_the_databases_own() {
+        let protected = Protected {
+            label: MAINTENANCE.to_owned(),
+            database: "orders_upkeep".to_owned(),
+            allowed: vec![MAINTENANCE_ROLE.to_owned()],
+        };
+        let found = [
+            Finding::RoleSwitched {
+                session_user: MAINTENANCE_ROLE.to_owned(),
+                current_user: "orders_reader".to_owned(),
+            },
+            Finding::MaintenanceAttribute("BYPASSRLS"),
+            Finding::MaintenanceReaches("pg_write_server_files".to_owned()),
+            Finding::MaintenanceReaches("cluster_root".to_owned()),
+            Finding::Public(DatabasePrivilege::Connect),
+        ];
+        let error = verdict(&protected, &found).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(error.reason(), None);
+        assert_eq!(
+            error.message(),
+            "preflight of the maintenance database orders_upkeep: the maintenance session \
+             runs as role orders_reader, not as its session role orders_maintenance; the \
+             maintenance role holds BYPASSRLS; the maintenance role reaches role \
+             pg_write_server_files; the maintenance role reaches role cluster_root; PUBLIC \
+             holds CONNECT"
+        );
+    }
+
+    #[test]
+    fn every_finding_displays_its_description() {
+        let all = [
+            (Finding::Missing, "it does not exist"),
+            (
+                Finding::Public(DatabasePrivilege::Temporary),
+                "PUBLIC holds TEMPORARY",
+            ),
+            (
+                Finding::TenantOwner("app_t_0123".to_owned()),
+                "tenant role app_t_0123 owns it",
+            ),
+            (
+                Finding::TenantMayConnect("app_t_0123".to_owned()),
+                "tenant role app_t_0123 may connect",
+            ),
+            (
+                Finding::RoleMayConnect("billing_reader".to_owned()),
+                "role billing_reader may connect and is neither its owner, an allowed role nor \
+                 a superuser",
+            ),
+            (
+                Finding::RoleSwitched {
+                    session_user: MAINTENANCE_ROLE.to_owned(),
+                    current_user: "orders_reader".to_owned(),
+                },
+                "the maintenance session runs as role orders_reader, not as its session role \
+                 orders_maintenance",
+            ),
+            (
+                Finding::MaintenanceAttribute("SUPERUSER"),
+                "the maintenance role holds SUPERUSER",
+            ),
+            (
+                Finding::MaintenanceReaches("pg_execute_server_program".to_owned()),
+                "the maintenance role reaches role pg_execute_server_program",
+            ),
+        ];
+        for (finding, text) in all {
+            assert_eq!(describe(&finding), text);
+            assert_eq!(finding.to_string(), text);
+        }
     }
 
     #[test]

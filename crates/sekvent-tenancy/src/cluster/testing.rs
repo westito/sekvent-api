@@ -1,7 +1,9 @@
 //! The in-crate Docker tests' database: one of the shared test server whose
 //! own `search_path` puts `public` before `pg_catalog`, so that a session
 //! without the crate's startup options resolves unqualified names, and
-//! operators without an exact `pg_catalog` match, to `public` first.
+//! operators not named with their schema, to `public` first: an operator of
+//! `public` wins there even where `pg_catalog` has one of exactly the same
+//! types.
 //!
 //! The tests skip when Docker tests are off; the container is reaped with
 //! the process.

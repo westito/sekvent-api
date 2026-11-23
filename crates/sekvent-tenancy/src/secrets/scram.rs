@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use super::kdf::{hmac_sha256, pbkdf2_sha256_block};
 
 /// The PBKDF2 iteration count of every verifier this crate makes or accepts.
+/// Postgres accepts other counts; exactly 4096 is this crate's policy.
 pub const SCRAM_ITERATIONS: u32 = 4096;
 
 /// The mechanism name that opens every verifier.
@@ -23,6 +24,19 @@ const SALT_BYTES: usize = 16;
 
 /// The bytes of a decoded `StoredKey` or `ServerKey`: one SHA-256.
 const KEY_BYTES: usize = 32;
+
+/// The characters of an encoded `StoredKey` or `ServerKey`: 32 bytes in
+/// padded standard base64 are 43 characters and one `=`.
+const KEY_CHARS: usize = 44;
+
+/// The most characters an encoded salt may have. Postgres sets no bound; this
+/// crate makes 16-byte salts (24 characters) and refuses a longer salt than
+/// 1024 characters before decoding it, so a check never decodes more than
+/// [`MAX_DECODED_BYTES`].
+const MAX_SALT_CHARS: usize = 1024;
+
+/// The most bytes a part within [`MAX_SALT_CHARS`] decodes to.
+const MAX_DECODED_BYTES: usize = MAX_SALT_CHARS / 4 * 3;
 
 /// A SCRAM-SHA-256 verifier as Postgres stores it. `Debug` prints the type
 /// name only.
@@ -85,7 +99,8 @@ impl ScramVerifier {
     }
 
     /// A verifier made elsewhere, after the check of [`is_scram_verifier`]:
-    /// its grammar, a salt that decodes and two keys of 32 bytes each.
+    /// its grammar with exactly 4096 iterations, a salt of at most
+    /// 1024 characters that decodes, and two keys of 32 bytes each.
     /// `INTERNAL` otherwise, naming nothing of the text.
     pub fn parse(text: Secret) -> Result<Self, AppError> {
         if is_scram_verifier(text.expose()) {
@@ -123,10 +138,18 @@ impl fmt::Debug for ScramVerifier {
 /// `SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`, each part standard
 /// base64 (`[A-Za-z0-9+/]+={0,2}`), nothing before or after.
 ///
-/// Each part is also decoded (standard base64, canonical padding): the salt
-/// must give at least one byte and both keys exactly 32. Postgres stores any
-/// other text as a plaintext password and hashes it, so a text that fails
-/// here would not act as a verifier there.
+/// Postgres stores a text as a SCRAM verifier only when it parses as one: the
+/// salt decodes and both keys decode to 32 bytes. It hashes any other text as
+/// a plaintext password, so a text that fails that part here would not act as
+/// a verifier there. This check therefore decodes every part (standard
+/// base64, canonical padding and trailing bits): the salt must give at least
+/// one byte and both keys exactly 32.
+///
+/// The rest is this crate's own policy, stricter than Postgres: exactly
+/// [`SCRAM_ITERATIONS`] iterations spelled `4096`, canonical standard base64,
+/// and a salt of at most 1024 characters. The lengths are checked before any
+/// decoding, so an oversized part is refused without being decoded, and the
+/// decoded bytes sit in a buffer wiped on drop.
 pub fn is_scram_verifier(text: &str) -> bool {
     let Some(rest) = text.strip_prefix(HEAD) else {
         return false;
@@ -145,13 +168,23 @@ pub fn is_scram_verifier(text: &str) -> bool {
     let Some((stored, server)) = keys.split_once(':') else {
         return false;
     };
+    if salt.len() > MAX_SALT_CHARS || stored.len() != KEY_CHARS || server.len() != KEY_CHARS {
+        return false;
+    }
     if ![salt, stored, server].into_iter().all(is_base64_part) {
         return false;
     }
-    let decoded_len = |part: &str| STANDARD.decode(part).ok().map(|bytes| bytes.len());
     decoded_len(salt).is_some_and(|len| len > 0)
         && decoded_len(stored) == Some(KEY_BYTES)
         && decoded_len(server) == Some(KEY_BYTES)
+}
+
+/// The bytes `part` decodes to, `None` when it does not decode. `part` has at
+/// most [`MAX_SALT_CHARS`] characters; the bytes land in a stack buffer that
+/// is wiped on drop, also when the decoding fails halfway.
+fn decoded_len(part: &str) -> Option<usize> {
+    let mut buffer = Zeroizing::new([0u8; MAX_DECODED_BYTES]);
+    STANDARD.decode_slice(part, &mut buffer[..]).ok()
 }
 
 /// `[A-Za-z0-9+/]+={0,2}`.
@@ -174,6 +207,8 @@ mod tests {
     use super::*;
 
     const RFC_SALT: &str = "W22ZaJ0SNY7soEsUEjb6gQ==";
+    const RFC_STORED: &str = "WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=";
+    const RFC_SERVER: &str = "wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
     const RFC_VERIFIER: &str = "SCRAM-SHA-256$4096:W22ZaJ0SNY7soEsUEjb6gQ==$\
         WG5d8oPm3OtcPnkdi4Uo7BkeZkBFzpcXkuLmtbsT4qY=:wfPLwcE6nTWhTAmQ7tl2KeoiWGPlZqQxSrmfPwDl2dU=";
     const DERIVED_PASSWORD: &str = "OYf0aWaTG6covLgwbEBL-T_7D3AQj2pe2UOV6g1yxFo";
@@ -183,11 +218,24 @@ mod tests {
     const KEY_31: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHg==";
     const KEY_32: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
     const KEY_33: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g";
-    /// [`KEY_32`] without its padding: the right alphabet, no valid decoding.
+    /// [`KEY_32`] without its padding: 43 characters.
     const KEY_32_UNPADDED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    /// [`KEY_32`] with a set trailing bit: 44 characters of the alphabet that
+    /// do not decode canonically.
+    const KEY_32_TRAILING_BITS: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9=";
 
     fn verifier(salt: &str, stored: &str, server: &str) -> String {
         format!("SCRAM-SHA-256$4096:{salt}${stored}:{server}")
+    }
+
+    /// The RFC 7677 verifier's parts under another head and iteration count.
+    fn rfc_with(head: &str, iterations: &str) -> String {
+        format!("{head}{iterations}:{RFC_SALT}${RFC_STORED}:{RFC_SERVER}")
+    }
+
+    /// `part` with the ASCII character at `at` replaced by `with`.
+    fn swap(part: &str, at: usize, with: &str) -> String {
+        format!("{}{with}{}", &part[..at], &part[at + 1..])
     }
 
     fn decode(text: &str) -> Vec<u8> {
@@ -284,6 +332,14 @@ mod tests {
             verifier("AAECAwQ=", KEY_32, KEY_32),
             verifier("c2FsdHNhbHRzYWx0", KEY_32, KEY_32),
             verifier("c2FsdHNhbHRzYWx0c2FsdA==", KEY_32, KEY_32),
+            verifier(RFC_SALT, KEY_32, KEY_32),
+            // Salts of 1024 characters, the bound: 768 and 766 bytes.
+            verifier(&"AAAA".repeat(256), KEY_32, KEY_32),
+            verifier(
+                &format!("{}AA==", "AAAA".repeat(255)),
+                RFC_STORED,
+                RFC_SERVER,
+            ),
         ] {
             assert!(is_scram_verifier(&text), "{text}");
         }
@@ -292,67 +348,120 @@ mod tests {
     #[test]
     fn the_check_refuses_parts_that_do_not_decode_to_their_lengths() {
         for text in [
-            // Short keys: the grammar holds, the lengths do not.
+            // Short keys: the grammar holds, the encoded lengths do not.
             verifier("a2V5", "a2V5", "a2V5"),
             verifier("c2FsdHNhbHRzYWx0c2FsdA==", "a2V5", "a2V5"),
             verifier("a+/=", "Zg==", "Z"),
-            // Each key of the wrong length on its own.
+            // 44 characters each, decoding to 31 or 33 bytes.
             verifier("a2V5", KEY_31, KEY_32),
             verifier("a2V5", KEY_32, KEY_31),
             verifier("a2V5", KEY_33, KEY_32),
             verifier("a2V5", KEY_32, KEY_33),
+            // Each key of the wrong encoded length on its own: 4, 43 and 45
+            // characters.
             verifier("a2V5", "a2V5", KEY_32),
             verifier("a2V5", KEY_32, "a2V5"),
-            // The alphabet holds, the decoding fails.
+            verifier("a2V5", KEY_32_UNPADDED, KEY_32),
+            verifier("a2V5", KEY_32, KEY_32_UNPADDED),
+            verifier("a2V5", &format!("{KEY_32}A"), KEY_32),
+            verifier("a2V5", KEY_32, &format!("{KEY_32}A")),
+            verifier(RFC_SALT, &format!("{RFC_STORED}="), RFC_SERVER),
+            // The alphabet and the lengths hold, the decoding fails.
             verifier("a2V", KEY_32, KEY_32),
             verifier("Zg=", KEY_32, KEY_32),
             verifier("Zh==", KEY_32, KEY_32),
-            verifier("a2V5", KEY_32_UNPADDED, KEY_32),
-            verifier("a2V5", KEY_32, KEY_32_UNPADDED),
+            verifier("a2V5", KEY_32_TRAILING_BITS, KEY_32),
+            verifier("a2V5", KEY_32, KEY_32_TRAILING_BITS),
+            // A salt over 1024 characters, though it would decode.
+            verifier(
+                &format!("{}AA==", "AAAA".repeat(256)),
+                RFC_STORED,
+                RFC_SERVER,
+            ),
+            verifier(&"AAAA".repeat(512), KEY_32, KEY_32),
         ] {
             assert!(!is_scram_verifier(&text), "{text}");
         }
     }
 
+    /// Each case is the RFC 7677 verifier with one thing changed; the lengths
+    /// stay right, so each is refused by its own rule.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn the_check_admits_nothing_else() {
+        let head = "SCRAM-SHA-256$";
+        assert!(is_scram_verifier(&rfc_with(head, "4096")));
         for text in [
-            "",
-            "SCRAM-SHA-256$",
-            "SCRAM-SHA-1$4096:a2V5$a2V5:a2V5",
-            "scram-sha-256$4096:a2V5$a2V5:a2V5",
-            "md5$4096:a2V5$a2V5:a2V5",
-            "SCRAM-SHA-256$4095:a2V5$a2V5:a2V5",
-            "SCRAM-SHA-256$04096:a2V5$a2V5:a2V5",
-            "SCRAM-SHA-256$+4096:a2V5$a2V5:a2V5",
-            "SCRAM-SHA-256$:a2V5$a2V5:a2V5",
-            "SCRAM-SHA-256$4096",
-            "SCRAM-SHA-256$4096:a2V5",
-            "SCRAM-SHA-256$4096:a2V5$a2V5",
-            "SCRAM-SHA-256$4096:a2V5===$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a2V5$a2V5===:a2V5",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5===",
-            "SCRAM-SHA-256$4096:$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a2V5$:a2V5",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:",
-            "SCRAM-SHA-256$4096:==$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a2'V5$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5'",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5';DROP ROLE x;--",
-            "SCRAM-SHA-256$4096:a2\\V5$a2V5:a2V5",
-            " SCRAM-SHA-256$4096:a2V5$a2V5:a2V5",
-            "xSCRAM-SHA-256$4096:a2V5$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5 ",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5\n",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5=x",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5$x",
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5:x",
-            "SCRAM-SHA-256$4096:a2V5$a2V5$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a2-V5$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a2_V5$a2V5:a2V5",
-            "SCRAM-SHA-256$4096:a2é$a2V5:a2V5",
+            String::new(),
+            head.to_owned(),
+            // The mechanism.
+            rfc_with("SCRAM-SHA-1$", "4096"),
+            rfc_with("scram-sha-256$", "4096"),
+            rfc_with("md5$", "4096"),
+            rfc_with(" SCRAM-SHA-256$", "4096"),
+            rfc_with("xSCRAM-SHA-256$", "4096"),
+            // The iterations.
+            rfc_with(head, "4095"),
+            rfc_with(head, "40960"),
+            rfc_with(head, "04096"),
+            rfc_with(head, "+4096"),
+            rfc_with(head, "4096 "),
+            rfc_with(head, ""),
+            // Missing parts and separators.
+            "SCRAM-SHA-256$4096".to_owned(),
+            format!("SCRAM-SHA-256$4096:{RFC_SALT}"),
+            format!("SCRAM-SHA-256$4096:{RFC_SALT}${RFC_STORED}"),
+            format!("SCRAM-SHA-256$4096:{RFC_SALT}{RFC_STORED}:{RFC_SERVER}"),
+            // Empty parts.
+            verifier("", RFC_STORED, RFC_SERVER),
+            verifier("==", RFC_STORED, RFC_SERVER),
+            // Padding: three `=`, or `=` inside a part.
+            verifier(&format!("{RFC_SALT}="), RFC_STORED, RFC_SERVER),
+            verifier(RFC_SALT, &format!("{}===", &RFC_STORED[..41]), RFC_SERVER),
+            verifier(RFC_SALT, RFC_STORED, &format!("{}===", &RFC_SERVER[..41])),
+            verifier(&swap(RFC_SALT, 4, "="), RFC_STORED, RFC_SERVER),
+            verifier(RFC_SALT, RFC_STORED, &swap(RFC_SERVER, 20, "=")),
+            // Quotes and statements.
+            verifier(&swap(RFC_SALT, 2, "'"), RFC_STORED, RFC_SERVER),
+            verifier(RFC_SALT, RFC_STORED, &swap(RFC_SERVER, 43, "'")),
+            verifier(
+                &format!("{RFC_SALT}';DROP ROLE x;--"),
+                RFC_STORED,
+                RFC_SERVER,
+            ),
+            verifier(
+                RFC_SALT,
+                RFC_STORED,
+                &format!("{}';DROP ROLE x;--", &RFC_SERVER[..28]),
+            ),
+            // Backslashes.
+            verifier(&swap(RFC_SALT, 2, "\\"), RFC_STORED, RFC_SERVER),
+            verifier(RFC_SALT, &swap(RFC_STORED, 10, "\\"), RFC_SERVER),
+            // Whitespace.
+            verifier(&format!(" {RFC_SALT}"), RFC_STORED, RFC_SERVER),
+            verifier(&format!("{RFC_SALT}\n"), RFC_STORED, RFC_SERVER),
+            verifier(RFC_SALT, RFC_STORED, &swap(RFC_SERVER, 43, " ")),
+            verifier(RFC_SALT, RFC_STORED, &swap(RFC_SERVER, 43, "\n")),
+            verifier(RFC_SALT, &swap(RFC_STORED, 0, "\t"), RFC_SERVER),
+            // Separators inside a part.
+            verifier(&swap(RFC_SALT, 4, ":"), RFC_STORED, RFC_SERVER),
+            verifier(RFC_SALT, &swap(RFC_STORED, 20, "$"), RFC_SERVER),
+            verifier(RFC_SALT, &swap(RFC_STORED, 0, "$"), RFC_SERVER),
+            verifier(RFC_SALT, RFC_STORED, &swap(RFC_SERVER, 20, ":")),
+            verifier(RFC_SALT, RFC_STORED, &swap(RFC_SERVER, 20, "$")),
+            // URL-safe base64 and non-ASCII.
+            verifier(&swap(RFC_SALT, 2, "-"), RFC_STORED, RFC_SERVER),
+            verifier(&swap(RFC_SALT, 2, "_"), RFC_STORED, RFC_SERVER),
+            verifier(RFC_SALT, &swap(RFC_STORED, 10, "-"), RFC_SERVER),
+            verifier(RFC_SALT, RFC_STORED, &swap(RFC_SERVER, 10, "_")),
+            verifier(&swap(RFC_SALT, 2, "é"), RFC_STORED, RFC_SERVER),
+            verifier(
+                RFC_SALT,
+                &format!("{}é{}", &RFC_STORED[..10], &RFC_STORED[12..]),
+                RFC_SERVER,
+            ),
         ] {
-            assert!(!is_scram_verifier(text), "{text}");
+            assert!(!is_scram_verifier(&text), "{text}");
         }
     }
 
@@ -362,7 +471,8 @@ mod tests {
         assert_eq!(parsed.text.expose(), RFC_VERIFIER);
 
         for refused in [
-            "SCRAM-SHA-256$4096:a2V5$a2V5:a2V5'".to_owned(),
+            format!("{RFC_VERIFIER}'"),
+            verifier(RFC_SALT, RFC_STORED, &swap(RFC_SERVER, 43, "'")),
             verifier("a2V5", KEY_31, KEY_32),
             verifier("a2V5", KEY_32, KEY_32_UNPADDED),
         ] {
@@ -371,8 +481,9 @@ mod tests {
             assert_eq!(error.reason(), None);
             let source = error.source().map(ToString::to_string).unwrap_or_default();
             let shown = format!("{error} {error:?} {source}");
-            assert!(!shown.contains("a2V5"));
-            assert!(!shown.contains("AAECAw"));
+            for part in ["a2V5", "AAECAw", "W22Z", "WG5d", "wfPL"] {
+                assert!(!shown.contains(part), "{part}");
+            }
         }
     }
 

@@ -522,31 +522,44 @@ one `Maintenance::with_application_name` sets, read back with
 `application_name`), and with sqlx's statement logging off, because role
 statements carry verifiers. Catalog reads are static SQL with bound names;
 utility statements are built only from the checked `TenantRole`,
-`DatabaseName` and `ScramVerifier`. Every catalog statement is type-exact:
-each cast and function is qualified with `pg_catalog`, each comparison has
-an operator of exactly its two types there, and any other operator is
-named (`OPERATOR(pg_catalog.~)`), so no object of the connected database is
-called whatever the `search_path` is.
+`DatabaseName` and `ScramVerifier`. Every catalog statement of `cluster`
+qualifies each cast and function with `pg_catalog` and names
+`pg_catalog`'s operator for every comparison (`OPERATOR(pg_catalog.=)`,
+`OPERATOR(pg_catalog.<>)`, `OPERATOR(pg_catalog.~)`, a list or a subquery
+with `OPERATOR(pg_catalog.=) ANY (…)`). Postgres resolves an unnamed
+operator in `search_path` order, even where `pg_catalog` has one of exactly
+the operand types, so on a connection that keeps the database's own
+`search_path` (the preflight's, a privilege read's) a `public."="(name,
+text)` would otherwise win; with every operator named, no object of the
+connected database is called whatever the `search_path` is.
 
 `connect` and `connect_to` confirm each session once, within the 10 s
 connect bound and before anything else runs on it, with one statement that
-reads back `session_user`, `CURRENT_USER`, `search_path`, both timeouts and
-`client_min_messages` (compared in Rust: the `search_path` as a list, the
-timeouts in milliseconds whatever unit Postgres shows, the words without
-regard to case). The session must act as its `session_user` and hold every
-setting it asked for. A session that a role setting switched at startup
-(`ALTER ROLE … [IN DATABASE …] SET role`, `ALTER DATABASE … SET role`, a
-`role` startup option in the options), or that lost its startup options on
-the way (something between the crate and the server dropping them), is
-closed, and the connect is `INTERNAL` without a reason; the error's source
-names the database, the roles and each broken setting (`the maintenance
-session on database billing_maintenance is refused: the maintenance session
-runs as role …, not as its session role billing_maintenance; its
-search_path is …, not pg_catalog,pg_temp`). The operations name the
+reads back `session_user`, `CURRENT_USER`, `current_database()`,
+`search_path`, both timeouts and `client_min_messages` (compared in Rust:
+the names exactly, the `search_path` as a list with only the whitespace
+Postgres's scanner skips trimmed, the timeouts in milliseconds whatever
+unit Postgres shows, the words without regard to case). The session must
+be signed in as the options' user, be on the database it asked for (the
+options' database, else the one named like the user, as
+`Maintenance::database` defaults), act as its `session_user` and hold
+every setting it asked for. A session that a role setting switched at
+startup (`ALTER ROLE … [IN DATABASE …] SET role`, `ALTER DATABASE … SET
+role`, a `role` startup option in the options), that lost its startup
+options on the way (something between the crate and the server dropping
+them), or that is not who it asked to be, is dropped without waiting for a
+close (so a stalled close cannot turn the refusal into `UNAVAILABLE`), and
+the connect is `INTERNAL` without a reason; the error's source names the
+database, the roles and each broken setting (`the maintenance session on
+database billing_maintenance is refused: the maintenance session runs as
+role …, not as its session role billing_maintenance; its search_path is …,
+not pg_catalog,pg_temp`), each shown value cut and its control characters
+escaped (`\n`), so a value cannot forge a log line. The operations name the
 maintenance role by the session user and grant to `CURRENT_USER`, so they
 must be one role. The startup preflight sees only the maintenance database
-at startup; the handover's sessions open on another database, and any
-session may open after a setting changed.
+at startup and reads back no session settings; the handover's sessions
+open on another database, and any session may open after a setting
+changed.
 
 ### Poisoning
 
@@ -572,11 +585,16 @@ its sessions start read-only (`default_transaction_read_only = on`), keep
 the lock and statement bounds and `client_min_messages = warning`, and use
 the database's own `search_path`, so use it only after `handover::prepare`
 found no object of a third role there. Each connection is confirmed when it
-opens, by the pool's `after_connect`: it acts as its session user, holds
-both bounds and `client_min_messages`, and its transactions are read-only.
-A refused connection is closed and the refusal logged by the driver, which
-tries again until the pool's 10 s acquire bound; the acquire then fails
-with the driver's timeout, which names nothing.
+opens, by the pool's `after_connect`: it is signed in as the maintenance
+role on the pool's database and acts as that session user, holds both
+bounds and `client_min_messages`, and both `transaction_read_only` and
+`default_transaction_read_only` are `on`. The read-only rule is confirmed
+when the connection opens, not enforced for later statements: a statement
+the product runs on the pool may still `SET` it off, so the pool keeps a
+check read-only only as long as the check does not undo it. A refused
+connection is closed and the refusal logged by the driver, which tries
+again until the pool's 10 s acquire bound; the acquire then fails with the
+driver's timeout, which names nothing.
 
 ```rust
 let pool = maintenance.pool_on(&candidate).await?; // candidate: DatabaseName
@@ -629,14 +647,15 @@ refused and left exactly as it was; drift is an operator's to resolve.
   `owner` and pass `privileges::check_tenant_database` (another owner, a
   template, a grant to a third role or to the maintenance role, `CREATE`
   for `PUBLIC` are refused). Then, always, as the owner in one transaction:
-  `CONNECT` revoked from `PUBLIC` and granted to the owner, and connections
-  allowed. The database opens only together with its restriction, so a call
-  resumed after a failure at any point converges. Then the database is read
-  once more: a finding of `privileges::tenant_database_findings` for the
-  owner, or a `CONNECT` of `PUBLIC` (one that a role with a grant option
-  gave, which the owner's revoke leaves in place), is `INTERNAL` with the
-  findings in the error's source, and nothing is repaired. Afterwards only
-  the owner may connect.
+  `CONNECT` revoked from `PUBLIC` and granted to the owner, connections
+  allowed, and one read of the database before the commit: a finding of
+  `privileges::tenant_database_findings` for the owner, or a `CONNECT` of
+  `PUBLIC` (one that a role with a grant option gave, which the owner's
+  revoke leaves in place), is `INTERNAL` with the findings in the error's
+  source, and the whole transaction rolls back: a created database stays
+  closed, and nothing is repaired. The database opens only together with a
+  restriction that passed its read, so a call resumed after a failure at
+  any point converges. Afterwards only the owner may connect.
 - `databases::access(conn, database)` returns a `DatabaseAccess` (the
   owner and whether `PUBLIC` holds an effective `CONNECT`), `None` for no
   such database. It takes any name as a `&str`, `postgres` and other names
@@ -731,14 +750,32 @@ while its statements act as the current user; the two differ when a role
 setting switches the session at startup (`ALTER ROLE … SET role`,
 `ALTER DATABASE … SET role`, a `role` startup option). The maintenance role
 (the session user) passes only when it holds none of `SUPERUSER`,
-`REPLICATION` and `BYPASSRLS`. These rules belong to the maintenance
-connection of `check_control_and_maintenance`, read once on it, and are
-reported, the role switch first, with the findings of the database that
-connection's check covers (the maintenance database, or the shared one).
-Other pools' sessions are not held to them.
-`preflight::session_role_attributes` reads the session role's attributes
-in one statement, and the pure `preflight::maintenance_role_findings`
-applies the rule to them.
+`REPLICATION` and `BYPASSRLS`, and when it reaches, through a membership
+chain of any edges whatever their options, no superuser and none of
+`pg_execute_server_program`, `pg_read_server_files` and
+`pg_write_server_files`: through such a chain the role could grant itself,
+or switch to, powers beyond the cluster's databases. These rules belong to
+the maintenance connection of `check_control_and_maintenance`, read once
+on it, and are reported, the role switch first, then the attributes, then
+the reached roles, before the findings of the database that connection's
+check covers (the maintenance database, or the shared one). Other pools'
+sessions are not held to them. `preflight::session_role_attributes` and
+`preflight::session_role_reach` read the session role's attributes and
+the reached roles (sorted, each once) in one statement each, and the pure
+`preflight::maintenance_role_findings` and
+`preflight::maintenance_reach_findings` apply the rules to them. The
+control database is checked first, and a superuser may connect to it: a
+reached superuser is a tenant role there (rule 2), so on separate
+databases it is reported as the control database's finding. The preflight
+does not read back the maintenance session's startup settings: a path
+that drops startup options is found at the first maintenance call (see
+[The maintenance connection](#the-maintenance-connection)), not at
+startup.
+
+The preflight runs on the product's own connections, which keep the
+database's own `search_path`; its statements name `pg_catalog`'s operator
+for every comparison, so no operator or function of the database is
+called.
 
 "May connect" is the effective `CONNECT` as Postgres computes it: an own
 grant, `PUBLIC`'s, an inherited membership's, or a superuser's. A database
@@ -754,6 +791,9 @@ without an ACL is read as its defaults (the owner's privileges, `PUBLIC`'s
 | `RoleMayConnect(role)` | another `LOGIN` role may connect and is neither owner, allowed nor a superuser | revoke the grant, or add the role to the allowed list |
 | `RoleSwitched { session_user, current_user }` | the maintenance session acts as another role than the one it signed in as | remove the role setting (`ALTER ROLE … RESET role`, `ALTER DATABASE … RESET role`) or the `role` startup option |
 | `MaintenanceAttribute(attribute)` | the maintenance role holds `SUPERUSER`, `REPLICATION` or `BYPASSRLS` (`the maintenance role holds REPLICATION`) | `ALTER ROLE … NOSUPERUSER NOREPLICATION NOBYPASSRLS` as a superuser |
+| `MaintenanceReaches(role)` | the maintenance role reaches a superuser or one of `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files` through a membership chain (`the maintenance role reaches role pg_read_server_files`) | revoke the membership of the chain (`REVOKE … FROM …`) as a superuser |
+
+Every `Finding` displays as the text the error names it by.
 
 Nothing is repaired. A finding is `FAILED_PRECONDITION` without a reason,
 its message naming the label, the database and every finding (`preflight of
@@ -895,8 +935,8 @@ operation built on it is [Adopt an existing database](#adopt-an-existing-databas
 
 | Function | Does |
 |---|---|
-| `handover::prepare(&maintenance, &database, &role)` | the checks, and on the reassign path the isolation of the database; returns the `Adoption` still to do. `role` need not exist yet |
-| `handover::adopt(&maintenance, &database, &role)` | the tenant-role check, `prepare`, the transfer, the CONNECT restriction and a read of the result. `role` must exist, pass `privileges::check_tenant_role` and be held by the maintenance role, as `roles::create` leaves it |
+| `handover::prepare(&maintenance, &database, &role)` | the tenant-role check of an existing role, the checks, and on the reassign path the isolation of the database; returns the `Adoption` still to do. `role` need not exist yet |
+| `handover::adopt(&maintenance, &database, &role)` | `prepare`, the transfer, the CONNECT restriction and a read of the result. `role` must exist, pass `privileges::check_tenant_role` and be held by the maintenance role, as `roles::create` leaves it |
 
 `Adoption::Reassign` means the maintenance role still owns the database;
 `Adoption::Restrict` means the tenant role owns it already and only the
@@ -912,19 +952,27 @@ after:
 
 | Step | Session on | What |
 |---|---|---|
-| 1 | the maintenance database | for `adopt` first, the tenant-role check of an existing role; the preconditions below up to `owns_more` |
+| 1 | the maintenance database | first, the tenant-role check of an existing role (`prepare` and `adopt` alike); the preconditions below up to `owns_more` |
 | 2, reassign only | the database | `foreign_object`; then `CONNECT` revoked from `PUBLIC`, on its own; then `session` |
 | 3, reassign only, `adopt` | the database | one transaction: the tenant-role check first, then every check of steps 1 and 2 again (the revoke too); the maintenance role's membership in the tenant role set to `INHERIT TRUE, SET TRUE`; the database's owner changed; `REASSIGN OWNED BY CURRENT_USER TO` the tenant role; the membership back to `INHERIT FALSE, SET TRUE`. An error rolls all of it back |
-| 4, `adopt` | the maintenance database | the tenant-role check; as the new owner, in one transaction: `CONNECT` revoked from `PUBLIC` and granted to the owner, connections allowed; then one read of the database: no finding of `privileges::tenant_database_findings` for the owner and no `CONNECT` of `PUBLIC` |
+| 4, `adopt` | the maintenance database | the tenant-role check; as the new owner, in one transaction: `CONNECT` revoked from `PUBLIC` and granted to the owner, connections allowed, and one read of the database before the commit: no finding of `privileges::tenant_database_findings` for the owner and no `CONNECT` of `PUBLIC` |
 
 A tenant role that fails its check, and a database that step 4's read finds
 not as expected, are `INTERNAL` without a reason, the findings in the
 error's source; nothing is repaired. The role check in step 1, of a role
-that exists, comes before anything changes; the one in step 3 before the
-inheriting membership exists (a missing role is refused there), the one in
-step 4 before the restriction. A database refused by
-step 4's read keeps its new owner and its restriction, and every later
-call refuses it again. `prepare` does not check the role.
+that exists, comes before anything changes, in `prepare` as in `adopt`;
+the one in step 3 before the inheriting membership exists (a missing role
+is refused there, after step 2's revoke), the one in step 4 before the
+restriction. A database refused by step 4's read keeps its new owner; the
+read's rollback leaves its `CONNECT` grants and its `ALLOW_CONNECTIONS` as
+step 4 found them, and every later call refuses it again.
+
+Known limits: a database whose ACL gives its owner `CONNECT` only through
+`PUBLIC` passes step 1, and step 2's revoke then keeps the maintenance
+role out of it for step 3 until an operator grants the owner `CONNECT`
+again; a membership granted to or from the tenant role while step 3's
+transaction runs, after its role check, is refused only by step 4's
+check.
 
 The membership inherits only inside step 3's transaction, because
 `REASSIGN OWNED` needs the privileges of the receiving role. One deadline
@@ -2254,20 +2302,25 @@ maintenance database. A violation describes the problem and never repeats
 the name. Then the call takes the lifecycle admission.
 
 **Checks before anything is created.** When the tenant has no control row
-yet, the call runs the handover's checks (`handover::prepare`: `missing`,
-`template`, `owner`, `grantee`, `owns_more`, `foreign_object`, `session`;
-see [Adopting a database](#adopting-a-database)) and then, while the
+yet, the call runs the handover's checks (`handover::prepare`: first the
+tenant-role check of a role of the tenant's name that already exists, then
+`missing`, `template`, `owner`, `grantee`, `owns_more`, `foreign_object`,
+`session`; see [Adopting a database](#adopting-a-database)) and then, while the
 maintenance role still owns the database, the product's
 `TenantHooks::check_adoptable` on a pool of the maintenance role on that
 database (`Maintenance::pool_on`). Its sessions start read-only, so a write
-in the check fails with SQLSTATE `25006`; the check is bounded like a
+in the check fails with SQLSTATE `25006` (the rule is confirmed when a
+connection opens; a check that sets it off itself is not stopped); the
+check is bounded like a
 maintenance operation (150 s, then `UNAVAILABLE`) and its pool is closed
 whatever it answers. The default `check_adoptable` refuses every database
 (`ADOPTION_REFUSED`, `check` = `not_checked`): a product that adopts
 implements it and says which databases it accepts. A refusal, the
 handover's or the product's, is the call's answer unchanged and leaves no
 control row and no role; the only change it can leave is `PUBLIC`'s
-`CONNECT` revoked on the database.
+`CONNECT` revoked on the database. An existing role of the tenant's name
+that fails the tenant-role check is refused `INTERNAL` before that revoke
+and before `check_adoptable` runs.
 
 **Steps.** The row is inserted (a new id at the tenant cap is
 `TENANT_LIMIT_REACHED`, still without a role), then the steps of a
@@ -2757,8 +2810,11 @@ there are.
 - A database is dropped only as the tenant's role, and only when that role
   owns it.
 - The maintenance role is a non-superuser with `CREATEDB` and `CREATEROLE`,
-  without `REPLICATION` and `BYPASSRLS` (the preflight checks all three),
-  that owns no tenant database and has no members; it holds tenant roles
+  without `REPLICATION` and `BYPASSRLS`, that reaches no superuser and none
+  of `pg_execute_server_program`, `pg_read_server_files` and
+  `pg_write_server_files` through any membership chain (the preflight
+  checks all of these), that owns no tenant database and has no members;
+  it holds tenant roles
   without inheriting their privileges and has no `CONNECT` on their
   databases.
 - Tenant connections never carry the base options' credentials, and the

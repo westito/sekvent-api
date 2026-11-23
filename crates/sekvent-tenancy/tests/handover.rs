@@ -1011,10 +1011,10 @@ fn assert_no_inheriting_membership(state: &State) {
 }
 
 /// An adoption resumed at its database step, after the tenant role made by
-/// the role step gained a membership, is refused before anything changes:
-/// the owner, `PUBLIC`'s `CONNECT` and the maintenance role's membership
-/// (`INHERIT FALSE`) stay as they were. Without the membership it goes
-/// through.
+/// the role step gained a membership, is refused before anything changes,
+/// by `prepare` and `adopt` alike: the owner, `PUBLIC`'s `CONNECT` and the
+/// maintenance role's membership (`INHERIT FALSE`) stay as they were.
+/// Without the membership it goes through.
 #[tokio::test]
 #[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
 async fn an_adoption_whose_role_gained_a_membership_is_refused_and_changes_nothing() {
@@ -1049,6 +1049,10 @@ async fn an_adoption_whose_role_gained_a_membership_is_refused_and_changes_nothi
             ),
         ] {
             cluster.admin_execute("postgres", &grant).await;
+            let err = run_prepare(&maintenance, &database, &role)
+                .await
+                .expect_err("prepare checks the role before anything else");
+            assert_role_refused(&err, &role, &finding);
             let err = run_adopt(&maintenance, &database, &role)
                 .await
                 .expect_err("the role is checked before anything else");
@@ -1056,7 +1060,7 @@ async fn an_adoption_whose_role_gained_a_membership_is_refused_and_changes_nothi
             assert_eq!(
                 state(&cluster, database.as_str(), role.as_str()).await,
                 before,
-                "nothing changed"
+                "nothing changed: no revoke of step 2"
             );
             cluster.admin_execute("postgres", &revoke).await;
         }
@@ -1066,6 +1070,60 @@ async fn an_adoption_whose_role_gained_a_membership_is_refused_and_changes_nothi
         let after = state(&cluster, database.as_str(), role.as_str()).await;
         assert_eq!(after.owner, role.as_str());
         assert_no_inheriting_membership(&after);
+    }))
+    .await;
+}
+
+/// A handover to a role that does not exist passes step 1, where a missing
+/// role is no finding, and step 2, which revokes `PUBLIC`'s `CONNECT`; step
+/// 3's transaction refuses it before anything else and rolls back, so the
+/// maintenance role still owns the database.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+async fn a_handover_to_a_missing_role_is_refused_at_the_transfer() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let maintenance = cluster.maintenance();
+        let absent = cluster.names().role(common::new_tenant());
+        let database = candidate(&cluster).await;
+        as_maintenance(
+            &cluster,
+            database.as_str(),
+            "CREATE TABLE public.orders (id bigint)",
+        )
+        .await;
+        let before = state(&cluster, database.as_str(), absent.as_str()).await;
+        assert_eq!(before.owner, cluster.maintenance_role());
+        assert!(before.public_connect);
+        assert_eq!(before.memberships, [] as [String; 0]);
+
+        let err = run_adopt(&maintenance, &database, &absent)
+            .await
+            .expect_err("step 3 refuses a missing role");
+        assert_eq!(err.code(), ErrorCode::Internal, "{err:?}");
+        assert_eq!(err.reason(), None);
+        assert_eq!(err.message(), "internal error");
+        assert_eq!(
+            source(&err),
+            format!("tenant role {} does not exist", absent.as_str())
+        );
+        let after = state(&cluster, database.as_str(), absent.as_str()).await;
+        assert_eq!(
+            after.owner,
+            cluster.maintenance_role(),
+            "the owner is unchanged"
+        );
+        assert!(!after.public_connect, "step 2's revoke stays");
+        assert_eq!(
+            State {
+                public_connect: true,
+                ..after
+            },
+            before,
+            "step 3 rolled back: owner, objects and connections unchanged"
+        );
     }))
     .await;
 }
@@ -1090,12 +1148,10 @@ async fn the_restrict_path_is_refused_before_the_restriction_when_the_role_chang
             .await;
         let before = state(&cluster, &name, role.as_str()).await;
         assert!(before.public_connect);
-        assert_eq!(
-            run_prepare(&maintenance, &database, &role)
-                .await
-                .expect("prepare does not check the role"),
-            Adoption::Restrict
-        );
+        let err = run_prepare(&maintenance, &database, &role)
+            .await
+            .expect_err("prepare checks an existing role first");
+        assert_role_refused(&err, &role, &format!("it reaches role {third}"));
         let err = run_adopt(&maintenance, &database, &role)
             .await
             .expect_err("the role is checked before the restriction");
@@ -1104,6 +1160,18 @@ async fn the_restrict_path_is_refused_before_the_restriction_when_the_role_chang
             state(&cluster, &name, role.as_str()).await,
             before,
             "nothing was restricted"
+        );
+        cluster
+            .admin_execute(
+                "postgres",
+                &format!("REVOKE {} FROM {}", quote(&third), quote(role.as_str())),
+            )
+            .await;
+        assert_eq!(
+            run_prepare(&maintenance, &database, &role)
+                .await
+                .expect("without the membership the role passes"),
+            Adoption::Restrict
         );
     }))
     .await;

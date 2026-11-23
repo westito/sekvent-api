@@ -5,6 +5,7 @@
 mod common;
 
 use std::borrow::Cow;
+use std::error::Error as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use common::Cluster;
@@ -12,6 +13,7 @@ use common::product::hooks::{ADOPTED, CHECK_ADOPTABLE, OrdersHooks};
 use common::product::{self, OrdersFactory};
 use sekvent_error::{AppError, ErrorCode};
 use sekvent_tenancy::cluster::handover::CHECK_KEY;
+use sekvent_tenancy::cluster::privileges;
 use sekvent_tenancy::control::{ProvisionStep, rows};
 use sekvent_tenancy::invalidation::Sender;
 use sekvent_tenancy::lifecycle::{
@@ -154,6 +156,17 @@ async fn database_owner(cluster: &Cluster, database: &str) -> String {
     .expect("the database exists");
     admin.close().await.expect("the admin session closed");
     owner
+}
+
+/// Whether `PUBLIC` holds `CONNECT` on `database`.
+async fn public_connect(cluster: &Cluster, database: &str) -> bool {
+    let mut admin = cluster.admin().await;
+    let connect = privileges::public_may_connect(&mut admin, database)
+        .await
+        .expect("the ACL is readable")
+        .expect("the database exists");
+    admin.close().await.expect("the admin session closed");
+    connect
 }
 
 /// The check a handover refusal names, after its shape is asserted.
@@ -399,6 +412,57 @@ async fn the_product_refusal_reaches_the_caller_and_leaves_nothing() {
             database_owner(&cluster, &name).await,
             cluster.maintenance_role()
         );
+    }))
+    .await;
+}
+
+/// A role of the tenant's name that exists before the adoption and fails the tenant-role check
+/// is refused by the handover's first step: before `PUBLIC`'s `CONNECT` is revoked, before the
+/// product is asked and before a control row exists.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn an_existing_role_with_drift_is_refused_before_anything_changes() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(Box::pin(async {
+        let (registry, control) = registry(&cluster).await;
+        let hooks = OrdersHooks::new();
+        let provisioner = cluster.provisioner(&registry, &hooks);
+        let name = product_candidate(&cluster).await;
+        let request = request("orders", &name);
+        let tenant = request.tenant;
+        let role = cluster.names().role(tenant);
+        cluster
+            .create_role_named(role.as_str(), "NOINHERIT CREATEDB")
+            .await;
+        assert!(public_connect(&cluster, &name).await);
+
+        let err = adopt(&provisioner, request)
+            .await
+            .expect_err("the drifted role is refused");
+        assert_eq!(err.code(), ErrorCode::Internal, "{err:?}");
+        assert_eq!(err.reason(), None);
+        let why = err.source().map(ToString::to_string).unwrap_or_default();
+        assert!(
+            why.contains(&format!("tenant role {} is not as expected", role.as_str())),
+            "{why}"
+        );
+        assert!(why.contains("it holds CREATEDB"), "{why}");
+        assert_eq!(hooks.count(CHECK_ADOPTABLE), 0, "the product was not asked");
+        assert!(
+            public_connect(&cluster, &name).await,
+            "PUBLIC's CONNECT was not revoked"
+        );
+        assert_eq!(
+            database_owner(&cluster, &name).await,
+            cluster.maintenance_role()
+        );
+        let mut conn = control.acquire().await.expect("a control connection");
+        let row = rows::get(&mut conn, tenant)
+            .await
+            .expect("the control row is readable");
+        assert!(row.is_none(), "no control row: {row:?}");
     }))
     .await;
 }

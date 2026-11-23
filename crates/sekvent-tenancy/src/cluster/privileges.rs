@@ -2,11 +2,11 @@
 //! privileges.
 //!
 //! Every read is static SQL with bound names on the connection it is given,
-//! changes nothing and needs only catalog access. Every comparison has an
-//! operator of exactly its two types in `pg_catalog` (`oid`, `name` with
-//! `text`, `text`), and every cast and function is qualified. Any membership
-//! edge is a path, whatever its options, and chains are followed to their
-//! end.
+//! changes nothing and needs only catalog access. Every comparison names
+//! `pg_catalog`'s operator (`OPERATOR(pg_catalog.=)`), and every cast and
+//! function is qualified, so no object of the connected database is called
+//! whatever the connection's `search_path` is. Any membership edge is a
+//! path, whatever its options, and chains are followed to their end.
 //!
 //! The reads ([`role_facts`], [`database_facts`], [`role_may_connect`],
 //! [`roles_that_may_connect`], [`public_may_connect`]) are one statement
@@ -183,35 +183,39 @@ pub enum DatabaseFinding {
 const ROLE_FACTS: &str = "\
 WITH RECURSIVE
 target AS (
-    SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = $1
+    SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) $1
 ),
 reaching(oid) AS (
-    SELECT m.member FROM pg_catalog.pg_auth_members m JOIN target t ON m.roleid = t.oid
+    SELECT m.member FROM pg_catalog.pg_auth_members m
+    JOIN target t ON m.roleid OPERATOR(pg_catalog.=) t.oid
     UNION
-    SELECT m.member FROM pg_catalog.pg_auth_members m JOIN reaching x ON m.roleid = x.oid
+    SELECT m.member FROM pg_catalog.pg_auth_members m
+    JOIN reaching x ON m.roleid OPERATOR(pg_catalog.=) x.oid
 ),
 reached(oid) AS (
-    SELECT m.roleid FROM pg_catalog.pg_auth_members m JOIN target t ON m.member = t.oid
+    SELECT m.roleid FROM pg_catalog.pg_auth_members m
+    JOIN target t ON m.member OPERATOR(pg_catalog.=) t.oid
     UNION
-    SELECT m.roleid FROM pg_catalog.pg_auth_members m JOIN reached x ON m.member = x.oid
+    SELECT m.roleid FROM pg_catalog.pg_auth_members m
+    JOIN reached x ON m.member OPERATOR(pg_catalog.=) x.oid
 )
 SELECT 0::pg_catalog.int4, r.rolname::pg_catalog.text, session_user::pg_catalog.text,
        r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb,
        r.rolcanlogin, r.rolreplication, r.rolbypassrls
-FROM pg_catalog.pg_roles r JOIN target t ON r.oid = t.oid
+FROM pg_catalog.pg_roles r JOIN target t ON r.oid OPERATOR(pg_catalog.=) t.oid
 UNION ALL
 SELECT 1, g.rolname::pg_catalog.text, u.rolname::pg_catalog.text,
        m.admin_option, m.inherit_option, m.set_option, false, false, false, false
 FROM pg_catalog.pg_auth_members m
-JOIN target t ON t.oid IN (m.roleid, m.member)
-JOIN pg_catalog.pg_roles g ON g.oid = m.roleid
-JOIN pg_catalog.pg_roles u ON u.oid = m.member
+JOIN target t ON t.oid OPERATOR(pg_catalog.=) ANY (ARRAY[m.roleid, m.member])
+JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) m.roleid
+JOIN pg_catalog.pg_roles u ON u.oid OPERATOR(pg_catalog.=) m.member
 UNION ALL
 SELECT 2, r.rolname::pg_catalog.text, NULL, false, false, false, false, false, false, false
-FROM reaching x JOIN pg_catalog.pg_roles r ON r.oid = x.oid
+FROM reaching x JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) x.oid
 UNION ALL
 SELECT 3, r.rolname::pg_catalog.text, NULL, false, false, false, false, false, false, false
-FROM reached x JOIN pg_catalog.pg_roles r ON r.oid = x.oid";
+FROM reached x JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) x.oid";
 
 /// One row of [`ROLE_FACTS`].
 type RoleRow = (
@@ -234,13 +238,13 @@ type RoleRow = (
 const DATABASE_FACTS: &str = "\
 SELECT d.datname::pg_catalog.text, pg_catalog.pg_get_userbyid(d.datdba)::pg_catalog.text,
        d.datistemplate,
-       CASE WHEN a.grantee = 0::pg_catalog.oid THEN NULL
+       CASE WHEN a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN NULL
             ELSE pg_catalog.pg_get_userbyid(a.grantee)::pg_catalog.text END,
        a.privilege_type, a.is_grantable
 FROM pg_catalog.pg_database d
 LEFT JOIN LATERAL pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba)))
     WITH ORDINALITY AS a(grantor, grantee, privilege_type, is_grantable, n) ON true
-WHERE d.datname = $1
+WHERE d.datname OPERATOR(pg_catalog.=) $1
 ORDER BY a.n";
 
 /// One row of [`DATABASE_FACTS`].
@@ -259,7 +263,7 @@ type DatabaseRow = (
 const ROLE_MAY_CONNECT: &str = "\
 SELECT pg_catalog.has_database_privilege(r.oid, d.oid, 'CONNECT')
 FROM pg_catalog.pg_roles r CROSS JOIN pg_catalog.pg_database d
-WHERE r.rolname = $1 AND d.datname = $2";
+WHERE r.rolname OPERATOR(pg_catalog.=) $1 AND d.datname OPERATOR(pg_catalog.=) $2";
 
 /// Every `LOGIN` role with an effective `CONNECT`; one NULL row when the
 /// database exists and none may connect, no row when it is missing.
@@ -268,17 +272,18 @@ SELECT r.rolname::pg_catalog.text
 FROM pg_catalog.pg_database d
 LEFT JOIN pg_catalog.pg_roles r
     ON r.rolcanlogin AND pg_catalog.has_database_privilege(r.oid, d.oid, 'CONNECT')
-WHERE d.datname = $1";
+WHERE d.datname OPERATOR(pg_catalog.=) $1";
 
 /// Whether the ACL (or its default) gives `PUBLIC` `CONNECT`.
 const PUBLIC_MAY_CONNECT: &str = "\
 SELECT EXISTS (
     SELECT 1
     FROM pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a
-    WHERE a.grantee = 0::pg_catalog.oid AND a.privilege_type = 'CONNECT'
+    WHERE a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+      AND a.privilege_type OPERATOR(pg_catalog.=) 'CONNECT'::pg_catalog.text
 )
 FROM pg_catalog.pg_database d
-WHERE d.datname = $1";
+WHERE d.datname OPERATOR(pg_catalog.=) $1";
 
 /// Every catalog statement of this module, by name, for the scan of
 /// `cluster::tests`.

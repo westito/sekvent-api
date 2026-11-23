@@ -14,7 +14,8 @@ use crate::{ScramVerifier, TenantRole};
 const CONNECTION_LIMIT_MAX: u32 = i32::MAX.unsigned_abs();
 
 /// Whether a role of the name exists.
-const ROLE_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)";
+const ROLE_EXISTS: &str = "SELECT EXISTS \
+     (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) $1)";
 
 /// Every catalog statement of this module, by name, for the scan of
 /// `cluster::tests`.

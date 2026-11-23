@@ -8,10 +8,10 @@
 //!
 //! | Step | Session on | What |
 //! |---|---|---|
-//! | 1 | the maintenance database | for [`adopt`] first, an existing tenant role passes `privileges::check_tenant_role`; the database exists (`missing`), is no template (`template`), is owned by the maintenance role or already by the tenant role (`owner`), its ACL names no grantee but its owner and `PUBLIC`, and `PUBLIC` only with `CONNECT` or `TEMPORARY` without grant option (`grantee`); when the maintenance role owns it, that role owns no other database and no tablespace, which `REASSIGN OWNED` would move too (`owns_more`) |
+//! | 1 | the maintenance database | first, an existing tenant role passes `privileges::check_tenant_role`; the database exists (`missing`), is no template (`template`), is owned by the maintenance role or already by the tenant role (`owner`), its ACL names no grantee but its owner and `PUBLIC`, and `PUBLIC` only with `CONNECT` or `TEMPORARY` without grant option (`grantee`); when the maintenance role owns it, that role owns no other database and no tablespace, which `REASSIGN OWNED` would move too (`owns_more`) |
 //! | 2, reassign only | the database | no object of a role other than the maintenance role and the tenant role (`foreign_object`); `CONNECT` revoked from `PUBLIC`, on its own; no session of a role other than the maintenance role (`session`) |
 //! | 3, reassign only, [`adopt`] | the database | one transaction: the tenant-role check, then the checks of steps 1 and 2 again, the revoke included; the membership in the tenant role `WITH INHERIT TRUE, SET TRUE`; the database's owner changed; `REASSIGN OWNED BY CURRENT_USER`; the membership back to `INHERIT FALSE, SET TRUE` |
-//! | 4, [`adopt`] | the maintenance database | the tenant-role check; as the new owner: `CONNECT` revoked from `PUBLIC` and granted to the owner, connections allowed; then one read of the database: no finding of `privileges::tenant_database_findings` for the owner and no `CONNECT` of `PUBLIC` |
+//! | 4, [`adopt`] | the maintenance database | the tenant-role check; then one transaction as the new owner: `CONNECT` revoked from `PUBLIC` and granted to the owner, connections allowed, and one read of the database before the commit: no finding of `privileges::tenant_database_findings` for the owner and no `CONNECT` of `PUBLIC` |
 //!
 //! A refusal is `FAILED_PRECONDITION` with the reason `ADOPTION_REFUSED`, the
 //! message `the database cannot be adopted` and the metadata key `check`
@@ -25,11 +25,13 @@
 //! A tenant role that fails its check, and a database that is not as
 //! expected after the restriction, are `INTERNAL` without a reason, the
 //! findings in the error's source, and nothing is repaired. An existing
-//! role is checked in step 1 before anything changes; the role is checked
-//! again first in step 3's transaction, before the inheriting membership
-//! exists, where a missing role is refused too; and in step 4 before the
-//! restriction. A database refused by step 4's read keeps its
-//! new owner and its restriction, and every later call refuses it again.
+//! role is checked in step 1, by [`prepare`] and [`adopt`] alike, before
+//! anything changes; the role is checked again first in step 3's
+//! transaction, before the inheriting membership exists, where a missing
+//! role is refused too; and in step 4 before the restriction. A database
+//! refused by step 4's read keeps its new owner, and the read's rollback
+//! leaves its `CONNECT` grants and `ALLOW_CONNECTIONS` as step 4 found them;
+//! every later call refuses it again.
 //!
 //! A call made again after an interruption converges: a database the tenant
 //! role already owns takes the [`Adoption::Restrict`] path, and so does step
@@ -49,7 +51,7 @@ use sekvent_error::AppError;
 use sqlx::PgConnection;
 use tokio::time::{Instant, timeout_at};
 
-use crate::cluster::databases::{check_restricted, restrict_connect};
+use crate::cluster::databases::restrict_connect;
 use crate::cluster::maintenance::{
     Failure, OPERATION_TIMEOUT, begin, end_transaction, own_role, roll_back,
 };
@@ -66,20 +68,21 @@ const REFUSED: &str = "the database cannot be adopted";
 pub const CHECK_KEY: &str = "check";
 
 /// Other databases and tablespaces owned by the maintenance role (`$1`),
-/// the candidate (`$2`) aside. Like every statement of the handover it is
-/// type-exact: each comparison has an operator of exactly its two types in
-/// `pg_catalog` (`oid`, `name` with `text`), which the session's
-/// `search_path` searches first; casts and functions are qualified.
+/// the candidate (`$2`) aside. Like every statement under `cluster`, it
+/// names `pg_catalog`'s operator for every comparison and qualifies every
+/// cast and function, so no object of the database stands in for one
+/// whatever the session's `search_path` is.
 const OWNED_ELSEWHERE: &str = "
 SELECT
     (SELECT pg_catalog.count(*)
        FROM pg_catalog.pg_database d
-       JOIN pg_catalog.pg_roles r ON r.oid = d.datdba
-      WHERE r.rolname = $1 AND d.datname <> $2),
+       JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) d.datdba
+      WHERE r.rolname OPERATOR(pg_catalog.=) $1
+        AND d.datname OPERATOR(pg_catalog.<>) $2),
     (SELECT pg_catalog.count(*)
        FROM pg_catalog.pg_tablespace t
-       JOIN pg_catalog.pg_roles r ON r.oid = t.spcowner
-      WHERE r.rolname = $1)";
+       JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) t.spcowner
+      WHERE r.rolname OPERATOR(pg_catalog.=) $1)";
 
 /// Whether an object of the current database has an owner other than the
 /// roles `$1` and `$2`: first from the recorded ownership dependencies, with
@@ -89,16 +92,18 @@ SELECT
 /// inspected).
 ///
 /// Catalog classes are compared as `oid` with `oid` (a `regclass` cast on to
-/// `oid`), and the temporary schemas are matched with `pg_catalog`'s `~` on
-/// `text`, named: no operator of the database's own can stand in for one of
-/// these comparisons.
+/// `oid`), and every operator, the `~` that matches the temporary schemas
+/// among them, is `pg_catalog`'s, named: no operator of the database's own
+/// can stand in for one of these comparisons.
 const FOREIGN_OBJECTS: &str = "
 WITH here AS (
     SELECT oid FROM pg_catalog.pg_database
-     WHERE datname = pg_catalog.current_database()
+     WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
 ),
 allowed AS (
-    SELECT oid FROM pg_catalog.pg_roles WHERE rolname IN ($1, $2)
+    SELECT oid FROM pg_catalog.pg_roles
+     WHERE rolname OPERATOR(pg_catalog.=)
+           ANY (ARRAY[$1::pg_catalog.text, $2::pg_catalog.text])
 ),
 owned (class_id, object_id, owner_id, namespace_id) AS (
     SELECT 'pg_catalog.pg_namespace'::pg_catalog.regclass::pg_catalog.oid, oid, nspowner, oid
@@ -163,31 +168,33 @@ owned (class_id, object_id, owner_id, namespace_id) AS (
     UNION ALL SELECT 'pg_catalog.pg_subscription'::pg_catalog.regclass::pg_catalog.oid,
            oid, subowner, 0::pg_catalog.oid
       FROM pg_catalog.pg_subscription
-     WHERE subdbid = (SELECT oid FROM here)
+     WHERE subdbid OPERATOR(pg_catalog.=) (SELECT oid FROM here)
 )
 SELECT
     EXISTS (
         SELECT 1 FROM pg_catalog.pg_shdepend s
-         WHERE s.dbid = (SELECT oid FROM here)
-           AND s.deptype = 'o'
-           AND s.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass::pg_catalog.oid
-           AND s.refobjid NOT IN (SELECT oid FROM allowed)
+         WHERE s.dbid OPERATOR(pg_catalog.=) (SELECT oid FROM here)
+           AND s.deptype OPERATOR(pg_catalog.=) 'o'::pg_catalog.\"char\"
+           AND s.refclassid OPERATOR(pg_catalog.=)
+               'pg_catalog.pg_authid'::pg_catalog.regclass::pg_catalog.oid
+           AND NOT (s.refobjid OPERATOR(pg_catalog.=) ANY (SELECT oid FROM allowed))
     ),
     EXISTS (
         SELECT 1 FROM owned o
-         WHERE o.object_id >= 16384::pg_catalog.oid
-           AND o.owner_id NOT IN (SELECT oid FROM allowed)
+         WHERE o.object_id OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid
+           AND NOT (o.owner_id OPERATOR(pg_catalog.=) ANY (SELECT oid FROM allowed))
            AND NOT EXISTS (
                SELECT 1 FROM pg_catalog.pg_namespace n
-                WHERE n.oid = o.namespace_id
+                WHERE n.oid OPERATOR(pg_catalog.=) o.namespace_id
                   AND n.nspname::pg_catalog.text
                       OPERATOR(pg_catalog.~) '^pg_(toast_)?temp_[0-9]+$'::pg_catalog.text
            )
            AND NOT EXISTS (
                SELECT 1 FROM pg_catalog.pg_depend d
-                WHERE d.classid = o.class_id
-                  AND d.objid = o.object_id
-                  AND d.deptype IN ('e', 'i')
+                WHERE d.classid OPERATOR(pg_catalog.=) o.class_id
+                  AND d.objid OPERATOR(pg_catalog.=) o.object_id
+                  AND d.deptype OPERATOR(pg_catalog.=)
+                      ANY (ARRAY['e'::pg_catalog.\"char\", 'i'::pg_catalog.\"char\"])
            )
     )";
 
@@ -196,11 +203,13 @@ SELECT
 const OTHER_SESSIONS: &str = "
 SELECT pg_catalog.count(*)
   FROM pg_catalog.pg_stat_activity a
- WHERE a.datid = (SELECT oid FROM pg_catalog.pg_database
-                   WHERE datname = pg_catalog.current_database())
+ WHERE a.datid OPERATOR(pg_catalog.=)
+       (SELECT oid FROM pg_catalog.pg_database
+         WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database())
    AND a.usesysid IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
-                    WHERE r.oid = a.usesysid AND r.rolname = $1)";
+                    WHERE r.oid OPERATOR(pg_catalog.=) a.usesysid
+                      AND r.rolname OPERATOR(pg_catalog.=) $1)";
 
 /// Every catalog statement of this module, by name, for the scan of
 /// `cluster::tests`.
@@ -223,9 +232,11 @@ pub enum Adoption {
 
 /// The checks before the database changes hands.
 ///
-/// Step 1 on the maintenance database; when the maintenance role owns the
-/// database, step 2 on the database itself, which revokes `PUBLIC`'s
-/// `CONNECT` before its session check. `role` need not exist yet. A role of
+/// Step 1 on the maintenance database, which checks an existing tenant role
+/// first; when the maintenance role owns the database, step 2 on the
+/// database itself, which revokes `PUBLIC`'s `CONNECT` before its session
+/// check. `role` need not exist yet; an existing one that fails the
+/// tenant-role check is `INTERNAL` before anything changes. A role of
 /// another object-name prefix, and the maintenance database itself, are
 /// `INTERNAL` before any session opens.
 pub async fn prepare(
@@ -234,11 +245,11 @@ pub async fn prepare(
     role: &TenantRole,
 ) -> Result<Adoption, AppError> {
     let deadline = Instant::now() + OPERATION_TIMEOUT;
-    prepare_until(maintenance, database, role, deadline, RoleCheck::Skipped).await
+    prepare_until(maintenance, database, role, deadline).await
 }
 
-/// [`prepare`] with the tenant-role check first, the handover, the CONNECT
-/// restriction and the read of the restricted database.
+/// [`prepare`], the handover, and the CONNECT restriction with its read of
+/// the restricted database.
 ///
 /// `role` must exist, pass the tenant-role check and be held by the
 /// maintenance role (as `roles::create` leaves it). An existing role that
@@ -251,7 +262,7 @@ pub async fn adopt(
     role: &TenantRole,
 ) -> Result<(), AppError> {
     let deadline = Instant::now() + OPERATION_TIMEOUT;
-    let adoption = prepare_until(maintenance, database, role, deadline, RoleCheck::First).await?;
+    let adoption = prepare_until(maintenance, database, role, deadline).await?;
     if adoption == Adoption::Reassign {
         let mut conn = maintenance.connect_to(database).await?;
         let result = transfer(&mut conn, database, role, deadline).await;
@@ -262,26 +273,16 @@ pub async fn adopt(
     finish(conn, result).await
 }
 
-/// Whether step 1 checks the tenant role before anything else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RoleCheck {
-    /// [`adopt`]: an existing role is checked first.
-    First,
-    /// [`prepare`]: the role need not exist yet.
-    Skipped,
-}
-
 /// Steps 1 and 2 under `deadline`.
 async fn prepare_until(
     maintenance: &Maintenance,
     database: &DatabaseName,
     role: &TenantRole,
     deadline: Instant,
-    role_check: RoleCheck,
 ) -> Result<Adoption, AppError> {
     check_arguments(maintenance, database, role)?;
     let mut conn = maintenance.connect().await?;
-    let result = inspect(&mut conn, database, role, deadline, role_check).await;
+    let result = inspect(&mut conn, database, role, deadline).await;
     let adoption = finish(conn, result).await?;
     if adoption == Adoption::Reassign {
         let mut conn = maintenance.connect_to(database).await?;
@@ -320,15 +321,10 @@ async fn inspect(
     database: &DatabaseName,
     role: &TenantRole,
     deadline: Instant,
-    role_check: RoleCheck,
 ) -> Result<Adoption, AppError> {
     let maintenance = conn.maintenance_role().to_owned();
     let session = conn.live()?;
-    let outcome = timeout_at(
-        deadline,
-        inspect_on(session, database, role, &maintenance, role_check),
-    )
-    .await;
+    let outcome = timeout_at(deadline, inspect_on(session, database, role, &maintenance)).await;
     conn.bounded(outcome)
 }
 
@@ -370,17 +366,14 @@ async fn restrict(
     conn.bounded(outcome)
 }
 
-/// The checks of step 1, the tenant role's first when `role_check` asks.
+/// The checks of step 1, an existing tenant role's first.
 async fn inspect_on(
     conn: &mut PgConnection,
     database: &DatabaseName,
     role: &TenantRole,
     maintenance: &str,
-    role_check: RoleCheck,
 ) -> Result<Adoption, AppError> {
-    if role_check == RoleCheck::First {
-        privileges::check_existing_tenant_role(&mut *conn, role).await?;
-    }
+    privileges::check_existing_tenant_role(&mut *conn, role).await?;
     let facts = privileges::database_facts(&mut *conn, database.as_str()).await?;
     let adoption =
         check_database(facts.as_ref(), maintenance, role.as_str()).map_err(Check::refuse)?;
@@ -463,17 +456,15 @@ async fn transfer_steps(
     Ok(adoption)
 }
 
-/// The statements of step 4: the tenant-role check, the restriction, the
-/// read of the restricted database.
+/// The statements of step 4: the tenant-role check, then the restriction
+/// and the read of the restricted database in one transaction.
 async fn restrict_on(
     conn: &mut PgConnection,
     database: &DatabaseName,
     role: &TenantRole,
 ) -> Result<(), Failure> {
     privileges::check_tenant_role(&mut *conn, role).await?;
-    restrict_connect(&mut *conn, database, role).await?;
-    check_restricted(conn, database, role).await?;
-    Ok(())
+    restrict_connect(conn, database, role).await
 }
 
 /// The number of other databases and of tablespaces `maintenance` owns.
@@ -604,9 +595,8 @@ mod tests {
     use sqlx::{Connection, PgConnection};
 
     use super::{
-        Adoption, CHECK_KEY, Check, FOREIGN_OBJECTS, RoleCheck, adopt, check_database,
-        check_foreign_objects, check_owns_nothing_else, check_sessions, inspect, isolate, prepare,
-        restrict, transfer,
+        Adoption, CHECK_KEY, Check, FOREIGN_OBJECTS, adopt, check_database, check_foreign_objects,
+        check_owns_nothing_else, check_sessions, inspect, isolate, prepare, restrict, transfer,
     };
     use crate::cluster::maintenance::OPERATION_TIMEOUT;
     use crate::cluster::privileges::{DatabaseFacts, DatabaseGrant, DatabasePrivilege, Grantee};
@@ -887,11 +877,7 @@ mod tests {
         let deadline = Instant::now() + OPERATION_TIMEOUT;
         let mut conn = MaintenanceConn::detached(names(), MAINTENANCE);
         let codes = [
-            inspect(&mut conn, &orders(), &role(), deadline, RoleCheck::Skipped)
-                .await
-                .expect_err("no session")
-                .code(),
-            inspect(&mut conn, &orders(), &role(), deadline, RoleCheck::First)
+            inspect(&mut conn, &orders(), &role(), deadline)
                 .await
                 .expect_err("no session")
                 .code(),
@@ -908,26 +894,42 @@ mod tests {
                 .expect_err("no session")
                 .code(),
         ];
-        assert_eq!(codes, [ErrorCode::Internal; 5]);
+        assert_eq!(codes, [ErrorCode::Internal; 4]);
     }
 
-    /// `public."="(oid, regclass)` and `public."~"(name, name)`, whose
-    /// functions raise, and a table of a third role so that an ownership is
-    /// recorded: the comparisons the object scan once made had no
-    /// `pg_catalog` operator of exactly their types, so these would win.
+    /// The operators of `public` the object scan would reach on a
+    /// `search_path` that puts `public` first if it left one unnamed, each
+    /// raising: `=` of `oid` with `regclass` and `~` of `name` with `name`,
+    /// which `pg_catalog` has no operator of exactly, and `=` and `>=` of
+    /// exactly the types the scan compares, which `public` outranks there;
+    /// and a table of a third role, so that an ownership is recorded.
     fn hostile_operators(database: &str) -> String {
-        format!(
-            "CREATE FUNCTION public.hostile_eq(oid, pg_catalog.regclass) RETURNS boolean {raises}; \
-             CREATE OPERATOR public.= (LEFTARG = oid, RIGHTARG = pg_catalog.regclass, \
-                 FUNCTION = public.hostile_eq); \
-             CREATE FUNCTION public.hostile_match(name, name) RETURNS boolean {raises}; \
-             CREATE OPERATOR public.~ (LEFTARG = name, RIGHTARG = name, \
-                 FUNCTION = public.hostile_match); \
-             CREATE ROLE \"{database}_owner\"; \
+        let mut objects: Vec<String> = [
+            ("=", "oid", "pg_catalog.regclass"),
+            ("~", "name", "name"),
+            ("=", "pg_catalog.oid", "pg_catalog.oid"),
+            (">=", "pg_catalog.oid", "pg_catalog.oid"),
+            ("=", "pg_catalog.name", "pg_catalog.text"),
+            ("=", "pg_catalog.name", "pg_catalog.name"),
+            ("=", "pg_catalog.\"char\"", "pg_catalog.\"char\""),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(n, (operator, left, right))| {
+            format!(
+                "CREATE FUNCTION public.hostile_{n}({left}, {right}) RETURNS boolean {raises}; \
+                 CREATE OPERATOR public.{operator} (LEFTARG = {left}, RIGHTARG = {right}, \
+                     FUNCTION = public.hostile_{n})",
+                raises = testing::RAISES
+            )
+        })
+        .collect();
+        objects.push(format!(
+            "CREATE ROLE \"{database}_owner\"; \
              CREATE TABLE public.recorded (id bigint); \
-             ALTER TABLE public.recorded OWNER TO \"{database}_owner\"",
-            raises = testing::RAISES
-        )
+             ALTER TABLE public.recorded OWNER TO \"{database}_owner\""
+        ));
+        objects.join("; ")
     }
 
     #[tokio::test]

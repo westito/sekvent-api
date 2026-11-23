@@ -1,4 +1,4 @@
-//! The startup preflight on a real server: a clean fixture passes, each finding alone, one shared database, many roles in one call, a maintenance session that switched role.
+//! The startup preflight on a real server: a clean fixture passes, each finding alone, one shared database, many roles in one call, a maintenance session that switched role, a maintenance role that reaches a role it must not.
 #![cfg(feature = "serving")]
 
 mod common;
@@ -916,6 +916,162 @@ async fn a_maintenance_role_with_a_widening_attribute_is_refused() {
         )
         .await
         .expect("without the attributes the maintenance role passes");
+        pool.close().await;
+    })
+    .await;
+}
+
+/// The roles the maintenance role reaches that the preflight refuses, read
+/// on a session of its own on the maintenance database.
+async fn reach_of(cluster: &Cluster) -> Vec<String> {
+    let mut conn = cluster
+        .connect_as(
+            cluster.maintenance_role(),
+            cluster.maintenance_password(),
+            cluster.maintenance_database(),
+        )
+        .await
+        .expect("the maintenance role connected");
+    let reached = preflight::session_role_reach(&mut conn)
+        .await
+        .expect("the reach was read");
+    conn.close().await.expect("the session closed");
+    reached
+}
+
+/// A maintenance role that reaches one of the predefined roles of the
+/// server's files and programs, or a superuser through a chain of edges
+/// without `INHERIT`, is refused naming the reached role; without the
+/// memberships the same cluster passes.
+#[tokio::test]
+#[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+#[allow(clippy::too_many_lines)]
+async fn a_maintenance_role_that_reaches_a_widening_role_is_refused() {
+    let Some(cluster) = Cluster::start().await else {
+        return;
+    };
+    common::guard(async {
+        let maintenance = quote(cluster.maintenance_role());
+        let pool = cluster.control_pool().await;
+        assert_eq!(reach_of(&cluster).await, [] as [String; 0]);
+
+        admin_sql(
+            &cluster,
+            &format!("GRANT pg_read_server_files TO {maintenance}"),
+        )
+        .await;
+        assert_eq!(reach_of(&cluster).await, ["pg_read_server_files"]);
+        let error = preflight::check_control_and_maintenance(
+            &pool,
+            &cluster.maintenance_options(),
+            cluster.names(),
+        )
+        .await
+        .unwrap_err();
+        assert_refused(
+            &cluster,
+            &error,
+            "maintenance",
+            cluster.maintenance_database(),
+            "the maintenance role reaches role pg_read_server_files",
+        );
+        wait_for_no_sessions(&cluster, cluster.maintenance_database()).await;
+        admin_sql(
+            &cluster,
+            &format!("REVOKE pg_read_server_files FROM {maintenance}"),
+        )
+        .await;
+
+        // maintenance -> middle -> root, a superuser that cannot sign in.
+        let root = cluster.create_role("root", "SUPERUSER").await;
+        let middle = cluster.create_role("middle", "").await;
+        for statement in [
+            format!(
+                "GRANT {} TO {} WITH INHERIT FALSE",
+                quote(&root),
+                quote(&middle)
+            ),
+            format!(
+                "GRANT {} TO {maintenance} WITH INHERIT FALSE",
+                quote(&middle)
+            ),
+        ] {
+            admin_sql(&cluster, &statement).await;
+        }
+        assert_eq!(reach_of(&cluster).await, std::slice::from_ref(&root));
+        // The control database is checked first, and a superuser may
+        // connect to it: as a role the maintenance role reaches, it is a
+        // tenant role there.
+        let error = preflight::check_control_and_maintenance(
+            &pool,
+            &cluster.maintenance_options(),
+            cluster.names(),
+        )
+        .await
+        .unwrap_err();
+        assert_refused(
+            &cluster,
+            &error,
+            "control",
+            cluster.control_database(),
+            &format!("tenant role {root} may connect"),
+        );
+        wait_for_no_sessions(&cluster, cluster.maintenance_database()).await;
+
+        // On a database shared with the control pool, the one check names
+        // the reach first, then the database's own finding.
+        admin_sql(
+            &cluster,
+            &format!(
+                "GRANT CONNECT ON DATABASE {} TO {maintenance}",
+                quote(cluster.control_database())
+            ),
+        )
+        .await;
+        let shared = cluster.options_for(
+            cluster.maintenance_role(),
+            cluster.maintenance_password(),
+            cluster.control_database(),
+        );
+        let error = preflight::check_control_and_maintenance(&pool, &shared, cluster.names())
+            .await
+            .unwrap_err();
+        assert_refused(
+            &cluster,
+            &error,
+            "control and maintenance",
+            cluster.control_database(),
+            &format!("the maintenance role reaches role {root}; tenant role {root} may connect"),
+        );
+        assert!(!error.message().contains(&middle), "{}", error.message());
+        admin_sql(
+            &cluster,
+            &format!(
+                "REVOKE CONNECT ON DATABASE {} FROM {maintenance}",
+                quote(cluster.control_database())
+            ),
+        )
+        .await;
+
+        admin_sql(
+            &cluster,
+            &format!("REVOKE {} FROM {maintenance}", quote(&middle)),
+        )
+        .await;
+        assert_eq!(reach_of(&cluster).await, [] as [String; 0]);
+        preflight::check_control_and_maintenance(
+            &pool,
+            &cluster.maintenance_options(),
+            cluster.names(),
+        )
+        .await
+        .expect("without the memberships the maintenance role passes");
+        wait_for_no_sessions(&cluster, cluster.maintenance_database()).await;
+        admin_sql(
+            &cluster,
+            &format!("DROP ROLE {}; DROP ROLE {}", quote(&middle), quote(&root)),
+        )
+        .await;
         pool.close().await;
     })
     .await;

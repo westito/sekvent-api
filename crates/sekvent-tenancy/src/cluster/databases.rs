@@ -17,33 +17,34 @@ use crate::{DatabaseName, ObjectNames, TenantRole};
 
 /// The owner of a database, no row when there is none.
 const DATABASE_OWNER: &str = "SELECT pg_catalog.pg_get_userbyid(datdba)::pg_catalog.text \
-     FROM pg_catalog.pg_database WHERE datname = $1";
+     FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) $1";
 
 /// Everything the drop decides from, in one read: the owner, whether it is a
 /// template, whether it is the session's own database, the session's role,
 /// whether the expected owner (`$2`) exists.
 const DROP_FACTS: &str = "SELECT pg_catalog.pg_get_userbyid(d.datdba)::pg_catalog.text, \
-     d.datistemplate, d.datname = pg_catalog.current_database(), \
+     d.datistemplate, d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database(), \
      CURRENT_USER::pg_catalog.text, \
-     EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = $2) \
-     FROM pg_catalog.pg_database d WHERE d.datname = $1";
+     EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) $2) \
+     FROM pg_catalog.pg_database d WHERE d.datname OPERATOR(pg_catalog.=) $1";
 
 /// The owner of a database and the session's role.
 const SIZE_FACTS: &str = "SELECT pg_catalog.pg_get_userbyid(datdba)::pg_catalog.text, \
      CURRENT_USER::pg_catalog.text \
-     FROM pg_catalog.pg_database WHERE datname = $1";
+     FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) $1";
 
 /// The owner of a database and whether its ACL (or the default one) gives
 /// `PUBLIC` `CONNECT`, in one row; no row when there is no such database.
 const DATABASE_ACCESS: &str = "SELECT pg_catalog.pg_get_userbyid(d.datdba)::pg_catalog.text, \
      EXISTS (SELECT 1 \
      FROM pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a \
-     WHERE a.grantee = 0::pg_catalog.oid AND a.privilege_type = 'CONNECT') \
-     FROM pg_catalog.pg_database d WHERE d.datname = $1";
+     WHERE a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+     AND a.privilege_type OPERATOR(pg_catalog.=) 'CONNECT'::pg_catalog.text) \
+     FROM pg_catalog.pg_database d WHERE d.datname OPERATOR(pg_catalog.=) $1";
 
 /// The size of a database, no row when it is gone.
 const DATABASE_SIZE: &str = "SELECT pg_catalog.pg_database_size(oid) \
-     FROM pg_catalog.pg_database WHERE datname = $1";
+     FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) $1";
 
 /// Every catalog statement of this module, by name, for the scan of
 /// `cluster::tests`.
@@ -67,10 +68,11 @@ const INSUFFICIENT_PRIVILEGE: &str = "42501";
 /// database is created closed (`ALLOW_CONNECTIONS false`) and opens only
 /// together with its restriction, so a call resumed after a failure at any
 /// point converges. An existing database with drift is refused and left as
-/// it was. After the restriction the database is read once more: a finding
-/// of `privileges::tenant_database_findings` for `owner`, or a `CONNECT`
-/// of `PUBLIC`, is `INTERNAL` with the findings in the error's source, and
-/// nothing is repaired (the restriction stays).
+/// it was. The restriction's transaction reads the database before it
+/// commits: a finding of `privileges::tenant_database_findings` for
+/// `owner`, or a `CONNECT` of `PUBLIC`, is `INTERNAL` with the findings in
+/// the error's source, the whole restriction is rolled back (a created
+/// database stays closed) and nothing is repaired.
 pub async fn create(
     conn: &mut MaintenanceConn,
     database: &DatabaseName,
@@ -147,8 +149,10 @@ pub async fn access(
 }
 
 /// As `owner`, in one transaction (`SET LOCAL ROLE`): `CONNECT` revoked from
-/// `PUBLIC` and granted to the owner, then connections allowed. A failed
-/// statement rolls the transaction back before the error returns.
+/// `PUBLIC` and granted to the owner, connections allowed, then the result
+/// read back ([`check_restricted`]) before the commit. A failed statement or
+/// a finding of the read rolls the whole transaction back before the error
+/// returns, so the database keeps the `ALLOW_CONNECTIONS` it had.
 pub(crate) async fn restrict_connect(
     conn: &mut PgConnection,
     database: &DatabaseName,
@@ -159,7 +163,8 @@ pub(crate) async fn restrict_connect(
     end_transaction(tx, result).await
 }
 
-/// The statements of [`restrict_connect`], inside its transaction.
+/// The statements of [`restrict_connect`] and its read, inside its
+/// transaction.
 async fn restrict_steps(
     tx: &mut PgConnection,
     database: &DatabaseName,
@@ -173,14 +178,14 @@ async fn restrict_steps(
     ] {
         sql::run(tx, &statement).await.map_err(to_app_error)?;
     }
-    Ok(())
+    check_restricted(tx, database, owner).await
 }
 
-/// After [`restrict_connect`], in one read: `database` has no finding of
-/// [`tenant_database_findings`] for `owner` and `PUBLIC` holds no
+/// The read of a restriction, in one statement: `database` has no finding
+/// of [`tenant_database_findings`] for `owner` and `PUBLIC` holds no
 /// `CONNECT`. Anything else, and a missing database, is `INTERNAL` naming
 /// every finding in its source; nothing is repaired.
-pub(crate) async fn check_restricted(
+async fn check_restricted(
     conn: &mut PgConnection,
     database: &DatabaseName,
     owner: &TenantRole,
@@ -281,9 +286,7 @@ async fn create_on(
             .into());
         }
     }
-    restrict_connect(session, database, owner).await?;
-    check_restricted(session, database, owner).await?;
-    Ok(())
+    restrict_connect(session, database, owner).await
 }
 
 /// What the drop's one catalog read found about an existing database.
@@ -843,6 +846,94 @@ mod tests {
                 "{why}"
             );
             assert!(why.ends_with("; PUBLIC holds CONNECT"), "{why}");
+            admin.close().await.expect("the session closed");
+        })
+        .await
+        .expect("the scenario finished within its 30 s guard");
+    }
+
+    /// Whether `database` allows connections, read by `conn`.
+    async fn allows_connections(conn: &mut PgConnection, database: &DatabaseName) -> bool {
+        sqlx::query_scalar(
+            "SELECT datallowconn FROM pg_catalog.pg_database \
+             WHERE datname OPERATOR(pg_catalog.=) $1",
+        )
+        .bind(database.as_str())
+        .fetch_one(conn)
+        .await
+        .expect("the database exists")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Docker; set SEKVENT_DOCKER_TESTS=1 and pass --ignored"]
+    async fn a_refused_restriction_rolls_back_and_leaves_the_database_closed() {
+        let tenant = TenantId::from_uuid(Uuid::new_v4());
+        let role = names().role(tenant);
+        let database = names().database(tenant);
+        let grantor = format!("{}_grantor", role.as_str());
+        let roles = format!("CREATE ROLE {}; CREATE ROLE \"{grantor}\"", role.quoted());
+        let Some((options, _)) = testing::public_first(|_| roles).await else {
+            return;
+        };
+        timeout(testing::SCENARIO_TIMEOUT, async {
+            let mut admin = PgConnection::connect_with(&options)
+                .await
+                .expect("the superuser connected");
+            // Created closed, as `create` creates it, with a CONNECT of
+            // PUBLIC's that the owner's revoke leaves in place.
+            testing::execute(
+                &mut admin,
+                &format!(
+                    "CREATE DATABASE {} OWNER {} ALLOW_CONNECTIONS false",
+                    database.quoted(),
+                    role.quoted()
+                ),
+            )
+            .await;
+            testing::execute(
+                &mut admin,
+                &format!(
+                    "GRANT CONNECT ON DATABASE {db} TO \"{grantor}\" WITH GRANT OPTION; \
+                     SET ROLE \"{grantor}\"; GRANT CONNECT ON DATABASE {db} TO PUBLIC; \
+                     RESET ROLE",
+                    db = database.quoted()
+                ),
+            )
+            .await;
+            let failure = restrict_connect(&mut admin, &database, &role)
+                .await
+                .expect_err("the read inside the restriction refuses it");
+            assert!(failure.is_settled(), "the rollback was awaited");
+            let error = failure.error();
+            assert_eq!(error.code(), ErrorCode::Internal);
+            assert_eq!(error.reason(), None);
+            let why = source(error);
+            assert!(
+                why.contains(&format!("role {grantor} holds CONNECT with grant option")),
+                "{why}"
+            );
+            assert!(why.ends_with("; PUBLIC holds CONNECT"), "{why}");
+            assert!(
+                !allows_connections(&mut admin, &database).await,
+                "the refused restriction did not open the database"
+            );
+
+            testing::execute(
+                &mut admin,
+                &format!(
+                    "REVOKE CONNECT ON DATABASE {} FROM \"{grantor}\" CASCADE",
+                    database.quoted()
+                ),
+            )
+            .await;
+            restrict_connect(&mut admin, &database, &role)
+                .await
+                .map_err(|failure| failure.error().message().to_owned())
+                .expect("a clean restriction commits");
+            assert!(
+                allows_connections(&mut admin, &database).await,
+                "the restriction opened the database"
+            );
             admin.close().await.expect("the session closed");
         })
         .await
